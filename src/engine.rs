@@ -226,6 +226,89 @@ impl Engine {
             let _ = std::io::stdout().flush();
         })
     }
+
+    /// Compute perplexity on a text.
+    ///
+    /// Token-by-token evaluation: at each position, the model predicts the next token.
+    /// PPL = exp(average negative log-likelihood).
+    /// `stride`: number of tokens to process in the prefill before switching to per-token eval.
+    pub fn compute_perplexity(&mut self, text: &str, stride: usize) -> Result<f64> {
+        let encoding = self.tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow::anyhow!("Tokenize error: {}", e))?;
+        let tokens = encoding.get_ids().to_vec();
+        let n_tokens = tokens.len();
+
+        if n_tokens < 2 {
+            anyhow::bail!("Text too short for perplexity (need >= 2 tokens)");
+        }
+
+        eprintln!("Perplexity eval: {} tokens", n_tokens);
+
+        let mut total_nll = 0.0f64;
+        let mut n_evaluated = 0usize;
+        self.position = 0;
+
+        // Process first token (no prediction possible)
+        let first = Tensor::new(&tokens[0..1], &self.device)?.unsqueeze(0)?;
+        let logits = self.model.forward(&first, 0)?;
+        self.position = 1;
+
+        // Get prediction for token[1] from the first forward pass
+        let logits = logits.squeeze(0)?.to_device(&Device::Cpu)?.to_dtype(candle_core::DType::F32)?;
+        let logit_vec = if logits.dims().len() == 2 {
+            logits.get(logits.dims()[0] - 1)?.to_vec1::<f32>()?
+        } else {
+            logits.to_vec1::<f32>()?
+        };
+        let nll = compute_nll(&logit_vec, tokens[1] as usize);
+        total_nll += nll;
+        n_evaluated += 1;
+
+        // Token-by-token evaluation
+        for t in 1..n_tokens - 1 {
+            let input = Tensor::new(&tokens[t..t + 1], &self.device)?.unsqueeze(0)?;
+            let logits = self.model.forward(&input, self.position)?;
+            self.position += 1;
+
+            let logits = logits.squeeze(0)?.to_device(&Device::Cpu)?.to_dtype(candle_core::DType::F32)?;
+            let logit_vec = if logits.dims().len() == 2 {
+                logits.get(logits.dims()[0] - 1)?.to_vec1::<f32>()?
+            } else {
+                logits.to_vec1::<f32>()?
+            };
+
+            let nll = compute_nll(&logit_vec, tokens[t + 1] as usize);
+            total_nll += nll;
+            n_evaluated += 1;
+
+            if n_evaluated % 100 == 0 {
+                let current_ppl = (total_nll / n_evaluated as f64).exp();
+                eprintln!("  [{}/{}] PPL: {:.3}", n_evaluated, n_tokens - 1, current_ppl);
+            }
+        }
+
+        let avg_nll = total_nll / n_evaluated as f64;
+        let perplexity = avg_nll.exp();
+
+        eprintln!("Final perplexity: {:.3} ({} tokens)", perplexity, n_evaluated);
+        Ok(perplexity)
+    }
+}
+
+/// Compute negative log-likelihood for a target token given logits.
+fn compute_nll(logits: &[f32], target_id: usize) -> f64 {
+    let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let log_sum_exp: f64 = logits.iter()
+        .map(|&x| ((x - max_val) as f64).exp())
+        .sum::<f64>()
+        .ln() + max_val as f64;
+    let target_logit = if target_id < logits.len() {
+        logits[target_id] as f64
+    } else {
+        logits[0] as f64
+    };
+    log_sum_exp - target_logit
 }
 
 fn extract_last_logits(logits: &Tensor) -> candle_core::Result<Tensor> {

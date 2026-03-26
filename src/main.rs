@@ -87,6 +87,14 @@ struct Args {
     /// TurboQuant bit width (2, 3, or 4)
     #[arg(long, default_value = "4")]
     tq_bits: u8,
+
+    /// Run perplexity evaluation on a text file
+    #[arg(long)]
+    perplexity: Option<PathBuf>,
+
+    /// Chunk size for perplexity evaluation
+    #[arg(long, default_value = "512")]
+    ppl_chunk: usize,
 }
 
 fn main() -> Result<()> {
@@ -125,6 +133,15 @@ fn main() -> Result<()> {
 
     if args.serve {
         return serve::run_daemon(engine, &template, args.port);
+    }
+
+    // Perplexity evaluation mode
+    if let Some(ppl_file) = &args.perplexity {
+        let text = std::fs::read_to_string(ppl_file)
+            .with_context(|| format!("Cannot read perplexity file: {}", ppl_file.display()))?;
+        let ppl = engine.compute_perplexity(&text, args.ppl_chunk)?;
+        println!("Perplexity: {:.3}", ppl);
+        return Ok(());
     }
 
     let gen_params = GenerationParams {
