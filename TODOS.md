@@ -28,19 +28,18 @@
 ## Open — Phase 1: Parallel Sprint (This Week)
 
 **Track A — Engineering:**
-- [ ] candle PR: upstream RmsNorm CUDA implementation
-- [ ] candle PR: upstream RoPE CUDA implementation
-- [ ] candle PR: upstream softmax CUDA implementation
-- [ ] Metric audit — versiyon + benchmark rakamlarını hizala, BENCHMARK.md = tek kaynak
-- [ ] Qwen 72B fused attention long-context diagnosis (ayrı bug — bias fix faaa8ac'de yapıldı)
-- [ ] fused_attention_scores() dedicated test + buffer reuse (per-key alloc kaldır)
-- [ ] Inline yorumları İngilizce'ye çevir (HN lansmanı öncesi)
+- [x] candle CUDA ops: RmsNorm, RoPE, softmax — upstream already fixed in candle 0.9.2
+- [ ] candle dependency update: bump candle-core/candle-nn from 0.9 to 0.9.2, test native CUDA ops
+- [x] Metric audit — versiyon + benchmark rakamları hizalandı, BENCHMARK.md = tek kaynak
+- [ ] Qwen 72B fused attention long-context diagnosis (diagnostic tool hazır, model test bekliyor)
+- [x] fused_attention_scores() dedicated test + buffer reuse (per-key alloc kaldırıldı)
+- [x] Inline yorumlar İngilizce'ye çevrildi
 
 **Track B — Launch (paralel, metric audit sonrası):**
-- [ ] TurboQuant implementasyon karşılaştırma tablosu (README section)
+- [x] TurboQuant implementasyon karşılaştırma tablosu (README'ye eklendi)
 - [ ] candle-examples PR (TurboQuant KV cache example)
-- [ ] tq-demo CLI subcommand — bundled NIAH test + compression stats
-- [ ] HN post draft (docs/hn-launch.md) — 4-bit PPL +0.8%, CUDA, pure Rust, NIAH 9/9
+- [x] tq-demo CLI subcommand — bundled NIAH test + compression stats
+- [x] HN post draft (docs/hn-launch.md) — 4-bit PPL +0.8%, CUDA, pure Rust, NIAH 9/9
 - [ ] Reddit posts: r/rust + r/LocalLLaMA
 
 ## Open — Phase 2: Performance (Week 2-3)
