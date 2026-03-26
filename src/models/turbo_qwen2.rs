@@ -30,23 +30,33 @@ impl RmsNorm {
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let x_dtype = x.dtype();
-        let x = x.to_dtype(DType::F32)?;
-        let variance = x.sqr()?.mean_keepdim(x.rank() - 1)?;
-        let rms = (variance + self.eps)?.sqrt()?;
-        let normalized = x.broadcast_div(&rms)?;
-        normalized.broadcast_mul(&self.weight)?.to_dtype(x_dtype)
+        if x.device().is_cpu() {
+            // Use candle's native implementation on CPU
+            candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
+        } else {
+            // Manual implementation for CUDA
+            let x_dtype = x.dtype();
+            let x = x.to_dtype(DType::F32)?;
+            let variance = x.sqr()?.mean_keepdim(x.rank() - 1)?;
+            let rms = (variance + self.eps)?.sqrt()?;
+            let normalized = x.broadcast_div(&rms)?;
+            normalized.broadcast_mul(&self.weight)?.to_dtype(x_dtype)
+        }
     }
 }
 
 pub const MAX_SEQ_LEN: usize = 4096;
 
 fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
-    let last = x.rank() - 1;
-    let max_val = x.max_keepdim(last)?;
-    let exp = x.broadcast_sub(&max_val)?.exp()?;
-    let sum = exp.sum_keepdim(last)?;
-    exp.broadcast_div(&sum)
+    if x.device().is_cpu() {
+        candle_nn::ops::softmax_last_dim(x)
+    } else {
+        let last = x.rank() - 1;
+        let max_val = x.max_keepdim(last)?;
+        let exp = x.broadcast_sub(&max_val)?.exp()?;
+        let sum = exp.sum_keepdim(last)?;
+        exp.broadcast_div(&sum)
+    }
 }
 
 fn silu(x: &Tensor) -> Result<Tensor> {
@@ -142,6 +152,9 @@ struct LayerWeights {
     attention_wk: QMatMul,
     attention_wv: QMatMul,
     attention_wo: QMatMul,
+    attention_bq: Tensor,
+    attention_bk: Tensor,
+    attention_bv: Tensor,
     attention_norm: RmsNorm,
     mlp: Mlp,
     ffn_norm: RmsNorm,
@@ -180,7 +193,12 @@ impl LayerWeights {
         let (_b_sz, _n_head, seq_len, _n_embd) = x.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        rope_i_manual(&x.contiguous()?, &cos, &sin)
+        // Use candle's native rope_i on CPU, manual on CUDA
+        if x.device().is_cpu() {
+            candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+        } else {
+            rope_i_manual(&x.contiguous()?, &cos, &sin)
+        }
     }
 
     fn forward_attn(
@@ -194,6 +212,10 @@ impl LayerWeights {
         let q = self.attention_wq.forward(x)?;
         let k = self.attention_wk.forward(x)?;
         let v = self.attention_wv.forward(x)?;
+
+        let q = q.broadcast_add(&self.attention_bq)?;
+        let k = k.broadcast_add(&self.attention_bk)?;
+        let v = v.broadcast_add(&self.attention_bv)?;
 
         let q = q.reshape((b_sz, seq_len, self.n_head, self.head_dim))?.transpose(1, 2)?;
         let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
@@ -320,6 +342,7 @@ pub struct ModelWeights {
 fn precomput_freqs_cis(
     head_dim: usize,
     freq_base: f32,
+    context_length: usize,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
     let theta: Vec<_> = (0..head_dim)
@@ -327,9 +350,9 @@ fn precomput_freqs_cis(
         .map(|i| 1f32 / freq_base.powf(i as f32 / head_dim as f32))
         .collect();
     let theta = Tensor::new(theta.as_slice(), device)?;
-    let idx_theta = Tensor::arange(0, MAX_SEQ_LEN as u32, device)?
+    let idx_theta = Tensor::arange(0, context_length as u32, device)?
         .to_dtype(DType::F32)?
-        .reshape((MAX_SEQ_LEN, 1))?
+        .reshape((context_length, 1))?
         .matmul(&theta.reshape((1, theta.elem_count()))?)?;
     Ok((idx_theta.cos()?, idx_theta.sin()?))
 }
@@ -353,16 +376,18 @@ impl ModelWeights {
         let rms_norm_eps = md_get("qwen2.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
         let rope_freq_base = md_get("qwen2.rope.freq_base")
             .and_then(|m| m.to_f32()).unwrap_or(1000000f32);
+        let context_length = md_get("qwen2.context_length")
+            .and_then(|m| m.to_u32()).unwrap_or(MAX_SEQ_LEN as u32) as usize;
 
         let head_dim = embedding_length / head_count;
         eprintln!(
-            "TurboQuant Qwen2: {} layers, {} heads, head_dim={}, {}-bit KV cache (fused attention)",
-            block_count, head_count, head_dim, tq_config.bits
+            "TurboQuant Qwen2: {} layers, {} heads (kv={}), head_dim={}, emb={}, eps={:.2e}, rope_base={}, {}-bit KV cache",
+            block_count, head_count, head_count_kv, head_dim, embedding_length, rms_norm_eps, rope_freq_base, tq_config.bits
         );
 
         let signs = tq_kv::hadamard::generate_signs(head_dim, tq_config.rotation_seed);
 
-        let (cos, sin) = precomput_freqs_cis(head_dim, rope_freq_base, device)?;
+        let (cos, sin) = precomput_freqs_cis(head_dim, rope_freq_base, context_length, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
@@ -381,6 +406,9 @@ impl ModelWeights {
             let attention_wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
             let attention_wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
             let attention_wv = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
+            let attention_bq = ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?;
+            let attention_bk = ct.tensor(reader, &format!("{prefix}.attn_k.bias"), device)?;
+            let attention_bv = ct.tensor(reader, &format!("{prefix}.attn_v.bias"), device)?;
             let attention_wo = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
             let w1 = ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
             let w2 = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
@@ -393,6 +421,9 @@ impl ModelWeights {
                 attention_wk: QMatMul::from_qtensor(attention_wk)?,
                 attention_wv: QMatMul::from_qtensor(attention_wv)?,
                 attention_wo: QMatMul::from_qtensor(attention_wo)?,
+                attention_bq: attention_bq.dequantize(device)?,
+                attention_bk: attention_bk.dequantize(device)?,
+                attention_bv: attention_bv.dequantize(device)?,
                 attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps, device)?,
                 mlp: Mlp {
                     feed_forward_w1: QMatMul::from_qtensor(w1)?,
