@@ -52,12 +52,12 @@ Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 
 
 PPL remains flat as context length grows:
 
-| Context Length | PPL | vs Baseline |
-|:--------------:|----:|:----------:|
-| 256 tokens | 10.12 | +0.4% |
-| 512 tokens | 9.87 | +0.9% |
-| 1024 tokens | 9.71 | +1.2% |
-| 2048 tokens | 9.69 | +1.9% |
+| Context Length | Standard | 4-bit | vs Baseline |
+|:--------------:|---------:|------:|:----------:|
+| 256 tokens | 13.863 | 14.076 | +1.5% |
+| 512 tokens | 11.368 | 11.585 | +1.9% |
+| 1024 tokens | 7.441 | 7.474 | +0.4% |
+| 2048 tokens | 9.651 | 9.718 | +0.7% |
 
 No quality cliff. Compression holds across sequence lengths.
 
