@@ -1,30 +1,30 @@
-//! PolarQuant: Kartezyen → Kutupsal koordinat dönüşümü ile quantization.
+//! PolarQuant: Quantization via Cartesian → Polar coordinate transform.
 //!
-//! Standart quantization her bileşeni bağımsız quantize eder.
-//! PolarQuant vektörü norm + yön olarak ayırır:
-//!   - Norm: tek skaler, yüksek hassasiyetle saklanır
-//!   - Yön (unit vector): düşük bit ile uniform quantize edilir
+//! Standard quantization quantizes each component independently.
+//! PolarQuant separates the vector into norm + direction:
+//!   - Norm: single scalar, stored at high precision
+//!   - Direction (unit vector): uniformly quantized at low bit width
 //!
-//! Hadamard rotation sonrası bileşenler yaklaşık Gaussian dağılır,
-//! bu da uniform quantization için ideal koşul sağlar.
+//! After Hadamard rotation, components are approximately Gaussian,
+//! which provides ideal conditions for uniform quantization.
 
-/// PolarQuant ile sıkıştırılmış tek bir vektör.
+/// A single vector compressed with PolarQuant.
 #[derive(Clone, Debug)]
 pub struct PolarQuantized {
-    /// Orijinal vektörün L2 normu (f32 hassasiyette saklanır)
+    /// L2 norm of the original vector (stored at f32 precision)
     pub norm: f32,
-    /// Quantize edilmiş unit vector bileşenleri (her biri `bits` bit)
+    /// Quantized unit vector components (each `bits` bits)
     pub quantized_unit: Vec<u8>,
-    /// Dequantization için scale
+    /// Scale for dequantization
     pub scale: f32,
-    /// Dequantization için zero point
+    /// Zero point for dequantization
     pub zero_point: f32,
 }
 
-/// Quantization konfigürasyonu
+/// Quantization configuration
 #[derive(Clone, Debug)]
 pub struct PolarConfig {
-    /// Bit genişliği (3 veya 4)
+    /// Bit width (3 or 4)
     pub bits: u8,
 }
 
@@ -35,21 +35,21 @@ impl Default for PolarConfig {
 }
 
 impl PolarConfig {
-    /// Maksimum quantized değer
+    /// Maximum quantized value
     #[inline]
     fn max_val(&self) -> u8 {
         (1u16 << self.bits) as u8 - 1
     }
 }
 
-/// Tek bir f32 vektörünü PolarQuant ile sıkıştır.
+/// Compress a single f32 vector with PolarQuant.
 ///
-/// Girdi: Hadamard-rotated vektör (bileşenler ~ Gaussian)
-/// Çıktı: norm + quantized unit vector
+/// Input: Hadamard-rotated vector (components ~ Gaussian)
+/// Output: norm + quantized unit vector
 pub fn quantize(vector: &[f32], config: &PolarConfig) -> PolarQuantized {
     let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-    // Sıfır vektör
+    // Zero vector
     if norm < 1e-10 {
         return PolarQuantized {
             norm: 0.0,
@@ -90,9 +90,9 @@ pub fn quantize(vector: &[f32], config: &PolarConfig) -> PolarQuantized {
     }
 }
 
-/// PolarQuant verisini geri aç (dequantize).
+/// Decompress (dequantize) PolarQuant data.
 ///
-/// Çıktı: yaklaşık orijinal vektör (Hadamard domain'de)
+/// Output: approximate original vector (in Hadamard domain)
 pub fn dequantize(pq: &PolarQuantized) -> Vec<f32> {
     pq.quantized_unit
         .iter()
@@ -103,10 +103,10 @@ pub fn dequantize(pq: &PolarQuantized) -> Vec<f32> {
         .collect()
 }
 
-/// Batch quantize: birden fazla vektörü aynı anda sıkıştır.
-/// Her vektör `dim` boyutunda.
+/// Batch quantize: compress multiple vectors at once.
+/// Each vector is `dim`-dimensional.
 pub fn quantize_batch(data: &[f32], dim: usize, config: &PolarConfig) -> Vec<PolarQuantized> {
-    assert_eq!(data.len() % dim, 0, "Veri boyutu dim'e tam bölünmeli");
+    assert_eq!(data.len() % dim, 0, "Data length must be evenly divisible by dim");
     data.chunks_exact(dim)
         .map(|chunk| quantize(chunk, config))
         .collect()
@@ -121,7 +121,7 @@ pub fn dequantize_batch(quantized: &[PolarQuantized], dim: usize) -> Vec<f32> {
     result
 }
 
-/// Quantization hatasını hesapla (MSE).
+/// Compute quantization error (MSE).
 pub fn compute_mse(original: &[f32], reconstructed: &[f32]) -> f32 {
     assert_eq!(original.len(), reconstructed.len());
     let sum_sq_err: f32 = original
@@ -132,9 +132,9 @@ pub fn compute_mse(original: &[f32], reconstructed: &[f32]) -> f32 {
     sum_sq_err / original.len() as f32
 }
 
-/// Sıkıştırma oranını hesapla.
-/// Orijinal: dim * 32 bit (f32)
-/// Sıkıştırılmış: 32 (norm) + 32 (scale) + 32 (zero) + dim * bits
+/// Compute compression ratio.
+/// Original: dim * 32 bits (f32)
+/// Compressed: 32 (norm) + 32 (scale) + 32 (zero) + dim * bits
 pub fn compression_ratio(dim: usize, bits: u8) -> f32 {
     let original_bits = dim as f32 * 32.0;
     let compressed_bits = 96.0 + dim as f32 * bits as f32; // 3x32 metadata + quantized values
@@ -152,32 +152,32 @@ mod tests {
         let pq = quantize(&vector, &config);
         let reconstructed = dequantize(&pq);
 
-        // Norm korunmalı (yaklaşık)
+        // Norm should be preserved (approximately)
         let orig_norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(
             (orig_norm - pq.norm).abs() < 1e-5,
-            "Norm farkı: {} vs {}",
+            "Norm difference: {} vs {}",
             orig_norm,
             pq.norm
         );
 
-        // Reconstruction error düşük olmalı
+        // Reconstruction error should be low
         let mse = compute_mse(&vector, &reconstructed);
-        assert!(mse < 0.01, "MSE çok yüksek: {}", mse);
+        assert!(mse < 0.01, "MSE too high: {}", mse);
     }
 
     #[test]
     fn test_compression_ratio_4bit() {
         let ratio = compression_ratio(128, 4);
         // 128 * 32 / (96 + 128 * 4) = 4096 / 608 ≈ 6.7x
-        assert!(ratio > 6.0, "4-bit sıkıştırma oranı beklenen: >6x, gerçek: {:.1}x", ratio);
+        assert!(ratio > 6.0, "4-bit compression ratio expected: >6x, actual: {:.1}x", ratio);
     }
 
     #[test]
     fn test_compression_ratio_3bit() {
         let ratio = compression_ratio(128, 3);
         // 128 * 32 / (96 + 128 * 3) = 4096 / 480 ≈ 8.5x
-        assert!(ratio > 8.0, "3-bit sıkıştırma oranı beklenen: >8x, gerçek: {:.1}x", ratio);
+        assert!(ratio > 8.0, "3-bit compression ratio expected: >8x, actual: {:.1}x", ratio);
     }
 
     #[test]
@@ -187,7 +187,7 @@ mod tests {
         let batch = quantize_batch(&data, 8, &config);
         let reconstructed = dequantize_batch(&batch, 8);
         let mse = compute_mse(&data, &reconstructed);
-        assert!(mse < 0.01, "Batch MSE çok yüksek: {}", mse);
+        assert!(mse < 0.01, "Batch MSE too high: {}", mse);
     }
 
     #[test]

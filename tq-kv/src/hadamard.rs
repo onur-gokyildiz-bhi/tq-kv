@@ -1,11 +1,11 @@
 //! Fast Walsh-Hadamard Transform (WHT)
 //!
-//! TurboQuant'ın ilk adımı: vektörleri rastgele döndürmek.
-//! Hadamard matrisi ile çarpma O(n log n) karmaşıklıkta yapılır.
-//! Bu, outlier değerleri dağıtarak quantization hatasını minimuma indirir.
+//! The first step of TurboQuant: randomly rotating vectors.
+//! Multiplication with the Hadamard matrix is done in O(n log n) complexity.
+//! This minimizes quantization error by spreading out outlier values.
 
 /// In-place Fast Walsh-Hadamard Transform.
-/// Girdi uzunluğu 2'nin kuvveti olmalı. Değilse en yakın kuvvete pad'lenir.
+/// Input length must be a power of 2. If not, it is padded to the nearest power.
 ///
 /// Butterfly pattern:
 /// ```text
@@ -15,7 +15,7 @@
 /// ```
 pub fn fast_wht(x: &mut [f32]) {
     let n = x.len();
-    debug_assert!(n.is_power_of_two(), "WHT girdi boyutu 2'nin kuvveti olmalı: {}", n);
+    debug_assert!(n.is_power_of_two(), "WHT input size must be a power of 2: {}", n);
 
     let mut h = 1;
     while h < n {
@@ -30,24 +30,24 @@ pub fn fast_wht(x: &mut [f32]) {
         h *= 2;
     }
 
-    // Normalize: 1/sqrt(n) ile çarp (ortogonal dönüşüm)
+    // Normalize: multiply by 1/sqrt(n) (orthogonal transform)
     let scale = 1.0 / (n as f32).sqrt();
     for val in x.iter_mut() {
         *val *= scale;
     }
 }
 
-/// WHT'nin tersi. Ortogonal olduğu için kendisi ile aynı (self-inverse).
-/// Sadece tekrar çağırmak yeterli.
+/// Inverse of WHT. Since it is orthogonal, it is self-inverse.
+/// Simply calling it again is sufficient.
 #[inline]
 pub fn inverse_wht(x: &mut [f32]) {
     fast_wht(x);
 }
 
-/// Vektörü rastgele işaret değişikliği ile döndür (randomized Hadamard).
-/// Bu, outlier'ları dağıtmak için WHT öncesi uygulanan standart teknik.
+/// Rotate vector with random sign flipping (randomized Hadamard).
+/// This is the standard technique applied before WHT to spread outliers.
 ///
-/// `signs[i]` = +1 veya -1, seed'den deterministik üretilir.
+/// `signs[i]` = +1 or -1, deterministically generated from seed.
 pub fn random_sign_flip(x: &mut [f32], signs: &[f32]) {
     debug_assert_eq!(x.len(), signs.len());
     for (val, &sign) in x.iter_mut().zip(signs.iter()) {
@@ -55,7 +55,7 @@ pub fn random_sign_flip(x: &mut [f32], signs: &[f32]) {
     }
 }
 
-/// Seed'den deterministik rastgele işaretler üret.
+/// Generate deterministic random signs from seed.
 /// Requires `std` feature (uses ChaCha8 RNG).
 #[cfg(feature = "std")]
 pub fn generate_signs(dim: usize, seed: u64) -> Vec<f32> {
@@ -82,7 +82,7 @@ pub fn pad_to_power_of_two(x: &[f32]) -> Vec<f32> {
 }
 
 /// Randomized Hadamard Transform: sign flip + WHT
-/// Tam pipeline: x → diag(signs) * x → WHT(x)
+/// Full pipeline: x → diag(signs) * x → WHT(x)
 /// Requires `std` feature.
 #[cfg(feature = "std")]
 pub fn randomized_hadamard(x: &mut [f32], seed: u64) {
@@ -92,7 +92,7 @@ pub fn randomized_hadamard(x: &mut [f32], seed: u64) {
 }
 
 /// Randomized Hadamard Transform with pre-computed signs.
-/// Signs alloc'u kaydeder — hot loop'larda kullanın.
+/// Saves signs allocation — use in hot loops.
 pub fn randomized_hadamard_with_signs(x: &mut [f32], signs: &[f32]) {
     random_sign_flip(x, signs);
     fast_wht(x);
@@ -150,7 +150,7 @@ mod tests {
         let norm_after: f32 = transformed.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(
             (norm_before - norm_after).abs() < 1e-5,
-            "Norm korunmadı: {} vs {}",
+            "Norm not preserved: {} vs {}",
             norm_before,
             norm_after
         );
