@@ -29,6 +29,10 @@ rayon = "1.10"
 name = "tq-engine"
 path = "src/main.rs"
 
+[[bin]]
+name = "tq-diagnose"
+path = "src/diagnose.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

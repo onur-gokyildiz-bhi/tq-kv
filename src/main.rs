@@ -1,5 +1,6 @@
 mod chat;
 mod config;
+mod diagnostics;
 mod download;
 mod engine;
 mod inference;
