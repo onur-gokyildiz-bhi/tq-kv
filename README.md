@@ -21,6 +21,28 @@ Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 
 - **Faster, not just smaller** -- smaller KV cache = less memory bandwidth = faster inference. Independently confirmed across Metal, CUDA, and CPU implementations.
 - **Production architecture** -- O(1) incremental cache, Rayon parallel multi-head attention, `no_std` core, 45+ tests including FFI integration.
 
+## TurboQuant Implementations Compared
+
+> As of March 2026. TurboQuant (ICLR 2026, Google Research) has multiple community implementations.
+
+| Feature | **tq-kv** (this) | turboquant_plus | turboquant | turbo-quant | Dejan (Triton) |
+|:--------|:----------------:|:---------------:|:----------:|:-----------:|:--------------:|
+| Language | Rust | Python/C | Rust | Rust | Python/CUDA |
+| CUDA GPU | **Yes** | No | No | No | **Yes** (Triton) |
+| AVX2 SIMD | **Yes** | No | No | No | No |
+| C FFI | **Yes** | No | No | No | No |
+| llama.cpp patch | **Yes** | **Yes** (fork) | No | No | No |
+| Fused attention | **Yes** | No | No | No | No |
+| Incremental cache | **Yes** | No | No | No | No |
+| PPL benchmark | **+0.8%** (4-bit) | N/A | N/A | N/A | N/A |
+| NIAH test | **9/9 pass** | N/A | N/A | N/A | N/A |
+| no_std | **Yes** | No | No | No | No |
+| crates.io | **v0.3.0** | N/A | alpha | minimal | N/A |
+| Lines of code | ~3K lib | N/A | ~6.9K | ~1.1K | N/A |
+| Metal (Apple) | No | **Yes** | No | No | No |
+
+tq-kv is the most complete Rust implementation with the only published perplexity and NIAH benchmarks.
+
 ---
 
 ## Key Results
