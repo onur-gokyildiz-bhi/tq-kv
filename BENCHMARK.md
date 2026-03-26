@@ -167,6 +167,38 @@ New architecture: compress 1 new key + append + fused attention = O(1) cache + O
 > CUDA support required custom implementations of RmsNorm, RoPE, and softmax because candle's
 > quantized_nn ops lack CUDA kernels.
 
+## Needle-In-A-Haystack (NIAH)
+
+> Trendyol Llama-3 8B, ~4K token context, RTX 3080 10GB
+
+Needle: "The secret code for the treasure vault is GOLDEN-PHOENIX-7742."
+Question: "What is the secret code for the treasure vault?"
+
+| Depth | Standard | TurboQuant 4-bit | TurboQuant 2-bit |
+|:-----:|:--------:|:----------------:|:----------------:|
+| 10% | PASS | PASS | PASS |
+| 50% | PASS | PASS | PASS |
+| 90% | PASS | PASS | PASS |
+
+9/9 pass. Compressed keys preserve retrieval accuracy at every depth.
+
+---
+
+## Context Scaling
+
+> Trendyol Llama-3 8B, wikitext-2, CPU inference
+
+PPL at different context lengths:
+
+| Context | Standard | 4-bit | vs Baseline | 2-bit | vs Baseline |
+|:-------:|---------:|------:|:----------:|------:|:----------:|
+| 256 | 13.863 | 14.076 | +1.5% | 15.906 | +14.7% |
+| 512 | 11.368 | 11.585 | +1.9% | 13.364 | +17.6% |
+| 1024 | 7.441 | 7.474 | +0.4% | 9.041 | +21.5% |
+| 2048 | 9.651 | 9.718 | +0.7% | 12.946 | +34.1% |
+
+4-bit PPL remains flat across all context lengths (+0.4% to +1.9%).
+
 ---
 
 ## Codebook Quality (isolated, ideal Gaussian data)
