@@ -18,7 +18,8 @@ Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 
 - **Proven quality** -- 4-bit perplexity 9.594 vs 9.515 baseline (+0.8%) on wikitext-2, NIAH pass at all depths. Not toy benchmarks; real model, real text.
 - **CUDA + AVX2 SIMD** -- the only TurboQuant crate with NVIDIA GPU support (3.2x over CPU) and fused AVX2+FMA attention (8.9x over decompress path).
 - **C FFI for llama.cpp** -- ships `tq_kv.h` + `libtq_kv.a`. Drop into any C/C++ inference engine. Multi-head layer API included.
-- **Production architecture** -- O(1) incremental cache (935x overhead reduction), Rayon parallel multi-head attention, `no_std` core, 41 tests + 4 FFI integration tests.
+- **Faster, not just smaller** -- smaller KV cache = less memory bandwidth = faster inference. Independently confirmed across Metal, CUDA, and CPU implementations.
+- **Production architecture** -- O(1) incremental cache, Rayon parallel multi-head attention, `no_std` core, 45+ tests including FFI integration.
 
 ---
 
@@ -247,6 +248,13 @@ Link: `-ltq_kv -lpthread -ldl -lm` (Linux) or `tq_kv.lib` (Windows MSVC).
 |:--------|-----:|:-------:|
 | CUDA GPU | 7.4 s | **3.2x** |
 | CPU | 23.4 s | 1.0x |
+
+### Verified Models
+
+| Model | Parameters | Architecture | Status |
+|:------|:---------:|:------------:|:------:|
+| Trendyol Llama-3 8B | 8B | Llama | PPL verified, NIAH 9/9 |
+| Qwen2.5 72B Instruct | 72B | Qwen2 (GQA-8) | Correct output verified |
 
 Run benchmarks: `cargo run --release -p tq-kv --bin tq-kv-bench`
 

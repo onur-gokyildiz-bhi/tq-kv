@@ -124,6 +124,20 @@ Output: packed_indices (uint8) + norms (fp32)
 > QJL adds +1.2 dB SNR but costs **29x compress**, **128x decompress**, and worse ratio (2.7x vs 3.8x).
 > Removed from all defaults.
 
+### QJL Long Context Investigation
+
+Does QJL help more at longer sequences? Tested 64 to 8192 vectors:
+
+| Vectors | 4-bit OFF | 4-bit ON | 2-bit OFF | 2-bit ON |
+|--------:|:---------:|:--------:|:---------:|:--------:|
+| 64 | 0.9954 | 0.9965 | 0.940 | 0.956 |
+| 256 | 0.9953 | 0.9965 | 0.940 | 0.956 |
+| 1024 | 0.9954 | 0.9965 | 0.940 | 0.956 |
+| 4096 | 0.9954 | 0.9965 | 0.940 | 0.956 |
+| 8192 | 0.9955 | 0.9965 | 0.941 | 0.956 |
+
+QJL improvement is **constant** (+1.1-1.2 dB) regardless of context length. Per-vector compression is independent — error does not accumulate. QJL removal decision stands.
+
 ---
 
 ## Fused Attention vs Decompress Path
@@ -137,6 +151,19 @@ Output: packed_indices (uint8) + norms (fp32)
 | 4-bit | 83 | 503 | **6.1x** | 0.000001 |
 
 Fused attention computes attention scores directly from compressed key indices via centroid table lookup. No key decompression needed. Pre-rotate query once, then per-key cost is a dot product with scaled centroids.
+
+---
+
+## Qwen2.5 72B — Real Model Validation
+
+> 80 layers, 8 KV heads (GQA-8), 64 query heads, head_dim=128, Q4_K_M
+
+| Mode | Output |
+|:-----|:-------|
+| Standard (no TQ) | "Turkiye'nin baskenti Ankara'dir." |
+| TurboQuant 4-bit | "Turkiye'nin baskenti Ankara'dir." |
+
+Qwen2 requires attention Q/K/V bias (attn_q.bias, attn_k.bias, attn_v.bias) and context_length from GGUF metadata. Missing bias was the root cause of initial failures — not compression quality.
 
 ---
 

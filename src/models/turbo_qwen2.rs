@@ -30,33 +30,23 @@ impl RmsNorm {
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        if x.device().is_cpu() {
-            // Use candle's native implementation on CPU
-            candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)
-        } else {
-            // Manual implementation for CUDA
-            let x_dtype = x.dtype();
-            let x = x.to_dtype(DType::F32)?;
-            let variance = x.sqr()?.mean_keepdim(x.rank() - 1)?;
-            let rms = (variance + self.eps)?.sqrt()?;
-            let normalized = x.broadcast_div(&rms)?;
-            normalized.broadcast_mul(&self.weight)?.to_dtype(x_dtype)
-        }
+        let x_dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
+        let variance = x.sqr()?.mean_keepdim(x.rank() - 1)?;
+        let rms = (variance + self.eps)?.sqrt()?;
+        let normalized = x.broadcast_div(&rms)?;
+        normalized.broadcast_mul(&self.weight)?.to_dtype(x_dtype)
     }
 }
 
 pub const MAX_SEQ_LEN: usize = 4096;
 
 fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
-    if x.device().is_cpu() {
-        candle_nn::ops::softmax_last_dim(x)
-    } else {
-        let last = x.rank() - 1;
-        let max_val = x.max_keepdim(last)?;
-        let exp = x.broadcast_sub(&max_val)?.exp()?;
-        let sum = exp.sum_keepdim(last)?;
-        exp.broadcast_div(&sum)
-    }
+    let last = x.rank() - 1;
+    let max_val = x.max_keepdim(last)?;
+    let exp = x.broadcast_sub(&max_val)?.exp()?;
+    let sum = exp.sum_keepdim(last)?;
+    exp.broadcast_div(&sum)
 }
 
 fn silu(x: &Tensor) -> Result<Tensor> {
@@ -193,12 +183,7 @@ impl LayerWeights {
         let (_b_sz, _n_head, seq_len, _n_embd) = x.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        // Use candle's native rope_i on CPU, manual on CUDA
-        if x.device().is_cpu() {
-            candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
-        } else {
-            rope_i_manual(&x.contiguous()?, &cos, &sin)
-        }
+        rope_i_manual(&x.contiguous()?, &cos, &sin)
     }
 
     fn forward_attn(
