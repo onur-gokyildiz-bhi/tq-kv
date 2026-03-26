@@ -1,0 +1,30 @@
+[package]
+name = "tq-kv"
+version = "0.1.0"
+edition = "2021"
+description = "TurboQuant: Extreme KV Cache Compression for LLMs — ICLR 2026 Pure Rust implementation. Lloyd-Max codebook, fused attention, SIMD (AVX2). 2-4 bit, up to 15x compression."
+license = "MIT OR Apache-2.0"
+keywords = ["llm", "quantization", "kv-cache", "compression", "transformers"]
+categories = ["science", "compression", "algorithms"]
+repository = "https://github.com/onur-gokyildiz-bhi/tq-kv"
+readme = "README.md"
+
+[lib]
+crate-type = ["lib", "staticlib"]
+
+[features]
+default = ["std"]
+std = ["rand", "rand_chacha"]
+ffi = ["std"]
+
+[[bin]]
+name = "tq-kv-bench"
+path = "src/main.rs"
+required-features = ["std"]
+
+[dependencies]
+rand = { version = "0.8", optional = true }
+rand_chacha = { version = "0.3", optional = true }
+
+[build-dependencies]
+cbindgen = { version = "0.28", optional = true }
