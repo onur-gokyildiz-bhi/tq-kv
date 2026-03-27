@@ -9,10 +9,10 @@ description = "TurboQuant-powered LLM inference engine — Pure Rust, compressed
 keywords = ["llm", "inference", "turboquant", "kv-cache", "quantization"]
 
 [dependencies]
-tq-kv = { path = "tq-kv" }
-candle-core = { version = "0.9", features = ["cuda"] }
-candle-nn = "0.9"
-candle-transformers = "0.9"
+tq-kv = { path = "tq-kv", features = ["candle"] }
+candle-core = { version = "0.9.2", features = ["cuda"] }
+candle-nn = "0.9.2"
+candle-transformers = "0.9.2"
 tokenizers = "0.20"
 clap = { version = "4", features = ["derive"] }
 hf-hub = "0.4"
@@ -28,6 +28,10 @@ rayon = "1.10"
 [[bin]]
 name = "tq-engine"
 path = "src/main.rs"
+
+[[bin]]
+name = "tq-diagnose"
+path = "src/diagnose.rs"
 
 [profile.release]
 opt-level = 3

@@ -1,17 +1,17 @@
 //! Lloyd-Max Optimal Codebook for Gaussian-distributed coordinates.
 //!
-//! TurboQuant'ın temel farkı: random rotation sonrası her koordinat
-//! yaklaşık Gaussian(0, 1/sqrt(d)) dağılır. Bu dağılım için Lloyd-Max
-//! algoritması ile optimal centroid'ler önceden hesaplanır.
+//! The key insight of TurboQuant: after random rotation, each coordinate
+//! is approximately Gaussian(0, 1/sqrt(d)). Optimal centroids are
+//! pre-computed for this distribution using the Lloyd-Max algorithm.
 //!
-//! Uniform quantization'a göre ~2-3 dB daha iyi SNR sağlar.
-//! Bu yüzden 2-bit'te bile sıfır kalite kaybı mümkün.
+//! Provides ~2-3 dB better SNR compared to uniform quantization.
+//! This is why near-zero quality loss is possible even at 2-bit.
 
 /// Pre-computed Lloyd-Max centroids for standard Gaussian N(0,1).
-/// Gerçek kullanımda sigma = 1/sqrt(dim) ile ölçeklenir.
+/// In practice, scaled by sigma = 1/sqrt(dim).
 ///
-/// Kaynak: J. Max, "Quantizing for Minimum Distortion", IRE Trans., 1960
-/// Değerler 300 iterasyon Lloyd-Max optimizasyonu ile doğrulanmıştır.
+/// Source: J. Max, "Quantizing for Minimum Distortion", IRE Trans., 1960
+/// Values verified with 300 iterations of Lloyd-Max optimization.
 
 /// 2-bit (4 centroid) — 16x theoretical compression
 pub const CENTROIDS_2BIT: &[f32] = &[-1.5104, -0.4528, 0.4528, 1.5104];
@@ -40,44 +40,44 @@ pub const BOUNDARIES_4BIT: &[f32] = &[
      1.4371,  1.8435,  2.4008,
 ];
 
-/// Bit genişliğine göre statik centroid dizisi döndür.
-/// Fused attention'da centroid table lookup için kullanılır.
+/// Return static centroid array for the given bit width.
+/// Used for centroid table lookup in fused attention.
 pub fn get_centroids(bits: u8) -> &'static [f32] {
     match bits {
         2 => CENTROIDS_2BIT,
         3 => CENTROIDS_3BIT,
         4 => CENTROIDS_4BIT,
-        _ => panic!("Desteklenmeyen bit genişliği: {}. Desteklenen: 2, 3, 4", bits),
+        _ => panic!("Unsupported bit width: {}. Supported: 2, 3, 4", bits),
     }
 }
 
-/// Codebook konfigürasyonu.
+/// Codebook configuration.
 #[derive(Clone, Debug)]
 pub struct Codebook {
     pub centroids: &'static [f32],
     pub boundaries: &'static [f32],
     pub bits: u8,
-    /// Sigma: 1/sqrt(dim) — rotation sonrası koordinat std dev
+    /// Sigma: 1/sqrt(dim) — coordinate std dev after rotation
     pub sigma: f32,
 }
 
 impl Codebook {
-    /// Verilen bit genişliği ve vektör boyutu için codebook oluştur.
+    /// Create a codebook for the given bit width and vector dimension.
     pub fn new(bits: u8, dim: usize) -> Self {
         let sigma = 1.0 / (dim as f32).sqrt();
         let (centroids, boundaries) = match bits {
             2 => (CENTROIDS_2BIT, BOUNDARIES_2BIT),
             3 => (CENTROIDS_3BIT, BOUNDARIES_3BIT),
             4 => (CENTROIDS_4BIT, BOUNDARIES_4BIT),
-            _ => panic!("Desteklenmeyen bit genişliği: {}. Desteklenen: 2, 3, 4", bits),
+            _ => panic!("Unsupported bit width: {}. Supported: 2, 3, 4", bits),
         };
         Self { centroids, boundaries, bits, sigma }
     }
 
-    /// Tek bir skaler değeri quantize et → centroid index.
+    /// Quantize a single scalar value → centroid index.
     #[inline]
     pub fn quantize(&self, value: f32) -> u8 {
-        // Normalize: gerçek değeri standard Gaussian'a çevir
+        // Normalize: convert actual value to standard Gaussian scale
         let normalized = value / self.sigma;
         // Binary search on boundaries
         let mut idx = 0u8;
@@ -91,18 +91,18 @@ impl Codebook {
         idx
     }
 
-    /// Centroid index → reconstruct edilen değer.
+    /// Centroid index → reconstructed value.
     #[inline]
     pub fn dequantize(&self, index: u8) -> f32 {
         self.centroids[index as usize] * self.sigma
     }
 
-    /// Centroid tablosunu scaled olarak döndür (pre-rotated query trick için).
+    /// Return the centroid table scaled (for the pre-rotated query trick).
     pub fn scaled_centroids(&self) -> Vec<f32> {
         self.centroids.iter().map(|&c| c * self.sigma).collect()
     }
 
-    /// Vektörü quantize et → index array + per-vector norm.
+    /// Quantize a vector → index array + per-vector norm.
     pub fn quantize_vector(&self, vector: &[f32]) -> (Vec<u8>, f32) {
         let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
         let indices: Vec<u8> = vector.iter().map(|&v| self.quantize(v)).collect();
@@ -111,26 +111,26 @@ impl Codebook {
 
     /// Index array + norm → reconstructed vector.
     pub fn dequantize_vector(&self, indices: &[u8], _norm: f32) -> Vec<f32> {
-        // NOT: norm kullanılmıyor çünkü per-coordinate quantization
-        // zaten doğru ölçekte. Norm sadece QJL için saklanıyor.
+        // NOTE: norm is not used because per-coordinate quantization
+        // is already at the correct scale. Norm is only stored for QJL.
         indices.iter().map(|&i| self.dequantize(i)).collect()
     }
 
-    /// Batch quantize: birden fazla vektörü aynı anda.
+    /// Batch quantize: multiple vectors at once.
     pub fn quantize_batch(&self, data: &[f32], dim: usize) -> Vec<(Vec<u8>, f32)> {
         data.chunks_exact(dim)
             .map(|chunk| self.quantize_vector(chunk))
             .collect()
     }
 
-    /// Byte cinsinden sıkıştırılmış boyut (bir vektör için).
+    /// Compressed size in bytes (for a single vector).
     pub fn compressed_size_bytes(&self, dim: usize) -> usize {
-        // Her koordinat `bits` bit → toplam dim * bits bit
-        // + 4 byte norm
+        // Each coordinate is `bits` bits → total dim * bits bits
+        // + 4 bytes for norm
         (dim * self.bits as usize + 7) / 8 + 4
     }
 
-    /// Sıkıştırma oranı.
+    /// Compression ratio.
     pub fn compression_ratio(&self, dim: usize) -> f32 {
         let original = dim * 4; // f32
         let compressed = self.compressed_size_bytes(dim);
@@ -138,7 +138,7 @@ impl Codebook {
     }
 }
 
-/// Bit-pack: index array'i compact byte'lara sıkıştır.
+/// Bit-pack: compress index array into compact bytes.
 pub fn pack_indices(indices: &[u8], bits: u8) -> Vec<u8> {
     match bits {
         2 => {
@@ -182,7 +182,57 @@ pub fn pack_indices(indices: &[u8], bits: u8) -> Vec<u8> {
     }
 }
 
-/// Bit-unpack: compact byte'lardan index array'e aç.
+/// Bit-unpack into a pre-allocated buffer (zero-alloc hot path).
+/// `output` must have length >= count. Same logic as `unpack_indices`.
+pub fn unpack_indices_into(packed: &[u8], output: &mut [u8], bits: u8) {
+    let count = output.len();
+    match bits {
+        2 => {
+            let mut idx = 0;
+            for &byte in packed {
+                for i in 0..4 {
+                    if idx >= count { return; }
+                    output[idx] = (byte >> (i * 2)) & 0x03;
+                    idx += 1;
+                }
+            }
+        }
+        3 => {
+            let mut idx = 0;
+            let mut bit_buf: u32 = 0;
+            let mut bit_count = 0;
+            let mut byte_idx = 0;
+            while idx < count {
+                while bit_count < 3 && byte_idx < packed.len() {
+                    bit_buf |= (packed[byte_idx] as u32) << bit_count;
+                    bit_count += 8;
+                    byte_idx += 1;
+                }
+                output[idx] = (bit_buf & 0x07) as u8;
+                bit_buf >>= 3;
+                bit_count -= 3;
+                idx += 1;
+            }
+        }
+        4 => {
+            let mut idx = 0;
+            for &byte in packed {
+                if idx >= count { return; }
+                output[idx] = byte & 0x0F;
+                idx += 1;
+                if idx < count {
+                    output[idx] = (byte >> 4) & 0x0F;
+                    idx += 1;
+                }
+            }
+        }
+        _ => {
+            output[..count].copy_from_slice(&packed[..count]);
+        }
+    }
+}
+
+/// Bit-unpack: extract index array from compact bytes.
 pub fn unpack_indices(packed: &[u8], count: usize, bits: u8) -> Vec<u8> {
     match bits {
         2 => {

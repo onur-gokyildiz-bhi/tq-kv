@@ -14,7 +14,7 @@ use tokenizers::Tokenizer;
 use tq_kv::TurboQuantConfig;
 
 use crate::config::ModelArch;
-use crate::models::{turbo_llama, turbo_qwen2};
+use crate::models::{turbo_generic, turbo_llama, turbo_qwen2};
 
 /// Model variants — standard or TurboQuant enhanced.
 enum ModelWeights {
@@ -22,6 +22,7 @@ enum ModelWeights {
     Qwen2(qqw::ModelWeights),
     TurboLlama(turbo_llama::ModelWeights),
     TurboQwen2(turbo_qwen2::ModelWeights),
+    TurboGeneric(turbo_generic::GenericTurboModel),
 }
 
 impl ModelWeights {
@@ -31,6 +32,7 @@ impl ModelWeights {
             Self::Qwen2(m) => m.forward(x, pos),
             Self::TurboLlama(m) => m.forward(x, pos),
             Self::TurboQwen2(m) => m.forward(x, pos),
+            Self::TurboGeneric(m) => m.forward(x, pos),
         }
     }
 }
@@ -101,17 +103,12 @@ impl Engine {
             .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
 
         let model = match (arch, tq_config) {
-            (ModelArch::Llama, Some(tq)) => {
-                eprintln!("TurboQuant Llama: {}-bit KV cache", tq.bits);
-                let w = turbo_llama::ModelWeights::from_gguf(content, &mut file, &device, tq)
-                    .map_err(|e| anyhow::anyhow!("TurboLlama load error: {}", e))?;
-                ModelWeights::TurboLlama(w)
-            }
-            (ModelArch::Qwen2, Some(tq)) => {
-                eprintln!("TurboQuant Qwen2: {}-bit KV cache", tq.bits);
-                let w = turbo_qwen2::ModelWeights::from_gguf(content, &mut file, &device, tq)
-                    .map_err(|e| anyhow::anyhow!("TurboQwen2 load error: {}", e))?;
-                ModelWeights::TurboQwen2(w)
+            (_, Some(tq)) => {
+                // TurboQuant: use generic model for ANY architecture
+                eprintln!("TurboQuant Generic: {}-bit KV cache (auto-detecting architecture from GGUF)", tq.bits);
+                let w = turbo_generic::GenericTurboModel::from_gguf(content, &mut file, &device, tq)
+                    .map_err(|e| anyhow::anyhow!("TurboGeneric load error: {}", e))?;
+                ModelWeights::TurboGeneric(w)
             }
             (ModelArch::Llama, None) => {
                 let w = qlm::ModelWeights::from_gguf(content, &mut file, &device)

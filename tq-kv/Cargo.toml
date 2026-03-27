@@ -16,15 +16,23 @@ crate-type = ["lib", "staticlib"]
 default = ["std"]
 std = ["rand", "rand_chacha"]
 ffi = ["std"]
+candle = ["std", "candle-core", "rayon"]
 
 [[bin]]
 name = "tq-kv-bench"
 path = "src/main.rs"
 required-features = ["std"]
 
+[[bin]]
+name = "tq-demo"
+path = "src/demo.rs"
+required-features = ["std"]
+
 [dependencies]
 rand = { version = "0.8", optional = true }
 rand_chacha = { version = "0.3", optional = true }
+candle-core = { version = "0.9.2", optional = true }
+rayon = { version = "1.10", optional = true }
 
 [build-dependencies]
 cbindgen = { version = "0.28", optional = true }

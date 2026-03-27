@@ -1,46 +1,46 @@
 //! QJL: Quantized Johnson-Lindenstrauss Error Correction
 //!
-//! PolarQuant sonrası kalan hatayı 1-bit ile düzeltir.
-//! Johnson-Lindenstrauss lemması: rastgele projeksiyon uzaklıkları korur.
+//! Corrects residual error after PolarQuant using 1-bit projections.
+//! Johnson-Lindenstrauss lemma: random projections preserve distances.
 //!
-//! Algoritma:
-//! 1. Hata vektörünü hesapla: e = original - reconstructed
-//! 2. Rastgele matris R ile projekte et: p = R @ e
-//! 3. Sadece işaretleri sakla: s = sign(p)  → 1-bit per projeksiyon
-//! 4. Geri çözerken: correction = alpha * R^T @ s
+//! Algorithm:
+//! 1. Compute error vector: e = original - reconstructed
+//! 2. Project with random matrix R: p = R @ e
+//! 3. Store only signs: s = sign(p)  → 1-bit per projection
+//! 4. During reconstruction: correction = alpha * R^T @ s
 //!
-//! Bu, toplamda sadece 1 ek bit/eleman ile ~30-50% hata azaltması sağlar.
+//! This achieves ~30-50% error reduction with only 1 extra bit/element.
 
 use rand::SeedableRng;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
-/// QJL sıkıştırma sonucu
+/// QJL compression result
 #[derive(Clone, Debug)]
 pub struct QjlCorrection {
-    /// Projeksiyon işaretleri, bit-packed: her u8 = 8 projeksiyon
+    /// Projection signs, bit-packed: each u8 = 8 projections
     pub signs: Vec<u8>,
-    /// Projeksiyon boyutu
+    /// Projection dimension
     pub proj_dim: usize,
-    /// Orijinal boyut
+    /// Original dimension
     pub orig_dim: usize,
-    /// Düzeltme katsayısı (öğrenilmiş veya sabit)
+    /// Correction coefficient (learned or fixed)
     pub alpha: f32,
-    /// Random seed (projeksiyon matrisini yeniden üretmek için)
+    /// Random seed (for reproducing the projection matrix)
     pub seed: u64,
 }
 
-/// 1-bit projeksiyon üret.
+/// Generate 1-bit projection.
 ///
-/// `error`: orijinal ile reconstruct arasındaki fark vektörü
-/// `proj_dim`: projeksiyon boyutu (genellikle orig_dim ile aynı veya yarısı)
+/// `error`: difference vector between original and reconstructed
+/// `proj_dim`: projection dimension (usually same as orig_dim or half)
 /// `seed`: deterministik random seed
 pub fn compute(error: &[f32], proj_dim: usize, seed: u64) -> QjlCorrection {
     let orig_dim = error.len();
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-    // Rastgele projeksiyon: R[i] @ error
-    // R'nin her satırı ±1/sqrt(proj_dim) değerleri (Rademacher dağılımı)
+    // Random projection: R[i] @ error
+    // Each row of R has ±1/sqrt(proj_dim) values (Rademacher distribution)
     let scale = 1.0 / (proj_dim as f32).sqrt();
     let mut projected = Vec::with_capacity(proj_dim);
 
@@ -53,7 +53,7 @@ pub fn compute(error: &[f32], proj_dim: usize, seed: u64) -> QjlCorrection {
         projected.push(dot);
     }
 
-    // İşaretleri bit-pack
+    // Bit-pack the signs
     let num_bytes = (proj_dim + 7) / 8;
     let mut signs = vec![0u8; num_bytes];
     for (i, &p) in projected.iter().enumerate() {
@@ -62,8 +62,8 @@ pub fn compute(error: &[f32], proj_dim: usize, seed: u64) -> QjlCorrection {
         }
     }
 
-    // Alpha: optimal düzeltme katsayısı
-    // Teorik olarak alpha = ||error|| * sqrt(2/pi) / sqrt(proj_dim)
+    // Alpha: optimal correction coefficient
+    // Theoretically alpha = ||error|| * sqrt(2/pi) / sqrt(proj_dim)
     let error_norm: f32 = error.iter().map(|x| x * x).sum::<f32>().sqrt();
     let alpha = error_norm * (2.0 / std::f32::consts::PI).sqrt() / (proj_dim as f32).sqrt();
 
@@ -76,29 +76,29 @@ pub fn compute(error: &[f32], proj_dim: usize, seed: u64) -> QjlCorrection {
     }
 }
 
-/// QJL düzeltmesini uygula.
+/// Apply QJL correction.
 ///
-/// `reconstructed`: PolarQuant'tan gelen yaklaşık vektör (in-place düzeltilir)
+/// `reconstructed`: approximate vector from PolarQuant (corrected in-place)
 pub fn apply(reconstructed: &mut [f32], correction: &QjlCorrection) {
     assert_eq!(reconstructed.len(), correction.orig_dim);
 
     let mut rng = ChaCha8Rng::seed_from_u64(correction.seed);
     let scale = 1.0 / (correction.proj_dim as f32).sqrt();
 
-    // R^T @ signs: her orijinal boyut için tüm projeksiyonların katkısını topla
-    // Bu O(proj_dim * orig_dim) ama orig_dim = head_dim = 128 için hızlı
+    // R^T @ signs: accumulate all projection contributions for each original dimension
+    // This is O(proj_dim * orig_dim) but fast for orig_dim = head_dim = 128
     //
-    // Optimization: R'yi satır satır üreterek bellek tasarrufu
-    // R[i,j] aynı seed ile aynı sırada üretilir
+    // Optimization: generate R row by row to save memory
+    // R[i,j] is generated in the same order with the same seed
 
-    // Önce tüm R elemanlarını üretmemiz gerekiyor (aynı sırada)
+    // We need to generate all R elements first (in the same order)
     // R shape: (proj_dim, orig_dim)
-    // Projeksiyonda: projected[i] = sum_j R[i,j] * error[j]
-    // Geri çözmede: correction[j] = sum_i R[i,j] * sign[i]
+    // In projection: projected[i] = sum_j R[i,j] * error[j]
+    // In reconstruction: correction[j] = sum_i R[i,j] * sign[i]
 
-    // R'yi transpose olarak uygulamamız lazım.
-    // R satır-major üretildi, şimdi sütun-major okumamız gerekiyor.
-    // En temiz yol: tüm R'yi üret, sonra transpose multiply.
+    // We need to apply R transposed.
+    // R was generated row-major, now we need to read column-major.
+    // Cleanest approach: generate all of R, then transpose multiply.
     // head_dim=128, proj_dim=128 → 128*128 = 16K f32 = 64KB. OK.
 
     let mut r_matrix = Vec::with_capacity(correction.proj_dim * correction.orig_dim);
@@ -121,7 +121,7 @@ pub fn apply(reconstructed: &mut [f32], correction: &QjlCorrection) {
     }
 }
 
-/// Batch compute: birden fazla hata vektörü için QJL düzeltmesi
+/// Batch compute: QJL correction for multiple error vectors
 pub fn compute_batch(
     errors: &[f32],
     dim: usize,
@@ -133,7 +133,7 @@ pub fn compute_batch(
         .chunks_exact(dim)
         .enumerate()
         .map(|(i, chunk)| {
-            // Her vektör için farklı seed (ama deterministik)
+            // Different seed per vector (but deterministic)
             compute(chunk, proj_dim, base_seed.wrapping_add(i as u64))
         })
         .collect()
@@ -147,7 +147,7 @@ pub fn apply_batch(reconstructed: &mut [f32], corrections: &[QjlCorrection], dim
     }
 }
 
-/// QJL düzeltmesinin bellek maliyeti (bit cinsinden)
+/// Memory cost of QJL correction (in bits)
 pub fn memory_cost_bits(proj_dim: usize) -> usize {
     // 1-bit per projection + alpha (32-bit) + seed (64-bit)
     proj_dim + 32 + 64
@@ -159,35 +159,35 @@ mod tests {
 
     #[test]
     fn test_qjl_reduces_error() {
-        // Rastgele bir hata vektörü oluştur
+        // Create a random error vector
         let mut rng = ChaCha8Rng::seed_from_u64(123);
         let dim = 128;
         let error: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
 
         let error_norm_before: f32 = error.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-        // QJL düzeltmesi hesapla
+        // Compute QJL correction
         let correction = compute(&error, dim, 42);
 
-        // Sıfır vektöre düzeltme uygula (sadece düzeltmeyi görmek için)
+        // Apply correction to zero vector (to see only the correction)
         let mut approx = vec![0.0f32; dim];
         apply(&mut approx, &correction);
 
-        // Kalan hata
+        // Residual error
         let residual: Vec<f32> = error.iter().zip(approx.iter()).map(|(e, a)| e - a).collect();
         let error_norm_after: f32 = residual.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-        // Düzeltme hata normunu azaltmalı
+        // Correction should reduce error norm
         assert!(
             error_norm_after < error_norm_before,
-            "QJL hata azaltmadı: {:.4} → {:.4}",
+            "QJL did not reduce error: {:.4} → {:.4}",
             error_norm_before,
             error_norm_after
         );
 
         let reduction = 1.0 - error_norm_after / error_norm_before;
         eprintln!(
-            "QJL hata azaltma: {:.1}% ({:.4} → {:.4})",
+            "QJL error reduction: {:.1}% ({:.4} → {:.4})",
             reduction * 100.0,
             error_norm_before,
             error_norm_after
@@ -199,7 +199,7 @@ mod tests {
         let error = vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8];
         let c1 = compute(&error, 8, 42);
         let c2 = compute(&error, 8, 42);
-        assert_eq!(c1.signs, c2.signs, "Aynı seed farklı sonuç verdi");
+        assert_eq!(c1.signs, c2.signs, "Same seed produced different results");
         assert_eq!(c1.alpha, c2.alpha);
     }
 
@@ -207,7 +207,7 @@ mod tests {
     fn test_bit_packing() {
         let error = vec![1.0; 16];
         let correction = compute(&error, 16, 42);
-        // 16 projeksiyon → 2 byte
+        // 16 projections → 2 bytes
         assert_eq!(correction.signs.len(), 2);
     }
 }

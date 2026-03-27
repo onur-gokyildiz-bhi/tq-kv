@@ -50,15 +50,23 @@ pub fn get_model(name: &str) -> Option<&'static ModelConfig> {
 }
 
 /// Detect model architecture from filename.
+/// Note: when --turbo-quant is used, the GenericTurboModel reads
+/// the actual architecture from GGUF metadata, so this enum only
+/// matters for the standard (non-TQ) candle-transformers path.
 pub enum ModelArch {
     Llama,
     Qwen2,
+    // Gemma2 standard path not yet supported — use --turbo-quant for Gemma models
 }
 
 pub fn detect_arch(model_name: &str) -> ModelArch {
     let lower = model_name.to_lowercase();
     if lower.contains("qwen") {
         ModelArch::Qwen2
+    } else if lower.contains("gemma") {
+        eprintln!("Warning: Gemma standard (non-TQ) path not supported. Use --turbo-quant for Gemma models.");
+        // Fall through to Llama — will fail if --turbo-quant not used, but TQ path handles Gemma correctly
+        ModelArch::Llama
     } else {
         ModelArch::Llama
     }

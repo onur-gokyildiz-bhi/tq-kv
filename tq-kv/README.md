@@ -35,7 +35,7 @@ Compressed: packed indices + norm + optional QJL signs
 
 ```toml
 [dependencies]
-tq-kv = "0.1"
+tq-kv = "0.3"
 ```
 
 ```rust

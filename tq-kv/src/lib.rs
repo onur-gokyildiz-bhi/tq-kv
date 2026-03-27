@@ -55,6 +55,11 @@ pub mod qjl;
 /// Compile with `cargo build --release --features ffi` to produce `libtq_kv.a`.
 #[cfg(feature = "ffi")]
 pub mod ffi;
+
+/// TurboQuant KV cache — drop-in replacement for candle_nn::kv_cache::KvCache.
+/// Compile with `cargo build --features candle` to enable.
+#[cfg(feature = "candle")]
+pub mod candle_kv;
 #[doc(hidden)]
 pub mod bench;
 
@@ -87,8 +92,8 @@ impl Default for TurboQuantConfig {
 
 impl TurboQuantConfig {
     /// 2-bit extreme compression (~16x theoretical)
-    /// Dejan'ın RTX 4090 testinde karakter-karakter aynı sonuç verdi.
-    /// QJL kapalı: 2-bit'te codebook tek başına yeterli, QJL overhead'i oranı düşürür.
+    /// Produced character-for-character identical output in Dejan's RTX 4090 test.
+    /// QJL disabled: at 2-bit the codebook alone is sufficient, QJL overhead reduces the ratio.
     pub fn extreme() -> Self {
         Self { bits: 2, use_qjl: false, ..Default::default() }
     }
@@ -99,8 +104,8 @@ impl TurboQuantConfig {
     }
 
     /// 4-bit balanced compression (~8x theoretical)
-    /// QJL kapalı: +1.2 dB SNR karşılığında 29x yavaş compress, 128x yavaş decompress,
-    /// ve ratio 3.8x→2.7x'e düşüyor. Fused attention'da QJL çalışmıyor (Dejan: cos_sim=0.69).
+    /// QJL disabled: +1.2 dB SNR costs 29x slower compress, 128x slower decompress,
+    /// and ratio drops from 3.8x to 2.7x. QJL breaks fused attention (Dejan: cos_sim=0.69).
     pub fn balanced() -> Self {
         Self { bits: 4, use_qjl: false, ..Default::default() }
     }
@@ -192,7 +197,7 @@ pub fn decompress_vectors(compressed: &CompressedVectors) -> Vec<f32> {
 
 // ============================================================
 // V2 API: Paper-faithful Lloyd-Max codebook quantization
-// Dejan'ın Triton kernel yaklaşımı ile uyumlu.
+// Compatible with Dejan's Triton kernel approach.
 // ============================================================
 
 /// Paper-faithful compressed key cache.
@@ -216,7 +221,7 @@ pub struct CompressedKeys {
 }
 
 impl CompressedKeys {
-    /// Boş compressed keys oluştur (incremental append için).
+    /// Create empty compressed keys (for incremental append).
     pub fn new_empty(bits: u8, dim: usize, rotation_seed: u64) -> Self {
         Self {
             packed_indices: Vec::new(),
@@ -229,21 +234,21 @@ impl CompressedKeys {
         }
     }
 
-    /// Tek bir compress edilmiş key'i cache'e ekle.
-    /// `packed`: pack_indices çıktısı (tek vektör için)
-    /// `norm`: vektörün L2 normu (rotated domain'de)
+    /// Append a single compressed key to the cache.
+    /// `packed`: pack_indices output (for a single vector)
+    /// `norm`: L2 norm of the vector (in rotated domain)
     pub fn append_raw(&mut self, packed: &[u8], norm: f32) {
         self.packed_indices.extend_from_slice(packed);
         self.norms.push(norm);
         self.count += 1;
     }
 
-    /// Packed format'ta vektör başına byte sayısı.
+    /// Number of bytes per vector in packed format.
     pub fn bytes_per_vector(&self) -> usize {
         (self.dim * self.bits as usize + 7) / 8
     }
 
-    /// Belirli bir vektörün unpack edilmiş index'lerini döndür.
+    /// Return the unpacked indices for a specific vector.
     pub fn get_indices(&self, vector_idx: usize) -> Vec<u8> {
         let bpv = self.bytes_per_vector();
         let start = vector_idx * bpv;
@@ -421,8 +426,8 @@ pub fn pre_rotate_query_with_signs(query: &[f32], signs: &[f32]) -> Vec<f32> {
     rotated
 }
 
-/// Tek bir key vektörünü compress et. Incremental KV cache için.
-/// Döndürür: (packed_indices, norm)
+/// Compress a single key vector. For incremental KV cache.
+/// Returns: (packed_indices, norm)
 pub fn compress_single_key(
     key: &[f32],
     dim: usize,
@@ -448,8 +453,8 @@ pub fn compress_single_key(
     (packed, norm)
 }
 
-/// Tek bir key vektörünü pre-computed signs ile compress et.
-/// Hot loop'ta signs alloc'unu kaydeder.
+/// Compress a single key vector with pre-computed signs.
+/// Saves signs allocation in the hot loop.
 pub fn compress_single_key_with_signs(
     key: &[f32],
     dim: usize,
@@ -506,10 +511,10 @@ pub fn fused_dot_product(
 }
 
 /// Fused dot product with pre-computed centroid table.
-/// Hot loop'ta Codebook oluşturma overhead'ini kaldırır.
+/// Eliminates Codebook construction overhead in the hot loop.
 ///
-/// `base_centroids`: N(0,1) centroids (codebook::get_centroids ile alınır)
-/// Adaptive sigma per-key: centroid * sigma ile ölçeklenir.
+/// `base_centroids`: N(0,1) centroids (obtained via codebook::get_centroids)
+/// Adaptive sigma per-key: scaled by centroid * sigma.
 ///
 /// Uses SIMD (AVX2) when available for ~4x speedup on the inner loop.
 #[inline]
@@ -626,18 +631,27 @@ pub fn fused_attention_scores(
     let dim = compressed.dim;
     let bpv = compressed.bytes_per_vector();
 
-    (0..compressed.count).map(|pos| {
+    let mut indices_buf = vec![0u8; dim];
+    let mut scores = Vec::with_capacity(compressed.count);
+
+    for pos in 0..compressed.count {
         let norm = compressed.norms[pos];
         if norm < 1e-10 {
-            return 0.0;
+            scores.push(0.0);
+            continue;
         }
         let start = pos * bpv;
         let end = start + bpv;
-        let indices = codebook::unpack_indices(
-            &compressed.packed_indices[start..end], dim, compressed.bits,
+        codebook::unpack_indices_into(
+            &compressed.packed_indices[start..end], &mut indices_buf, compressed.bits,
         );
-        fused_dot_product_with_centroids(rotated_query, &indices, norm, base_centroids, dim) * scale
-    }).collect()
+        let score = fused_dot_product_with_centroids(
+            rotated_query, &indices_buf, norm, base_centroids, dim,
+        ) * scale;
+        scores.push(score);
+    }
+
+    scores
 }
 
 /// Evaluate V2 compression quality.
@@ -1040,5 +1054,75 @@ mod tests {
             eprintln!("{:<6} {:<12.1} {:<10.6} {:<10.1} {:<10.4}",
                 bits, stats.ratio, stats.mse, stats.snr_db, stats.max_error);
         }
+    }
+
+    // ========================================
+    // Fused Attention Scores Batch Test
+    // ========================================
+
+    #[test]
+    fn test_fused_attention_scores_batch() {
+        let dim = 128;
+        let num_keys = 8;
+        let config = TurboQuantConfig::extreme(); // 2-bit
+
+        // Create random keys and compress them into a cache
+        let keys = random_vectors(num_keys, dim, 42);
+        let signs = hadamard::generate_signs(dim, config.rotation_seed);
+
+        let mut cache = CompressedKeys::new_empty(config.bits, dim, config.rotation_seed);
+        for chunk in keys.chunks_exact(dim) {
+            let (packed, norm) = compress_single_key_with_signs(chunk, dim, &config, &signs);
+            cache.append_raw(&packed, norm);
+        }
+        assert_eq!(cache.count, num_keys);
+
+        // Create and pre-rotate a query
+        let query = random_vectors(1, dim, 99);
+        let rotated_q = pre_rotate_query_with_signs(&query, &signs);
+        let base_centroids = codebook::get_centroids(config.bits);
+        let scale = 1.0 / (dim as f32).sqrt();
+
+        // Get batch scores via fused_attention_scores
+        let batch_scores = fused_attention_scores(&rotated_q, &cache, base_centroids, scale);
+        assert_eq!(batch_scores.len(), num_keys);
+
+        // Verify each score matches calling fused_dot_product_with_centroids individually
+        for pos in 0..num_keys {
+            let indices = cache.get_indices(pos);
+            let individual_score = fused_dot_product_with_centroids(
+                &rotated_q, &indices, cache.norms[pos], base_centroids, dim,
+            ) * scale;
+            assert!(
+                (batch_scores[pos] - individual_score).abs() < 1e-6,
+                "Score mismatch at pos {}: batch={}, individual={}",
+                pos, batch_scores[pos], individual_score,
+            );
+        }
+
+        // Edge case: empty cache (0 keys)
+        let empty_cache = CompressedKeys::new_empty(config.bits, dim, config.rotation_seed);
+        let empty_scores = fused_attention_scores(&rotated_q, &empty_cache, base_centroids, scale);
+        assert!(empty_scores.is_empty(), "Empty cache should return empty scores");
+
+        // Edge case: single key cache
+        let mut single_cache = CompressedKeys::new_empty(config.bits, dim, config.rotation_seed);
+        let first_key = &keys[..dim];
+        let (packed, norm) = compress_single_key_with_signs(first_key, dim, &config, &signs);
+        single_cache.append_raw(&packed, norm);
+        assert_eq!(single_cache.count, 1);
+
+        let single_scores = fused_attention_scores(&rotated_q, &single_cache, base_centroids, scale);
+        assert_eq!(single_scores.len(), 1);
+
+        let single_indices = single_cache.get_indices(0);
+        let expected_score = fused_dot_product_with_centroids(
+            &rotated_q, &single_indices, single_cache.norms[0], base_centroids, dim,
+        ) * scale;
+        assert!(
+            (single_scores[0] - expected_score).abs() < 1e-6,
+            "Single key score mismatch: batch={}, individual={}",
+            single_scores[0], expected_score,
+        );
     }
 }

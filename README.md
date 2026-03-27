@@ -16,10 +16,32 @@ Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 
 ## Why tq-kv?
 
 - **Proven quality** -- 4-bit perplexity 9.594 vs 9.515 baseline (+0.8%) on wikitext-2, NIAH pass at all depths. Not toy benchmarks; real model, real text.
-- **CUDA + AVX2 SIMD** -- the only TurboQuant crate with NVIDIA GPU support (3.2x over CPU) and fused AVX2+FMA attention (8.9x over decompress path).
+- **CUDA + AVX2 SIMD** -- the only TurboQuant crate with NVIDIA GPU support (3.2x over CPU) and fused AVX2+FMA attention (8.9x SIMD speedup in fused_dot_product).
 - **C FFI for llama.cpp** -- ships `tq_kv.h` + `libtq_kv.a`. Drop into any C/C++ inference engine. Multi-head layer API included.
 - **Faster, not just smaller** -- smaller KV cache = less memory bandwidth = faster inference. Independently confirmed across Metal, CUDA, and CPU implementations.
 - **Production architecture** -- O(1) incremental cache, Rayon parallel multi-head attention, `no_std` core, 45+ tests including FFI integration.
+
+## TurboQuant Implementations Compared
+
+> As of March 2026. TurboQuant (ICLR 2026, Google Research) has multiple community implementations.
+
+| Feature | **tq-kv** (this) | turboquant_plus | turboquant | turbo-quant | Dejan (Triton) |
+|:--------|:----------------:|:---------------:|:----------:|:-----------:|:--------------:|
+| Language | Rust | Python/C | Rust | Rust | Python/CUDA |
+| CUDA GPU | **Yes** | No | No | No | **Yes** (Triton) |
+| AVX2 SIMD | **Yes** | No | No | No | No |
+| C FFI | **Yes** | No | No | No | No |
+| llama.cpp patch | **Yes** | **Yes** (fork) | No | No | No |
+| Fused attention | **Yes** | No | No | No | No |
+| Incremental cache | **Yes** | No | No | No | No |
+| PPL benchmark | **+0.8%** (4-bit) | N/A | N/A | N/A | N/A |
+| NIAH test | **9/9 pass** | N/A | N/A | N/A | N/A |
+| no_std | **Yes** | No | No | No | No |
+| crates.io | **v0.3.0** | N/A | alpha | minimal | N/A |
+| Lines of code | ~3K lib | N/A | ~6.9K | ~1.1K | N/A |
+| Metal (Apple) | No | **Yes** | No | No | No |
+
+tq-kv is the most complete Rust implementation with the only published perplexity and NIAH benchmarks.
 
 ---
 
@@ -31,7 +53,7 @@ Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 
 |:-------|------:|------:|------:|
 | Compression ratio | **14.2x** | **9.8x** | **3.8x** |
 | Cosine similarity | 0.943 | 0.984 | 0.996 |
-| Fused attention speedup (vs decompress) | **8.9x** | **5.4x** | **8.6x** |
+| SIMD fused_dot_product speedup (AVX2+FMA) | **8.9x** | **5.4x** | **8.6x** |
 | VRAM saved (Llama-3 8B, 4096 ctx) | 238 MB | 230 MB | 208 MB |
 | VRAM saved (Qwen 72B, 4096 ctx) | 595 MB | 575 MB | 520 MB |
 | Per-token cache overhead | 0.65 ms | 0.65 ms | 0.65 ms |
@@ -83,7 +105,7 @@ Compressed keys preserve retrieval accuracy at every depth.
 
 ```toml
 [dependencies]
-tq-kv = "0.1"
+tq-kv = "0.3"
 ```
 
 ```rust
@@ -135,7 +157,7 @@ tq-engine --serve --port 8088 --turbo-quant --tq-bits 2
 
 ```toml
 [dependencies]
-tq-kv = { version = "0.1", default-features = false }
+tq-kv = { version = "0.3", default-features = false }
 ```
 
 Core compression/decompression works without allocator. The `_with_signs` variants accept pre-computed sign arrays for embedded and bare-metal targets.

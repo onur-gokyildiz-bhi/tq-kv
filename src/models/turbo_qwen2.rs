@@ -136,6 +136,12 @@ fn decompress_cache_to_tensor(
 // Layer with TurboQuant KV cache
 // ============================================================
 
+/// Number of initial layers to keep uncompressed (fp16 KV cache).
+/// Reduces error accumulation in deep models like Qwen 72B (80 layers).
+/// Early layers have the most impact because their errors propagate through
+/// all subsequent layers. Keeping them at full precision breaks the error chain.
+const TQ_SKIP_FIRST_LAYERS: usize = 4;
+
 #[derive(Debug, Clone)]
 struct LayerWeights {
     attention_wq: QMatMul,
@@ -154,6 +160,10 @@ struct LayerWeights {
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
+    /// Layer index (0-based) — used for selective compression
+    layer_idx: usize,
+    /// Standard KV cache for uncompressed layers
+    kv_cache: Option<(Tensor, Tensor)>,
     kv_compressed: Option<CompressedKvCache>,
     tq_config: TurboQuantConfig,
     signs: Vec<f32>,
@@ -162,19 +172,20 @@ struct LayerWeights {
     span_mlp: tracing::Span,
 }
 
-fn rope_i_manual(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+/// CUDA-compatible halved RoPE (Qwen2 uses halved, NOT interleaved layout).
+/// Equivalent to candle_nn::rotary_emb::rope but uses only primitive ops
+/// that have CUDA kernels.
+fn rope_manual(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let (_b, _h, _s, d) = x.dims4()?;
     let half = d / 2;
-    let x = x.reshape((_b, _h, _s, half, 2))?;
-    let x0 = x.narrow(4, 0, 1)?.squeeze(4)?;
-    let x1 = x.narrow(4, 1, 1)?.squeeze(4)?;
-    let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
+    // Halved layout: first half and second half of the dimension
+    let x0 = x.narrow(3, 0, half)?;     // x[..., :d/2]
+    let x1 = x.narrow(3, half, half)?;  // x[..., d/2:]
+    let cos = cos.unsqueeze(0)?.unsqueeze(0)?; // (1, 1, seq, half)
     let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
     let r0 = (x0.broadcast_mul(&cos)? - x1.broadcast_mul(&sin)?)?;
     let r1 = (x0.broadcast_mul(&sin)? + x1.broadcast_mul(&cos)?)?;
-    let r0 = r0.unsqueeze(4)?;
-    let r1 = r1.unsqueeze(4)?;
-    Tensor::cat(&[&r0, &r1], 4)?.reshape((_b, _h, _s, d))
+    Tensor::cat(&[&r0, &r1], 3)
 }
 
 impl LayerWeights {
@@ -183,7 +194,7 @@ impl LayerWeights {
         let (_b_sz, _n_head, seq_len, _n_embd) = x.dims4()?;
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
-        rope_i_manual(&x.contiguous()?, &cos, &sin)
+        rope_manual(&x.contiguous()?, &cos, &sin)
     }
 
     fn forward_attn(
@@ -202,96 +213,136 @@ impl LayerWeights {
         let k = k.broadcast_add(&self.attention_bk)?;
         let v = v.broadcast_add(&self.attention_bv)?;
 
-        let q = q.reshape((b_sz, seq_len, self.n_head, self.head_dim))?.transpose(1, 2)?;
-        let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
+        let q = q.reshape((b_sz, seq_len, self.n_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let v = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
 
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
-        // Incremental KV Cache
-        let k_contiguous = k.contiguous()?;
-        let k_flat = k_contiguous.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let cache_dtype = k.dtype();
-
-        if self.kv_compressed.is_none() {
-            let mut k_per_head = Vec::with_capacity(self.n_kv_head);
-            for _ in 0..self.n_kv_head {
-                k_per_head.push(tq_kv::CompressedKeys::new_empty(
-                    self.tq_config.bits, self.head_dim, self.tq_config.rotation_seed,
-                ));
-            }
-            self.kv_compressed = Some(CompressedKvCache {
-                k_per_head,
-                v: v.clone(),
-                cached_len: 0,
-                dtype: cache_dtype,
-            });
-        }
-
-        let cache = self.kv_compressed.as_mut().unwrap();
-
-        for h in 0..self.n_kv_head {
-            for s in 0..seq_len {
-                let offset = (h * seq_len + s) * self.head_dim;
-                let key_vec = &k_flat[offset..offset + self.head_dim];
-                let (packed, norm) = tq_kv::compress_single_key_with_signs(
-                    key_vec, self.head_dim, &self.tq_config, &self.signs,
-                );
-                cache.k_per_head[h].append_raw(&packed, norm);
-            }
-        }
-
-        if cache.cached_len > 0 {
-            cache.v = Tensor::cat(&[&cache.v, &v], 2)?;
-        } else {
-            cache.v = v.clone();
-        }
-        cache.cached_len += seq_len;
-        let total_len = cache.cached_len;
-
+        // Selective compression: first TQ_SKIP_FIRST_LAYERS use standard fp16 KV cache,
+        // remaining layers use TurboQuant compression. This breaks the error accumulation
+        // chain in deep models (80 layers) where early-layer errors propagate through
+        // all subsequent layers.
+        let use_compression = self.layer_idx >= TQ_SKIP_FIRST_LAYERS;
         let n_rep = self.n_head / self.n_kv_head;
 
-        let y = if seq_len == 1 && total_len > 1 && q.device().is_cpu() {
-            // FUSED PATH: Rayon parallel + SIMD
-            let q_flat = q.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-            let centroids = tq_kv::codebook::get_centroids(self.tq_config.bits);
-            let scale = 1.0 / (self.head_dim as f32).sqrt();
+        if use_compression {
+            // COMPRESSED PATH: TurboQuant KV cache
+            let k_contiguous = k.contiguous()?;
+            let k_flat = k_contiguous.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let cache_dtype = k.dtype();
 
-            let head_scores: Vec<Vec<f32>> = (0..self.n_head).into_par_iter().map(|qh| {
-                let kv_h = qh / n_rep;
-                let q_vec = &q_flat[qh * self.head_dim..(qh + 1) * self.head_dim];
-                let rotated_q = tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs);
-                let compressed = &cache.k_per_head[kv_h];
-                tq_kv::fused_attention_scores(&rotated_q, compressed, centroids, scale)
-            }).collect();
-
-            let mut att_scores = Vec::with_capacity(self.n_head * total_len);
-            for scores in &head_scores {
-                att_scores.extend_from_slice(scores);
+            if self.kv_compressed.is_none() {
+                let mut k_per_head = Vec::with_capacity(self.n_kv_head);
+                for _ in 0..self.n_kv_head {
+                    k_per_head.push(tq_kv::CompressedKeys::new_empty(
+                        self.tq_config.bits, self.head_dim, self.tq_config.rotation_seed,
+                    ));
+                }
+                self.kv_compressed = Some(CompressedKvCache {
+                    k_per_head,
+                    v: v.clone(),
+                    cached_len: 0,
+                    dtype: cache_dtype,
+                });
             }
 
-            let att = Tensor::from_vec(
-                att_scores, (b_sz, self.n_head, 1, total_len), q.device(),
-            )?.to_dtype(cache.dtype)?;
-            let att = softmax_last_dim(&att)?;
-            let v_for_attn = repeat_kv(cache.v.clone(), n_rep)?;
-            att.matmul(&v_for_attn.contiguous()?)?
-        } else if seq_len == 1 && total_len > 1 {
-            // GPU GENERATION: decompress + standard attention
-            let k_full = decompress_cache_to_tensor(
-                &cache.k_per_head, self.n_kv_head, total_len,
-                self.head_dim, cache.dtype, q.device(), &self.tq_config,
-            )?;
-            let k_full = repeat_kv(k_full, n_rep)?;
-            let v_for_attn = repeat_kv(cache.v.clone(), n_rep)?;
-            let att = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
-            let att = softmax_last_dim(&att)?;
-            att.matmul(&v_for_attn.contiguous()?)?
+            let cache = self.kv_compressed.as_mut().unwrap();
+
+            for h in 0..self.n_kv_head {
+                for s in 0..seq_len {
+                    let offset = (h * seq_len + s) * self.head_dim;
+                    let key_vec = &k_flat[offset..offset + self.head_dim];
+                    let (packed, norm) = tq_kv::compress_single_key_with_signs(
+                        key_vec, self.head_dim, &self.tq_config, &self.signs,
+                    );
+                    cache.k_per_head[h].append_raw(&packed, norm);
+                }
+            }
+
+            if cache.cached_len > 0 {
+                cache.v = Tensor::cat(&[&cache.v, &v], 2)?;
+            } else {
+                cache.v = v.clone();
+            }
+            cache.cached_len += seq_len;
+            let total_len = cache.cached_len;
+
+            let y = if seq_len == 1 && total_len > 1 && q.device().is_cpu() {
+                // FUSED PATH: Rayon parallel + SIMD
+                let q_flat = q.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                let centroids = tq_kv::codebook::get_centroids(self.tq_config.bits);
+                let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+                let head_scores: Vec<Vec<f32>> = (0..self.n_head).into_par_iter().map(|qh| {
+                    let kv_h = qh / n_rep;
+                    let q_vec = &q_flat[qh * self.head_dim..(qh + 1) * self.head_dim];
+                    let rotated_q = tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs);
+                    let compressed = &cache.k_per_head[kv_h];
+                    tq_kv::fused_attention_scores(&rotated_q, compressed, centroids, scale)
+                }).collect();
+
+                let mut att_scores = Vec::with_capacity(self.n_head * total_len);
+                for scores in &head_scores {
+                    att_scores.extend_from_slice(scores);
+                }
+
+                // f32 softmax to prevent precision loss at long context
+                let att = Tensor::from_vec(
+                    att_scores, (b_sz, self.n_head, 1, total_len), q.device(),
+                )?;
+                let att = softmax_last_dim(&att)?.to_dtype(cache.dtype)?;
+                let v_for_attn = repeat_kv(cache.v.clone(), n_rep)?;
+                att.matmul(&v_for_attn.contiguous()?)?
+            } else if seq_len == 1 && total_len > 1 {
+                // GENERATION: decompress + f32 attention
+                let q_f32 = q.to_dtype(DType::F32)?;
+                let k_full = decompress_cache_to_tensor(
+                    &cache.k_per_head, self.n_kv_head, total_len,
+                    self.head_dim, DType::F32, q.device(), &self.tq_config,
+                )?;
+                let k_full = repeat_kv(k_full, n_rep)?;
+                let v_f32 = repeat_kv(cache.v.to_dtype(DType::F32)?, n_rep)?;
+                let att = (q_f32.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+                let att = softmax_last_dim(&att)?;
+                att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)?
+            } else {
+                // PREFILL
+                let k = repeat_kv(k, n_rep)?;
+                let v_for_attn = repeat_kv(v, n_rep)?;
+                let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+                let att = match mask {
+                    None => att,
+                    Some(mask) => {
+                        let mask = mask.broadcast_as(att.shape())?;
+                        masked_fill(&att, &mask, &self.neg_inf)?
+                    }
+                };
+                let att = softmax_last_dim(&att)?;
+                att.matmul(&v_for_attn.contiguous()?)?
+            };
+
+            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
+            self.attention_wo.forward(&y)
         } else {
-            // PREFILL / FIRST TOKEN
+            // UNCOMPRESSED PATH: standard fp16 KV cache (first N layers)
+            let (k, v) = match &self.kv_cache {
+                None => (k, v),
+                Some((prev_k, prev_v)) => {
+                    if index_pos == 0 {
+                        (k, v)
+                    } else {
+                        let k = Tensor::cat(&[prev_k, &k], 2)?;
+                        let v = Tensor::cat(&[prev_v, &v], 2)?;
+                        (k, v)
+                    }
+                }
+            };
+            self.kv_cache = Some((k.clone(), v.clone()));
+
             let k = repeat_kv(k, n_rep)?;
-            let v_for_attn = repeat_kv(v, n_rep)?;
+            let v = repeat_kv(v, n_rep)?;
             let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
             let att = match mask {
                 None => att,
@@ -301,11 +352,11 @@ impl LayerWeights {
                 }
             };
             let att = softmax_last_dim(&att)?;
-            att.matmul(&v_for_attn.contiguous()?)?
-        };
+            let y = att.matmul(&v.contiguous()?)?;
 
-        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
-        self.attention_wo.forward(&y)
+            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
+            self.attention_wo.forward(&y)
+        }
     }
 }
 
@@ -422,6 +473,8 @@ impl ModelWeights {
                 cos: cos.clone(),
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
+                layer_idx,
+                kv_cache: None,
                 kv_compressed: None,
                 tq_config: tq_config.clone(),
                 signs: signs.clone(),
