@@ -24,13 +24,34 @@ pub fn load_engine(
 
     let tokenizer_path = match tokenizer_repo_override {
         Some(repo) => {
-            let api = hf_hub::api::sync::Api::new()
-                .map_err(|e| anyhow::anyhow!("HF API init failed: {}", e))?;
-            let hf_repo = api.model(repo.to_string());
-            hf_repo.get("tokenizer.json")
-                .map_err(|e| anyhow::anyhow!("Tokenizer download from {} failed: {}", repo, e))?
+            // Check if it's a local path with tokenizer.json
+            let local_tokenizer = Path::new(repo).join("tokenizer.json");
+            if local_tokenizer.exists() {
+                local_tokenizer
+            } else if Path::new(repo).exists() && repo.ends_with(".json") {
+                PathBuf::from(repo)
+            } else {
+                // Treat as HF repo
+                let api = hf_hub::api::sync::Api::new()
+                    .map_err(|e| anyhow::anyhow!("HF API init failed: {}", e))?;
+                let hf_repo = api.model(repo.to_string());
+                hf_repo.get("tokenizer.json")
+                    .map_err(|e| anyhow::anyhow!("Tokenizer download from {} failed: {}", repo, e))?
+            }
         }
-        None => download::ensure_tokenizer(model_config, &models_dir)?,
+        None => {
+            // Auto-detect: check for tokenizer.json next to model file
+            if let Some(model_dir) = model_path.parent() {
+                let local_tokenizer = model_dir.join("tokenizer.json");
+                if local_tokenizer.exists() {
+                    local_tokenizer
+                } else {
+                    download::ensure_tokenizer(model_config, &models_dir)?
+                }
+            } else {
+                download::ensure_tokenizer(model_config, &models_dir)?
+            }
+        }
     };
     let arch = config::detect_arch(&model_path.to_string_lossy());
 

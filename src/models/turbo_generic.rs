@@ -89,6 +89,7 @@ impl QMatMul {
 // MLP / MoE
 // ============================================================
 
+/// Standard 3-gate MLP: gate (w1) + up (w3) → silu(gate) * up → down (w2)
 #[derive(Debug, Clone)]
 struct Mlp {
     feed_forward_w1: QMatMul,
@@ -104,9 +105,26 @@ impl Module for Mlp {
     }
 }
 
+/// Phi-style 2-gate MLP: up projects to 2×intermediate, split into gate+up halves,
+/// apply silu(gate) * up, then down projects back.
+#[derive(Debug, Clone)]
+struct MlpUpDown {
+    ffn_up: QMatMul,
+    ffn_down: QMatMul,
+}
+
+impl Module for MlpUpDown {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let up = self.ffn_up.forward(xs)?;
+        let chunks = up.chunk(2, xs.rank() - 1)?;
+        self.ffn_down.forward(&(silu(&chunks[0])? * &chunks[1])?)
+    }
+}
+
 #[derive(Debug, Clone)]
 enum MlpOrMoe {
     Mlp(Mlp),
+    UpDown(MlpUpDown),
     MoE {
         n_expert_used: usize,
         feed_forward_gate_inp: QMatMul,
@@ -160,6 +178,7 @@ impl Module for MlpOrMoe {
                 ys.reshape((b_size, seq_len, hidden_dim))
             }
             Self::Mlp(mlp) => mlp.forward(xs),
+            Self::UpDown(mlp) => mlp.forward(xs),
         }
     }
 }
@@ -264,19 +283,26 @@ enum RopeStyle {
 /// propagate through all subsequent layers.
 const TQ_SKIP_FIRST_LAYERS: usize = 4;
 
+/// QKV weight layout — separate tensors (most models) or merged single tensor (Phi-3.5).
+#[derive(Debug, Clone)]
+enum QkvWeights {
+    Separate { wq: QMatMul, wk: QMatMul, wv: QMatMul },
+    Merged { wqkv: QMatMul },
+}
+
 #[derive(Debug, Clone)]
 struct LayerWeights {
-    attention_wq: QMatMul,
-    attention_wk: QMatMul,
-    attention_wv: QMatMul,
+    qkv: QkvWeights,
     attention_wo: QMatMul,
     // Optional biases (Qwen2 has them, Llama doesn't)
     attention_bq: Option<Tensor>,
     attention_bk: Option<Tensor>,
     attention_bv: Option<Tensor>,
     attention_norm: RmsNorm,
+    post_attention_norm: Option<RmsNorm>,
     mlp_or_moe: MlpOrMoe,
     ffn_norm: RmsNorm,
+    post_ffn_norm: Option<RmsNorm>,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -304,9 +330,21 @@ impl LayerWeights {
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
         let x = x.contiguous()?;
-        match self.rope_style {
-            RopeStyle::Halved => rope_halved(&x, &cos, &sin),
-            RopeStyle::Interleaved => rope_interleaved(&x, &cos, &sin),
+        if self.rope_dim < self.head_dim {
+            // Partial RoPE: apply rotation only to first rope_dim dimensions,
+            // leave the remaining dimensions unchanged.
+            let x_rope = x.narrow(3, 0, self.rope_dim)?;
+            let x_pass = x.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
+            let x_rotated = match self.rope_style {
+                RopeStyle::Halved => rope_halved(&x_rope, &cos, &sin)?,
+                RopeStyle::Interleaved => rope_interleaved(&x_rope, &cos, &sin)?,
+            };
+            Tensor::cat(&[&x_rotated, &x_pass], 3)
+        } else {
+            match self.rope_style {
+                RopeStyle::Halved => rope_halved(&x, &cos, &sin),
+                RopeStyle::Interleaved => rope_interleaved(&x, &cos, &sin),
+            }
         }
     }
 
@@ -318,11 +356,22 @@ impl LayerWeights {
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, n_embd) = x.dims3()?;
-        let mut q = self.attention_wq.forward(x)?;
-        let mut k = self.attention_wk.forward(x)?;
-        let mut v = self.attention_wv.forward(x)?;
+        let (mut q, mut k, mut v) = match &self.qkv {
+            QkvWeights::Separate { wq, wk, wv } => {
+                (wq.forward(x)?, wk.forward(x)?, wv.forward(x)?)
+            }
+            QkvWeights::Merged { wqkv } => {
+                let qkv = wqkv.forward(x)?;
+                let q_size = self.n_head * self.head_dim;
+                let kv_size = self.n_kv_head * self.head_dim;
+                let q = qkv.narrow(2, 0, q_size)?;
+                let k = qkv.narrow(2, q_size, kv_size)?;
+                let v = qkv.narrow(2, q_size + kv_size, kv_size)?;
+                (q, k, v)
+            }
+        };
 
-        // Apply biases if present (Qwen2 has them, Llama doesn't)
+        // Apply biases if present (Qwen2 has them, Llama/Phi/Gemma don't)
         if let Some(bq) = &self.attention_bq {
             q = q.broadcast_add(bq)?;
         }
@@ -572,6 +621,19 @@ impl GenericTurboModel {
 
         // Auto-detect features from GGUF tensors
         let has_bias = ct.tensor(reader, "blk.0.attn_q.bias", device).is_ok();
+        let has_merged_qkv = ct.tensor(reader, "blk.0.attn_qkv.weight", device).is_ok();
+        let has_ffn_gate = ct.tensor(reader, "blk.0.ffn_gate.weight", device).is_ok();
+        let has_post_attn_norm = ct.tensor(reader, "blk.0.post_attention_norm.weight", device).is_ok();
+        let has_post_ffn_norm = ct.tensor(reader, "blk.0.post_ffw_norm.weight", device).is_ok();
+
+        let qkv_style = if has_merged_qkv { "merged" } else { "separate" };
+        let mlp_style = if n_expert > 1 {
+            "moe"
+        } else if has_ffn_gate {
+            "gated-silu"
+        } else {
+            "silu-up-down"
+        };
 
         eprintln!(
             "TurboQuant Generic [{}]: {} layers, {} heads (kv={}), head_dim={}, emb={}, \
@@ -580,6 +642,10 @@ impl GenericTurboModel {
             rms_norm_eps, rope_freq_base, rope_dim, rope_style, has_bias,
             if n_expert > 1 { format!("{}of{}", n_expert_used, n_expert) } else { "no".into() },
             tq_config.bits,
+        );
+        eprintln!(
+            "  qkv={}, mlp={}, post_attn_norm={}, post_ffn_norm={}",
+            qkv_style, mlp_style, has_post_attn_norm, has_post_ffn_norm,
         );
 
         // Pre-compute shared state
@@ -607,13 +673,23 @@ impl GenericTurboModel {
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
 
-            // Attention weights
-            let attention_wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
-            let attention_wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
-            let attention_wv = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
+            // Attention weights: merged QKV (Phi-3.5) or separate (most models)
+            let qkv = if has_merged_qkv {
+                let wqkv = ct.tensor(reader, &format!("{prefix}.attn_qkv.weight"), device)?;
+                QkvWeights::Merged { wqkv: QMatMul::from_qtensor(wqkv)? }
+            } else {
+                let wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
+                let wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
+                let wv = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
+                QkvWeights::Separate {
+                    wq: QMatMul::from_qtensor(wq)?,
+                    wk: QMatMul::from_qtensor(wk)?,
+                    wv: QMatMul::from_qtensor(wv)?,
+                }
+            };
             let attention_wo = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
 
-            // Optional biases
+            // Optional biases (Qwen2 has them, Llama/Phi/Gemma don't)
             let attention_bq = if has_bias {
                 Some(ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?.dequantize(device)?)
             } else {
@@ -630,17 +706,8 @@ impl GenericTurboModel {
                 None
             };
 
-            // MLP or MoE
-            let mlp_or_moe = if n_expert <= 1 {
-                let w1 = ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
-                let w2 = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
-                let w3 = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
-                MlpOrMoe::Mlp(Mlp {
-                    feed_forward_w1: QMatMul::from_qtensor(w1)?,
-                    feed_forward_w2: QMatMul::from_qtensor(w2)?,
-                    feed_forward_w3: QMatMul::from_qtensor(w3)?,
-                })
-            } else {
+            // MLP: 3-gate (most models), 2-gate up/down (Phi-3.5), or MoE
+            let mlp_or_moe = if n_expert > 1 {
                 let gate_inp = ct.tensor(reader, &format!("{prefix}.ffn_gate_inp.weight"), device)?;
                 let mut experts = Vec::with_capacity(n_expert);
                 for i in 0..n_expert {
@@ -658,22 +725,53 @@ impl GenericTurboModel {
                     feed_forward_gate_inp: QMatMul::from_qtensor(gate_inp)?,
                     experts,
                 }
+            } else if has_ffn_gate {
+                let w1 = ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
+                let w2 = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
+                let w3 = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
+                MlpOrMoe::Mlp(Mlp {
+                    feed_forward_w1: QMatMul::from_qtensor(w1)?,
+                    feed_forward_w2: QMatMul::from_qtensor(w2)?,
+                    feed_forward_w3: QMatMul::from_qtensor(w3)?,
+                })
+            } else {
+                // Phi-style: only ffn_up and ffn_down (no ffn_gate)
+                let up = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
+                let down = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
+                MlpOrMoe::UpDown(MlpUpDown {
+                    ffn_up: QMatMul::from_qtensor(up)?,
+                    ffn_down: QMatMul::from_qtensor(down)?,
+                })
             };
 
             let attention_norm = ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?;
             let ffn_norm = ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?;
 
+            // Optional post-norms (Gemma2)
+            let post_attention_norm = if has_post_attn_norm {
+                let t = ct.tensor(reader, &format!("{prefix}.post_attention_norm.weight"), device)?;
+                Some(RmsNorm::from_qtensor(t, rms_norm_eps, device)?)
+            } else {
+                None
+            };
+            let post_ffn_norm = if has_post_ffn_norm {
+                let t = ct.tensor(reader, &format!("{prefix}.post_ffw_norm.weight"), device)?;
+                Some(RmsNorm::from_qtensor(t, rms_norm_eps, device)?)
+            } else {
+                None
+            };
+
             layers.push(LayerWeights {
-                attention_wq: QMatMul::from_qtensor(attention_wq)?,
-                attention_wk: QMatMul::from_qtensor(attention_wk)?,
-                attention_wv: QMatMul::from_qtensor(attention_wv)?,
+                qkv,
                 attention_wo: QMatMul::from_qtensor(attention_wo)?,
                 attention_bq,
                 attention_bk,
                 attention_bv,
                 attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps, device)?,
+                post_attention_norm,
                 mlp_or_moe,
                 ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps, device)?,
+                post_ffn_norm,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
@@ -731,12 +829,22 @@ impl GenericTurboModel {
             let residual = &x;
             let x = layer.attention_norm.forward(&x)?;
             let attn = layer.forward_attn(&x, mask.as_ref(), index_pos)?;
+            // Optional post-attention norm (Gemma2)
+            let attn = match &layer.post_attention_norm {
+                Some(norm) => norm.forward(&attn)?,
+                None => attn,
+            };
             let x = (attn + residual)?;
 
             let _enter = layer.span_mlp.enter();
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp_or_moe.forward(&x)?;
+            // Optional post-FFN norm (Gemma2)
+            let x = match &layer.post_ffn_norm {
+                Some(norm) => norm.forward(&x)?,
+                None => x,
+            };
             let x = (x + residual)?;
             layer_in = x;
         }
