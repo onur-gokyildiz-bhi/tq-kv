@@ -105,7 +105,7 @@ Compressed keys preserve retrieval accuracy at every depth.
 
 ```toml
 [dependencies]
-tq-kv = "0.3"
+tq-kv = "0.4"
 ```
 
 ```rust
@@ -157,7 +157,7 @@ tq-engine --serve --port 8088 --turbo-quant --tq-bits 2
 
 ```toml
 [dependencies]
-tq-kv = { version = "0.3", default-features = false }
+tq-kv = { version = "0.4", default-features = false }
 ```
 
 Core compression/decompression works without allocator. The `_with_signs` variants accept pre-computed sign arrays for embedded and bare-metal targets.

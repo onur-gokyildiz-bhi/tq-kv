@@ -1,6 +1,6 @@
 # TurboQuant Benchmark Results
 
-> **tq-kv** v0.3.0 — Pure Rust, zero C/C++ dependency, CUDA accelerated
+> **tq-kv** v0.4.0 — Pure Rust, zero C/C++ dependency, CUDA accelerated
 > ICLR 2026 paper implementation: Lloyd-Max codebook + adaptive sigma + fused attention + incremental KV cache
 > [arxiv.org/abs/2504.19874](https://arxiv.org/abs/2504.19874)
 
@@ -270,7 +270,7 @@ Rotate query once, then each key is just a table lookup. No decompression.
 ## Technical Details
 
 ```
-Crate:            tq-kv v0.3.0
+Crate:            tq-kv v0.4.0
 License:          MIT / Apache-2.0
 Language:         Pure Rust (no C/C++/Python)
 Algorithm:        TurboQuant (ICLR 2026, Google Research)
@@ -300,7 +300,7 @@ cargo run --release -p tq-kv --bin tq-kv-bench
 
 ```toml
 [dependencies]
-tq-kv = "0.3"
+tq-kv = "0.4"
 ```
 
 ```rust
