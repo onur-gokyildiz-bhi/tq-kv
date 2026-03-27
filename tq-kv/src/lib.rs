@@ -55,6 +55,11 @@ pub mod qjl;
 /// Compile with `cargo build --release --features ffi` to produce `libtq_kv.a`.
 #[cfg(feature = "ffi")]
 pub mod ffi;
+
+/// TurboQuant KV cache — drop-in replacement for candle_nn::kv_cache::KvCache.
+/// Compile with `cargo build --features candle` to enable.
+#[cfg(feature = "candle")]
+pub mod candle_kv;
 #[doc(hidden)]
 pub mod bench;
 
