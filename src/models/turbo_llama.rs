@@ -365,10 +365,12 @@ impl LayerWeights {
                 att_scores.extend_from_slice(scores);
             }
 
+            // FIX: Keep attention scores in f32 through softmax to prevent
+            // precision loss with f16. Only cast after softmax for value matmul.
             let att = Tensor::from_vec(
                 att_scores, (b_sz, self.n_head, 1, total_len), q.device(),
-            )?.to_dtype(cache.dtype)?;
-            let att = softmax_last_dim(&att)?;
+            )?;
+            let att = softmax_last_dim(&att)?.to_dtype(cache.dtype)?;
             let v_for_attn = repeat_kv(cache.v.clone(), n_rep)?;
             att.matmul(&v_for_attn.contiguous()?)?
         } else if seq_len == 1 && total_len > 1 {

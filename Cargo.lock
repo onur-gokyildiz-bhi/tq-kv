@@ -2828,9 +2828,11 @@ dependencies = [
 name = "tq-kv"
 version = "0.3.0"
 dependencies = [
+ "candle-core",
  "cbindgen",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
+ "rayon",
 ]
 
 [[package]]
