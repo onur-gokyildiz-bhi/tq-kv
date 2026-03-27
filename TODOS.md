@@ -24,47 +24,51 @@
 - [x] V1 API deprecated, internal modules #[doc(hidden)]
 - [x] README killer — PPL, NIAH, context scaling, C FFI, verified models
 - [x] Design doc approved — hybrid engine (candle + custom kernels)
+- [x] candle CUDA ops: RmsNorm, RoPE, softmax — upstream already in candle 0.9.2
+- [x] candle 0.9.2 dependency update — tested, working
+- [x] Metric audit — version + benchmark numbers aligned, BENCHMARK.md = single source
+- [x] fused_attention_scores() dedicated test + buffer reuse optimization
+- [x] Inline comments translated to English (5 source files)
+- [x] TurboQuant comparison table (README section)
+- [x] tq-demo CLI — bundled NIAH test + compression stats
+- [x] HN post draft (docs/hn-launch.md)
+- [x] Qwen 72B RoPE fix — halved vs interleaved layout (root cause of long-context bug)
+- [x] TurboKvCache — generic drop-in replacement for candle KvCache
+- [x] GenericTurboModel — unified engine for ALL GGUF architectures (llama, qwen2, mistral, gemma, phi3)
+- [x] Qwen 72B 4-bit validated: 150 token coherent output (CPU + GPU)
+- [x] Qwen2.5 7B GPU validated: correct output on CUDA RTX 3080
+- [x] Selective layer compression — first N layers uncompressed for deep models
+- [x] f32 softmax fix — prevents precision loss at long context
 
-## Open — Phase 1: Parallel Sprint (This Week)
+## Open — Phase 2: Performance (This Week)
 
-**Track A — Engineering:**
-- [x] candle CUDA ops: RmsNorm, RoPE, softmax — upstream already fixed in candle 0.9.2
-- [ ] candle dependency update: bump candle-core/candle-nn from 0.9 to 0.9.2, test native CUDA ops
-- [x] Metric audit — versiyon + benchmark rakamları hizalandı, BENCHMARK.md = tek kaynak
-- [ ] Qwen 72B fused attention long-context diagnosis (diagnostic tool hazır, model test bekliyor)
-- [x] fused_attention_scores() dedicated test + buffer reuse (per-key alloc kaldırıldı)
-- [x] Inline yorumlar İngilizce'ye çevrildi
-
-**Track B — Launch (paralel, metric audit sonrası):**
-- [x] TurboQuant implementasyon karşılaştırma tablosu (README'ye eklendi)
-- [ ] candle-examples PR (TurboQuant KV cache example)
-- [x] tq-demo CLI subcommand — bundled NIAH test + compression stats
-- [x] HN post draft (docs/hn-launch.md) — 4-bit PPL +0.8%, CUDA, pure Rust, NIAH 9/9
-- [ ] Reddit posts: r/rust + r/LocalLLaMA
-
-## Open — Phase 2: Performance (Week 2-3)
-
-- [ ] llama.cpp Q4_K_M baseline — aynı donanımda tok/s kaydet (RTX 3080, Llama-3 8B)
+- [ ] llama.cpp Q4_K_M baseline — record tok/s on same hardware (RTX 3080, Qwen 7B)
 - [ ] Q4_K_M AVX2 SIMD matmul kernel — close the gap to llama.cpp
 - [ ] Benchmark: target within 3x of llama.cpp on short context (≤4K)
-- [ ] Benchmark: FASTER than llama.cpp on 16K+ context
-- [ ] Blog: technical deep-dive (SIMD performance story ile bağlantılı)
+- [ ] Benchmark: FASTER than llama.cpp on 16K+ context (TQ advantage)
+- [ ] Blog: technical deep-dive (SIMD performance story)
 - [ ] "v2 update" HN/Reddit post with performance results
 
 ## Open — Phase 3: Developer Experience (Week 3-4)
 
 - [ ] `.with_turbo_quant(bits)` API — builder pattern on candle models
-- [ ] Auto quality gate — if PPL > +2% threshold, auto-promote to next bit width (validate demand first)
+- [ ] Auto quality gate — if PPL > +2% threshold, auto-promote to next bit width
 - [ ] tok/s, TTFT, memory profiling benchmarks
+
+## Open — Launch
+
+- [ ] HN post (docs/hn-launch.md ready — submit when timing is right)
+- [ ] Reddit posts: r/rust + r/LocalLLaMA
+- [ ] candle-examples PR (TurboQuant KV cache example)
 
 ## Future / Exploratory
 
 - [ ] GitHub Actions CI/CD
 - [ ] Web playground demo (after CLI demo validates UX)
 - [ ] Claude Code local integration — TQ as MCP tool or local inference helper
-- [ ] Chat tool — interactive TQ compression demo
 - [ ] Metal shader (Apple Silicon) — deferred, needs Apple hardware
 - [ ] PyO3 Python binding — deferred, no demand evidence yet
-- [ ] Adaptive QJL — context-length-based threshold (if layer-level accumulation found)
+- [ ] Adaptive QJL — context-length-based threshold
 - [ ] Layer-adaptive bitwidth — early layers 2-bit, late layers 4-bit
 - [ ] Flash Attention tiling for fused TQ attention
+- [ ] Qwen3.5 architecture support (GGUF arch = "qwen35", needs testing)
