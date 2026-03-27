@@ -306,6 +306,9 @@ struct LayerWeights {
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
+    /// Padded head_dim (next power of 2) for Hadamard transform.
+    /// Equal to head_dim when head_dim is already a power of 2.
+    padded_head_dim: usize,
     rope_dim: usize,
     rope_style: RopeStyle,
     cos: Tensor,
@@ -355,7 +358,7 @@ impl LayerWeights {
         index_pos: usize,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
-        let (b_sz, seq_len, n_embd) = x.dims3()?;
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
         let (mut q, mut k, mut v) = match &self.qkv {
             QkvWeights::Separate { wq, wk, wv } => {
                 (wq.forward(x)?, wk.forward(x)?, wv.forward(x)?)
@@ -404,7 +407,7 @@ impl LayerWeights {
                 let mut k_per_head = Vec::with_capacity(self.n_kv_head);
                 for _ in 0..self.n_kv_head {
                     k_per_head.push(tq_kv::CompressedKeys::new_empty(
-                        self.tq_config.bits, self.head_dim, self.tq_config.rotation_seed,
+                        self.tq_config.bits, self.padded_head_dim, self.tq_config.rotation_seed,
                     ));
                 }
                 self.kv_compressed = Some(CompressedKvCache {
@@ -421,10 +424,20 @@ impl LayerWeights {
                 for s in 0..seq_len {
                     let offset = (h * seq_len + s) * self.head_dim;
                     let key_vec = &k_flat[offset..offset + self.head_dim];
-                    let (packed, norm) = tq_kv::compress_single_key_with_signs(
-                        key_vec, self.head_dim, &self.tq_config, &self.signs,
-                    );
-                    cache.k_per_head[h].append_raw(&packed, norm);
+                    if self.padded_head_dim > self.head_dim {
+                        // Pad key vector with zeros to next power of 2 for Hadamard
+                        let mut key_vec_padded = vec![0.0f32; self.padded_head_dim];
+                        key_vec_padded[..self.head_dim].copy_from_slice(key_vec);
+                        let (packed, norm) = tq_kv::compress_single_key_with_signs(
+                            &key_vec_padded, self.padded_head_dim, &self.tq_config, &self.signs,
+                        );
+                        cache.k_per_head[h].append_raw(&packed, norm);
+                    } else {
+                        let (packed, norm) = tq_kv::compress_single_key_with_signs(
+                            key_vec, self.head_dim, &self.tq_config, &self.signs,
+                        );
+                        cache.k_per_head[h].append_raw(&packed, norm);
+                    }
                 }
             }
 
@@ -441,11 +454,22 @@ impl LayerWeights {
                 let q_flat = q.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
                 let centroids = tq_kv::codebook::get_centroids(self.tq_config.bits);
                 let scale = 1.0 / (self.head_dim as f32).sqrt();
+                let need_pad = self.padded_head_dim > self.head_dim;
+                let pdim = self.padded_head_dim;
+                let hdim = self.head_dim;
 
                 let head_scores: Vec<Vec<f32>> = (0..self.n_head).into_par_iter().map(|qh| {
                     let kv_h = qh / n_rep;
-                    let q_vec = &q_flat[qh * self.head_dim..(qh + 1) * self.head_dim];
-                    let rotated_q = tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs);
+                    let q_vec = &q_flat[qh * hdim..(qh + 1) * hdim];
+                    let q_for_rotate = if need_pad {
+                        // Pad query vector with zeros to match padded compressed keys
+                        let mut padded = vec![0.0f32; pdim];
+                        padded[..hdim].copy_from_slice(q_vec);
+                        padded
+                    } else {
+                        q_vec.to_vec()
+                    };
+                    let rotated_q = tq_kv::pre_rotate_query_with_signs(&q_for_rotate, &self.signs);
                     let compressed = &cache.k_per_head[kv_h];
                     tq_kv::fused_attention_scores(&rotated_q, compressed, centroids, scale)
                 }).collect();
@@ -464,11 +488,17 @@ impl LayerWeights {
                 att.matmul(&v_for_attn.contiguous()?)?
             } else if seq_len == 1 && total_len > 1 {
                 // GPU GENERATION: decompress + f32 attention
-                let q_f32 = q.to_dtype(DType::F32)?;
+                // Decompress keys (padded_head_dim), then truncate to head_dim
                 let k_full = decompress_cache_to_tensor(
                     &cache.k_per_head, self.n_kv_head, total_len,
-                    self.head_dim, DType::F32, q.device(), &self.tq_config,
+                    self.padded_head_dim, DType::F32, q.device(), &self.tq_config,
                 )?;
+                let k_full = if self.padded_head_dim > self.head_dim {
+                    k_full.narrow(3, 0, self.head_dim)?
+                } else {
+                    k_full
+                };
+                let q_f32 = q.to_dtype(DType::F32)?;
                 let k_full = repeat_kv(k_full, n_rep)?;
                 let v_f32 = repeat_kv(cache.v.to_dtype(DType::F32)?, n_rep)?;
                 let att = (q_f32.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
@@ -490,7 +520,7 @@ impl LayerWeights {
                 att.matmul(&v_for_attn.contiguous()?)?
             };
 
-            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
+            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
             self.attention_wo.forward(&y)
         } else {
             // UNCOMPRESSED PATH: standard fp16 KV cache (first N layers)
@@ -521,7 +551,7 @@ impl LayerWeights {
             let att = softmax_last_dim(&att)?;
             let y = att.matmul(&v.contiguous()?)?;
 
-            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
+            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
             self.attention_wo.forward(&y)
         }
     }
@@ -609,7 +639,21 @@ impl GenericTurboModel {
             .and_then(|v| v.to_u32())
             .unwrap_or(0) as usize;
 
-        let head_dim = embedding_length / head_count;
+        // head_dim: prefer explicit GGUF metadata (Gemma2 has head_dim != embedding_length/head_count)
+        let head_dim = md_get(&format!("{arch}.attention.key_length"))
+            .and_then(|m| m.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(embedding_length / head_count);
+
+        // Padded head_dim for Hadamard transform (must be power of 2).
+        // Phi-3.5 has head_dim=96 which needs padding to 128.
+        let padded_head_dim = head_dim.next_power_of_two();
+        if padded_head_dim != head_dim {
+            eprintln!(
+                "  head_dim={} is not a power of 2, padding to {} for Hadamard transform",
+                head_dim, padded_head_dim,
+            );
+        }
 
         // RoPE dimension: some models (llama) specify it explicitly, others use head_dim
         let rope_dim = md_get(&format!("{arch}.rope.dimension_count"))
@@ -636,9 +680,11 @@ impl GenericTurboModel {
         };
 
         eprintln!(
-            "TurboQuant Generic [{}]: {} layers, {} heads (kv={}), head_dim={}, emb={}, \
+            "TurboQuant Generic [{}]: {} layers, {} heads (kv={}), head_dim={}{}, emb={}, \
              eps={:.2e}, rope_base={}, rope_dim={}, rope={:?}, bias={}, moe={}, {}-bit KV cache",
-            arch, block_count, head_count, head_count_kv, head_dim, embedding_length,
+            arch, block_count, head_count, head_count_kv, head_dim,
+            if padded_head_dim != head_dim { format!(" (padded={})", padded_head_dim) } else { String::new() },
+            embedding_length,
             rms_norm_eps, rope_freq_base, rope_dim, rope_style, has_bias,
             if n_expert > 1 { format!("{}of{}", n_expert_used, n_expert) } else { "no".into() },
             tq_config.bits,
@@ -649,7 +695,7 @@ impl GenericTurboModel {
         );
 
         // Pre-compute shared state
-        let signs = tq_kv::hadamard::generate_signs(head_dim, tq_config.rotation_seed);
+        let signs = tq_kv::hadamard::generate_signs(padded_head_dim, tq_config.rotation_seed);
         let (cos, sin) = precompute_freqs_cis(rope_dim, rope_freq_base, context_length, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
@@ -775,6 +821,7 @@ impl GenericTurboModel {
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
+                padded_head_dim,
                 rope_dim,
                 rope_style,
                 cos: cos.clone(),
