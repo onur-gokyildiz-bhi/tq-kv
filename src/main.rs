@@ -1,8 +1,10 @@
+mod catalog;
 mod chat;
 mod config;
 mod diagnostics;
 mod download;
 mod engine;
+mod hub;
 mod inference;
 mod model;
 mod models;
@@ -95,14 +97,18 @@ enum Commands {
     },
     /// Download a model from HuggingFace
     Pull {
-        /// Model name (e.g., qwen72b)
+        /// Model name (e.g., qwen2:7b, llama:8b, mistral:7b)
         model: String,
     },
-    /// List downloaded models
-    List,
+    /// List downloaded or available models
+    List {
+        /// Show all available models in catalog (not just downloaded)
+        #[arg(short, long)]
+        available: bool,
+    },
     /// Remove a downloaded model
     Rm {
-        /// Model name
+        /// Model name (e.g., qwen2:7b)
         model: String,
     },
     /// Run performance benchmarks
@@ -143,18 +149,9 @@ async fn main() -> Result<()> {
         Some(Commands::Chat { .. }) => cmd_chat(&cli),
         Some(Commands::Doctor) => cmd_doctor(),
         Some(Commands::Perplexity { .. }) => cmd_perplexity(&cli),
-        Some(Commands::Pull { ref model }) => {
-            eprintln!("tq pull {} -- coming in Phase 2", model);
-            Ok(())
-        }
-        Some(Commands::List) => {
-            eprintln!("tq list -- coming in Phase 2");
-            Ok(())
-        }
-        Some(Commands::Rm { ref model }) => {
-            eprintln!("tq rm {} -- coming in Phase 2", model);
-            Ok(())
-        }
+        Some(Commands::Pull { ref model }) => cmd_pull(model),
+        Some(Commands::List { available }) => cmd_list(available),
+        Some(Commands::Rm { ref model }) => cmd_rm(model),
         Some(Commands::Bench { ref model }) => {
             eprintln!("tq bench {} -- coming in Phase 3", model);
             Ok(())
@@ -188,6 +185,96 @@ fn resolve_tq_config(turbo_quant: bool, tq_bits: u8) -> Option<tq_kv::TurboQuant
     }
 }
 
+fn cmd_pull(model_query: &str) -> Result<()> {
+    let entry = catalog::find(model_query).with_context(|| {
+        format!(
+            "Unknown model: '{}'\n\nAvailable models:\n{}",
+            model_query,
+            catalog::list_available()
+                .iter()
+                .map(|e| format!("  {}:{:<6} {}", e.name, e.tag, e.display))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    })?;
+
+    hub::download(entry)?;
+    Ok(())
+}
+
+fn cmd_list(show_available: bool) -> Result<()> {
+    if show_available {
+        println!("Available models:\n");
+        println!(
+            "{:<16} {:<30} {:>8}  {}",
+            "NAME", "DESCRIPTION", "SIZE", "ARCH"
+        );
+        println!("{}", "-".repeat(72));
+        for entry in catalog::list_available() {
+            let pulled = if hub::is_downloaded(entry.name, entry.tag) {
+                " (pulled)"
+            } else {
+                ""
+            };
+            println!(
+                "{:<16} {:<30} {:>6.1} GB  {}{}",
+                format!("{}:{}", entry.name, entry.tag),
+                entry.display,
+                entry.size_gb,
+                entry.arch,
+                pulled,
+            );
+        }
+        return Ok(());
+    }
+
+    let downloaded = hub::list_downloaded();
+    if downloaded.is_empty() {
+        eprintln!("No models downloaded yet.");
+        eprintln!("\nRun `tq pull <model>` to download a model.");
+        eprintln!("Run `tq list --available` to see all available models.");
+        return Ok(());
+    }
+
+    println!("Downloaded models:\n");
+    println!(
+        "{:<16} {:<30} {:>8}  {}",
+        "NAME", "DESCRIPTION", "SIZE", "STATUS"
+    );
+    println!("{}", "-".repeat(72));
+    for dm in &downloaded {
+        let status = if dm.gguf_exists { "ready" } else { "missing" };
+        println!(
+            "{:<16} {:<30} {:>6.1} GB  {}",
+            format!("{}:{}", dm.meta.name, dm.meta.tag),
+            dm.meta.display,
+            dm.meta.size_gb,
+            status,
+        );
+    }
+
+    if downloaded.iter().any(|d| d.gguf_exists) {
+        println!();
+        println!("Use `tq chat <name:tag>` to start chatting.");
+    }
+
+    Ok(())
+}
+
+fn cmd_rm(model_query: &str) -> Result<()> {
+    // Parse name:tag
+    let (name, tag) = if let Some(entry) = catalog::find(model_query) {
+        (entry.name, entry.tag)
+    } else {
+        anyhow::bail!(
+            "Unknown model: '{}'. Use `tq list` to see downloaded models.",
+            model_query
+        );
+    };
+
+    hub::remove(name, tag)
+}
+
 fn cmd_chat(cli: &Cli) -> Result<()> {
     let (model_name, system, max_tokens, temperature, top_p, top_k, repeat_penalty,
          turbo_quant, model_path_override, tokenizer_repo_override) = match &cli.command {
@@ -202,24 +289,56 @@ fn cmd_chat(cli: &Cli) -> Result<()> {
         _ => unreachable!(),
     };
 
-    let model_config = config::get_model(model_name).context(format!(
-        "Unknown model: '{}'. Supported: {}",
-        model_name,
-        config::ALL_MODELS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")
-    ))?;
-
-    eprintln!("Model: {}", model_config.display_name);
-
     let tq_config = resolve_tq_config(turbo_quant, cli.tq_bits);
 
-    let mut engine = model::load_engine(
-        model_config, model_path_override,
-        tq_config, tokenizer_repo_override, cli.cpu,
-    )?;
+    // Try legacy config first, then fall back to hub resolution
+    let (mut engine, model_file) = if let Some(model_config) = config::get_model(model_name) {
+        eprintln!("Model: {}", model_config.display_name);
+        let eng = model::load_engine(
+            model_config, model_path_override,
+            tq_config, tokenizer_repo_override, cli.cpu,
+        )?;
+        let mf = model_path_override
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| model_config.gguf_filename.to_string());
+        (eng, mf)
+    } else if model_path_override.is_none() {
+        // Try hub resolution (catalog-based)
+        let (gguf_path, tokenizer_path) = hub::resolve(model_name)?;
+        let tok_path = match (tokenizer_repo_override, tokenizer_path) {
+            (Some(repo), _) => {
+                // User override
+                let local = std::path::Path::new(repo).join("tokenizer.json");
+                if local.exists() {
+                    local
+                } else if std::path::Path::new(repo).exists() && repo.ends_with(".json") {
+                    PathBuf::from(repo)
+                } else {
+                    let api = hf_hub::api::sync::Api::new()?;
+                    api.model(repo.to_string()).get("tokenizer.json")?
+                }
+            }
+            (None, Some(tp)) => tp,
+            (None, None) => anyhow::bail!(
+                "No tokenizer found for model. Use --tokenizer-repo to specify one."
+            ),
+        };
 
-    let model_file = model_path_override
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| model_config.gguf_filename.to_string());
+        let mf = gguf_path.to_string_lossy().to_string();
+        let arch = config::detect_arch(&mf);
+
+        eprintln!("Model: {}", model_name);
+        let eng = Engine::load_with_device(
+            &gguf_path, &tok_path, arch, tq_config, cli.cpu,
+        )?;
+        (eng, mf)
+    } else {
+        anyhow::bail!(
+            "Unknown model: '{}'. Use `tq list --available` to see available models.",
+            model_name
+        );
+    };
+
     let template = chat::ChatTemplate::detect(&model_file);
 
     let gen_params = GenerationParams {
@@ -243,27 +362,61 @@ async fn cmd_serve(cli: &Cli) -> Result<()> {
             _ => unreachable!(),
         };
 
-    let model_config = config::get_model(model_name).context(format!(
-        "Unknown model: '{}'. Supported: {}",
-        model_name,
-        config::ALL_MODELS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")
-    ))?;
-
-    eprintln!("Model: {}", model_config.display_name);
-
     let tq_config = resolve_tq_config(turbo_quant, cli.tq_bits);
 
-    let engine = model::load_engine(
-        model_config, model_path_override,
-        tq_config, tokenizer_override, cli.cpu,
-    )?;
+    // Try legacy config first, then fall back to hub resolution
+    let (engine, model_file, display_name) = if let Some(model_config) = config::get_model(model_name) {
+        eprintln!("Model: {}", model_config.display_name);
+        let eng = model::load_engine(
+            model_config, model_path_override,
+            tq_config, tokenizer_override, cli.cpu,
+        )?;
+        let mf = model_path_override
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| model_config.gguf_filename.to_string());
+        (eng, mf, model_config.display_name.to_string())
+    } else if model_path_override.is_none() {
+        // Try hub resolution
+        let (gguf_path, tokenizer_path) = hub::resolve(model_name)?;
+        let tok_path = match (tokenizer_override, tokenizer_path) {
+            (Some(repo), _) => {
+                let local = std::path::Path::new(repo).join("tokenizer.json");
+                if local.exists() {
+                    local
+                } else if std::path::Path::new(repo).exists() && repo.ends_with(".json") {
+                    PathBuf::from(repo)
+                } else {
+                    let api = hf_hub::api::sync::Api::new()?;
+                    api.model(repo.to_string()).get("tokenizer.json")?
+                }
+            }
+            (None, Some(tp)) => tp,
+            (None, None) => anyhow::bail!(
+                "No tokenizer found for model. Use --tokenizer to specify one."
+            ),
+        };
 
-    let model_file = model_path_override
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| model_config.gguf_filename.to_string());
+        let mf = gguf_path.to_string_lossy().to_string();
+        let arch = config::detect_arch(&mf);
+        let display = catalog::find(model_name)
+            .map(|e| e.display.to_string())
+            .unwrap_or_else(|| model_name.to_string());
+
+        eprintln!("Model: {}", display);
+        let eng = Engine::load_with_device(
+            &gguf_path, &tok_path, arch, tq_config, cli.cpu,
+        )?;
+        (eng, mf, display)
+    } else {
+        anyhow::bail!(
+            "Unknown model: '{}'. Use `tq list --available` to see available models.",
+            model_name
+        );
+    };
+
     let template = chat::ChatTemplate::detect(&model_file);
 
-    serve::run_server(engine, template, model_name.to_string(), port).await
+    serve::run_server(engine, template, display_name, port).await
 }
 
 fn cmd_doctor() -> Result<()> {
@@ -306,10 +459,27 @@ fn cmd_doctor() -> Result<()> {
         .join("models");
     println!("\nModels directory: {}", models_dir.display());
 
-    // Known models
-    println!("\nSupported models:");
+    // Known models (legacy config)
+    println!("\nLegacy models (config.rs):");
     for m in config::ALL_MODELS {
         println!("  {} ({})", m.name, m.display_name);
+    }
+
+    // Catalog models
+    println!("\nModel Hub catalog:");
+    for e in catalog::list_available() {
+        let pulled = if hub::is_downloaded(e.name, e.tag) { " [pulled]" } else { "" };
+        println!("  {}:{} — {}{}", e.name, e.tag, e.display, pulled);
+    }
+
+    // Downloaded models
+    let downloaded = hub::list_downloaded();
+    if !downloaded.is_empty() {
+        println!("\nPulled models:");
+        for dm in &downloaded {
+            let status = if dm.gguf_exists { "ready" } else { "cache missing" };
+            println!("  {}:{} — {} ({})", dm.meta.name, dm.meta.tag, dm.meta.display, status);
+        }
     }
 
     Ok(())
@@ -327,18 +497,42 @@ fn cmd_perplexity(cli: &Cli) -> Result<()> {
             _ => unreachable!(),
         };
 
-    let model_config = config::get_model(model_name).context(format!(
-        "Unknown model: '{}'. Supported: {}",
-        model_name,
-        config::ALL_MODELS.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")
-    ))?;
-
     let tq_config = resolve_tq_config(turbo_quant, cli.tq_bits);
 
-    let mut engine = model::load_engine(
-        model_config, model_path_override,
-        tq_config, tokenizer_repo_override, cli.cpu,
-    )?;
+    // Try legacy config first, then fall back to hub resolution
+    let mut engine = if let Some(model_config) = config::get_model(model_name) {
+        model::load_engine(
+            model_config, model_path_override,
+            tq_config, tokenizer_repo_override, cli.cpu,
+        )?
+    } else if model_path_override.is_none() {
+        let (gguf_path, tokenizer_path) = hub::resolve(model_name)?;
+        let tok_path = match (tokenizer_repo_override, tokenizer_path) {
+            (Some(repo), _) => {
+                let local = std::path::Path::new(repo).join("tokenizer.json");
+                if local.exists() {
+                    local
+                } else if std::path::Path::new(repo).exists() && repo.ends_with(".json") {
+                    PathBuf::from(repo)
+                } else {
+                    let api = hf_hub::api::sync::Api::new()?;
+                    api.model(repo.to_string()).get("tokenizer.json")?
+                }
+            }
+            (None, Some(tp)) => tp,
+            (None, None) => anyhow::bail!(
+                "No tokenizer found for model. Use --tokenizer-repo to specify one."
+            ),
+        };
+        let mf = gguf_path.to_string_lossy().to_string();
+        let arch = config::detect_arch(&mf);
+        Engine::load_with_device(&gguf_path, &tok_path, arch, tq_config, cli.cpu)?
+    } else {
+        anyhow::bail!(
+            "Unknown model: '{}'. Use `tq list --available` to see available models.",
+            model_name
+        );
+    };
 
     let text = std::fs::read_to_string(file)
         .with_context(|| format!("Cannot read perplexity file: {}", file.display()))?;
