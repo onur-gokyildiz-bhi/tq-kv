@@ -131,7 +131,8 @@ System & Model & KV Format & Failure \\
 vLLM \#10411 & Qwen 2.5 7B Q5\_K\_M & FP8 KV & Infinite repetition \\
 llama.cpp \#10697 & Llama 3.3 70B Q4\_K\_M & q8\_0 KV & Incorrect output \\
 ik\_llama.cpp \#1142 & Various & q4/q5 KV & Garbled text \\
-All 7 TurboQuant impl. & Various & 4-bit KV & FP16 only tested \\
+gguf-runner~\citep{jens2026ggufrunner} & Qwen3 30B Q4\_K\_M & $\sim$3-bit KV & No quality metrics \\
+All other TurboQuant impl. & Various & 4-bit KV & FP16 only tested \\
 \bottomrule
 \end{tabular}
 \end{table}
