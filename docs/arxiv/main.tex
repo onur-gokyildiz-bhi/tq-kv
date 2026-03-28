@@ -50,6 +50,8 @@ To address weight memory, the industry adopted GGUF and other post-training quan
 
 When TurboQuant is applied to the output of already-quantized weights, \emph{compound quantization error} occurs---a phenomenon where two stages of quantization noise interact multiplicatively through softmax, producing catastrophic output degradation~\citep{bondarenko2023softmax, wkvquant}.
 
+\textbf{Concurrent work:} TheTom~\citep{theTom2026turbo4} independently identified and fixed implementation bugs in turbo4 on Apple Silicon (Metal), achieving PPL~6.125 on FP16 models. Our work is complementary: we address the distinct problem of compound error when TurboQuant is applied to \emph{already-quantized} GGUF models---a failure mode that persists even with correct TurboQuant implementation.
+
 \subsection{Contributions}
 
 \begin{enumerate}
@@ -234,11 +236,13 @@ The +4.5~dB SNR improvement over dense QJL is unexpected. We hypothesize that SR
 
 \subsection{The ``QJL Hurts'' Consensus}
 
-Three independent groups---ikawrakow (ik\_llama.cpp), spiritbuun (CUDA), and scos-lab---concluded that QJL hurts quality~\citep{llamacpp_tq}. Their reasoning: QJL variance is amplified by softmax, causing wrong token rankings. Response: disable QJL entirely.
+Five independent groups have confirmed that QJL hurts quality: ikawrakow/TheTom (turboquant\_plus on Metal)~\citep{theTom2026turbo4}, spiritbuun (CUDA), scos-lab, Arclabs001/YATQ, and the paper's own ablation on OpenReview~\citep{llamacpp_tq}. TheTom's analysis is definitive: ``QJL eliminates bias but explodes variance. Softmax amplifies variance. So you're spending 1 bit per value to make your model dumber.'' Their solution---drop QJL, use all 4 bits for 16-centroid PolarQuant---achieved PPL~6.125 (+0.23\% vs q8\_0) on Qwen~3.5 35B MoE~\citep{theTom2026turbo4}.
 
-\subsection{Our Counterargument}
+The key insight, as TheTom articulates: ``The paper optimized for MSE. Attention optimizes through softmax. Different objective, different answer.'' More centroids consistently beat error correction at every tested configuration.
 
-These findings used \emph{dense} QJL with high-variance random projection. SRHT QJL has lower variance. We measure \textbf{attention KL divergence} (not just MSE):
+\subsection{Our Counterargument: Dense vs Structured Projection}
+
+These findings all used the paper's \emph{dense Rademacher} QJL, which has high variance from random projection. We observe that SRHT QJL has fundamentally different variance properties due to structured (Hadamard-based) projection. We measure \textbf{attention KL divergence} (not just MSE) on synthetic Gaussian data:
 
 \begin{table}[h]
 \centering
@@ -258,11 +262,13 @@ Context Length & KL(no QJL) & KL(SRHT QJL) & Reduction \\
 \end{tabular}
 \end{table}
 
-SRHT QJL consistently reduces KL divergence by $\sim$2.9$\times$ at all context lengths. Top-5 token accuracy improves from 80--85\% to 87--95\%.
+On synthetic data, SRHT QJL consistently reduces KL divergence by $\sim$2.9$\times$ at all context lengths. Top-5 token accuracy improves from 80--85\% to 87--95\%.
+
+\textbf{Important caveat:} These results are on synthetic Gaussian data. TheTom's real-model evidence (PPL measurements on Qwen~3.5 35B) shows dense QJL hurting quality. Whether SRHT's lower variance changes this tradeoff on real models remains an open question requiring perplexity validation at extended context lengths. We present these results as preliminary evidence that the projection structure matters, not as a definitive recommendation.
 
 \subsection{Adaptive Activation}
 
-We introduce \texttt{QjlMode::Adaptive\{threshold\}}: QJL off below threshold (minimal variance), on above (bias correction). Default threshold: 4096 tokens.
+Given the tension between our synthetic results (SRHT QJL helps) and community real-model evidence (dense QJL hurts), we introduce a conservative \texttt{QjlMode::Adaptive\{threshold\}}: QJL off below threshold (following TheTom's recommendation for short context), on above (where accumulated bias may outweigh variance). Default threshold: 4096 tokens. This hedges against both failure modes until real-model validation resolves the question.
 
 %=============================================================================
 \section{Implementation}

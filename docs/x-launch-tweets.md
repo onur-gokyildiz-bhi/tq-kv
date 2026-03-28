@@ -1,224 +1,210 @@
-# X (Twitter) Launch Tweets
+# X (Twitter) Launch Tweets — Updated with TheTom/turbo4 findings
 
-## Thread 1: The Discovery (Ana Tweet + Thread)
+## Main Thread: The Discovery
 
-### Tweet 1 (Hook)
-We found a problem that affects EVERY TurboQuant implementation.
+### Tweet 1 (Hook) [+ Visual 1: Before/After]
+Every TurboQuant implementation fails on GGUF models.
 
-None of them work on quantized models (GGUF Q4_K_M).
+Not "degrades slightly." FAILS. Gibberish in 5 languages within 50 tokens.
 
-We fixed it. First working TurboQuant on real deployed models.
+7+ implementations (Python, C, CUDA, Rust). All test on FP16 only. Nobody tested on the models people actually deploy.
 
-Paper + code: [link]
+We fixed it.
 
-1/7
+[IMAGE: visual-1-before-after.png]
 
-### Tweet 2 (Problem)
-The problem: TurboQuant paper assumes FP16 weights.
+### Tweet 2 (The Problem) [+ Visual 4: Journey]
+The problem has a name: compound quantization error.
 
-But nobody runs FP16 anymore. Everyone uses GGUF Q4_K_M.
+Model weights: already 4-bit (GGUF Q4_K_M)
+KV cache: TurboQuant compresses to 4-bit
 
-When you apply TurboQuant to already-quantized models:
-- 50 tokens of OK output
-- Then gibberish: Turkish + Chinese + French mixed together
-- Complete semantic collapse
-
-2/7
-
-### Tweet 3 (Why)
-Root cause: compound quantization error.
-
-Weight quant noise + KV quant noise = not additive.
-
-It's MULTIPLICATIVE through softmax attention.
+Two layers of noise. Softmax amplifies it multiplicatively, not additively.
 
 exp(q * k_noisy) / sum(exp(q * k_j_noisy))
 
-Small systematic bias in every key -> softmax amplifies -> attention distribution shifts -> wrong tokens generated.
+Small bias per key. 2000+ keys. Catastrophic attention shift.
 
-3/7
+Per-key cos_sim = 0.996. Looks fine. Output = gibberish.
 
-### Tweet 4 (Solution)
-Our fix -- 3 paper-backed techniques, zero retraining:
+### Tweet 3 (Our Solution) [+ Visual 2: 3-Fix Pipeline]
+3 paper-backed fixes. Zero retraining. Zero calibration:
 
-1. Sink token preservation (first 4 tokens stay FP16)
-   -> 81% error reduction [KVSink, arXiv:2508.04257]
+1. Sink tokens stay FP16 (first 4 tokens get 50%+ attention)
+   → 81% error reduction [KVSink]
 
-2. Past-Only Quantization (current token = lossless)
-   -> highest-impact position protected [WKVQuant]
+2. Current token = lossless (POQ)
+   → Highest-impact position protected [WKVQuant]
 
-3. Cache reset (bug nobody caught)
-   -> stale conversations contaminating attention
+3. Cache reset between conversations
+   → A bug nobody caught because per-key metrics can't detect it
 
-4/7
+[IMAGE: visual-2-3fix.png]
 
-### Tweet 5 (QJL Insight)
-Bonus discovery: everyone says "QJL hurts" (ikawrakow, spiritbuun, scos-lab).
+### Tweet 4 (TheTom + QJL Context)
+Meanwhile, @TheTom revived turbo4 from the dead on Metal.
 
-Wrong. DENSE QJL hurts. STRUCTURED QJL helps.
+PPL 679 → 6.125 (+0.23% vs q8_0). 7 implementation bugs. Amazing work.
 
-We replaced O(d^2) random projection with SRHT:
+Key shared finding: "QJL eliminates bias but explodes variance. Softmax amplifies variance."
+
+5 groups confirmed: dense QJL hurts.
+
+But we found something different...
+
+### Tweet 5 (SRHT QJL — Contrarian) [+ Visual 6: QJL Controversy]
+Dense QJL hurts. STRUCTURED QJL helps.
+
+We replaced O(d^2) random projection with SRHT (Hadamard-based):
 - 115x faster
-- +4.5 dB SNR (BETTER, not just faster)
-- 2.9x lower attention KL divergence at ALL context lengths
+- +4.5 dB SNR (3.75x better than dense)
+- 2.9x lower attention KL divergence
 
-The tool was broken, not the idea.
+The tool was broken. Not the idea.
 
-5/7
+*Caveat: synthetic data. Real-model validation pending. TheTom's evidence on real models is stronger. We present this as an open question.
 
-### Tweet 6 (Numbers)
+[IMAGE: visual-3-srht.png]
+
+### Tweet 6 (Numbers + Impact) [+ Visual 5: VRAM]
 Results on Qwen 2.5 7B Q4_K_M:
 
-Before fix: "Ataturk'dur pesticale Cumhuri Rencontre"
-After fix: "Turkiye Cumhuriyeti'ni kurmus olan kisi Mustafa Kemal Ataturk'tur"
+Before fix: 50 tokens then gibberish
+After 3-Fix: 300+ tokens, zero language mixing
 
-300+ tokens, zero language mixing.
+Compression:
+- 4-bit: 3.8x (256 MB → 48 MB)
+- 2-bit: 14.2x (256 MB → 18 MB)
+- Llama 70B 32K: 20 GB → 1.4 GB
 
-4-bit: 3.8x compression, 0.996 cosine sim
-2-bit: 14.2x compression, NIAH 9/9 pass
-10K LOC pure Rust, zero C/C++ deps
+NIAH: 9/9 pass at all depths.
 
-6/7
+[IMAGE: visual-5-vram.png]
 
-### Tweet 7 (CTA)
+### Tweet 7 (Product + CTA)
+Not just a paper. A full product:
+
+```
+tq pull qwen2:7b
+tq serve --turbo-quant
+tq chat
+```
+
+Web UI, OpenAI API, model hub. 10K LOC Pure Rust.
+
+"Rust's Ollama" with 4x memory compression.
+
 Paper: [arxiv link]
 Code: github.com/onur-gokyildiz-bhi/tq-kv
 Crate: crates.io/crates/tq-kv
 
-Full product -- not just a library:
-  tq pull qwen2:7b
-  tq serve --turbo-quant
-  tq chat
-
-"Rust's Ollama" with TurboQuant KV compression.
-
-BHI Research -- @onaborkyildiz
-
-7/7
+@onurgokyildiz | BHI Research
 
 ---
 
-## Thread 2: Technical Deep Dive (for ML audience)
+## Technical Thread (for ML audience)
 
-### Tweet 1
-Deep dive: why TurboQuant fails on GGUF and how we fixed it.
+### T1 [+ Visual 2]
+Technical deep dive: why TurboQuant + GGUF = broken, and how compound-aware compression fixes it.
 
-Key insight from 17 papers surveyed:
+The assumption that killed everyone: "KV vectors are clean FP16."
+
+In production, k = W_K_q4 * x + noise_w. Your keys are already noisy. Thread:
+
+### T2
+After Hadamard rotation, TurboQuant assumes coordinates ~ N(0, sigma^2).
+
+With Q4 weights, they're NOT Gaussian. They carry structured quantization artifacts.
 
 "Hadamard rotation only improves concentration, not alignment" (arXiv:2603.04359)
 
-When inputs are already noisy from weight quant, rotation alone isn't enough.
+The codebook is optimized for the wrong distribution.
 
-Thread:
+### T3
+But per-key quality looks fine! cos_sim=0.996. SNR=20.3 dB.
 
-### Tweet 2
-The paper assumes: k = W_K * x (clean FP16)
+The trap: these metrics measure RECONSTRUCTION error.
+Attention measures SOFTMAX of dot products.
 
-Reality: k = W_K_q4 * x + noise_w (quantized weight noise)
+Softmax is 8x more sensitive to quantization than any other activation (Bondarenko 2023).
 
-After Hadamard: not quite Gaussian. Outlier channels survive.
+0.4% error per key * 2000 keys * softmax amplification = semantic collapse.
 
-Lloyd-Max codebook is optimal for Gaussian.
-For non-Gaussian from Q4: suboptimal boundaries -> systematic bias.
+### T4
+The 3-Fix targets the highest-impact positions:
 
-### Tweet 3
-Softmax is the amplifier:
+Position 0-3 (sink tokens): get 50%+ attention. Keep FP16. 8 KB per layer.
+Position t (current): most recent context. Keep FP16. Zero overhead.
+Stale cache: hard reset per conversation. Zero overhead.
 
-attn_i = exp(q * k_i / sqrt(d)) / sum(exp(q * k_j / sqrt(d)))
+Simple. Paper-backed. Works.
 
-Quantization bias in k is NOT random noise.
-It's systematic: every key shifts in the same direction.
+### T5
+On QJL — the interesting debate:
 
-exp(bias) is multiplicative, not additive.
-2000 keys * small bias = large attention shift.
+@TheTom + 4 others: "Drop QJL. More centroids > error correction."
+Us: "Dense QJL hurts. SRHT QJL might help."
 
-### Tweet 4
-The fix is elegant:
+Dense: O(d^2), random Rademacher, high variance
+SRHT: O(d log d), structured Hadamard, lower variance
 
-Sink tokens (positions 0-3): FP16
-  -> These get 50%+ of attention weight in many models
-  -> Quantizing them = 81% of total error
+Our synthetic tests: 2.9x better attention KL divergence.
+TheTom's real tests: QJL hurts PPL.
 
-Current token: FP16
-  -> Most attended recent token stays lossless
+Open question. We implemented adaptive mode as a hedge.
 
-Past tokens: TurboQuant 4-bit
-  -> Compound error exists but is diluted
+### T6
+New research direction: compound-aware KV cache compression.
 
-### Tweet 5
-On QJL -- the contrarian finding:
+The field assumes clean inputs. Reality is everything is quantized.
 
-Community: "QJL adds variance that softmax amplifies"
-Us: "That's because you're using DENSE random projection"
+Next steps:
+- Per-channel key scaling (SmoothQuant for KV cache)
+- Calibrated codebooks from Q4 activations
+- Real-model QJL validation at 32K+ context
 
-SRHT (Hadamard-based) projection:
-  - Structured -> lower variance
-  - O(d log d) instead of O(d^2)
-  - +4.5 dB SNR (dense was +1.2 dB)
-
-The projection quality matters more than the projection speed.
-
-### Tweet 6
-We think this opens a new research direction:
-
-"Compound-aware KV cache compression"
-
-The assumption that KV vectors are clean needs to die.
-In production, EVERYTHING is quantized.
-
-Next: per-channel key scaling, calibrated codebooks, adaptive QJL threshold tuning.
-
-Paper: [arxiv link]
+Paper: [arxiv]
+Code: github.com/onur-gokyildiz-bhi/tq-kv
 
 ---
 
-## Standalone Tweets (for different days)
+## Standalone Tweets
 
-### Standalone 1 (Controversial/Engagement)
-Hot take: QJL doesn't hurt. You're just implementing it wrong.
+### Standalone 1 (Engagement bait)
+"Do not bother using turbo4" — community consensus, March 2026
 
-Every TurboQuant implementer: "QJL adds noise, remove it"
+@TheTom: Fixed 7 bugs. PPL 679 → 6.125.
+Us: Fixed compound error on GGUF. First working TurboQuant on quantized models.
 
-Us: Replace dense O(d^2) with structured SRHT O(d log d).
+Sometimes the answer is just debugging until it works.
 
-Result: 115x faster AND better quality (+4.5 dB vs +1.2 dB).
-
-The tool was broken. Not the concept.
-
-### Standalone 2 (Practical/Developer)
-TIL: No TurboQuant implementation works on GGUF quantized models.
-
-All 7+ implementations (Python, C, CUDA, Rust) only test on FP16.
-
-But everyone deploys Q4_K_M.
-
-We fixed it. 3 lines of code principle, 17 papers of research.
-
-github.com/onur-gokyildiz-bhi/tq-kv
-
-### Standalone 3 (Visual/Numbers)
-TurboQuant on GGUF Q4_K_M -- before and after:
-
-BEFORE:
-"Ataturk'dur. pesticale Cumhuri Rencontre kukka"
-
-AFTER (our 3-fix):
-"Turkiye Cumhuriyeti'ni kurmus olan kisi
- Mustafa Kemal Ataturk'tur. Ataturk'un reformlari
- Turkiye'nin modernlesmesinde onemli rol oynamistir."
-
-300+ tokens. Zero language mixing. Pure Rust.
-
-### Standalone 4 (For Rust community)
-Rust + ML: tq-kv ships as a full LLM platform
+### Standalone 2 (For Rust devs)
+Pure Rust LLM inference with 4x memory compression:
 
 tq pull qwen2:7b
 tq serve --turbo-quant
 tq chat
 
-10K LOC. Zero C/C++. SIMD AVX2+FMA.
-candle backend. crates.io v0.4.0.
+10K LOC. Zero C/C++. AVX2+FMA SIMD.
+Works with ChatBox and Open WebUI.
 
-"Rust's Ollama" with 4x memory compression.
+Rust's Ollama. crates.io/crates/tq-kv
 
-@rustlang
+### Standalone 3 (Numbers visual) [+ Visual 3]
+SRHT vs Dense QJL:
+
+Dense: 29x slower, +1.2 dB
+SRHT: 1.45x overhead, +4.5 dB
+
+115x faster. 3.75x better quality.
+
+Same algorithm. Different projection matrix.
+
+The implementation matters more than the theory.
+
+### Standalone 4 (The quote)
+"The paper optimized for MSE. Attention optimizes through softmax. Different objective, different answer."
+
+— @TheTom on why QJL hurts
+
+This is the most important insight in KV cache compression right now. The metric you optimize for determines everything.
