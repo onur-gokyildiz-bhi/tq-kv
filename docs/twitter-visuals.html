@@ -291,28 +291,28 @@
   <div style="margin: 32px 0;">
     <div style="margin-bottom: 24px;">
       <h3 class="white">Llama 3.1 70B @ 32K context</h3>
-      <div style="display: flex; gap: 16px; align-items: center; margin-top: 8px;">
-        <div style="flex: 1;">
-          <div style="background: #da363340; height: 32px; border-radius: 4px; position: relative;">
-            <div style="position:absolute; left:8px; top:6px; font-size:14px;" class="red">FP16 KV: 20 GB</div>
-          </div>
+
+      <!-- FP16 bar -->
+      <div style="display: flex; align-items: center; margin-top: 16px; gap: 16px;">
+        <div style="width: 700px; background: #da363340; height: 40px; border-radius: 6px; display: flex; align-items: center; padding-left: 12px;">
+          <span class="red" style="font-size: 15px;">FP16 KV: 20 GB</span>
         </div>
+        <span class="dim" style="font-size: 14px;">baseline</span>
       </div>
-      <div style="display: flex; gap: 16px; align-items: center; margin-top: 4px;">
-        <div style="flex: 0.265;">
-          <div style="background: #3fb95040; height: 32px; border-radius: 4px; position: relative;">
-            <div style="position:absolute; left:8px; top:6px; font-size:14px;" class="green">TQ 4-bit: 5.3 GB</div>
-          </div>
+
+      <!-- TQ 4-bit bar -->
+      <div style="display: flex; align-items: center; margin-top: 6px; gap: 16px;">
+        <div style="width: 185px; background: #3fb95040; height: 40px; border-radius: 6px; display: flex; align-items: center; padding-left: 12px;">
+          <span class="green" style="font-size: 15px;">TQ 4-bit: 5.3 GB</span>
         </div>
-        <span class="green" style="font-weight:700;">3.8x savings</span>
+        <span class="green" style="font-weight: 700; font-size: 16px;">3.8x savings</span>
       </div>
-      <div style="display: flex; gap: 16px; align-items: center; margin-top: 4px;">
-        <div style="flex: 0.07;">
-          <div style="background: #58a6ff40; height: 32px; border-radius: 4px; position: relative;">
-            <div style="position:absolute; left:8px; top:6px; font-size:14px; white-space:nowrap;" class="accent">TQ 2-bit: 1.4 GB</div>
-          </div>
-        </div>
-        <span class="accent" style="font-weight:700;">14.2x savings</span>
+
+      <!-- TQ 2-bit bar -->
+      <div style="display: flex; align-items: center; margin-top: 6px; gap: 16px;">
+        <div style="width: 50px; background: #58a6ff40; height: 40px; border-radius: 6px;"></div>
+        <span class="accent" style="font-size: 15px;">TQ 2-bit: 1.4 GB</span>
+        <span class="accent" style="font-weight: 700; font-size: 16px;">14.2x savings</span>
       </div>
     </div>
 
