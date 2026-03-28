@@ -185,14 +185,24 @@ impl Engine {
             .map_err(|e| anyhow::anyhow!("Sampling error: {}", e))?;
 
         let mut output = String::new();
+        let mut all_tokens: Vec<u32> = Vec::new();
+        let mut prev_decoded_len = 0;
         let mut n_generated = 0u32;
 
         while n_generated < params.max_tokens {
             if next_token == self.eos_token_id { break; }
 
-            let token_text = self.tokenizer.decode(&[next_token], true).unwrap_or_default();
-            on_token(&token_text);
-            output.push_str(&token_text);
+            // Incremental decode: decode ALL generated tokens, then diff with previous.
+            // This preserves spaces that sentencepiece tokenizers encode as part of
+            // the token (e.g., "▁Hello" → " Hello"). Single-token decode loses the space.
+            all_tokens.push(next_token);
+            let full_text = self.tokenizer.decode(&all_tokens, true).unwrap_or_default();
+            let new_text = &full_text[prev_decoded_len..];
+            if !new_text.is_empty() {
+                on_token(new_text);
+                output.push_str(new_text);
+            }
+            prev_decoded_len = full_text.len();
 
             let input = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
             let logits = self.model.forward(&input, self.position)?;
