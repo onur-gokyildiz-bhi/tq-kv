@@ -158,6 +158,8 @@ pub async fn run_server(
     });
 
     let app = Router::new()
+        .route("/", get(serve_ui))
+        .route("/index.html", get(serve_ui))
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
@@ -173,6 +175,7 @@ pub async fn run_server(
     eprintln!("  TurboQuant Engine Server (axum)");
     eprintln!("  http://localhost:{}", port);
     eprintln!("  Endpoints:");
+    eprintln!("    GET  /                     (Web UI)");
     eprintln!("    POST /v1/chat/completions  (OpenAI compatible)");
     eprintln!("    GET  /v1/models");
     eprintln!("    GET  /health");
@@ -186,6 +189,10 @@ pub async fn run_server(
 // ---------------------------------------------------------------------------
 // Route handlers
 // ---------------------------------------------------------------------------
+
+async fn serve_ui() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("web/index.html"))
+}
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {

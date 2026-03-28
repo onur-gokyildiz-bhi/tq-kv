@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>tq — TurboQuant Local LLM</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1a1a2e; color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            height: 100vh; display: flex; flex-direction: column;
+        }
+        .header {
+            background: #16213e; padding: 12px 20px;
+            display: flex; align-items: center; justify-content: space-between;
+            border-bottom: 1px solid #0f3460;
+        }
+        .header h1 { font-size: 18px; font-weight: 600; }
+        .header h1 span { color: #e94560; }
+        .header .stats { font-size: 12px; color: #888; }
+        .chat-container {
+            flex: 1; overflow-y: auto; padding: 20px;
+            display: flex; flex-direction: column; gap: 16px;
+        }
+        .message { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; }
+        .message.user {
+            align-self: flex-end; background: #0f3460;
+        }
+        .message.assistant {
+            align-self: flex-start; background: #16213e;
+            border: 1px solid #0f3460;
+        }
+        .message .content { white-space: pre-wrap; word-wrap: break-word; }
+        .message .role-label {
+            font-size: 11px; color: #888; margin-bottom: 4px; font-weight: 600;
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .input-area {
+            padding: 16px 20px; background: #16213e;
+            border-top: 1px solid #0f3460;
+            display: flex; gap: 12px; align-items: flex-end;
+        }
+        .input-area textarea {
+            flex: 1; background: #1a1a2e; border: 1px solid #0f3460;
+            color: #e0e0e0; padding: 10px 14px; border-radius: 8px;
+            font-size: 14px; resize: none; height: 44px; max-height: 120px;
+            font-family: inherit; line-height: 1.4;
+        }
+        .input-area textarea:focus { outline: none; border-color: #e94560; }
+        .input-area button {
+            background: #e94560; color: white; border: none;
+            padding: 10px 20px; border-radius: 8px; cursor: pointer;
+            font-size: 14px; font-weight: 600; white-space: nowrap;
+            height: 44px;
+        }
+        .input-area button:hover { background: #c83b52; }
+        .input-area button:disabled { background: #444; cursor: not-allowed; }
+        .status-bar {
+            padding: 6px 20px; background: #0f0f23; font-size: 11px; color: #666;
+            display: flex; justify-content: space-between;
+        }
+        .welcome {
+            text-align: center; color: #555; padding: 60px 20px;
+            display: flex; flex-direction: column; align-items: center; gap: 12px;
+        }
+        .welcome h2 { color: #e94560; font-size: 28px; font-weight: 700; }
+        .welcome p { max-width: 400px; line-height: 1.6; }
+        .typing-indicator { display: inline-block; }
+        .typing-indicator span {
+            display: inline-block; width: 6px; height: 6px;
+            background: #888; border-radius: 50%; margin: 0 2px;
+            animation: blink 1.4s infinite both;
+        }
+        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes blink {
+            0%, 80%, 100% { opacity: 0.3; }
+            40% { opacity: 1; }
+        }
+        @media (max-width: 600px) {
+            .message { max-width: 95%; }
+            .header h1 { font-size: 15px; }
+            .input-area { padding: 10px; gap: 8px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><span>tq</span> — TurboQuant Local LLM</h1>
+        <div class="stats" id="stats">Connecting...</div>
+    </div>
+
+    <div class="chat-container" id="chat">
+        <div class="welcome">
+            <h2>tq</h2>
+            <p>TurboQuant-compressed local inference. Type a message to begin.</p>
+        </div>
+    </div>
+
+    <div class="input-area">
+        <textarea id="input" placeholder="Type a message... (Shift+Enter for newline)"
+                  rows="1"></textarea>
+        <button id="sendBtn">Send</button>
+    </div>
+
+    <div class="status-bar">
+        <span id="status">Ready</span>
+        <span>Powered by TurboQuant KV Compression</span>
+    </div>
+
+    <script>
+        const chatEl = document.getElementById('chat');
+        const inputEl = document.getElementById('input');
+        const sendBtn = document.getElementById('sendBtn');
+        const statusEl = document.getElementById('status');
+        const statsEl = document.getElementById('stats');
+
+        let modelName = 'model';
+        let messages = [];
+        let generating = false;
+
+        // Auto-resize textarea
+        inputEl.addEventListener('input', function() {
+            this.style.height = '44px';
+            this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+        });
+
+        inputEl.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        sendBtn.addEventListener('click', sendMessage);
+
+        // Fetch model info
+        fetch('/v1/models')
+            .then(r => r.json())
+            .then(d => {
+                if (d.data && d.data.length > 0) {
+                    modelName = d.data[0].id;
+                    statsEl.textContent = 'Model: ' + modelName;
+                }
+            })
+            .catch(() => { statsEl.textContent = 'Not connected'; });
+
+        function addMessage(role, content) {
+            // Remove welcome on first message
+            const welcome = chatEl.querySelector('.welcome');
+            if (welcome) welcome.remove();
+
+            const div = document.createElement('div');
+            div.className = 'message ' + role;
+            const label = role === 'user' ? 'You' : 'Assistant';
+            div.innerHTML = '<div class="role-label">' + label + '</div>'
+                          + '<div class="content"></div>';
+            div.querySelector('.content').textContent = content;
+            chatEl.appendChild(div);
+            chatEl.scrollTop = chatEl.scrollHeight;
+            return div;
+        }
+
+        function scrollToBottom() {
+            chatEl.scrollTop = chatEl.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const text = inputEl.value.trim();
+            if (!text || generating) return;
+
+            generating = true;
+            inputEl.value = '';
+            inputEl.style.height = '44px';
+            sendBtn.disabled = true;
+            statusEl.textContent = 'Generating...';
+
+            messages.push({ role: 'user', content: text });
+            addMessage('user', text);
+
+            // Create assistant message with typing indicator
+            const assistantDiv = addMessage('assistant', '');
+            const contentEl = assistantDiv.querySelector('.content');
+            contentEl.innerHTML = '<div class="typing-indicator">'
+                + '<span></span><span></span><span></span></div>';
+
+            // Build request messages with system prompt
+            const reqMessages = [
+                { role: 'system', content: 'You are a helpful assistant.' },
+                ...messages
+            ];
+
+            try {
+                const response = await fetch('/v1/chat/completions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model: modelName,
+                        messages: reqMessages,
+                        stream: true,
+                        max_tokens: 1024
+                    })
+                });
+
+                if (!response.ok) {
+                    const err = await response.text();
+                    throw new Error('HTTP ' + response.status + ': ' + err);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let fullText = '';
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (!trimmed.startsWith('data: ')) continue;
+                        const data = trimmed.slice(6);
+                        if (data === '[DONE]') continue;
+                        try {
+                            const parsed = JSON.parse(data);
+                            const token = parsed.choices
+                                && parsed.choices[0]
+                                && parsed.choices[0].delta
+                                && parsed.choices[0].delta.content;
+                            if (token) {
+                                fullText += token;
+                                contentEl.textContent = fullText;
+                                scrollToBottom();
+                            }
+                        } catch(e) { /* skip malformed chunks */ }
+                    }
+                }
+
+                // Process any remaining buffer
+                if (buffer.trim().startsWith('data: ')) {
+                    const data = buffer.trim().slice(6);
+                    if (data !== '[DONE]') {
+                        try {
+                            const parsed = JSON.parse(data);
+                            const token = parsed.choices
+                                && parsed.choices[0]
+                                && parsed.choices[0].delta
+                                && parsed.choices[0].delta.content;
+                            if (token) {
+                                fullText += token;
+                                contentEl.textContent = fullText;
+                            }
+                        } catch(e) {}
+                    }
+                }
+
+                if (!fullText) {
+                    contentEl.textContent = '(empty response)';
+                }
+
+                messages.push({ role: 'assistant', content: fullText });
+                statusEl.textContent = 'Ready';
+            } catch (err) {
+                contentEl.textContent = 'Error: ' + err.message;
+                statusEl.textContent = 'Error';
+                // Remove failed assistant message from history
+            }
+
+            generating = false;
+            sendBtn.disabled = false;
+            inputEl.focus();
+        }
+
+        inputEl.focus();
+    </script>
+</body>
+</html>
