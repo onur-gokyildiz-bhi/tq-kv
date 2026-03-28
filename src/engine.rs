@@ -197,8 +197,8 @@ impl Engine {
             // the token (e.g., "▁Hello" → " Hello"). Single-token decode loses the space.
             all_tokens.push(next_token);
             let full_text = self.tokenizer.decode(&all_tokens, true).unwrap_or_default();
-            let new_text = &full_text[prev_decoded_len..];
-            if !new_text.is_empty() {
+            if full_text.len() > prev_decoded_len {
+                let new_text = &full_text[prev_decoded_len..];
                 on_token(new_text);
                 output.push_str(new_text);
             }
@@ -210,6 +210,26 @@ impl Engine {
 
             let logits = logits.squeeze(0)?;
             let logits = extract_last_logits(&logits)?.to_device(&Device::Cpu)?;
+
+            // Apply repetition penalty: reduce logits for tokens already generated
+            let logits = if params.repeat_penalty != 1.0 && !all_tokens.is_empty() {
+                let mut logits_vec = logits.to_vec1::<f32>()?;
+                for &token_id in &all_tokens {
+                    let idx = token_id as usize;
+                    if idx < logits_vec.len() {
+                        let score = logits_vec[idx];
+                        logits_vec[idx] = if score > 0.0 {
+                            score / params.repeat_penalty
+                        } else {
+                            score * params.repeat_penalty
+                        };
+                    }
+                }
+                Tensor::from_vec(logits_vec, logits.shape(), logits.device())?
+            } else {
+                logits
+            };
+
             next_token = logits_processor
                 .sample(&logits)
                 .map_err(|e| anyhow::anyhow!("Sampling error: {}", e))?;
