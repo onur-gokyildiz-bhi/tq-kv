@@ -63,25 +63,54 @@ pub mod candle_kv;
 #[doc(hidden)]
 pub mod bench;
 
+/// QJL activation mode.
+#[derive(Clone, Debug, PartialEq)]
+pub enum QjlMode {
+    /// QJL always disabled (best for short context, ≤4K tokens).
+    /// Community consensus: 4-bit MSE-only beats MSE+QJL at short context
+    /// because QJL variance is amplified by softmax.
+    Off,
+    /// QJL always enabled (use with SRHT for acceptable overhead).
+    On,
+    /// Adaptive: QJL activates when cached token count exceeds threshold.
+    /// At long context, accumulated quantization error grows large enough
+    /// that QJL's +4.5 dB SNR correction outweighs softmax variance cost.
+    Adaptive {
+        /// Token count threshold above which QJL activates (default: 8192)
+        threshold: usize,
+    },
+}
+
+impl Default for QjlMode {
+    fn default() -> Self {
+        QjlMode::Off
+    }
+}
+
 /// TurboQuant configuration.
 #[derive(Clone, Debug)]
 pub struct TurboQuantConfig {
-    /// Quantization bit width (3 or 4)
+    /// Quantization bit width (2, 3, or 4)
     pub bits: u8,
-    /// Enable QJL error correction
-    pub use_qjl: bool,
+    /// QJL error correction mode
+    pub qjl_mode: QjlMode,
     /// QJL projection dimension (0 = same as head_dim)
     pub qjl_proj_dim: usize,
     /// Hadamard rotation seed
     pub rotation_seed: u64,
     /// QJL base seed
     pub qjl_seed: u64,
+
+    // Legacy field — use qjl_mode instead
+    #[doc(hidden)]
+    pub use_qjl: bool,
 }
 
 impl Default for TurboQuantConfig {
     fn default() -> Self {
         Self {
             bits: 4,
+            qjl_mode: QjlMode::Off,
             use_qjl: false,
             qjl_proj_dim: 0,
             rotation_seed: 0x0054_5552_4230,
@@ -92,22 +121,40 @@ impl Default for TurboQuantConfig {
 
 impl TurboQuantConfig {
     /// 2-bit extreme compression (~16x theoretical)
-    /// Produced character-for-character identical output in Dejan's RTX 4090 test.
-    /// QJL disabled: at 2-bit the codebook alone is sufficient, QJL overhead reduces the ratio.
     pub fn extreme() -> Self {
-        Self { bits: 2, use_qjl: false, ..Default::default() }
+        Self { bits: 2, ..Default::default() }
     }
 
     /// 3-bit aggressive compression (~10x theoretical)
     pub fn aggressive() -> Self {
-        Self { bits: 3, use_qjl: false, ..Default::default() }
+        Self { bits: 3, ..Default::default() }
     }
 
     /// 4-bit balanced compression (~8x theoretical)
-    /// QJL disabled: +1.2 dB SNR costs 29x slower compress, 128x slower decompress,
-    /// and ratio drops from 3.8x to 2.7x. QJL breaks fused attention (Dejan: cos_sim=0.69).
     pub fn balanced() -> Self {
-        Self { bits: 4, use_qjl: false, ..Default::default() }
+        Self { bits: 4, ..Default::default() }
+    }
+
+    /// 4-bit with adaptive QJL — auto-enables error correction at long context.
+    /// SRHT QJL shows 2.9x lower attention KL divergence at all context lengths
+    /// on synthetic data. On real models with Q4 weights, softmax may amplify
+    /// QJL variance at short context. Adaptive mode hedges: OFF for prefill,
+    /// ON after threshold (when accumulated error outweighs variance cost).
+    pub fn balanced_adaptive() -> Self {
+        Self {
+            bits: 4,
+            qjl_mode: QjlMode::Adaptive { threshold: 4096 },
+            ..Default::default()
+        }
+    }
+
+    /// Check if QJL should be active given current cache length.
+    pub fn should_use_qjl(&self, cached_tokens: usize) -> bool {
+        match &self.qjl_mode {
+            QjlMode::Off => self.use_qjl, // legacy compat
+            QjlMode::On => true,
+            QjlMode::Adaptive { threshold } => cached_tokens >= *threshold,
+        }
     }
 }
 
