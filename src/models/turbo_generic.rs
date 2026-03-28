@@ -645,13 +645,17 @@ impl GenericTurboModel {
             .map(|v| v as usize)
             .unwrap_or(embedding_length / head_count);
 
-        // Padded head_dim for Hadamard transform (must be power of 2).
-        // Phi-3.5 has head_dim=96 which needs padding to 128.
-        let padded_head_dim = head_dim.next_power_of_two();
-        if padded_head_dim != head_dim {
-            eprintln!(
-                "  head_dim={} is not a power of 2, padding to {} for Hadamard transform",
-                head_dim, padded_head_dim,
+        // Hadamard transform requires power-of-2 dimensions.
+        // Models with non-power-of-2 head_dim (e.g., Phi-3.5 head_dim=96) are NOT supported
+        // for TQ compression because zero-padding degrades quality significantly:
+        // padding 96→128 adds 33% zeros that dilute signal after Hadamard rotation.
+        let padded_head_dim = head_dim;
+        if !head_dim.is_power_of_two() {
+            candle_core::bail!(
+                "TurboQuant requires power-of-2 head_dim, but this model has head_dim={}. \
+                 Models with non-standard head dimensions (Phi-3.5, etc.) are not supported \
+                 for KV compression. Run without --turbo-quant for these models.",
+                head_dim,
             );
         }
 

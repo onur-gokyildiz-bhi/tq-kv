@@ -55,16 +55,10 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_gb: 4.4,
         arch: "llama",
     },
-    CatalogEntry {
-        name: "phi",
-        tag: "3.5",
-        display: "Phi-3.5 Mini Instruct",
-        hf_repo: "bartowski/Phi-3.5-mini-instruct-GGUF",
-        filename: "Phi-3.5-mini-instruct-Q4_K_M.gguf",
-        tokenizer_repo: "microsoft/Phi-3.5-mini-instruct",
-        size_gb: 2.4,
-        arch: "phi3",
-    },
+    // Phi-3.5 removed: head_dim=96 (not power of 2) requires padding to 128,
+    // which adds 33% zero coordinates and degrades compression quality significantly.
+    // TurboQuant's Hadamard rotation spreads zeros across all dimensions, diluting signal.
+    // Will re-add when chunk-based Hadamard (split 96 = 64+32) is implemented.
     CatalogEntry {
         name: "gemma",
         tag: "9b",
@@ -106,9 +100,7 @@ pub fn find(query: &str) -> Option<&'static CatalogEntry> {
     if lower.contains("mistral") {
         return CATALOG.iter().find(|e| e.name == "mistral" && e.tag == "7b");
     }
-    if lower.contains("phi") {
-        return CATALOG.iter().find(|e| e.name == "phi" && e.tag == "3.5");
-    }
+    // Phi removed from catalog (head_dim=96 incompatible with TQ)
     if lower.contains("gemma") {
         if lower.contains("9") {
             return CATALOG.iter().find(|e| e.name == "gemma" && e.tag == "9b");
