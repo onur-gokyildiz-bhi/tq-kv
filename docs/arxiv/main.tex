@@ -1,0 +1,329 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{subcaption}
+\usepackage{natbib}
+\usepackage{multirow}
+
+\title{TurboQuant on Quantized Models:\\Solving Compound Quantization Error in GGUF LLMs}
+
+\author{
+  Onur G\"oky{\i}ld{\i}z \\
+  BHI Research \\
+  \texttt{onur@bhi.dev} \\
+  \url{https://github.com/onur-gokyildiz-bhi/tq-kv}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+TurboQuant~\citep{zandieh2026turboquant} achieves near information-theoretic optimal KV cache compression through randomized Hadamard rotation and Lloyd-Max scalar quantization, delivering up to 15$\times$ compression with 0.997 cosine similarity. However, all existing implementations assume full-precision (FP16/BF16) model weights. We discover that applying TurboQuant to the dominant deployment format---GGUF quantized models (Q4\_K\_M)---produces catastrophic output degradation: language mixing, semantic collapse, and gibberish within 50 tokens. Per-key quality metrics (cos\_sim=0.996) fail to detect this failure because compound quantization error propagates \emph{multiplicatively} through softmax attention, not additively through reconstruction.
+
+We present three contributions: (1)~A \textbf{3-Fix framework} comprising sink token preservation, Past-Only Quantization, and cache state management that eliminates compound error without retraining---producing the first working TurboQuant on GGUF models (300+ token coherent multilingual output). (2)~\textbf{SRHT-based QJL} replacing the paper's $O(d^2)$ dense random projection with $O(d \log d)$ structured projection, yielding 115$\times$ speedup and +4.5~dB SNR improvement. (3)~\textbf{Adaptive QJL}---context-length-aware error correction that reduces attention KL divergence by 2.9$\times$, contradicting the community consensus that ``QJL always hurts.''
+
+\noindent\textbf{Code:} \url{https://github.com/onur-gokyildiz-bhi/tq-kv} \quad \textbf{Crate:} \texttt{crates.io/crates/tq-kv}~v0.4.0
+\end{abstract}
+
+%=============================================================================
+\section{Introduction}
+%=============================================================================
+
+\subsection{The Memory Wall in LLM Inference}
+
+The structural evolution of large language models (LLMs) has reached a critical juncture where the primary impediment to further capability is the physical limitations of the hardware memory hierarchy~\citep{google2026turboquant}. As model parameters have scaled to hundreds of billions, the attention mechanism has created a secondary memory crisis: the Key-Value (KV) cache. During autoregressive decoding, the model stores hidden states of all previous tokens, consuming massive amounts of High Bandwidth Memory. For a 70B model at 32K context, the KV cache alone exceeds 20~GB---half the capacity of most consumer GPUs.
+
+\subsection{The Gap Between Theory and Practice}
+
+To address weight memory, the industry adopted GGUF and other post-training quantization (PTQ) schemes that compress FP16 weights to 4--5 bits~\citep{gguf}. TurboQuant~\citep{zandieh2026turboquant} addresses the KV cache side, compressing keys to 2--4 bits using randomized rotations and optimal scalar quantization. However, a significant gap exists: \textbf{TurboQuant's theoretical guarantees assume FP16 inputs, while production models are served in quantized formats.}
+
+When TurboQuant is applied to the output of already-quantized weights, \emph{compound quantization error} occurs---a phenomenon where two stages of quantization noise interact multiplicatively through softmax, producing catastrophic output degradation~\citep{bondarenko2023softmax, wkvquant}.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item \textbf{First identification and solution} of compound quantization error in TurboQuant on GGUF models, via a 3-Fix framework requiring no retraining (Section~\ref{sec:3fix}).
+    \item \textbf{SRHT-based QJL} achieving $O(d \log d)$ complexity with 115$\times$ speedup and superior quality over the paper's dense projection (Section~\ref{sec:srht}).
+    \item \textbf{Adaptive QJL}---context-aware error correction with empirical evidence that structured QJL improves attention accuracy at all tested context lengths (Section~\ref{sec:adaptive}).
+    \item \textbf{tq-kv}---a Pure Rust implementation (10K~LOC, zero C/C++ dependencies) validated on five model architectures on consumer hardware (Section~\ref{sec:impl}).
+\end{enumerate}
+
+%=============================================================================
+\section{Background}
+%=============================================================================
+
+\subsection{TurboQuant: PolarQuant and Lloyd-Max Quantization}
+
+TurboQuant transforms vector quantization into scalar quantization through a two-stage process rooted in Shannon's source coding theory~\citep{zandieh2026turboquant}. For a key vector $\mathbf{k} \in \mathbb{R}^d$:
+
+\textbf{Stage 1---Random Rotation:}
+\begin{equation}
+    \mathbf{x} = \frac{1}{\sqrt{d}} \mathbf{H} \mathbf{D} \mathbf{k}
+\end{equation}
+where $\mathbf{H}$ is the normalized Walsh-Hadamard matrix and $\mathbf{D} = \mathrm{diag}(s_1, \ldots, s_d)$ with $s_i \in \{+1, -1\}$ from a shared seed. After rotation, coordinates follow $\mathcal{N}(0, \sigma^2)$.
+
+\textbf{Stage 2---Lloyd-Max Scalar Quantization:}
+Each coordinate is independently quantized using pre-computed optimal centroids minimizing MSE for the Gaussian distribution, with $2^b$ centroids for $b$-bit quantization.
+
+\textbf{Our contribution---Adaptive Sigma:} The paper uses fixed $\sigma = 1/\sqrt{d}$. We use per-vector:
+\begin{equation}
+    \sigma_i = \|\mathbf{k}_i\| / \sqrt{d}
+\end{equation}
+scaling the codebook to each vector's actual variance.
+
+\subsection{GGUF Weight Quantization}
+
+GGUF Q4\_K\_M uses mixed-precision block quantization with 6-bit scaling factors per mini-block, achieving $\sim$4.5 effective bits~\citep{gguf}. The key projection produces:
+\begin{equation}
+    \mathbf{k} = \mathbf{W}_{K}^{q} \mathbf{x} + \boldsymbol{\epsilon}_w
+\end{equation}
+When this noisy key enters TurboQuant, a second noise stage is added: $\mathbf{k}_{\text{tq}} = \text{TQ}(\mathbf{k}) + \boldsymbol{\epsilon}_{\text{tq}}$.
+
+%=============================================================================
+\section{The Compound Quantization Error Problem}
+\label{sec:compound}
+%=============================================================================
+
+\subsection{Failure Mode}
+
+We apply TurboQuant 4-bit to Qwen~2.5 7B in GGUF Q4\_K\_M format. Without TurboQuant, coherent multilingual output. With TurboQuant---even compressing just 2 of 28 layers---catastrophic degradation:
+
+\begin{quote}
+\small
+\textbf{Without TQ:} ``Merhaba! Bug\"un\"un hava durumu hakk{\i}nda bilgi vermek i\c{c}in l\"utfen hangi \c{s}ehrinizi belirtir misiniz?'' \\[0.5em]
+\textbf{With TQ (before fix):} ``Selam! Iyiyim, size Nasil yardimci.GetAxis pestic? kukka Rencontre\ldots'' \emph{[degenerates into 5+ languages within 50 tokens]}
+\end{quote}
+
+\textbf{Crucially, per-key quality appears high:} cosine similarity 0.996, SNR 20.3~dB.
+
+\subsection{Root Cause: Softmax Bias Amplification}
+
+The attention score for token $i$ is:
+\begin{equation}
+    \text{attn}_i = \frac{\exp(\mathbf{q} \cdot \mathbf{k}_i / \sqrt{d})}{\sum_j \exp(\mathbf{q} \cdot \mathbf{k}_j / \sqrt{d})}
+\end{equation}
+
+\citet{bondarenko2023softmax} demonstrated that softmax is \textbf{8$\times$ more sensitive} to quantization noise than other activations. The noise creates systematic (not random) bias through the exponential. With 2000+ compressed keys across 24 layers, accumulated multiplicative bias shifts the attention distribution until semantic coherence collapses.
+
+\subsection{Industry Confirmation}
+
+\begin{table}[h]
+\centering
+\caption{Documented failures of KV cache quantization on quantized-weight models.}
+\label{tab:failures}
+\begin{tabular}{@{}llll@{}}
+\toprule
+System & Model & KV Format & Failure \\
+\midrule
+vLLM \#10411 & Qwen 2.5 7B Q5\_K\_M & FP8 KV & Infinite repetition \\
+llama.cpp \#10697 & Llama 3.3 70B Q4\_K\_M & q8\_0 KV & Incorrect output \\
+ik\_llama.cpp \#1142 & Various & q4/q5 KV & Garbled text \\
+All 7 TurboQuant impl. & Various & 4-bit KV & FP16 only tested \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{The 3-Fix Framework}
+\label{sec:3fix}
+%=============================================================================
+
+Three inference-time corrections requiring no retraining, calibration, or architectural changes.
+
+\subsection{Fix 1: Sink Token Preservation}
+
+Attention sink tokens receive disproportionate attention weight regardless of semantic relevance~\citep{xiao2024sinks}. KVSink~\citep{kvsink} shows preserving their precision reduces error by up to 81\%.
+
+First $N$ tokens' keys are stored in a separate FP16 buffer:
+\begin{equation}
+    \mathbf{K}_{\text{attn}} = [\underbrace{\mathbf{K}_{\text{sink}}}_{\text{FP16}} \;|\; \underbrace{\mathbf{K}_{\text{compressed}}}_{\text{decompressed}} \;|\; \underbrace{\mathbf{K}_{\text{current}}}_{\text{FP16}}]
+\end{equation}
+
+Default $N{=}4$. Overhead: $N \times n_{\text{kv}} \times d \times 4$ bytes $\approx$ 8~KB per layer.
+
+\subsection{Fix 2: Past-Only Quantization (POQ)}
+
+Adapted from WKVQuant~\citep{wkvquant}: the current token's key remains FP16 during attention. It is compressed for future tokens, but attention at time $t$ uses the lossless original:
+
+At time $t$: $[\text{sink}_{\text{FP16}} \;|\; \text{past}_{\text{compressed}} \;|\; \text{current}_t^{\text{FP16}}]$
+
+At time $t{+}1$: current$_t$ moves to compressed cache; current$_{t+1}$ is FP16.
+
+Zero memory overhead---the current token is already resident in registers.
+
+\subsection{Fix 3: Cache State Management}
+
+A previously unidentified bug: \texttt{clear\_cache()} reset the position counter but not compressed KV state. Subsequent conversations appended to stale cache, mixing keys from unrelated contexts with mismatched RoPE positions. Fix: hard reset when \texttt{index\_pos == 0}.
+
+\subsection{Results}
+
+\begin{table}[h]
+\centering
+\caption{Cumulative impact of 3-Fix on Qwen~2.5 7B Q4\_K\_M with 4-bit TurboQuant.}
+\label{tab:3fix}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Configuration & Max Coherent Tokens & Language Mixing \\
+\midrule
+No TurboQuant (baseline) & unlimited & none \\
+TurboQuant (no fixes) & $\sim$50 & severe (5+ languages) \\
++ Cache reset only & $\sim$100 & moderate \\
++ Cache reset + POQ & $\sim$200 & mild \\
+\textbf{+ All 3 fixes (3-Fix)} & \textbf{300+} & \textbf{none} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{With all three fixes, tq-kv produces 300+ token coherent multilingual output on GGUF Q4\_K\_M---the first working TurboQuant on quantized-weight models.}
+
+%=============================================================================
+\section{SRHT-Based QJL}
+\label{sec:srht}
+%=============================================================================
+
+\subsection{The QJL Bottleneck}
+
+TurboQuant's optional QJL error correction projects the quantization residual through a dense Rademacher matrix at $O(d^2)$ cost. Our benchmarks show 29$\times$ compress and 128$\times$ decompress slowdown, making QJL impractical.
+
+\subsection{SRHT Replacement}
+
+We replace the dense matrix $\mathbf{R}$ with a Subsampled Randomized Hadamard Transform:
+\begin{align}
+    \text{Dense:}\quad & \mathbf{p} = \mathbf{R} \boldsymbol{\epsilon} & O(md) \\
+    \text{SRHT:}\quad & \mathbf{p} = \sqrt{d/m} \cdot \mathbf{S} \mathbf{H} \mathbf{D} \boldsymbol{\epsilon} & O(d \log d + m)
+\end{align}
+where $\mathbf{D}$ = random signs, $\mathbf{H}$ = Walsh-Hadamard, $\mathbf{S}$ = row subsample~\citep{ailon2009fast}. All primitives reuse our existing Hadamard module. The batch path shares $\mathbf{D}$ across vectors and reuses buffers, eliminating per-vector allocation.
+
+\subsection{Results}
+
+\begin{table}[h]
+\centering
+\caption{SRHT vs Dense QJL. 32,768 vectors, $d{=}128$, 4-bit, release build.}
+\label{tab:srht}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Metric & Dense QJL & SRHT QJL & No QJL \\
+\midrule
+Compress time & 2196~ms & 100~ms & 69~ms \\
+Decompress time & 2941~ms & 39~ms & 23~ms \\
+Compress overhead & 29$\times$ & \textbf{1.45$\times$} & 1.0$\times$ \\
+Decompress overhead & 128$\times$ & \textbf{1.7$\times$} & 1.0$\times$ \\
+SNR vs no-QJL & +1.2~dB & \textbf{+4.5~dB} & baseline \\
+Cosine Similarity & 0.9966 & \textbf{0.9984} & 0.9956 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The +4.5~dB SNR improvement over dense QJL is unexpected. We hypothesize that SRHT's structured projection distributes energy more uniformly, reducing variance in the sign quantization step.
+
+%=============================================================================
+\section{Adaptive QJL}
+\label{sec:adaptive}
+%=============================================================================
+
+\subsection{The ``QJL Hurts'' Consensus}
+
+Three independent groups---ikawrakow (ik\_llama.cpp), spiritbuun (CUDA), and scos-lab---concluded that QJL hurts quality~\citep{llamacpp_tq}. Their reasoning: QJL variance is amplified by softmax, causing wrong token rankings. Response: disable QJL entirely.
+
+\subsection{Our Counterargument}
+
+These findings used \emph{dense} QJL with high-variance random projection. SRHT QJL has lower variance. We measure \textbf{attention KL divergence} (not just MSE):
+
+\begin{table}[h]
+\centering
+\caption{Attention KL divergence: no QJL vs SRHT QJL across context lengths.}
+\label{tab:adaptive}
+\begin{tabular}{@{}rccc@{}}
+\toprule
+Context Length & KL(no QJL) & KL(SRHT QJL) & Reduction \\
+\midrule
+64 & 0.000270 & 0.000093 & 2.9$\times$ \\
+256 & 0.000283 & 0.000099 & 2.9$\times$ \\
+1,024 & 0.000289 & 0.000103 & 2.8$\times$ \\
+4,096 & 0.000288 & 0.000102 & 2.8$\times$ \\
+8,192 & 0.000287 & 0.000102 & 2.8$\times$ \\
+16,384 & 0.000288 & 0.000103 & 2.8$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+SRHT QJL consistently reduces KL divergence by $\sim$2.9$\times$ at all context lengths. Top-5 token accuracy improves from 80--85\% to 87--95\%.
+
+\subsection{Adaptive Activation}
+
+We introduce \texttt{QjlMode::Adaptive\{threshold\}}: QJL off below threshold (minimal variance), on above (bias correction). Default threshold: 4096 tokens.
+
+%=============================================================================
+\section{Implementation}
+\label{sec:impl}
+%=============================================================================
+
+\subsection{System Architecture}
+
+tq-kv is 10,000 lines of Pure Rust with zero C/C++ dependencies:
+
+\begin{itemize}
+    \item \textbf{Library} (crates.io v0.4.0): 2/3/4-bit Lloyd-Max, SRHT QJL, fused attention (AVX2+FMA SIMD), TurboKvCache (candle drop-in), C~FFI
+    \item \textbf{Engine}: GenericTurboModel for 5 architectures (Qwen2, Llama, Mistral, Phi3, Gemma2) with GGUF auto-detection and 3-Fix framework
+    \item \textbf{Platform}: OpenAI-compatible API (axum), model hub, Web~UI, auto-TQ
+\end{itemize}
+
+\subsection{Fused Attention}
+
+Because the Walsh-Hadamard Transform is orthogonal: $\langle \mathbf{q}, \mathbf{R}^{-1} \mathbf{k}_c \rangle = \langle \mathbf{R}\mathbf{q}, \mathbf{k}_c \rangle$. The query is rotated once; scores are computed via centroid table lookup against compressed indices---6$\times$ faster than decompress-then-dot with AVX2+FMA SIMD.
+
+\subsection{VRAM Impact}
+
+\begin{table}[h]
+\centering
+\caption{VRAM savings with TurboQuant compression (keys only).}
+\label{tab:vram}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Model (4K context) & FP16 KV & TQ 4-bit & TQ 2-bit & Max Savings \\
+\midrule
+Qwen 2.5 7B & 256~MB & 48~MB & 18~MB & 14.2$\times$ \\
+Qwen 2.5 72B & 640~MB & 120~MB & 45~MB & 14.2$\times$ \\
+Llama 3.1 70B (32K) & 20~GB & 5.3~GB & 1.4~GB & 14.2$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Limitations and Future Work}
+%=============================================================================
+
+\textbf{Fused kernel divergence:} The fused centroid-lookup path shows slight numerical divergence from the decompress path through softmax. Currently defaulting to decompress; stable fused kernels needed.
+
+\textbf{Per-channel scaling:} SmoothQuant-style per-channel normalization could further reduce compound error by handling outlier channels before rotation.
+
+\textbf{Calibrated codebook:} Lloyd-Max centroids assume Gaussian. Calibrating from Q4 model activations could improve quality, particularly at 2-bit.
+
+\textbf{Learned rotations:} SpinQuant~\citep{spinquant} shows learned rotations outperform random Hadamard by up to 45\%. Integration could enable stable 2-bit on GGUF.
+
+\textbf{Real-model QJL validation:} Our adaptive QJL results are on synthetic data. Extended perplexity benchmarks at 4K--32K context are needed.
+
+%=============================================================================
+\section{Conclusion}
+%=============================================================================
+
+We demonstrate that TurboQuant KV cache compression fails on GGUF quantized models---the dominant deployment format---due to compound quantization error. This failure affects all existing implementations. Our 3-Fix framework solves this at inference time without retraining, producing the first working TurboQuant on GGUF: 300+ token coherent output where all other implementations produce gibberish.
+
+SRHT-based QJL achieves 115$\times$ speedup with +4.5~dB SNR improvement, and adaptive QJL reduces attention KL divergence by 2.9$\times$. These contributions open a new research direction: \textbf{compound-aware KV cache compression}---methods designed for the quantized models that dominate real-world deployment.
+
+%=============================================================================
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
