@@ -435,7 +435,7 @@ async fn cmd_serve(cli: &Cli) -> Result<()> {
         eprintln!("Model: {}", model_config.display_name);
         let eng = model::load_engine(
             model_config, model_path_override,
-            tq_config, tokenizer_override, cli.cpu,
+            tq_config.clone(), tokenizer_override, cli.cpu,
         )?;
         let mf = model_path_override
             .map(|p| p.to_string_lossy().to_string())
@@ -470,7 +470,7 @@ async fn cmd_serve(cli: &Cli) -> Result<()> {
 
         eprintln!("Model: {}", display);
         let eng = Engine::load_with_device(
-            &gguf_path, &tok_path, arch, tq_config, cli.cpu,
+            &gguf_path, &tok_path, arch, tq_config.clone(), cli.cpu,
         )?;
         (eng, mf, display)
     } else {
@@ -482,7 +482,7 @@ async fn cmd_serve(cli: &Cli) -> Result<()> {
 
     let template = chat::ChatTemplate::detect(&model_file);
 
-    serve::run_server(engine, template, display_name, port).await
+    serve::run_server(engine, template, display_name, port, tq_config, cli.cpu).await
 }
 
 fn cmd_doctor() -> Result<()> {
