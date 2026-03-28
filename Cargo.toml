@@ -35,10 +35,6 @@ name = "tq"
 path = "src/main.rs"
 
 [[bin]]
-name = "tq-engine"
-path = "src/main.rs"
-
-[[bin]]
 name = "tq-diagnose"
 path = "src/diagnose.rs"
 

@@ -14,14 +14,12 @@ use tokenizers::Tokenizer;
 use tq_kv::TurboQuantConfig;
 
 use crate::config::ModelArch;
-use crate::models::{turbo_generic, turbo_llama, turbo_qwen2};
+use crate::models::turbo_generic;
 
 /// Model variants — standard or TurboQuant enhanced.
 enum ModelWeights {
     Llama(qlm::ModelWeights),
     Qwen2(qqw::ModelWeights),
-    TurboLlama(turbo_llama::ModelWeights),
-    TurboQwen2(turbo_qwen2::ModelWeights),
     TurboGeneric(turbo_generic::GenericTurboModel),
 }
 
@@ -30,8 +28,6 @@ impl ModelWeights {
         match self {
             Self::Llama(m) => m.forward(x, pos),
             Self::Qwen2(m) => m.forward(x, pos),
-            Self::TurboLlama(m) => m.forward(x, pos),
-            Self::TurboQwen2(m) => m.forward(x, pos),
             Self::TurboGeneric(m) => m.forward(x, pos),
         }
     }
@@ -259,7 +255,7 @@ impl Engine {
     /// Token-by-token evaluation: at each position, the model predicts the next token.
     /// PPL = exp(average negative log-likelihood).
     /// `stride`: number of tokens to process in the prefill before switching to per-token eval.
-    pub fn compute_perplexity(&mut self, text: &str, stride: usize) -> Result<f64> {
+    pub fn compute_perplexity(&mut self, text: &str, _stride: usize) -> Result<f64> {
         let encoding = self.tokenizer
             .encode(text, false)
             .map_err(|e| anyhow::anyhow!("Tokenize error: {}", e))?;

@@ -6,8 +6,6 @@ pub struct ModelConfig {
     pub hf_repo: &'static str,
     pub gguf_filename: &'static str,
     pub tokenizer_repo: &'static str,
-    pub default_gpu_layers: u32,
-    pub default_context_size: u32,
 }
 
 pub const MODEL_LLAMA3_8B: ModelConfig = ModelConfig {
@@ -16,8 +14,6 @@ pub const MODEL_LLAMA3_8B: ModelConfig = ModelConfig {
     hf_repo: "bartowski/Meta-Llama-3-8B-Instruct-GGUF",
     gguf_filename: "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf",
     tokenizer_repo: "meta-llama/Meta-Llama-3-8B-Instruct",
-    default_gpu_layers: 33,
-    default_context_size: 4096,
 };
 
 pub const MODEL_QWEN25_72B: ModelConfig = ModelConfig {
@@ -26,8 +22,6 @@ pub const MODEL_QWEN25_72B: ModelConfig = ModelConfig {
     hf_repo: "bartowski/Qwen2.5-72B-Instruct-GGUF",
     gguf_filename: "Qwen2.5-72B-Instruct-Q4_K_M-00001-of-00002.gguf",
     tokenizer_repo: "Qwen/Qwen2.5-72B-Instruct",
-    default_gpu_layers: 20,
-    default_context_size: 4096,
 };
 
 pub const MODEL_GEMMA3_4B: ModelConfig = ModelConfig {
@@ -36,8 +30,6 @@ pub const MODEL_GEMMA3_4B: ModelConfig = ModelConfig {
     hf_repo: "bartowski/gemma-3-4b-it-GGUF",
     gguf_filename: "gemma-3-4b-it-Q4_K_M.gguf",
     tokenizer_repo: "google/gemma-3-4b-it",
-    default_gpu_layers: 33,
-    default_context_size: 4096,
 };
 
 pub const ALL_MODELS: &[ModelConfig] = &[MODEL_LLAMA3_8B, MODEL_QWEN25_72B, MODEL_GEMMA3_4B];

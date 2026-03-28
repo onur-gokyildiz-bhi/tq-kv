@@ -733,16 +733,6 @@ mod tests {
     // V2 API Tests (Paper-faithful Lloyd-Max)
     // ========================================
 
-    fn gaussian_vectors(count: usize, dim: usize, seed: u64) -> Vec<f32> {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let sigma = 1.0 / (dim as f32).sqrt();
-        (0..count * dim).map(|_| {
-            let u1: f32 = rng.gen::<f32>().max(1e-10);
-            let u2: f32 = rng.gen();
-            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos() * sigma
-        }).collect()
-    }
-
     #[test]
     fn test_v2_codebook_2bit() {
         let dim = 128;

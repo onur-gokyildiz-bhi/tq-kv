@@ -68,6 +68,7 @@
 - [ ] Claude Code local integration — TQ as MCP tool or local inference helper
 - [ ] Metal shader (Apple Silicon) — deferred, needs Apple hardware
 - [ ] PyO3 Python binding — deferred, no demand evidence yet
+- [ ] Re-evaluate QJL as default — SRHT brings overhead to 2x (was 29x), +4.5 dB SNR. Consider enabling by default at 2-bit.
 - [ ] Adaptive QJL — context-length-based threshold
 - [ ] Layer-adaptive bitwidth — early layers 2-bit, late layers 4-bit
 - [ ] Flash Attention tiling for fused TQ attention

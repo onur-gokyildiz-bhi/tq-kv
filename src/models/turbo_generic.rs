@@ -207,29 +207,54 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Ten
 // TurboQuant KV Cache — Incremental + Fused Attention
 // ============================================================
 
+/// Number of initial "sink" tokens whose keys are kept in FP16 (uncompressed).
+/// Attention sink tokens receive disproportionate attention weight — quantizing them
+/// causes up to 81% of total attention error. (KVSink, arXiv:2508.04257)
+/// Override with TQ_SINK env var.
+const TQ_SINK_TOKENS: usize = 4;
+
+fn get_sink_tokens() -> usize {
+    std::env::var("TQ_SINK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TQ_SINK_TOKENS)
+}
+
 #[derive(Clone, Debug)]
 struct CompressedKvCache {
+    /// Compressed keys per KV head (past tokens only, excluding sink + current)
     k_per_head: Vec<tq_kv::CompressedKeys>,
+    /// Uncompressed sink token keys: [1, n_kv_head, sink_len, head_dim]
+    sink_k: Option<Tensor>,
+    /// Number of sink tokens stored
+    sink_len: usize,
+    /// Full value cache (all tokens, uncompressed)
     v: Tensor,
+    /// Total cached length (sink + compressed + current)
     cached_len: usize,
     dtype: DType,
 }
 
-fn decompress_cache_to_tensor(
+/// Decompress compressed keys to tensor. Only decompresses the compressed portion.
+fn decompress_compressed_keys(
     k_per_head: &[tq_kv::CompressedKeys],
     n_kv_head: usize,
-    total_len: usize,
     head_dim: usize,
     dtype: DType,
     device: &Device,
     config: &TurboQuantConfig,
 ) -> Result<Tensor> {
-    let mut all_data = Vec::with_capacity(n_kv_head * total_len * head_dim);
+    let compressed_len = if k_per_head.is_empty() || k_per_head[0].count == 0 {
+        return Tensor::zeros((1, n_kv_head, 0, head_dim), dtype, device);
+    } else {
+        k_per_head[0].count
+    };
+    let mut all_data = Vec::with_capacity(n_kv_head * compressed_len * head_dim);
     for compressed in k_per_head.iter().take(n_kv_head) {
         let decompressed = tq_kv::decompress_keys(compressed, config);
         all_data.extend(decompressed);
     }
-    Tensor::from_vec(all_data, (1, n_kv_head, total_len, head_dim), device)?.to_dtype(dtype)
+    Tensor::from_vec(all_data, (1, n_kv_head, compressed_len, head_dim), device)?.to_dtype(dtype)
 }
 
 // ============================================================
@@ -281,7 +306,15 @@ enum RopeStyle {
 /// Number of initial layers to keep uncompressed (fp16 KV cache).
 /// Reduces error accumulation in deep models where early-layer errors
 /// propagate through all subsequent layers.
+/// Override with TQ_SKIP env var (e.g. TQ_SKIP=8 for first 8 layers uncompressed).
 const TQ_SKIP_FIRST_LAYERS: usize = 4;
+
+fn get_skip_layers() -> usize {
+    std::env::var("TQ_SKIP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TQ_SKIP_FIRST_LAYERS)
+}
 
 /// QKV weight layout — separate tensors (most models) or merged single tensor (Phi-3.5).
 #[derive(Debug, Clone)]
@@ -394,15 +427,27 @@ impl LayerWeights {
 
         // Selective compression: first TQ_SKIP_FIRST_LAYERS use standard fp16 KV cache,
         // remaining layers use TurboQuant compression.
-        let use_compression = self.layer_idx >= TQ_SKIP_FIRST_LAYERS;
+        let use_compression = self.layer_idx >= get_skip_layers();
         let n_rep = self.n_head / self.n_kv_head;
 
         if use_compression {
-            // COMPRESSED PATH: TurboQuant KV cache
-            let k_contiguous = k.contiguous()?;
-            let k_flat = k_contiguous.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-            let cache_dtype = k.dtype();
+            // COMPRESSED PATH: TurboQuant KV cache with 3-fix quality enhancement
+            //
+            // Three paper-backed techniques to handle compound error (W4+KV4):
+            //   Fix 1 — Sink token preservation: first N tokens' keys stay FP16 (KVSink)
+            //   Fix 2 — Past-Only Quantization: current token's key is FP16 during
+            //           attention, compressed into cache AFTER (WKVQuant)
+            //   Fix 3 — Per-channel scaling: (future — placeholder for now)
 
+            // Reset cache on new sequence
+            if index_pos == 0 {
+                self.kv_compressed = None;
+            }
+
+            let cache_dtype = k.dtype();
+            let sink_n = get_sink_tokens();
+
+            // Initialize cache on first call
             if self.kv_compressed.is_none() {
                 let mut k_per_head = Vec::with_capacity(self.n_kv_head);
                 for _ in 0..self.n_kv_head {
@@ -412,6 +457,8 @@ impl LayerWeights {
                 }
                 self.kv_compressed = Some(CompressedKvCache {
                     k_per_head,
+                    sink_k: None,
+                    sink_len: 0,
                     v: v.clone(),
                     cached_len: 0,
                     dtype: cache_dtype,
@@ -419,93 +466,139 @@ impl LayerWeights {
             }
 
             let cache = self.kv_compressed.as_mut().unwrap();
+            let prev_total = cache.cached_len;
 
-            for h in 0..self.n_kv_head {
-                for s in 0..seq_len {
-                    let offset = (h * seq_len + s) * self.head_dim;
-                    let key_vec = &k_flat[offset..offset + self.head_dim];
-                    if self.padded_head_dim > self.head_dim {
-                        // Pad key vector with zeros to next power of 2 for Hadamard
-                        let mut key_vec_padded = vec![0.0f32; self.padded_head_dim];
-                        key_vec_padded[..self.head_dim].copy_from_slice(key_vec);
-                        let (packed, norm) = tq_kv::compress_single_key_with_signs(
-                            &key_vec_padded, self.padded_head_dim, &self.tq_config, &self.signs,
-                        );
-                        cache.k_per_head[h].append_raw(&packed, norm);
-                    } else {
-                        let (packed, norm) = tq_kv::compress_single_key_with_signs(
-                            key_vec, self.head_dim, &self.tq_config, &self.signs,
-                        );
-                        cache.k_per_head[h].append_raw(&packed, norm);
-                    }
-                }
-            }
+            // Determine which tokens in this batch are sink vs compressible
+            // Sink tokens: positions [0, sink_n) in the sequence
+            // POQ: during generation (seq_len=1), current token is NOT compressed yet
+            let global_start = prev_total; // first position in this batch
 
+            // --- Store values (always uncompressed) ---
             if cache.cached_len > 0 {
                 cache.v = Tensor::cat(&[&cache.v, &v], 2)?;
             } else {
                 cache.v = v.clone();
             }
+
+            // --- Handle sink tokens (FP16, uncompressed) ---
+            let sink_end = sink_n.min(global_start + seq_len);
+            let new_sink_count = if global_start < sink_n {
+                // Some tokens in this batch are sink tokens
+                let n_sink_in_batch = sink_end - global_start;
+                // Extract sink portion of k: k is [1, n_kv_head, seq_len, head_dim]
+                let sink_k_batch = if n_sink_in_batch < seq_len {
+                    k.narrow(2, 0, n_sink_in_batch)?
+                } else {
+                    k.clone()
+                };
+                cache.sink_k = Some(match &cache.sink_k {
+                    Some(prev) => Tensor::cat(&[prev, &sink_k_batch], 2)?,
+                    None => sink_k_batch,
+                });
+                cache.sink_len += n_sink_in_batch;
+                n_sink_in_batch
+            } else {
+                0
+            };
+
+            // --- Compress non-sink tokens into cache ---
+            // All tokens after sink position get compressed into cache.
+            // POQ twist: during generation (seq_len=1), the current token is ALSO
+            // compressed into cache, but during attention we use the FP16 original
+            // instead of the decompressed version (Fix 2: Past-Only Quantization).
+            let compress_start = if global_start < sink_n { sink_end - global_start } else { 0 };
+            let tokens_to_compress = seq_len.saturating_sub(compress_start);
+
+            if tokens_to_compress > 0 {
+                let k_to_compress = k.narrow(2, compress_start, tokens_to_compress)?;
+                let k_flat = k_to_compress.contiguous()?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                let hdim = self.head_dim;
+                for h in 0..self.n_kv_head {
+                    for s in 0..tokens_to_compress {
+                        let offset = (h * tokens_to_compress + s) * hdim;
+                        let key_vec = &k_flat[offset..offset + hdim];
+                        if self.padded_head_dim > hdim {
+                            let mut padded = vec![0.0f32; self.padded_head_dim];
+                            padded[..hdim].copy_from_slice(key_vec);
+                            let (packed, norm) = tq_kv::compress_single_key_with_signs(
+                                &padded, self.padded_head_dim, &self.tq_config, &self.signs,
+                            );
+                            cache.k_per_head[h].append_raw(&packed, norm);
+                        } else {
+                            let (packed, norm) = tq_kv::compress_single_key_with_signs(
+                                key_vec, hdim, &self.tq_config, &self.signs,
+                            );
+                            cache.k_per_head[h].append_raw(&packed, norm);
+                        }
+                    }
+                }
+            }
+
             cache.cached_len += seq_len;
             let total_len = cache.cached_len;
 
-            let y = if seq_len == 1 && total_len > 1 && q.device().is_cpu() {
-                // FUSED PATH: Rayon parallel + SIMD (CPU generation)
-                let q_flat = q.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-                let centroids = tq_kv::codebook::get_centroids(self.tq_config.bits);
-                let scale = 1.0 / (self.head_dim as f32).sqrt();
-                let need_pad = self.padded_head_dim > self.head_dim;
-                let pdim = self.padded_head_dim;
-                let hdim = self.head_dim;
+            // --- Build full key tensor for attention ---
+            // Concatenate: [sink_keys (FP16) | decompressed_compressed_keys | current_key (FP16)]
+            // This is the POQ + Sink approach: highest-impact tokens are lossless
 
-                let head_scores: Vec<Vec<f32>> = (0..self.n_head).into_par_iter().map(|qh| {
-                    let kv_h = qh / n_rep;
-                    let q_vec = &q_flat[qh * hdim..(qh + 1) * hdim];
-                    let q_for_rotate = if need_pad {
-                        // Pad query vector with zeros to match padded compressed keys
-                        let mut padded = vec![0.0f32; pdim];
-                        padded[..hdim].copy_from_slice(q_vec);
-                        padded
-                    } else {
-                        q_vec.to_vec()
-                    };
-                    let rotated_q = tq_kv::pre_rotate_query_with_signs(&q_for_rotate, &self.signs);
-                    let compressed = &cache.k_per_head[kv_h];
-                    tq_kv::fused_attention_scores(&rotated_q, compressed, centroids, scale)
-                }).collect();
+            let y = if seq_len == 1 && total_len > 1 {
+                // GENERATION: single token attention against full cache
+                //
+                // POQ (Past-Only Quantization): for the current token's key, we use
+                // the FP16 original in attention instead of the compressed version.
+                // The compressed version IS in the cache (for future tokens), but
+                // we replace the last position with the lossless original.
+                let q_f32 = q.to_dtype(DType::F32)?;
 
-                let mut att_scores = Vec::with_capacity(self.n_head * total_len);
-                for scores in &head_scores {
-                    att_scores.extend_from_slice(scores);
+                // Build the full key tensor by concatenating parts
+                let mut k_parts: Vec<Tensor> = Vec::new();
+
+                // Part 1: Sink keys (FP16, lossless)
+                if let Some(ref sink) = cache.sink_k {
+                    k_parts.push(sink.to_dtype(DType::F32)?);
                 }
 
-                // f32 softmax to prevent precision loss at long context
-                let att = Tensor::from_vec(
-                    att_scores, (b_sz, self.n_head, 1, total_len), q.device(),
-                )?;
-                let att = softmax_last_dim(&att)?.to_dtype(cache.dtype)?;
-                let v_for_attn = repeat_kv(cache.v.clone(), n_rep)?;
-                att.matmul(&v_for_attn.contiguous()?)?
-            } else if seq_len == 1 && total_len > 1 {
-                // GPU GENERATION: decompress + f32 attention
-                // Decompress keys (padded_head_dim), then truncate to head_dim
-                let k_full = decompress_cache_to_tensor(
-                    &cache.k_per_head, self.n_kv_head, total_len,
-                    self.padded_head_dim, DType::F32, q.device(), &self.tq_config,
-                )?;
-                let k_full = if self.padded_head_dim > self.head_dim {
-                    k_full.narrow(3, 0, self.head_dim)?
+                // Part 2: Decompressed compressed keys (excluding last = current token)
+                let n_compressed = cache.k_per_head[0].count;
+                let n_past_compressed = if n_compressed > 0 { n_compressed - 1 } else { 0 };
+                if n_past_compressed > 0 {
+                    // Decompress only past compressed keys (not the current one)
+                    // We temporarily reduce count, decompress, then restore
+                    // This is safe because we're the only user of cache right now
+                    let k_decomp = decompress_compressed_keys(
+                        &cache.k_per_head, self.n_kv_head,
+                        self.padded_head_dim, DType::F32, q.device(), &self.tq_config,
+                    )?;
+                    let k_decomp = if self.padded_head_dim > self.head_dim {
+                        k_decomp.narrow(3, 0, self.head_dim)?
+                    } else {
+                        k_decomp
+                    };
+                    // Take all but last compressed position
+                    let k_past = k_decomp.narrow(2, 0, n_past_compressed)?;
+                    k_parts.push(k_past);
+                }
+
+                // Part 3: Current token key (FP16 original — POQ lossless)
+                k_parts.push(k.to_dtype(DType::F32)?);
+
+                let k_full = if k_parts.len() == 1 {
+                    k_parts.remove(0)
                 } else {
-                    k_full
+                    Tensor::cat(&k_parts, 2)?
                 };
-                let q_f32 = q.to_dtype(DType::F32)?;
+
+                // Verify dimensions: k_full should have total_len positions
+                // = sink_len + past_compressed + 1 (current)
+
                 let k_full = repeat_kv(k_full, n_rep)?;
                 let v_f32 = repeat_kv(cache.v.to_dtype(DType::F32)?, n_rep)?;
                 let att = (q_f32.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
                 let att = softmax_last_dim(&att)?;
                 att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)?
             } else {
-                // PREFILL
+                // PREFILL: use original uncompressed keys for attention (standard path)
+                // Keys are already compressed into cache above, but attention uses originals
                 let k = repeat_kv(k, n_rep)?;
                 let v_for_attn = repeat_kv(v, n_rep)?;
                 let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;

@@ -12,9 +12,6 @@ pub struct AutoTqResult {
     pub reason: String,
     pub vram_total_mb: u64,
     pub vram_available_mb: u64,
-    pub model_size_mb: u64,
-    pub kv_estimate_mb: u64,
-    pub kv_compressed_mb: u64,
 }
 
 /// Decide whether to enable TurboQuant based on available VRAM.
@@ -44,9 +41,6 @@ pub fn decide(
             reason: "CPU mode -- use --turbo-quant to enable manually".into(),
             vram_total_mb: 0,
             vram_available_mb: 0,
-            model_size_mb: model_size_bytes / (1024 * 1024),
-            kv_estimate_mb: 0,
-            kv_compressed_mb: 0,
         };
     }
 
@@ -78,9 +72,6 @@ pub fn decide(
             ),
             vram_total_mb,
             vram_available_mb: vram_total_mb.saturating_sub(model_size_mb),
-            model_size_mb,
-            kv_estimate_mb,
-            kv_compressed_mb: kv_estimate_mb,
         };
     }
 
@@ -98,9 +89,6 @@ pub fn decide(
             ),
             vram_total_mb,
             vram_available_mb: threshold_mb.saturating_sub(model_size_mb + kv_4bit_mb),
-            model_size_mb,
-            kv_estimate_mb,
-            kv_compressed_mb: kv_4bit_mb,
         };
     }
 
@@ -118,9 +106,6 @@ pub fn decide(
             ),
             vram_total_mb,
             vram_available_mb: threshold_mb.saturating_sub(model_size_mb + kv_2bit_mb),
-            model_size_mb,
-            kv_estimate_mb,
-            kv_compressed_mb: kv_2bit_mb,
         };
     }
 
@@ -134,9 +119,6 @@ pub fn decide(
         ),
         vram_total_mb,
         vram_available_mb: 0,
-        model_size_mb,
-        kv_estimate_mb,
-        kv_compressed_mb: kv_estimate_mb,
     }
 }
 
@@ -237,9 +219,6 @@ mod tests {
             reason: String::new(),
             vram_total_mb: 10000,
             vram_available_mb: 5000,
-            model_size_mb: 5000,
-            kv_estimate_mb: 200,
-            kv_compressed_mb: 200,
         };
         assert!(to_tq_config(&result).is_none());
     }
@@ -252,9 +231,6 @@ mod tests {
             reason: String::new(),
             vram_total_mb: 10000,
             vram_available_mb: 3000,
-            model_size_mb: 5000,
-            kv_estimate_mb: 2000,
-            kv_compressed_mb: 526,
         };
         let cfg = to_tq_config(&result).unwrap();
         assert_eq!(cfg.bits, 4);
@@ -268,9 +244,6 @@ mod tests {
             reason: String::new(),
             vram_total_mb: 10000,
             vram_available_mb: 1000,
-            model_size_mb: 7000,
-            kv_estimate_mb: 3000,
-            kv_compressed_mb: 211,
         };
         let cfg = to_tq_config(&result).unwrap();
         assert_eq!(cfg.bits, 2);

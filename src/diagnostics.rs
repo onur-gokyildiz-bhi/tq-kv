@@ -419,7 +419,7 @@ mod tests {
         // Generate random-ish keys (deterministic via simple formula)
         let total = n_kv_heads * seq_len * head_dim;
         let keys: Vec<f32> = (0..total)
-            .map(|i| ((i as f32 * 0.0137).sin() * 0.5))
+            .map(|i| (i as f32 * 0.0137).sin() * 0.5)
             .collect();
 
         let diag = diagnose_layer(&keys, n_kv_heads, seq_len, head_dim, &config, 0);

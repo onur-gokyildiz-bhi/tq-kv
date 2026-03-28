@@ -59,14 +59,23 @@ pub fn random_sign_flip(x: &mut [f32], signs: &[f32]) {
 /// Requires `std` feature (uses ChaCha8 RNG).
 #[cfg(feature = "std")]
 pub fn generate_signs(dim: usize, seed: u64) -> Vec<f32> {
+    let mut signs = vec![0.0f32; dim];
+    generate_signs_into(&mut signs, seed);
+    signs
+}
+
+/// Generate deterministic random signs into pre-allocated buffer.
+/// Zero-alloc variant for hot paths (batch QJL).
+#[cfg(feature = "std")]
+pub fn generate_signs_into(output: &mut [f32], seed: u64) {
     use rand::SeedableRng;
     use rand::Rng;
     use rand_chacha::ChaCha8Rng;
 
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    (0..dim)
-        .map(|_| if rng.gen::<bool>() { 1.0f32 } else { -1.0f32 })
-        .collect()
+    for val in output.iter_mut() {
+        *val = if rng.gen::<bool>() { 1.0f32 } else { -1.0f32 };
+    }
 }
 
 /// Pad vector to next power of 2 (if needed).
