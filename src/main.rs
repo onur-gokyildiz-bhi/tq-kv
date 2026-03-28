@@ -1,3 +1,4 @@
+mod auto_tq;
 mod catalog;
 mod chat;
 mod config;
@@ -14,6 +15,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use engine::{Engine, GenerationParams};
 
@@ -67,6 +69,9 @@ enum Commands {
         /// Enable TurboQuant KV cache compression
         #[arg(long)]
         turbo_quant: bool,
+        /// Disable auto-TQ (VRAM-aware automatic compression, enabled by default on GPU)
+        #[arg(long)]
+        no_auto_tq: bool,
         /// Custom GGUF model path
         #[arg(long)]
         model_path: Option<PathBuf>,
@@ -91,6 +96,9 @@ enum Commands {
         /// Enable TurboQuant KV cache compression
         #[arg(long)]
         turbo_quant: bool,
+        /// Disable auto-TQ (VRAM-aware automatic compression, enabled by default on GPU)
+        #[arg(long)]
+        no_auto_tq: bool,
         /// Enable web UI
         #[arg(long)]
         ui: bool,
@@ -111,10 +119,19 @@ enum Commands {
         /// Model name (e.g., qwen2:7b)
         model: String,
     },
-    /// Run performance benchmarks
+    /// Run performance benchmarks (with and without TurboQuant)
     Bench {
-        /// Model name or path
+        /// Model name or path (e.g., qwen2:7b, llama:8b)
         model: String,
+        /// Number of tokens to generate per run
+        #[arg(short = 'n', long, default_value = "100")]
+        tokens: u32,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+        /// Custom prompt for benchmark
+        #[arg(long)]
+        prompt: Option<String>,
     },
     /// Check system compatibility
     Doctor,
@@ -152,10 +169,7 @@ async fn main() -> Result<()> {
         Some(Commands::Pull { ref model }) => cmd_pull(model),
         Some(Commands::List { available }) => cmd_list(available),
         Some(Commands::Rm { ref model }) => cmd_rm(model),
-        Some(Commands::Bench { ref model }) => {
-            eprintln!("tq bench {} -- coming in Phase 3", model);
-            Ok(())
-        }
+        Some(Commands::Bench { .. }) => cmd_bench(&cli),
         None => {
             // Legacy mode: if prompt given, run like old tq-engine
             if cli.prompt.is_some() {
@@ -183,6 +197,54 @@ fn resolve_tq_config(turbo_quant: bool, tq_bits: u8) -> Option<tq_kv::TurboQuant
     } else {
         None
     }
+}
+
+/// Resolve TQ config with auto-TQ support.
+///
+/// Priority: --turbo-quant (explicit on) > --no-auto-tq (explicit off) > auto-decide
+fn resolve_tq_config_with_auto(
+    turbo_quant: bool,
+    no_auto_tq: bool,
+    tq_bits: u8,
+    force_cpu: bool,
+    model_name: &str,
+) -> Option<tq_kv::TurboQuantConfig> {
+    // If user explicitly enabled TQ, use that
+    if turbo_quant {
+        return resolve_tq_config(true, tq_bits);
+    }
+
+    // If user explicitly disabled auto-TQ, return None
+    if no_auto_tq {
+        return None;
+    }
+
+    // Auto-TQ: check if we should enable compression
+    if force_cpu {
+        // Auto-TQ only applies on GPU
+        return None;
+    }
+
+    let device = match candle_core::Device::cuda_if_available(0) {
+        Ok(dev) if dev.is_cuda() => dev,
+        _ => return None,
+    };
+
+    // Look up model in catalog for size/arch info
+    let entry = catalog::find(model_name);
+    let (model_size_bytes, arch, size_gb) = if let Some(e) = entry {
+        ((e.size_gb * 1024.0 * 1024.0 * 1024.0) as u64, e.arch, e.size_gb)
+    } else {
+        // Unknown model -- can't auto-decide, skip
+        return None;
+    };
+
+    let (n_layers, n_kv_heads, head_dim) = auto_tq::estimate_arch_params(arch, size_gb);
+    let max_context = 4096; // default context window
+
+    let result = auto_tq::decide(&device, model_size_bytes, n_layers, n_kv_heads, head_dim, max_context);
+    auto_tq::print_decision(&result);
+    auto_tq::to_tq_config(&result)
 }
 
 fn cmd_pull(model_query: &str) -> Result<()> {
@@ -277,19 +339,21 @@ fn cmd_rm(model_query: &str) -> Result<()> {
 
 fn cmd_chat(cli: &Cli) -> Result<()> {
     let (model_name, system, max_tokens, temperature, top_p, top_k, repeat_penalty,
-         turbo_quant, model_path_override, tokenizer_repo_override) = match &cli.command {
+         turbo_quant, no_auto_tq, model_path_override, tokenizer_repo_override) = match &cli.command {
         Some(Commands::Chat {
             model, system, max_tokens, temperature, top_p, top_k, repeat_penalty,
-            turbo_quant, model_path, tokenizer_repo,
+            turbo_quant, no_auto_tq, model_path, tokenizer_repo,
         }) => (
             model.as_str(), system.as_str(), *max_tokens, *temperature, *top_p,
-            *top_k, *repeat_penalty, *turbo_quant, model_path.as_deref(),
+            *top_k, *repeat_penalty, *turbo_quant, *no_auto_tq, model_path.as_deref(),
             tokenizer_repo.as_deref(),
         ),
         _ => unreachable!(),
     };
 
-    let tq_config = resolve_tq_config(turbo_quant, cli.tq_bits);
+    let tq_config = resolve_tq_config_with_auto(
+        turbo_quant, no_auto_tq, cli.tq_bits, cli.cpu, model_name,
+    );
 
     // Try legacy config first, then fall back to hub resolution
     let (mut engine, model_file) = if let Some(model_config) = config::get_model(model_name) {
@@ -354,15 +418,17 @@ fn cmd_chat(cli: &Cli) -> Result<()> {
 }
 
 async fn cmd_serve(cli: &Cli) -> Result<()> {
-    let (model_name, model_path_override, tokenizer_override, port, turbo_quant) =
+    let (model_name, model_path_override, tokenizer_override, port, turbo_quant, no_auto_tq) =
         match &cli.command {
-            Some(Commands::Serve { model, model_path, tokenizer, port, turbo_quant, .. }) => {
-                (model.as_str(), model_path.as_deref(), tokenizer.as_deref(), *port, *turbo_quant)
+            Some(Commands::Serve { model, model_path, tokenizer, port, turbo_quant, no_auto_tq, .. }) => {
+                (model.as_str(), model_path.as_deref(), tokenizer.as_deref(), *port, *turbo_quant, *no_auto_tq)
             }
             _ => unreachable!(),
         };
 
-    let tq_config = resolve_tq_config(turbo_quant, cli.tq_bits);
+    let tq_config = resolve_tq_config_with_auto(
+        turbo_quant, no_auto_tq, cli.tq_bits, cli.cpu, model_name,
+    );
 
     // Try legacy config first, then fall back to hub resolution
     let (engine, model_file, display_name) = if let Some(model_config) = config::get_model(model_name) {
@@ -539,6 +605,237 @@ fn cmd_perplexity(cli: &Cli) -> Result<()> {
     let ppl = engine.compute_perplexity(&text, chunk)?;
     println!("Perplexity: {:.3}", ppl);
     Ok(())
+}
+
+fn cmd_bench(cli: &Cli) -> Result<()> {
+    let (model_name, tokens, json_output, custom_prompt) = match &cli.command {
+        Some(Commands::Bench { model, tokens, json, prompt }) => {
+            (model.as_str(), *tokens, *json, prompt.as_deref())
+        }
+        _ => unreachable!(),
+    };
+
+    let bench_prompt = custom_prompt.unwrap_or(
+        "Explain the theory of relativity in simple terms. Include examples."
+    );
+
+    let display_name = catalog::find(model_name)
+        .map(|e| e.display.to_string())
+        .unwrap_or_else(|| model_name.to_string());
+
+    if !json_output {
+        eprintln!("TurboQuant Benchmark -- {}", display_name);
+        eprintln!("Generating {} tokens per run...\n", tokens);
+    }
+
+    let gen_params = GenerationParams {
+        max_tokens: tokens,
+        temperature: 0.0, // deterministic for benchmarking
+        ..Default::default()
+    };
+
+    // Helper to resolve and load engine
+    let load_engine = |tq_config: Option<tq_kv::TurboQuantConfig>| -> Result<Engine> {
+        if let Some(model_config) = config::get_model(model_name) {
+            model::load_engine(model_config, None, tq_config, None, cli.cpu)
+        } else {
+            let (gguf_path, tokenizer_path) = hub::resolve(model_name)?;
+            let tok_path = tokenizer_path.with_context(|| {
+                format!("No tokenizer found for model '{}'", model_name)
+            })?;
+            let mf = gguf_path.to_string_lossy().to_string();
+            let arch = config::detect_arch(&mf);
+            Engine::load_with_device(&gguf_path, &tok_path, arch, tq_config, cli.cpu)
+        }
+    };
+
+    // Detect chat template for proper prompt formatting
+    let formatted_prompt = if let Some(entry) = catalog::find(model_name) {
+        let lower = entry.arch.to_lowercase();
+        if lower.contains("qwen") {
+            format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", bench_prompt)
+        } else if lower.contains("llama") {
+            format!(
+                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+                bench_prompt
+            )
+        } else {
+            bench_prompt.to_string()
+        }
+    } else {
+        bench_prompt.to_string()
+    };
+
+    // --- Run 1: Standard (no TQ) ---
+    if !json_output {
+        eprintln!("[1/2] Loading model (standard)...");
+    }
+    let mut engine_std = load_engine(None)?;
+
+    let std_result = bench_run(&mut engine_std, &formatted_prompt, &gen_params)?;
+    drop(engine_std); // free memory before loading TQ variant
+
+    if !json_output {
+        eprintln!("  Standard: {:.1} tok/s, {:.2}s total, TTFT {:.3}s\n",
+            std_result.tok_per_sec, std_result.total_secs, std_result.ttft_secs);
+    }
+
+    // --- Run 2: TurboQuant 4-bit ---
+    if !json_output {
+        eprintln!("[2/2] Loading model (TQ 4-bit)...");
+    }
+    let tq_config = tq_kv::TurboQuantConfig::balanced(); // 4-bit
+    let mut engine_tq = load_engine(Some(tq_config))?;
+
+    let tq_result = bench_run(&mut engine_tq, &formatted_prompt, &gen_params)?;
+    drop(engine_tq);
+
+    if !json_output {
+        eprintln!("  TQ 4-bit: {:.1} tok/s, {:.2}s total, TTFT {:.3}s\n",
+            tq_result.tok_per_sec, tq_result.total_secs, tq_result.ttft_secs);
+    }
+
+    // --- KV cache estimates ---
+    let (n_layers, n_kv_heads, head_dim) = if let Some(entry) = catalog::find(model_name) {
+        auto_tq::estimate_arch_params(entry.arch, entry.size_gb)
+    } else {
+        (32, 8, 128) // defaults
+    };
+    let kv_bytes = 2 * n_layers * n_kv_heads * head_dim * 2 * (tokens as usize);
+    let kv_mb = kv_bytes as f64 / (1024.0 * 1024.0);
+    let kv_compressed_mb = kv_mb / 3.8;
+    let compression_ratio = 3.8;
+
+    // --- Output ---
+    if json_output {
+        let json = serde_json::json!({
+            "model": display_name,
+            "tokens": tokens,
+            "standard": {
+                "total_secs": std_result.total_secs,
+                "tok_per_sec": std_result.tok_per_sec,
+                "ttft_secs": std_result.ttft_secs,
+                "tokens_generated": std_result.tokens_generated,
+            },
+            "tq_4bit": {
+                "total_secs": tq_result.total_secs,
+                "tok_per_sec": tq_result.tok_per_sec,
+                "ttft_secs": tq_result.ttft_secs,
+                "tokens_generated": tq_result.tokens_generated,
+            },
+            "kv_cache_mb": kv_mb,
+            "kv_compressed_mb": kv_compressed_mb,
+            "compression_ratio": compression_ratio,
+            "speedup_pct": ((tq_result.tok_per_sec / std_result.tok_per_sec) - 1.0) * 100.0,
+        });
+        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else {
+        let time_delta = if tq_result.total_secs < std_result.total_secs {
+            format!("-{:.0}%", (1.0 - tq_result.total_secs / std_result.total_secs) * 100.0)
+        } else {
+            format!("+{:.0}%", (tq_result.total_secs / std_result.total_secs - 1.0) * 100.0)
+        };
+        let toks_delta = if tq_result.tok_per_sec > std_result.tok_per_sec {
+            format!("+{:.0}%", (tq_result.tok_per_sec / std_result.tok_per_sec - 1.0) * 100.0)
+        } else {
+            format!("-{:.0}%", (1.0 - tq_result.tok_per_sec / std_result.tok_per_sec) * 100.0)
+        };
+        let ttft_delta = if tq_result.ttft_secs > std_result.ttft_secs {
+            format!("+{:.0}%", (tq_result.ttft_secs / std_result.ttft_secs - 1.0) * 100.0)
+        } else {
+            format!("-{:.0}%", (1.0 - tq_result.ttft_secs / std_result.ttft_secs) * 100.0)
+        };
+
+        println!();
+        println!("+============================================================+");
+        println!("|  TurboQuant Benchmark -- {:<33}|", display_name);
+        println!("+============================================================+");
+        println!("| {:<20} | {:<11} | {:<11} | {:<7} |", "Metric", "Standard", "TQ 4-bit", "Delta");
+        println!("+----------------------+-------------+-------------+---------+");
+        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+            "Tokens generated",
+            std_result.tokens_generated,
+            tq_result.tokens_generated,
+            ""
+        );
+        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+            "Total time",
+            format!("{:.2}s", std_result.total_secs),
+            format!("{:.2}s", tq_result.total_secs),
+            time_delta
+        );
+        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+            "tok/s",
+            format!("{:.1}", std_result.tok_per_sec),
+            format!("{:.1}", tq_result.tok_per_sec),
+            toks_delta
+        );
+        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+            "TTFT",
+            format!("{:.3}s", std_result.ttft_secs),
+            format!("{:.3}s", tq_result.ttft_secs),
+            ttft_delta
+        );
+        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+            "KV cache (est.)",
+            format!("{:.0} MB", kv_mb),
+            format!("{:.0} MB", kv_compressed_mb),
+            format!("-{:.0}%", (1.0 - 1.0 / compression_ratio) * 100.0)
+        );
+        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+            "Compression ratio",
+            "1.0x",
+            format!("{:.1}x", compression_ratio),
+            ""
+        );
+        println!("+============================================================+");
+    }
+
+    Ok(())
+}
+
+struct BenchResult {
+    tokens_generated: u32,
+    total_secs: f64,
+    tok_per_sec: f64,
+    ttft_secs: f64,
+}
+
+fn bench_run(
+    engine: &mut Engine,
+    prompt: &str,
+    params: &GenerationParams,
+) -> Result<BenchResult> {
+    engine.clear_cache();
+
+    let start = Instant::now();
+    let mut first_token_time: Option<Instant> = None;
+    let mut token_count = 0u32;
+
+    let _output = engine.generate(prompt, params, |_token_text| {
+        if first_token_time.is_none() {
+            first_token_time = Some(Instant::now());
+        }
+        token_count += 1;
+    })?;
+
+    let total_elapsed = start.elapsed();
+    let total_secs = total_elapsed.as_secs_f64();
+    let ttft_secs = first_token_time
+        .map(|t| t.duration_since(start).as_secs_f64())
+        .unwrap_or(total_secs);
+    let tok_per_sec = if total_secs > 0.0 {
+        token_count as f64 / total_secs
+    } else {
+        0.0
+    };
+
+    Ok(BenchResult {
+        tokens_generated: token_count,
+        total_secs,
+        tok_per_sec,
+        ttft_secs,
+    })
 }
 
 fn cmd_legacy(cli: &Cli) -> Result<()> {
