@@ -132,6 +132,9 @@ enum Commands {
         /// Custom prompt for benchmark
         #[arg(long)]
         prompt: Option<String>,
+        /// Skip standard (non-TQ) run — use when CUDA lacks stock model support
+        #[arg(long)]
+        tq_only: bool,
     },
     /// Check system compatibility
     Doctor,
@@ -608,9 +611,9 @@ fn cmd_perplexity(cli: &Cli) -> Result<()> {
 }
 
 fn cmd_bench(cli: &Cli) -> Result<()> {
-    let (model_name, tokens, json_output, custom_prompt) = match &cli.command {
-        Some(Commands::Bench { model, tokens, json, prompt }) => {
-            (model.as_str(), *tokens, *json, prompt.as_deref())
+    let (model_name, tokens, json_output, custom_prompt, tq_only) = match &cli.command {
+        Some(Commands::Bench { model, tokens, json, prompt, tq_only }) => {
+            (model.as_str(), *tokens, *json, prompt.as_deref(), *tq_only)
         }
         _ => unreachable!(),
     };
@@ -667,22 +670,26 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
     };
 
     // --- Run 1: Standard (no TQ) ---
-    if !json_output {
-        eprintln!("[1/2] Loading model (standard)...");
-    }
-    let mut engine_std = load_engine(None)?;
-
-    let std_result = bench_run(&mut engine_std, &formatted_prompt, &gen_params)?;
-    drop(engine_std); // free memory before loading TQ variant
-
-    if !json_output {
-        eprintln!("  Standard: {:.1} tok/s, {:.2}s total, TTFT {:.3}s\n",
-            std_result.tok_per_sec, std_result.total_secs, std_result.ttft_secs);
-    }
+    let std_result = if tq_only {
+        None
+    } else {
+        if !json_output {
+            eprintln!("[1/2] Loading model (standard)...");
+        }
+        let mut engine_std = load_engine(None)?;
+        let result = bench_run(&mut engine_std, &formatted_prompt, &gen_params)?;
+        drop(engine_std);
+        if !json_output {
+            eprintln!("  Standard: {:.1} tok/s, {:.2}s total, TTFT {:.3}s\n",
+                result.tok_per_sec, result.total_secs, result.ttft_secs);
+        }
+        Some(result)
+    };
 
     // --- Run 2: TurboQuant 4-bit ---
     if !json_output {
-        eprintln!("[2/2] Loading model (TQ 4-bit)...");
+        if tq_only { eprintln!("[1/1] Loading model (TQ 4-bit)..."); }
+        else { eprintln!("[2/2] Loading model (TQ 4-bit)..."); }
     }
     let tq_config = tq_kv::TurboQuantConfig::balanced(); // 4-bit
     let mut engine_tq = load_engine(Some(tq_config))?;
@@ -708,15 +715,9 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
 
     // --- Output ---
     if json_output {
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "model": display_name,
             "tokens": tokens,
-            "standard": {
-                "total_secs": std_result.total_secs,
-                "tok_per_sec": std_result.tok_per_sec,
-                "ttft_secs": std_result.ttft_secs,
-                "tokens_generated": std_result.tokens_generated,
-            },
             "tq_4bit": {
                 "total_secs": tq_result.total_secs,
                 "tok_per_sec": tq_result.tok_per_sec,
@@ -726,68 +727,66 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
             "kv_cache_mb": kv_mb,
             "kv_compressed_mb": kv_compressed_mb,
             "compression_ratio": compression_ratio,
-            "speedup_pct": ((tq_result.tok_per_sec / std_result.tok_per_sec) - 1.0) * 100.0,
         });
+        if let Some(ref s) = std_result {
+            json["standard"] = serde_json::json!({
+                "total_secs": s.total_secs,
+                "tok_per_sec": s.tok_per_sec,
+                "ttft_secs": s.ttft_secs,
+                "tokens_generated": s.tokens_generated,
+            });
+            json["speedup_pct"] = serde_json::json!(
+                ((tq_result.tok_per_sec / s.tok_per_sec) - 1.0) * 100.0
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
-        let time_delta = if tq_result.total_secs < std_result.total_secs {
-            format!("-{:.0}%", (1.0 - tq_result.total_secs / std_result.total_secs) * 100.0)
-        } else {
-            format!("+{:.0}%", (tq_result.total_secs / std_result.total_secs - 1.0) * 100.0)
-        };
-        let toks_delta = if tq_result.tok_per_sec > std_result.tok_per_sec {
-            format!("+{:.0}%", (tq_result.tok_per_sec / std_result.tok_per_sec - 1.0) * 100.0)
-        } else {
-            format!("-{:.0}%", (1.0 - tq_result.tok_per_sec / std_result.tok_per_sec) * 100.0)
-        };
-        let ttft_delta = if tq_result.ttft_secs > std_result.ttft_secs {
-            format!("+{:.0}%", (tq_result.ttft_secs / std_result.ttft_secs - 1.0) * 100.0)
-        } else {
-            format!("-{:.0}%", (1.0 - tq_result.ttft_secs / std_result.ttft_secs) * 100.0)
-        };
-
         println!();
         println!("+============================================================+");
         println!("|  TurboQuant Benchmark -- {:<33}|", display_name);
         println!("+============================================================+");
-        println!("| {:<20} | {:<11} | {:<11} | {:<7} |", "Metric", "Standard", "TQ 4-bit", "Delta");
-        println!("+----------------------+-------------+-------------+---------+");
+
+        if let Some(ref s) = std_result {
+            let time_delta = if tq_result.total_secs < s.total_secs {
+                format!("-{:.0}%", (1.0 - tq_result.total_secs / s.total_secs) * 100.0)
+            } else {
+                format!("+{:.0}%", (tq_result.total_secs / s.total_secs - 1.0) * 100.0)
+            };
+            let toks_delta = if tq_result.tok_per_sec > s.tok_per_sec {
+                format!("+{:.0}%", (tq_result.tok_per_sec / s.tok_per_sec - 1.0) * 100.0)
+            } else {
+                format!("-{:.0}%", (1.0 - tq_result.tok_per_sec / s.tok_per_sec) * 100.0)
+            };
+            let ttft_delta = if tq_result.ttft_secs > s.ttft_secs {
+                format!("+{:.0}%", (tq_result.ttft_secs / s.ttft_secs - 1.0) * 100.0)
+            } else {
+                format!("-{:.0}%", (1.0 - tq_result.ttft_secs / s.ttft_secs) * 100.0)
+            };
+
+            println!("| {:<20} | {:<11} | {:<11} | {:<7} |", "Metric", "Standard", "TQ 4-bit", "Delta");
+            println!("+----------------------+-------------+-------------+---------+");
+            println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+                "Tokens generated", s.tokens_generated, tq_result.tokens_generated, "");
+            println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+                "Total time", format!("{:.2}s", s.total_secs), format!("{:.2}s", tq_result.total_secs), time_delta);
+            println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+                "tok/s", format!("{:.1}", s.tok_per_sec), format!("{:.1}", tq_result.tok_per_sec), toks_delta);
+            println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
+                "TTFT", format!("{:.3}s", s.ttft_secs), format!("{:.3}s", tq_result.ttft_secs), ttft_delta);
+        } else {
+            println!("| {:<20} | {:<11} |", "Metric", "TQ 4-bit");
+            println!("+----------------------+-------------+");
+            println!("| {:<20} | {:<11} |", "Tokens generated", tq_result.tokens_generated);
+            println!("| {:<20} | {:<11} |", "Total time", format!("{:.2}s", tq_result.total_secs));
+            println!("| {:<20} | {:<11} |", "tok/s", format!("{:.1}", tq_result.tok_per_sec));
+            println!("| {:<20} | {:<11} |", "TTFT", format!("{:.3}s", tq_result.ttft_secs));
+        }
+
         println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-            "Tokens generated",
-            std_result.tokens_generated,
-            tq_result.tokens_generated,
-            ""
-        );
+            "KV cache (est.)", format!("{:.0} MB", kv_mb), format!("{:.0} MB", kv_compressed_mb),
+            format!("-{:.0}%", (1.0 - 1.0 / compression_ratio) * 100.0));
         println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-            "Total time",
-            format!("{:.2}s", std_result.total_secs),
-            format!("{:.2}s", tq_result.total_secs),
-            time_delta
-        );
-        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-            "tok/s",
-            format!("{:.1}", std_result.tok_per_sec),
-            format!("{:.1}", tq_result.tok_per_sec),
-            toks_delta
-        );
-        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-            "TTFT",
-            format!("{:.3}s", std_result.ttft_secs),
-            format!("{:.3}s", tq_result.ttft_secs),
-            ttft_delta
-        );
-        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-            "KV cache (est.)",
-            format!("{:.0} MB", kv_mb),
-            format!("{:.0} MB", kv_compressed_mb),
-            format!("-{:.0}%", (1.0 - 1.0 / compression_ratio) * 100.0)
-        );
-        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-            "Compression ratio",
-            "1.0x",
-            format!("{:.1}x", compression_ratio),
-            ""
-        );
+            "Compression ratio", "1.0x", format!("{:.1}x", compression_ratio), "");
         println!("+============================================================+");
     }
 

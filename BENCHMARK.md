@@ -209,6 +209,13 @@ Fused attention computes attention scores directly from compressed key indices v
 > TQ overhead decreases with longer generation (amortized compression cost).
 > At 200 tokens, Qwen gap is only 8%. Memory bandwidth savings offset compression cost.
 
+### CUDA Throughput (TQ 4-bit, RTX 3080)
+
+| Model | CUDA tok/s | CPU tok/s | GPU Speedup | TTFT |
+|:------|:---------:|:---------:|:-----------:|:----:|
+| Qwen 2.5 7B | **28.2** | 6.04 | **4.7x** | 0.118s |
+| Llama 3.1 8B | **19.2** | 3.47 | **5.5x** | 0.126s |
+
 ---
 
 ## Qwen2.5 72B — Real Model Validation
