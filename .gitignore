@@ -5,4 +5,5 @@
 *.obj
 !Cargo.lock
 *.docx
+/docs/
 .claude/
