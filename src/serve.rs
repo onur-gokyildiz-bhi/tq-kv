@@ -297,10 +297,9 @@ async fn chat_completions(
 
     let stream = req.stream.unwrap_or(false);
 
-    // Build prompt from messages
-    let (system_prompt, user_prompt) = extract_prompts(&req.messages);
+    // Build prompt from messages (multi-turn aware)
     let template = state.template.lock().unwrap().clone();
-    let formatted = chat::format_chat(&template, &system_prompt, &user_prompt);
+    let formatted = build_prompt(&template, &req.messages);
 
     let params = GenerationParams {
         max_tokens: req.max_tokens.unwrap_or(512),
@@ -553,15 +552,29 @@ async fn model_status(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn extract_prompts(messages: &[Message]) -> (String, String) {
+/// Build a formatted prompt from OpenAI-style messages array.
+/// Handles single-turn (system + user) and multi-turn (system + user/assistant pairs).
+fn build_prompt(template: &ChatTemplate, messages: &[Message]) -> String {
     let mut system = String::new();
-    let mut user_parts = Vec::new();
+    let mut history: Vec<(String, String)> = Vec::new();
+    let mut pending_user: Option<String> = None;
 
     for msg in messages {
         match msg.role.as_str() {
             "system" => system = msg.content.clone(),
-            "user" => user_parts.push(msg.content.clone()),
-            "assistant" => {} // skip for now in single-turn
+            "user" => {
+                // If there was a previous user message without an assistant reply,
+                // pair it with an empty assistant response (shouldn't happen normally)
+                if let Some(prev_user) = pending_user.take() {
+                    history.push((prev_user, String::new()));
+                }
+                pending_user = Some(msg.content.clone());
+            }
+            "assistant" => {
+                if let Some(user_msg) = pending_user.take() {
+                    history.push((user_msg, msg.content.clone()));
+                }
+            }
             _ => {}
         }
     }
@@ -570,8 +583,16 @@ fn extract_prompts(messages: &[Message]) -> (String, String) {
         system = "You are a helpful assistant.".into();
     }
 
-    let user = user_parts.join("\n");
-    (system, user)
+    // The last user message is the current query (not yet answered)
+    let current_message = pending_user.unwrap_or_default();
+
+    if history.is_empty() {
+        // Single-turn: no prior conversation
+        chat::format_chat(template, &system, &current_message)
+    } else {
+        // Multi-turn: include conversation history
+        chat::format_multi_turn(template, &system, &history, &current_message)
+    }
 }
 
 fn api_error(status: StatusCode, message: &str) -> (StatusCode, Json<ErrorBody>) {
