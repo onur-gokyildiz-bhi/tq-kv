@@ -222,14 +222,27 @@ fn get_sink_tokens() -> usize {
 
 #[derive(Clone, Debug)]
 struct CompressedKvCache {
-    /// Compressed keys per KV head (past tokens only, excluding sink + current)
+    /// Compressed keys per KV head (hot tier, recent tokens at original bit width)
     k_per_head: Vec<tq_kv::CompressedKeys>,
+    /// Cold (decayed) keys per head — lower bit width, older tokens.
+    /// Order: cold tokens come BEFORE hot tokens in sequence position.
+    k_cold: Option<Vec<tq_kv::CompressedKeys>>,
+    /// How many tokens are in the cold tier (same across all heads)
+    cold_len: usize,
+    /// Temporal decay config (None = disabled)
+    decay_config: Option<tq_kv::TemporalDecayConfig>,
+    /// Tokens since last decay check
+    tokens_since_decay: usize,
     /// Uncompressed sink token keys: [1, n_kv_head, sink_len, head_dim]
     sink_k: Option<Tensor>,
     /// Number of sink tokens stored
     sink_len: usize,
-    /// Full value cache (all tokens, uncompressed)
-    v: Tensor,
+    /// Value cache — uncompressed path (value_bits=0)
+    v_raw: Option<Tensor>,
+    /// Value cache — compressed path (value_bits=8), per KV head
+    v_compressed: Option<Vec<tq_kv::CompressedValues>>,
+    /// Value quantization bits (0=fp16, 8=absmax)
+    value_bits: u8,
     /// Total cached length (sink + compressed + current)
     cached_len: usize,
     dtype: DType,
@@ -255,6 +268,51 @@ fn decompress_compressed_keys(
         all_data.extend(decompressed);
     }
     Tensor::from_vec(all_data, (1, n_kv_head, compressed_len, head_dim), device)?.to_dtype(dtype)
+}
+
+/// Decompress compressed values to F32 tensor: (1, n_kv_head, seq_len, head_dim).
+fn decompress_values(
+    v_per_head: &[tq_kv::CompressedValues],
+    n_kv_head: usize,
+    head_dim: usize,
+    seq_len: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut all_data = Vec::with_capacity(n_kv_head * seq_len * head_dim);
+    for compressed in v_per_head.iter().take(n_kv_head) {
+        let decompressed = compressed.decompress();
+        all_data.extend(decompressed);
+    }
+    Tensor::from_vec(all_data, (1, n_kv_head, seq_len, head_dim), device)
+}
+
+/// Sparse attention-value multiply on CPU tensors.
+///
+/// att shape: (1, n_heads, 1, seq_len)  — softmax weights for single query token
+/// v shape:   (1, n_heads, seq_len, head_dim) — value cache
+///
+/// Returns: (1, n_heads, 1, head_dim) — same as att.matmul(&v) but skipping
+/// V rows where the softmax weight < threshold.
+fn sparse_attn_v(
+    att: &Tensor,
+    v: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    threshold: f32,
+) -> Result<Tensor> {
+    let att_flat = att.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let v_flat = v.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+    let seq_len = att.dim(3)?;
+
+    let mut output = Vec::with_capacity(n_heads * head_dim);
+    for h in 0..n_heads {
+        let att_row = &att_flat[h * seq_len..(h + 1) * seq_len];
+        let v_block = &v_flat[h * seq_len * head_dim..(h + 1) * seq_len * head_dim];
+        let head_out = tq_kv::sparse_attn_v_mul(att_row, v_block, head_dim, threshold);
+        output.extend_from_slice(&head_out);
+    }
+
+    Tensor::from_vec(output, (1, n_heads, 1, head_dim), att.device())
 }
 
 // ============================================================
@@ -314,6 +372,59 @@ fn get_skip_layers() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(TQ_SKIP_FIRST_LAYERS)
+}
+
+/// Sparse V threshold. Softmax weights below this are skipped in V multiply.
+/// Set TQ_SPARSE_V=0 to disable. Default: 1e-6.
+/// Override with TQ_SPARSE_V env var (e.g. TQ_SPARSE_V=1e-5).
+const TQ_SPARSE_V_DEFAULT: f32 = 1e-6;
+
+fn get_sparse_v_threshold() -> f32 {
+    std::env::var("TQ_SPARSE_V")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TQ_SPARSE_V_DEFAULT)
+}
+
+/// Fused attention: compute attention scores directly from compressed indices
+/// instead of decompressing keys first. Saves memory bandwidth on CPU.
+/// Set TQ_FUSED=1 to enable. Default: off (decompress path).
+fn get_use_fused() -> bool {
+    std::env::var("TQ_FUSED")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Value cache quantization bits. 0 = uncompressed fp16, 8 = 8-bit absmax.
+/// Override with TQ_VBITS env var (e.g. TQ_VBITS=8 for 2x value savings).
+const TQ_VBITS_DEFAULT: u8 = 0;
+
+fn get_value_bits() -> u8 {
+    std::env::var("TQ_VBITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(TQ_VBITS_DEFAULT)
+}
+
+/// Temporal decay: demote old tokens to lower bit widths.
+/// Format: "age:bits[,age:bits]" e.g. "512:2" or "256:3,1024:2"
+/// Set TQ_DECAY=off to disable. Default: off.
+fn get_decay_config() -> Option<tq_kv::TemporalDecayConfig> {
+    let val = std::env::var("TQ_DECAY").ok()?;
+    if val == "off" || val == "0" || val.is_empty() { return None; }
+    let mut tiers = Vec::new();
+    for part in val.split(',') {
+        let parts: Vec<&str> = part.trim().split(':').collect();
+        if parts.len() == 2 {
+            if let (Ok(age), Ok(bits)) = (parts[0].parse::<usize>(), parts[1].parse::<u8>()) {
+                tiers.push(tq_kv::DecayTier { age_threshold: age, bits });
+            }
+        }
+    }
+    if tiers.is_empty() { return None; }
+    tiers.sort_by_key(|t| t.age_threshold);
+    Some(tq_kv::TemporalDecayConfig { tiers, decay_interval: 128 })
 }
 
 /// QKV weight layout — separate tensors (most models) or merged single tensor (Phi-3.5).
@@ -448,6 +559,7 @@ impl LayerWeights {
             let sink_n = get_sink_tokens();
 
             // Initialize cache on first call
+            let vbits = get_value_bits();
             if self.kv_compressed.is_none() {
                 let mut k_per_head = Vec::with_capacity(self.n_kv_head);
                 for _ in 0..self.n_kv_head {
@@ -455,11 +567,26 @@ impl LayerWeights {
                         self.tq_config.bits, self.padded_head_dim, self.tq_config.rotation_seed,
                     ));
                 }
+                let (v_raw, v_compressed) = if vbits == 0 {
+                    (None, None)
+                } else {
+                    let mut v_heads: Vec<tq_kv::CompressedValues> = Vec::with_capacity(self.n_kv_head);
+                    for _ in 0..self.n_kv_head {
+                        v_heads.push(tq_kv::CompressedValues::new_empty(self.head_dim));
+                    }
+                    (None, Some(v_heads))
+                };
                 self.kv_compressed = Some(CompressedKvCache {
                     k_per_head,
+                    k_cold: None,
+                    cold_len: 0,
+                    decay_config: get_decay_config(),
+                    tokens_since_decay: 0,
                     sink_k: None,
                     sink_len: 0,
-                    v: v.clone(),
+                    v_raw,
+                    v_compressed,
+                    value_bits: vbits,
                     cached_len: 0,
                     dtype: cache_dtype,
                 });
@@ -473,11 +600,27 @@ impl LayerWeights {
             // POQ: during generation (seq_len=1), current token is NOT compressed yet
             let global_start = prev_total; // first position in this batch
 
-            // --- Store values (always uncompressed) ---
-            if cache.cached_len > 0 {
-                cache.v = Tensor::cat(&[&cache.v, &v], 2)?;
+            // --- Store values ---
+            if cache.value_bits == 0 {
+                // Uncompressed fp16 path
+                if cache.cached_len > 0 {
+                    cache.v_raw = Some(match &cache.v_raw {
+                        Some(prev) => Tensor::cat(&[prev, &v], 2)?,
+                        None => v.clone(),
+                    });
+                } else {
+                    cache.v_raw = Some(v.clone());
+                }
             } else {
-                cache.v = v.clone();
+                // Compressed 8-bit path: quantize per head × position
+                let v_f32 = v.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                let v_comp = cache.v_compressed.as_mut().unwrap();
+                for h in 0..self.n_kv_head {
+                    for s in 0..seq_len {
+                        let offset = (h * seq_len + s) * self.head_dim;
+                        v_comp[h].append(&v_f32[offset..offset + self.head_dim]);
+                    }
+                }
             }
 
             // --- Handle sink tokens (FP16, uncompressed) ---
@@ -535,11 +678,54 @@ impl LayerWeights {
             }
 
             cache.cached_len += seq_len;
+            cache.tokens_since_decay += seq_len;
             let total_len = cache.cached_len;
 
+            // --- Temporal decay: demote old hot tokens to lower bit width ---
+            if let Some(ref decay_cfg) = cache.decay_config.clone() {
+                if cache.tokens_since_decay >= decay_cfg.decay_interval {
+                    cache.tokens_since_decay = 0;
+                    // Find the lowest tier that applies (smallest bits)
+                    // Use the first (and typically only) tier for simplicity
+                    if let Some(tier) = decay_cfg.tiers.first() {
+                        let hot_count = cache.k_per_head[0].count;
+                        // Tokens eligible for decay: those older than age_threshold
+                        // hot tokens span positions [sink_len .. sink_len + hot_count]
+                        // "age" of the oldest hot token = total_len - sink_len - 0 = hot_count + cold_len
+                        // We want to decay tokens whose age > threshold
+                        // That means the first (hot_count + cold_len - threshold) hot tokens
+                        let total_compressed = hot_count + cache.cold_len;
+                        if total_compressed > tier.age_threshold && hot_count > 0 {
+                            let to_decay = total_compressed - tier.age_threshold;
+                            let to_decay = to_decay.min(hot_count); // can't decay more than we have
+                            if to_decay > 0 {
+                                // Initialize cold tier if needed
+                                if cache.k_cold.is_none() {
+                                    let mut cold = Vec::with_capacity(self.n_kv_head);
+                                    for _ in 0..self.n_kv_head {
+                                        cold.push(tq_kv::CompressedKeys::new_empty(
+                                            tier.bits, self.padded_head_dim, self.tq_config.rotation_seed,
+                                        ));
+                                    }
+                                    cache.k_cold = Some(cold);
+                                }
+                                // Split front of hot, remap to cold bits, append to cold
+                                let cold = cache.k_cold.as_mut().unwrap();
+                                for h in 0..self.n_kv_head {
+                                    let front = cache.k_per_head[h].split_off_front(to_decay);
+                                    let remapped = front.remap_bits(tier.bits);
+                                    cold[h].append_from(&remapped);
+                                }
+                                cache.cold_len += to_decay;
+                            }
+                        }
+                    }
+                }
+            }
+
             // --- Build full key tensor for attention ---
-            // Concatenate: [sink_keys (FP16) | decompressed_compressed_keys | current_key (FP16)]
-            // This is the POQ + Sink approach: highest-impact tokens are lossless
+            // Concatenate: [sink_keys (FP16) | cold_keys (decayed) | hot_keys (original bits) | current_key (FP16)]
+            // This is the POQ + Sink + Decay approach: highest-impact tokens are lossless
 
             let y = if seq_len == 1 && total_len > 1 {
                 // GENERATION: single token attention against full cache
@@ -550,52 +736,173 @@ impl LayerWeights {
                 // we replace the last position with the lossless original.
                 let q_f32 = q.to_dtype(DType::F32)?;
 
-                // Build the full key tensor by concatenating parts
-                let mut k_parts: Vec<Tensor> = Vec::new();
-
-                // Part 1: Sink keys (FP16, lossless)
-                if let Some(ref sink) = cache.sink_k {
-                    k_parts.push(sink.to_dtype(DType::F32)?);
-                }
-
-                // Part 2: Decompressed compressed keys (excluding last = current token)
+                let use_fused = get_use_fused() && q.device().is_cpu();
                 let n_compressed = cache.k_per_head[0].count;
                 let n_past_compressed = if n_compressed > 0 { n_compressed - 1 } else { 0 };
-                if n_past_compressed > 0 {
-                    // Decompress only past compressed keys (not the current one)
-                    // We temporarily reduce count, decompress, then restore
-                    // This is safe because we're the only user of cache right now
-                    let k_decomp = decompress_compressed_keys(
-                        &cache.k_per_head, self.n_kv_head,
-                        self.padded_head_dim, DType::F32, q.device(), &self.tq_config,
+
+                // --- Compute attention scores ---
+                let att = if use_fused {
+                    // FUSED PATH: compute scores directly from compressed indices.
+                    // No key decompression — saves memory bandwidth.
+                    // Scores are computed per query-head using pre-rotated query
+                    // and centroid table lookup (AVX2 SIMD when available).
+                    let q_flat = q_f32.flatten_all()?.to_vec1::<f32>()?;
+                    let scale = 1.0 / (self.head_dim as f32).sqrt();
+                    let cold_centroids = cache.k_cold.as_ref()
+                        .map(|c| tq_kv::codebook::get_centroids(c[0].bits));
+
+                    use rayon::prelude::*;
+                    let head_scores: Vec<Vec<f32>> = (0..self.n_head)
+                        .into_par_iter()
+                        .map(|qh| {
+                            let kv_h = qh / n_rep;
+                            let q_vec = &q_flat[qh * self.head_dim..(qh + 1) * self.head_dim];
+                            let rotated_q = tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs);
+                            let mut scores = Vec::with_capacity(total_len);
+
+                            // Segment 1: Sink keys (standard dot product, not compressed)
+                            if let Some(ref sink) = cache.sink_k {
+                                let sink_f32 = sink.to_dtype(DType::F32).unwrap();
+                                let sink_flat = sink_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                let sink_count = cache.sink_len;
+                                for s in 0..sink_count {
+                                    let offset = (kv_h * sink_count + s) * self.head_dim;
+                                    let k_vec = &sink_flat[offset..offset + self.head_dim];
+                                    let dot: f32 = q_vec.iter().zip(k_vec.iter())
+                                        .map(|(&qi, &ki)| qi * ki).sum();
+                                    scores.push(dot * scale);
+                                }
+                            }
+
+                            // Segment 2: Cold (decayed) keys — fused at cold bit width
+                            if let Some(ref cold) = cache.k_cold {
+                                let cold_cb = cold_centroids.unwrap();
+                                let cold_scores = tq_kv::fused_attention_scores(
+                                    &rotated_q, &cold[kv_h], cold_cb, scale,
+                                );
+                                scores.extend_from_slice(&cold_scores);
+                            }
+
+                            // Segment 3: Hot compressed keys (excluding last = current)
+                            if n_past_compressed > 0 {
+                                let hot_cb = tq_kv::codebook::get_centroids(self.tq_config.bits);
+                                let hot = &cache.k_per_head[kv_h];
+                                let dim = hot.dim;
+                                let bpv = hot.bytes_per_vector();
+                                let mut idx_buf = vec![0u8; dim];
+                                for pos in 0..n_past_compressed {
+                                    let norm = hot.norms[pos];
+                                    if norm < 1e-10 {
+                                        scores.push(0.0);
+                                        continue;
+                                    }
+                                    let start = pos * bpv;
+                                    let end = start + bpv;
+                                    tq_kv::codebook::unpack_indices_into(
+                                        &hot.packed_indices[start..end], &mut idx_buf, hot.bits,
+                                    );
+                                    let score = tq_kv::fused_dot_product_with_centroids(
+                                        &rotated_q, &idx_buf, norm, hot_cb, dim,
+                                    ) * scale;
+                                    scores.push(score);
+                                }
+                            }
+
+                            // Segment 4: Current token key (FP16 original — POQ)
+                            {
+                                let k_f32 = k.to_dtype(DType::F32).unwrap();
+                                let k_flat = k_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                let k_vec = &k_flat[kv_h * self.head_dim..(kv_h + 1) * self.head_dim];
+                                let dot: f32 = q_vec.iter().zip(k_vec.iter())
+                                    .map(|(&qi, &ki)| qi * ki).sum();
+                                scores.push(dot * scale);
+                            }
+
+                            scores
+                        })
+                        .collect();
+
+                    let mut all_scores = Vec::with_capacity(self.n_head * total_len);
+                    for s in &head_scores {
+                        all_scores.extend_from_slice(s);
+                    }
+                    let att = Tensor::from_vec(
+                        all_scores, (1, self.n_head, 1, total_len), q.device(),
                     )?;
-                    let k_decomp = if self.padded_head_dim > self.head_dim {
-                        k_decomp.narrow(3, 0, self.head_dim)?
-                    } else {
-                        k_decomp
-                    };
-                    // Take all but last compressed position
-                    let k_past = k_decomp.narrow(2, 0, n_past_compressed)?;
-                    k_parts.push(k_past);
-                }
-
-                // Part 3: Current token key (FP16 original — POQ lossless)
-                k_parts.push(k.to_dtype(DType::F32)?);
-
-                let k_full = if k_parts.len() == 1 {
-                    k_parts.remove(0)
+                    softmax_last_dim(&att)?
                 } else {
-                    Tensor::cat(&k_parts, 2)?
+                    // DECOMPRESS PATH: decompress all keys, standard matmul
+                    let mut k_parts: Vec<Tensor> = Vec::new();
+
+                    // Part 1: Sink keys (FP16, lossless)
+                    if let Some(ref sink) = cache.sink_k {
+                        k_parts.push(sink.to_dtype(DType::F32)?);
+                    }
+
+                    // Part 1.5: Cold (decayed) keys
+                    if let Some(ref cold) = cache.k_cold {
+                        if cold[0].count > 0 {
+                            let k_cold = decompress_compressed_keys(
+                                cold, self.n_kv_head,
+                                self.padded_head_dim, DType::F32, q.device(), &self.tq_config,
+                            )?;
+                            let k_cold = if self.padded_head_dim > self.head_dim {
+                                k_cold.narrow(3, 0, self.head_dim)?
+                            } else {
+                                k_cold
+                            };
+                            k_parts.push(k_cold);
+                        }
+                    }
+
+                    // Part 2: Hot compressed keys (excluding last = current token)
+                    if n_past_compressed > 0 {
+                        let k_decomp = decompress_compressed_keys(
+                            &cache.k_per_head, self.n_kv_head,
+                            self.padded_head_dim, DType::F32, q.device(), &self.tq_config,
+                        )?;
+                        let k_decomp = if self.padded_head_dim > self.head_dim {
+                            k_decomp.narrow(3, 0, self.head_dim)?
+                        } else {
+                            k_decomp
+                        };
+                        let k_past = k_decomp.narrow(2, 0, n_past_compressed)?;
+                        k_parts.push(k_past);
+                    }
+
+                    // Part 3: Current token key (FP16 original — POQ lossless)
+                    k_parts.push(k.to_dtype(DType::F32)?);
+
+                    let k_full = if k_parts.len() == 1 {
+                        k_parts.remove(0)
+                    } else {
+                        Tensor::cat(&k_parts, 2)?
+                    };
+
+                    let k_full = repeat_kv(k_full, n_rep)?;
+                    let att = (q_f32.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+                    softmax_last_dim(&att)?
                 };
 
-                // Verify dimensions: k_full should have total_len positions
-                // = sink_len + past_compressed + 1 (current)
+                // --- Compute attention output: att @ V ---
+                let v_f32 = if cache.value_bits == 0 {
+                    repeat_kv(cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?, n_rep)?
+                } else {
+                    let v_tensor = decompress_values(
+                        cache.v_compressed.as_ref().unwrap(),
+                        self.n_kv_head, self.head_dim, total_len, q.device(),
+                    )?;
+                    repeat_kv(v_tensor, n_rep)?
+                };
 
-                let k_full = repeat_kv(k_full, n_rep)?;
-                let v_f32 = repeat_kv(cache.v.to_dtype(DType::F32)?, n_rep)?;
-                let att = (q_f32.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
-                let att = softmax_last_dim(&att)?;
-                att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)?
+                // Sparse V: skip V rows where softmax weight < threshold (CPU only)
+                let sparse_thresh = get_sparse_v_threshold();
+                if sparse_thresh > 0.0 && att.device().is_cpu() {
+                    sparse_attn_v(&att, &v_f32, self.n_head, self.head_dim, sparse_thresh)?
+                        .to_dtype(cache.dtype)?
+                } else {
+                    att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)?
+                }
             } else {
                 // PREFILL: use original uncompressed keys for attention (standard path)
                 // Keys are already compressed into cache above, but attention uses originals

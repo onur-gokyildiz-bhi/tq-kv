@@ -46,21 +46,24 @@
 - [x] Paper draft — "TurboQuant on Quantized Models" (docs/arxiv/)
 - [x] HN + X launch content (docs/hn-launch.md, docs/x-launch-tweets.md)
 
-## Open — Immediate (This Sprint)
+### Post-v0.5.0 Sprint (Mar 29, 2026)
+- [x] Sparse V — skip V rows when softmax < threshold (TQ_SPARSE_V, AVX2 SIMD, 3 tests)
+- [x] K/V Asymmetric — values 8-bit absmax, keys 4-bit (TQ_VBITS=8, ~1.9x V savings, 4 tests)
+- [x] Temporal Decay — older tokens demoted to 2-bit via index remap (TQ_DECAY=512:2, >30% savings, 6 tests)
+- [x] Fused attention path — TQ_FUSED=1, scores from compressed indices (no decompress), rayon parallel, sink/cold/hot/current segments, cos_sim > 0.99 vs decompress (1 test)
 
-- [ ] Sparse V — skip V dequant when softmax < 1e-6 (+22.8% decode, TheTom technique)
-- [ ] Fused path fix — numerik stabilite, decompress path ile tutarlı
+## Open — Immediate
+
 - [ ] Real-model PPL benchmark — Qwen 2.5 7B Q4_K_M, 4K/8K/16K context
 - [ ] arXiv submission — LaTeX compile + upload
 - [ ] HN Show post — submit docs/hn-launch.md
 - [ ] X thread launch — docs/x-launch-tweets.md + twitter-visuals.html
 
-## Open — Performance (Next Sprint)
+## Open — Performance
 
 - [ ] llama.cpp Q4_K_M baseline — record tok/s on same hardware (RTX 3080)
 - [ ] Benchmark: target within 3x of llama.cpp on short context (≤4K)
 - [ ] Benchmark: FASTER than llama.cpp on 16K+ context (TQ advantage)
-- [ ] K/V Asymmetric compression — values 8-bit, keys 4-bit (2x extra savings)
 - [ ] Per-channel key scaling — SmoothQuant-style, reduce compound error further
 - [ ] tok/s, TTFT, memory profiling benchmarks
 
@@ -78,7 +81,6 @@
 
 ## Future / Exploratory
 
-- [ ] Temporal decay — older tokens compressed more aggressively (TheTom: 30-34% savings)
 - [ ] Layer-adaptive bitwidth — early layers 2-bit, late layers 4-bit
 - [ ] Calibrated codebook — Lloyd-Max from Q4 model activations (not assumed Gaussian)
 - [ ] Learned rotation — SpinQuant-style (up to 45% better than random Hadamard)

@@ -277,6 +277,30 @@ pub fn unpack_indices(packed: &[u8], count: usize, bits: u8) -> Vec<u8> {
     }
 }
 
+/// Pre-computed index remap table: maps each index at `from_bits` to the nearest
+/// centroid index at `to_bits`. Used for temporal decay (demoting old tokens to
+/// lower bit widths without decompression).
+///
+/// Example: remap_table(4, 2) returns [0,0,0,1,1,1,1,1, 2,2,2,2,2,3,3,3]
+/// meaning 4-bit index 0 → 2-bit index 0, index 7 → 2-bit index 1, etc.
+pub fn remap_table(from_bits: u8, to_bits: u8) -> Vec<u8> {
+    assert!(to_bits < from_bits, "to_bits must be < from_bits");
+    let from_centroids = get_centroids(from_bits);
+    let to_centroids = get_centroids(to_bits);
+    from_centroids.iter().map(|&c| {
+        let mut best_idx = 0u8;
+        let mut best_dist = f32::MAX;
+        for (j, &tc) in to_centroids.iter().enumerate() {
+            let dist = (c - tc).abs();
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = j as u8;
+            }
+        }
+        best_idx
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

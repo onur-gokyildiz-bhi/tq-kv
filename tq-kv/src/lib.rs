@@ -100,6 +100,12 @@ pub struct TurboQuantConfig {
     pub rotation_seed: u64,
     /// QJL base seed
     pub qjl_seed: u64,
+    /// Sparse V threshold: softmax weights below this are skipped in V multiply.
+    /// Set to 0.0 to disable. Default: 1e-6.
+    pub sparse_v_threshold: f32,
+    /// Value cache quantization bit width. 0 = uncompressed (fp16), 8 = 8-bit absmax.
+    /// Keys use `bits` field; values use this. Default: 0 (uncompressed, matches paper).
+    pub value_bits: u8,
 
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
@@ -115,6 +121,8 @@ impl Default for TurboQuantConfig {
             qjl_proj_dim: 0,
             rotation_seed: 0x0054_5552_4230,
             qjl_seed: 0x0051_4A4C_4232,
+            sparse_v_threshold: 1e-6,
+            value_bits: 0,
         }
     }
 }
@@ -320,6 +328,213 @@ impl CompressedKeys {
 
     /// Compression ratio vs fp16.
     pub fn compression_ratio(&self) -> f32 {
+        self.original_memory_bytes() as f32 / self.memory_bytes() as f32
+    }
+
+    /// Split off the first `n` vectors from this cache, returning them as a new
+    /// CompressedKeys. The remaining vectors stay in `self`.
+    ///
+    /// Used for temporal decay: extract old tokens for demotion to lower bit width.
+    pub fn split_off_front(&mut self, n: usize) -> CompressedKeys {
+        assert!(n <= self.count, "split_off_front: n={} > count={}", n, self.count);
+        let bpv = self.bytes_per_vector();
+        let byte_split = n * bpv;
+
+        let front = CompressedKeys {
+            packed_indices: self.packed_indices[..byte_split].to_vec(),
+            norms: self.norms[..n].to_vec(),
+            qjl_corrections: None, // QJL corrections are dropped during decay
+            bits: self.bits,
+            dim: self.dim,
+            count: n,
+            rotation_seed: self.rotation_seed,
+        };
+
+        self.packed_indices = self.packed_indices[byte_split..].to_vec();
+        self.norms = self.norms[n..].to_vec();
+        self.qjl_corrections = None;
+        self.count -= n;
+
+        front
+    }
+
+    /// Remap all indices to a lower bit width (temporal decay).
+    ///
+    /// Each index at the current bit width is mapped to the nearest centroid
+    /// at `target_bits`. Norms are preserved. QJL corrections are dropped
+    /// (not meaningful after bit-width change).
+    ///
+    /// Returns a new CompressedKeys at the target bit width.
+    pub fn remap_bits(&self, target_bits: u8) -> CompressedKeys {
+        assert!(target_bits < self.bits,
+            "remap_bits: target {} must be < current {}", target_bits, self.bits);
+
+        let remap = codebook::remap_table(self.bits, target_bits);
+
+        // Unpack all indices, remap, repack at target bits
+        let all_indices = codebook::unpack_indices(
+            &self.packed_indices, self.count * self.dim, self.bits,
+        );
+        let remapped: Vec<u8> = all_indices.iter().map(|&idx| remap[idx as usize]).collect();
+        let packed = codebook::pack_indices(&remapped, target_bits);
+
+        CompressedKeys {
+            packed_indices: packed,
+            norms: self.norms.clone(),
+            qjl_corrections: None,
+            bits: target_bits,
+            dim: self.dim,
+            count: self.count,
+            rotation_seed: self.rotation_seed,
+        }
+    }
+
+    /// Append all vectors from `other` into this cache.
+    /// Both must have the same bit width and dimension.
+    pub fn append_from(&mut self, other: &CompressedKeys) {
+        assert_eq!(self.bits, other.bits);
+        assert_eq!(self.dim, other.dim);
+        self.packed_indices.extend_from_slice(&other.packed_indices);
+        self.norms.extend_from_slice(&other.norms);
+        self.count += other.count;
+    }
+}
+
+// ============================================================
+// Temporal Decay Configuration
+// ============================================================
+
+/// A single decay tier: tokens older than `age_threshold` get compressed to `bits`.
+#[derive(Clone, Debug)]
+pub struct DecayTier {
+    /// Token age (distance from most recent) at which this tier activates.
+    pub age_threshold: usize,
+    /// Target bit width for this tier.
+    pub bits: u8,
+}
+
+/// Temporal decay configuration.
+///
+/// Older tokens are progressively compressed to lower bit widths.
+/// Example: `tiers = [DecayTier { age: 1024, bits: 3 }, DecayTier { age: 4096, bits: 2 }]`
+/// means tokens older than 1024 get 3-bit, older than 4096 get 2-bit.
+///
+/// Tiers must be sorted by age_threshold ascending, bits descending.
+#[derive(Clone, Debug)]
+pub struct TemporalDecayConfig {
+    /// Decay tiers, sorted by age_threshold ascending.
+    pub tiers: Vec<DecayTier>,
+    /// How often (in tokens) to check and apply decay. Default: 128.
+    pub decay_interval: usize,
+}
+
+impl Default for TemporalDecayConfig {
+    fn default() -> Self {
+        Self {
+            tiers: vec![
+                DecayTier { age_threshold: 512, bits: 2 },
+            ],
+            decay_interval: 128,
+        }
+    }
+}
+
+// ============================================================
+// Value Compression (K/V Asymmetric)
+// ============================================================
+
+/// Compressed value cache using per-vector absmax quantization.
+///
+/// Each value vector is quantized to 8-bit using symmetric absmax scaling:
+///   quantized[i] = round(clamp(value[i] / scale, -127, 127)) + 128
+///   scale = max(|value[i]|) / 127
+///
+/// This gives 2x memory savings vs fp16 with negligible quality loss.
+/// Unlike keys (which use Hadamard + Lloyd-Max), values don't benefit from
+/// rotation — absmax is simpler and sufficient at 8-bit.
+#[derive(Clone, Debug)]
+pub struct CompressedValues {
+    /// Quantized data: uint8, row-major [count * dim]
+    pub data: Vec<u8>,
+    /// Per-vector absmax scale factors
+    pub scales: Vec<f32>,
+    /// Vector dimension (head_dim)
+    pub dim: usize,
+    /// Number of vectors
+    pub count: usize,
+}
+
+impl CompressedValues {
+    /// Create empty compressed values (for incremental append).
+    pub fn new_empty(dim: usize) -> Self {
+        Self { data: Vec::new(), scales: Vec::new(), dim, count: 0 }
+    }
+
+    /// Append a single value vector (f32) to the compressed cache.
+    pub fn append(&mut self, value: &[f32]) {
+        debug_assert_eq!(value.len(), self.dim);
+        let absmax = value.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = if absmax > 1e-10 { absmax / 127.0 } else { 1.0 };
+        let inv_scale = 1.0 / scale;
+        for &v in value {
+            let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+            self.data.push((q as i16 + 128) as u8);
+        }
+        self.scales.push(scale);
+        self.count += 1;
+    }
+
+    /// Append multiple value vectors from a flat f32 slice.
+    pub fn append_batch(&mut self, values: &[f32], dim: usize) {
+        debug_assert_eq!(values.len() % dim, 0);
+        for chunk in values.chunks_exact(dim) {
+            self.append(chunk);
+        }
+    }
+
+    /// Decompress all values back to f32.
+    pub fn decompress(&self) -> Vec<f32> {
+        let mut result = Vec::with_capacity(self.count * self.dim);
+        for i in 0..self.count {
+            let scale = self.scales[i];
+            let start = i * self.dim;
+            let end = start + self.dim;
+            for &q in &self.data[start..end] {
+                let v = (q as i16 - 128) as f32 * scale;
+                result.push(v);
+            }
+        }
+        result
+    }
+
+    /// Decompress a range of vectors [start_idx, start_idx + count).
+    pub fn decompress_range(&self, start_idx: usize, range_count: usize) -> Vec<f32> {
+        let mut result = Vec::with_capacity(range_count * self.dim);
+        for i in start_idx..start_idx + range_count {
+            let scale = self.scales[i];
+            let start = i * self.dim;
+            let end = start + self.dim;
+            for &q in &self.data[start..end] {
+                let v = (q as i16 - 128) as f32 * scale;
+                result.push(v);
+            }
+        }
+        result
+    }
+
+    /// Compressed memory in bytes.
+    pub fn memory_bytes(&self) -> usize {
+        self.data.len() + self.scales.len() * 4
+    }
+
+    /// Original fp16 memory in bytes.
+    pub fn original_memory_bytes(&self) -> usize {
+        self.count * self.dim * 2
+    }
+
+    /// Compression ratio vs fp16.
+    pub fn compression_ratio(&self) -> f32 {
+        if self.count == 0 { return 0.0; }
         self.original_memory_bytes() as f32 / self.memory_bytes() as f32
     }
 }
@@ -741,6 +956,111 @@ pub fn fused_attention_scores(
     }
 
     scores
+}
+
+/// Sparse attention-value multiply: only accumulate V rows where attention weight > threshold.
+///
+/// For autoregressive decode (seq_len=1), the attention weight vector is typically very sparse
+/// after softmax — most positions have near-zero weight. Skipping those positions saves
+/// memory bandwidth proportional to the sparsity (often 50-80% of V rows at long context).
+///
+/// # Arguments
+/// * `attn_weights` - Softmax attention weights, shape `[seq_len]` (one query position).
+/// * `values` - Value matrix, shape `[seq_len, head_dim]` (row-major).
+/// * `head_dim` - Dimension per head.
+/// * `threshold` - Weights below this are skipped. Use 0.0 to disable (dense path).
+///
+/// # Returns
+/// Weighted sum vector of length `head_dim`.
+pub fn sparse_attn_v_mul(
+    attn_weights: &[f32],
+    values: &[f32],
+    head_dim: usize,
+    threshold: f32,
+) -> Vec<f32> {
+    debug_assert_eq!(values.len(), attn_weights.len() * head_dim);
+    let seq_len = attn_weights.len();
+    let mut output = vec![0.0f32; head_dim];
+
+    if threshold <= 0.0 {
+        // Dense path — no sparsity
+        for pos in 0..seq_len {
+            let w = attn_weights[pos];
+            let v_row = &values[pos * head_dim..(pos + 1) * head_dim];
+            for (o, &v) in output.iter_mut().zip(v_row.iter()) {
+                *o += w * v;
+            }
+        }
+        return output;
+    }
+
+    // Sparse path — skip negligible weights
+    for pos in 0..seq_len {
+        let w = attn_weights[pos];
+        if w < threshold {
+            continue;
+        }
+        let v_row = &values[pos * head_dim..(pos + 1) * head_dim];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe { sparse_v_accumulate_avx2(&mut output, v_row, w); }
+                continue;
+            }
+        }
+        for (o, &v) in output.iter_mut().zip(v_row.iter()) {
+            *o += w * v;
+        }
+    }
+
+    output
+}
+
+/// AVX2+FMA accumulate: output[i] += weight * v_row[i]
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sparse_v_accumulate_avx2(output: &mut [f32], v_row: &[f32], weight: f32) {
+    use std::arch::x86_64::*;
+
+    let w_vec = _mm256_set1_ps(weight);
+    let n = output.len();
+    let chunks = n / 8;
+
+    for i in 0..chunks {
+        let offset = i * 8;
+        let o = _mm256_loadu_ps(output.as_ptr().add(offset));
+        let v = _mm256_loadu_ps(v_row.as_ptr().add(offset));
+        let result = _mm256_fmadd_ps(w_vec, v, o);
+        _mm256_storeu_ps(output.as_mut_ptr().add(offset), result);
+    }
+
+    // Remainder
+    let rem_start = chunks * 8;
+    for j in rem_start..n {
+        *output.get_unchecked_mut(j) += weight * *v_row.get_unchecked(j);
+    }
+}
+
+/// Statistics from a sparse V multiply: how many positions were active vs skipped.
+pub struct SparseVStats {
+    /// Total sequence positions
+    pub total: usize,
+    /// Positions with weight >= threshold (actually computed)
+    pub active: usize,
+}
+
+impl SparseVStats {
+    /// Fraction of positions skipped (0.0 = fully dense, 1.0 = all skipped).
+    pub fn sparsity(&self) -> f32 {
+        if self.total == 0 { return 0.0; }
+        (self.total - self.active) as f32 / self.total as f32
+    }
+}
+
+/// Count how many positions would be active for a given threshold.
+pub fn sparse_v_stats(attn_weights: &[f32], threshold: f32) -> SparseVStats {
+    let active = attn_weights.iter().filter(|&&w| w >= threshold).count();
+    SparseVStats { total: attn_weights.len(), active }
 }
 
 /// Evaluate V2 compression quality.
@@ -1203,5 +1523,319 @@ mod tests {
             "Single key score mismatch: batch={}, individual={}",
             single_scores[0], expected_score,
         );
+    }
+
+    // ========================================
+    // Sparse V Tests
+    // ========================================
+
+    #[test]
+    fn test_sparse_v_matches_dense() {
+        let head_dim = 128;
+        let seq_len = 64;
+
+        // Synthetic softmax-like weights (sum to 1, mostly small, few large)
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let raw: Vec<f32> = (0..seq_len).map(|_| rng.gen::<f32>()).collect();
+        let sum: f32 = raw.iter().sum();
+        let weights: Vec<f32> = raw.iter().map(|w| w / sum).collect();
+
+        let values = random_vectors(seq_len, head_dim, 99);
+
+        // Dense result (threshold = 0)
+        let dense = sparse_attn_v_mul(&weights, &values, head_dim, 0.0);
+        // Sparse result (threshold = 1e-6, should match since all weights > 1e-6)
+        let sparse = sparse_attn_v_mul(&weights, &values, head_dim, 1e-6);
+
+        for (d, s) in dense.iter().zip(sparse.iter()) {
+            assert!(
+                (d - s).abs() < 1e-5,
+                "Sparse/dense mismatch: dense={}, sparse={}", d, s,
+            );
+        }
+    }
+
+    #[test]
+    fn test_sparse_v_skips_small_weights() {
+        let head_dim = 64;
+        let seq_len = 8;
+
+        // Only position 3 has significant weight
+        let mut weights = vec![1e-8; seq_len];
+        weights[3] = 0.999;
+        // Normalize to sum=1 (close enough)
+        let rem = (1.0 - 0.999) / 7.0;
+        for (i, w) in weights.iter_mut().enumerate() {
+            if i != 3 { *w = rem; }
+        }
+
+        let mut values = vec![0.0f32; seq_len * head_dim];
+        // Set V[3] to all 1.0
+        for j in 0..head_dim {
+            values[3 * head_dim + j] = 1.0;
+        }
+        // Set other V rows to large values (should be skipped)
+        for i in 0..seq_len {
+            if i != 3 {
+                for j in 0..head_dim {
+                    values[i * head_dim + j] = 999.0;
+                }
+            }
+        }
+
+        // With high threshold, only position 3 survives
+        let result = sparse_attn_v_mul(&weights, &values, head_dim, 0.01);
+
+        // Result should be close to weights[3] * V[3] = 0.999 * [1,1,...,1]
+        for &r in &result {
+            assert!(
+                (r - 0.999).abs() < 0.01,
+                "Expected ~0.999, got {}", r,
+            );
+        }
+
+        // Stats should show high sparsity
+        let stats = sparse_v_stats(&weights, 0.01);
+        assert_eq!(stats.active, 1);
+        assert_eq!(stats.total, seq_len);
+        assert!(stats.sparsity() > 0.8);
+    }
+
+    #[test]
+    fn test_sparse_v_all_zeros_threshold() {
+        // threshold=0 should be dense (no skipping)
+        let head_dim = 32;
+        let seq_len = 4;
+        let weights = vec![0.25f32; seq_len];
+        let values = random_vectors(seq_len, head_dim, 7);
+
+        let result = sparse_attn_v_mul(&weights, &values, head_dim, 0.0);
+
+        // Manual dense computation
+        let mut expected = vec![0.0f32; head_dim];
+        for pos in 0..seq_len {
+            for j in 0..head_dim {
+                expected[j] += 0.25 * values[pos * head_dim + j];
+            }
+        }
+
+        for (e, r) in expected.iter().zip(result.iter()) {
+            assert!((e - r).abs() < 1e-6, "Mismatch: expected={}, got={}", e, r);
+        }
+    }
+
+    // ========================================
+    // Compressed Values Tests (K/V Asymmetric)
+    // ========================================
+
+    #[test]
+    fn test_compressed_values_roundtrip() {
+        let dim = 128;
+        let data = random_vectors(32, dim, 42);
+
+        let mut cv = CompressedValues::new_empty(dim);
+        cv.append_batch(&data, dim);
+        assert_eq!(cv.count, 32);
+
+        let decompressed = cv.decompress();
+        assert_eq!(decompressed.len(), data.len());
+
+        // 8-bit absmax should have very high cosine similarity
+        let dot: f32 = data.iter().zip(decompressed.iter()).map(|(a, b)| a * b).sum();
+        let norm_a: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_b: f32 = decompressed.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos_sim = dot / (norm_a * norm_b + 1e-10);
+        assert!(cos_sim > 0.999, "8-bit value cos_sim should be > 0.999, got {}", cos_sim);
+
+        // Max error per element should be small
+        let max_err: f32 = data.iter().zip(decompressed.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let data_max: f32 = data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let rel_max_err = max_err / data_max;
+        assert!(rel_max_err < 0.02, "8-bit relative max error should be < 2%, got {:.4}", rel_max_err);
+    }
+
+    #[test]
+    fn test_compressed_values_incremental() {
+        let dim = 64;
+        let mut cv = CompressedValues::new_empty(dim);
+
+        // Append one at a time
+        for i in 0..8 {
+            let vec = random_vectors(1, dim, i as u64);
+            cv.append(&vec);
+        }
+        assert_eq!(cv.count, 8);
+
+        // Decompress range
+        let range = cv.decompress_range(2, 3);
+        assert_eq!(range.len(), 3 * dim);
+
+        // Should match full decompress subset
+        let full = cv.decompress();
+        let expected = &full[2 * dim..5 * dim];
+        assert_eq!(range, expected);
+    }
+
+    #[test]
+    fn test_compressed_values_compression_ratio() {
+        let dim = 128;
+        let mut cv = CompressedValues::new_empty(dim);
+        let data = random_vectors(64, dim, 77);
+        cv.append_batch(&data, dim);
+
+        // 8-bit: 1 byte data + 4 bytes scale per vector
+        // fp16: 2 bytes per element
+        // Ratio: (64*128*2) / (64*128*1 + 64*4) = 16384 / 8448 ≈ 1.94x
+        let ratio = cv.compression_ratio();
+        assert!(ratio > 1.8, "8-bit value compression ratio should be ~1.9x, got {:.2}", ratio);
+        assert!(ratio < 2.1, "8-bit value compression ratio should be ~1.9x, got {:.2}", ratio);
+    }
+
+    #[test]
+    fn test_compressed_values_zero_vector() {
+        let dim = 32;
+        let mut cv = CompressedValues::new_empty(dim);
+        let zeros = vec![0.0f32; dim];
+        cv.append(&zeros);
+
+        let decompressed = cv.decompress();
+        for &v in &decompressed {
+            assert_eq!(v, 0.0, "Zero vector should decompress to zeros");
+        }
+    }
+
+    // ========================================
+    // Temporal Decay Tests
+    // ========================================
+
+    #[test]
+    fn test_remap_table_4to2() {
+        let remap = codebook::remap_table(4, 2);
+        assert_eq!(remap.len(), 16); // 4-bit = 16 centroids
+
+        // Verify symmetry: remap[i] and remap[15-i] should be symmetric around center
+        for i in 0..8 {
+            assert_eq!(remap[i], 3 - remap[15 - i],
+                "Remap should be symmetric: [{}]={}, [{}]={}", i, remap[i], 15-i, remap[15-i]);
+        }
+
+        // First centroids (most negative) should map to 2-bit index 0 (most negative)
+        assert_eq!(remap[0], 0);
+        // Last centroids (most positive) should map to 2-bit index 3 (most positive)
+        assert_eq!(remap[15], 3);
+    }
+
+    #[test]
+    fn test_remap_table_4to3() {
+        let remap = codebook::remap_table(4, 3);
+        assert_eq!(remap.len(), 16);
+        // All remapped indices should be in [0, 7]
+        for &idx in &remap {
+            assert!(idx < 8, "3-bit index should be < 8, got {}", idx);
+        }
+    }
+
+    #[test]
+    fn test_split_off_front() {
+        let dim = 64;
+        let config = TurboQuantConfig::balanced();
+        let data = random_vectors(10, dim, 42);
+        let compressed = compress_keys(&data, dim, &config);
+
+        let mut cache = compressed.clone();
+        let front = cache.split_off_front(4);
+
+        assert_eq!(front.count, 4);
+        assert_eq!(cache.count, 6);
+        assert_eq!(front.bits, 4);
+        assert_eq!(cache.bits, 4);
+
+        // Decompress both halves and verify they match original
+        let d_front = decompress_keys(&front, &config);
+        let d_back = decompress_keys(&cache, &config);
+        let d_full = decompress_keys(&compressed, &config);
+
+        // front + back should equal full
+        let mut combined = d_front.clone();
+        combined.extend_from_slice(&d_back);
+        for (i, (a, b)) in combined.iter().zip(d_full.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-6,
+                "Split/merge mismatch at index {}: {} vs {}", i, a, b);
+        }
+    }
+
+    #[test]
+    fn test_remap_bits_4to2() {
+        let dim = 128;
+        let config = TurboQuantConfig::balanced(); // 4-bit
+        let data = random_vectors(8, dim, 42);
+        let compressed = compress_keys(&data, dim, &config);
+
+        let remapped = compressed.remap_bits(2);
+        assert_eq!(remapped.count, 8);
+        assert_eq!(remapped.bits, 2);
+        assert_eq!(remapped.dim, dim);
+
+        // Remapped should use less memory
+        assert!(remapped.memory_bytes() < compressed.memory_bytes(),
+            "2-bit should use less memory: {} vs {}", remapped.memory_bytes(), compressed.memory_bytes());
+
+        // Decompress and check quality — 4→2 remap will lose some quality
+        let d_4bit = decompress_keys(&compressed, &config);
+        let config_2bit = TurboQuantConfig::extreme();
+        let d_2bit = decompress_keys(&remapped, &config_2bit);
+
+        // Cosine similarity between 4-bit decompressed and 2-bit remapped
+        let dot: f32 = d_4bit.iter().zip(d_2bit.iter()).map(|(a, b)| a * b).sum();
+        let n_a: f32 = d_4bit.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let n_b: f32 = d_2bit.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos_sim = dot / (n_a * n_b + 1e-10);
+        assert!(cos_sim > 0.85,
+            "4→2 remap cos_sim should be > 0.85, got {:.4}", cos_sim);
+    }
+
+    #[test]
+    fn test_append_from() {
+        let dim = 64;
+        let config = TurboQuantConfig::extreme(); // 2-bit
+        let data1 = random_vectors(4, dim, 42);
+        let data2 = random_vectors(4, dim, 99);
+
+        let c1 = compress_keys(&data1, dim, &config);
+        let c2 = compress_keys(&data2, dim, &config);
+
+        let mut merged = c1.clone();
+        merged.append_from(&c2);
+        assert_eq!(merged.count, 8);
+
+        // Decompress merged should equal individual decompressions concatenated
+        let d1 = decompress_keys(&c1, &config);
+        let d2 = decompress_keys(&c2, &config);
+        let d_merged = decompress_keys(&merged, &config);
+
+        let mut expected = d1;
+        expected.extend_from_slice(&d2);
+        for (i, (a, b)) in expected.iter().zip(d_merged.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-6,
+                "append_from mismatch at {}: {} vs {}", i, a, b);
+        }
+    }
+
+    #[test]
+    fn test_decay_memory_savings() {
+        let dim = 128;
+        let config = TurboQuantConfig::balanced(); // 4-bit
+        let data = random_vectors(64, dim, 42);
+        let compressed = compress_keys(&data, dim, &config);
+
+        let mem_4bit = compressed.memory_bytes();
+        let remapped = compressed.remap_bits(2);
+        let mem_2bit = remapped.memory_bytes();
+
+        // 2-bit should use roughly half the index bytes of 4-bit
+        let savings_pct = (1.0 - mem_2bit as f32 / mem_4bit as f32) * 100.0;
+        assert!(savings_pct > 30.0,
+            "4→2 decay should save >30% memory, got {:.1}%", savings_pct);
     }
 }

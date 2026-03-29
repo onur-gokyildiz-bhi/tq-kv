@@ -376,4 +376,61 @@ mod tests {
             assert!(s.is_finite(), "Score should be finite, got {}", s);
         }
     }
+
+    #[test]
+    fn test_fused_vs_decompress_consistency() {
+        // Verify that fused attention scores match decompress-then-matmul path.
+        // Use same number of query and KV heads (no GQA) for simple comparison.
+        let config = TurboQuantConfig::balanced(); // 4-bit
+        let n_heads = 4;
+        let head_dim = 128;
+        let mut cache = TurboKvCache::new(2, n_heads, head_dim, config.clone());
+
+        // Fill with 16 tokens
+        let k = make_random_tensor(&[1, n_heads, 16, head_dim], 42);
+        let v = make_random_tensor(&[1, n_heads, 16, head_dim], 43);
+        let (all_k, _all_v) = cache.append(&k, &v).unwrap();
+
+        // Single query token
+        let q = make_random_tensor(&[1, n_heads, 1, head_dim], 50);
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Fused path: scores computed directly from compressed indices
+        let fused_scores = cache.fused_attention(&q, n_heads, scale).unwrap();
+        let fused_vec = fused_scores.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // Decompress path: Q @ K^T / sqrt(d)
+        let q_f32 = q.to_dtype(DType::F32).unwrap();
+        let k_f32 = all_k.to_dtype(DType::F32).unwrap();
+        let decomp_scores = (q_f32.matmul(&k_f32.t().unwrap()).unwrap()
+            / (head_dim as f64).sqrt()).unwrap();
+        let decomp_vec = decomp_scores.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        assert_eq!(fused_vec.len(), decomp_vec.len());
+
+        // Compute cosine similarity between fused and decompress score vectors
+        let dot: f32 = fused_vec.iter().zip(decomp_vec.iter()).map(|(a, b)| a * b).sum();
+        let n_a: f32 = fused_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let n_b: f32 = decomp_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos_sim = dot / (n_a * n_b + 1e-10);
+
+        // Fused path avoids inverse Hadamard, so should be very close
+        // Differences are only from f32 accumulation order
+        assert!(
+            cos_sim > 0.99,
+            "Fused vs decompress score cos_sim should be > 0.99, got {:.6}",
+            cos_sim,
+        );
+
+        // Also check individual score differences
+        let max_abs_diff: f32 = fused_vec.iter().zip(decomp_vec.iter())
+            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let max_score: f32 = decomp_vec.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let rel_max_diff = max_abs_diff / (max_score + 1e-10);
+        assert!(
+            rel_max_diff < 0.05,
+            "Fused vs decompress max relative diff should be < 5%, got {:.4}",
+            rel_max_diff,
+        );
+    }
 }
