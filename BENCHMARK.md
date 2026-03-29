@@ -196,6 +196,21 @@ Fused attention computes attention scores directly from compressed key indices v
 
 ---
 
+## Generation Throughput (v0.5.0+)
+
+> CPU (i9-13900K), release build, Q4_K_M models
+
+| Model | Tokens | Standard tok/s | TQ 4-bit tok/s | Delta | TTFT Std | TTFT TQ |
+|:------|:------:|:--------------:|:--------------:|:-----:|:--------:|:-------:|
+| Qwen 2.5 7B | 50 | 5.66 | 4.75 | -16% | 2.31s | 2.51s |
+| Qwen 2.5 7B | 200 | 6.55 | 6.04 | **-8%** | 2.22s | 2.32s |
+| Llama 3.1 8B | 200 | 4.20 | 3.47 | -17% | 2.69s | 2.75s |
+
+> TQ overhead decreases with longer generation (amortized compression cost).
+> At 200 tokens, Qwen gap is only 8%. Memory bandwidth savings offset compression cost.
+
+---
+
 ## Qwen2.5 72B — Real Model Validation
 
 > 80 layers, 8 KV heads (GQA-8), 64 query heads, head_dim=128, Q4_K_M
