@@ -360,12 +360,11 @@ pub fn compress_keys(
 
     for chunk in rotated.chunks_exact(dim) {
         let norm: f32 = chunk.iter().map(|x| x * x).sum::<f32>().sqrt();
-        norms.push(norm);
 
         if norm < 1e-10 {
+            norms.push(norm);
             all_indices.extend(std::iter::repeat(0u8).take(dim));
         } else {
-            // Adaptive sigma: actual std of this vector's coordinates
             let adaptive_sigma = norm / (dim as f32).sqrt();
             let cb = codebook::Codebook {
                 sigma: adaptive_sigma,
@@ -374,6 +373,14 @@ pub fn compress_keys(
             let indices: Vec<u8> = chunk.iter()
                 .map(|&v| cb.quantize(v))
                 .collect();
+
+            // Norm correction: adjust stored norm so ||decompress|| ≈ ||original||
+            let recon_norm: f32 = indices.iter()
+                .map(|&idx| { let v = cb.dequantize(idx); v * v })
+                .sum::<f32>().sqrt();
+            let corrected_norm = if recon_norm > 1e-10 { norm * norm / recon_norm } else { norm };
+            norms.push(corrected_norm);
+
             all_indices.extend_from_slice(&indices);
         }
     }
@@ -474,7 +481,7 @@ pub fn pre_rotate_query_with_signs(query: &[f32], signs: &[f32]) -> Vec<f32> {
 }
 
 /// Compress a single key vector. For incremental KV cache.
-/// Returns: (packed_indices, norm)
+/// Returns: (packed_indices, corrected_norm)
 pub fn compress_single_key(
     key: &[f32],
     dim: usize,
@@ -496,12 +503,29 @@ pub fn compress_single_key(
         rotated.iter().map(|&v| cb.quantize(v)).collect()
     };
 
+    // Norm correction (see compress_single_key_with_signs for explanation)
+    let corrected_norm = if norm > 1e-10 {
+        let sigma = norm / (dim as f32).sqrt();
+        let cb = codebook::Codebook { sigma, ..base_cb };
+        let recon_norm: f32 = indices.iter()
+            .map(|&idx| { let v = cb.dequantize(idx); v * v })
+            .sum::<f32>().sqrt();
+        if recon_norm > 1e-10 { norm * norm / recon_norm } else { norm }
+    } else {
+        norm
+    };
+
     let packed = codebook::pack_indices(&indices, config.bits);
-    (packed, norm)
+    (packed, corrected_norm)
 }
 
 /// Compress a single key vector with pre-computed signs.
 /// Saves signs allocation in the hot loop.
+///
+/// **Norm Correction** (from turboquant_plus): after quantization, the reconstruction's
+/// L2 norm differs from the original. We store a corrected norm such that
+/// `||decompress(compress(k))|| ≈ ||k||`. This is free at decode time because
+/// decompression already scales by `stored_norm / sqrt(d)`.
 pub fn compress_single_key_with_signs(
     key: &[f32],
     dim: usize,
@@ -524,8 +548,26 @@ pub fn compress_single_key_with_signs(
         rotated.iter().map(|&v| cb.quantize(v)).collect()
     };
 
+    // Norm correction: compute reconstruction norm from indices, then adjust stored norm
+    // so that decompress produces a vector with the ORIGINAL norm.
+    // Decompression scales each centroid by (stored_norm / sqrt(d)), so:
+    //   ||recon|| = stored_norm * sqrt(sum(centroid[idx_i]^2)) / sqrt(d)
+    // We want ||recon|| = norm, so:
+    //   corrected_norm = norm * norm / recon_norm_from_indices
+    let corrected_norm = if norm > 1e-10 {
+        let sigma = norm / (dim as f32).sqrt();
+        let cb = codebook::Codebook { sigma, ..base_cb };
+        let recon_norm_sq: f32 = indices.iter()
+            .map(|&idx| { let v = cb.dequantize(idx); v * v })
+            .sum();
+        let recon_norm = recon_norm_sq.sqrt();
+        if recon_norm > 1e-10 { norm * norm / recon_norm } else { norm }
+    } else {
+        norm
+    };
+
     let packed = codebook::pack_indices(&indices, config.bits);
-    (packed, norm)
+    (packed, corrected_norm)
 }
 
 /// Compute attention score between pre-rotated query and compressed key.

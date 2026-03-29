@@ -150,6 +150,59 @@ mod tests {
     }
 
     #[test]
+    fn test_gaussianity_after_rotation() {
+        // TheTom found: kurtosis 900.4 → 2.9 after rotation (Gaussian=3.0)
+        // Verify our rotation produces near-Gaussian coordinates
+        use rand::SeedableRng;
+        use rand::Rng;
+        use rand_chacha::ChaCha8Rng;
+
+        let dim = 128;
+        let n_vectors = 256;
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Generate non-Gaussian vectors (sparse, with outliers)
+        let mut raw_coords = Vec::new();
+        let mut rotated_coords = Vec::new();
+
+        for _ in 0..n_vectors {
+            let mut v: Vec<f32> = (0..dim).map(|_| {
+                // Mix of small values + rare outliers (non-Gaussian)
+                if rng.gen::<f32>() < 0.05 { rng.gen::<f32>() * 10.0 - 5.0 }
+                else { rng.gen::<f32>() * 0.2 - 0.1 }
+            }).collect();
+
+            raw_coords.extend_from_slice(&v);
+
+            randomized_hadamard(&mut v, 42);
+            rotated_coords.extend_from_slice(&v);
+        }
+
+        // Compute kurtosis: E[(x-mu)^4] / (E[(x-mu)^2])^2
+        let kurtosis = |data: &[f32]| -> f32 {
+            let n = data.len() as f32;
+            let mean = data.iter().sum::<f32>() / n;
+            let m2 = data.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
+            let m4 = data.iter().map(|&x| (x - mean).powi(4)).sum::<f32>() / n;
+            if m2 > 0.0 { m4 / (m2 * m2) } else { 0.0 }
+        };
+
+        let k_before = kurtosis(&raw_coords);
+        let k_after = kurtosis(&rotated_coords);
+
+        eprintln!("Gaussianity verification:");
+        eprintln!("  Before rotation: kurtosis = {:.1} (Gaussian=3.0)", k_before);
+        eprintln!("  After rotation:  kurtosis = {:.1} (Gaussian=3.0)", k_after);
+
+        // After rotation, kurtosis should be close to 3.0 (Gaussian)
+        assert!(k_after > 2.0 && k_after < 5.0,
+            "Post-rotation kurtosis {:.1} too far from Gaussian (3.0)", k_after);
+        // Before rotation should be non-Gaussian (outlier-heavy)
+        assert!(k_before > 5.0,
+            "Pre-rotation kurtosis {:.1} should be non-Gaussian", k_before);
+    }
+
+    #[test]
     fn test_wht_orthogonality() {
         // WHT preserves L2 norm (Parseval's theorem)
         let x = vec![1.0, 2.0, 3.0, 4.0];
