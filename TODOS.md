@@ -19,57 +19,73 @@
 - [x] Qwen 72B bug fix — attention Q/K/V bias + context_length from GGUF
 - [x] QJL long context test — error does NOT accumulate, QJL removal confirmed
 - [x] Project rename — turbo-quant → tq-kv
-- [x] Directory rename — turbo-quant/ → tq-kv/
 - [x] LICENSE-MIT + LICENSE-APACHE
 - [x] V1 API deprecated, internal modules #[doc(hidden)]
 - [x] README killer — PPL, NIAH, context scaling, C FFI, verified models
 - [x] Design doc approved — hybrid engine (candle + custom kernels)
-- [x] candle CUDA ops: RmsNorm, RoPE, softmax — upstream already in candle 0.9.2
-- [x] candle 0.9.2 dependency update — tested, working
-- [x] Metric audit — version + benchmark numbers aligned, BENCHMARK.md = single source
-- [x] fused_attention_scores() dedicated test + buffer reuse optimization
-- [x] Inline comments translated to English (5 source files)
+- [x] candle 0.9.2 dependency update
+- [x] Metric audit — BENCHMARK.md = single source
 - [x] TurboQuant comparison table (README section)
 - [x] tq-demo CLI — bundled NIAH test + compression stats
 - [x] HN post draft (docs/hn-launch.md)
-- [x] Qwen 72B RoPE fix — halved vs interleaved layout (root cause of long-context bug)
+- [x] Qwen 72B RoPE fix — halved vs interleaved layout
 - [x] TurboKvCache — generic drop-in replacement for candle KvCache
-- [x] GenericTurboModel — unified engine for ALL GGUF architectures (llama, qwen2, mistral, gemma, phi3)
-- [x] Qwen 72B 4-bit validated: 150 token coherent output (CPU + GPU)
-- [x] Qwen2.5 7B GPU validated: correct output on CUDA RTX 3080
+- [x] GenericTurboModel — unified engine for ALL GGUF architectures
 - [x] Selective layer compression — first N layers uncompressed for deep models
 - [x] f32 softmax fix — prevents precision loss at long context
 
-## Open — Phase 2: Performance (This Week)
+### v0.5.0 Sprint (Mar 28-29, 2026)
+- [x] 3-Fix Framework — sink tokens + POQ + cache reset (GGUF compound error fix)
+- [x] SRHT QJL — O(d²) → O(d log d), 115x speedup, +4.5 dB SNR
+- [x] Adaptive QJL — QjlMode::Off/On/Adaptive{threshold}, context-aware
+- [x] Norm Correction — ||decompress|| matches ||original||, zero decode cost
+- [x] Gaussianity Verification — kurtosis 35.3 → 3.3 (confirms Lloyd-Max assumptions)
+- [x] Dead code cleanup — -1,198 LOC, turbo_llama/turbo_qwen2 removed
+- [x] Attention KL divergence test — SRHT QJL 2.9x better at all context lengths
+- [x] crates.io v0.5.0 published
+- [x] Paper draft — "TurboQuant on Quantized Models" (docs/arxiv/)
+- [x] HN + X launch content (docs/hn-launch.md, docs/x-launch-tweets.md)
 
-- [ ] llama.cpp Q4_K_M baseline — record tok/s on same hardware (RTX 3080, Qwen 7B)
-- [ ] Q4_K_M AVX2 SIMD matmul kernel — close the gap to llama.cpp
+## Open — Immediate (This Sprint)
+
+- [ ] Sparse V — skip V dequant when softmax < 1e-6 (+22.8% decode, TheTom technique)
+- [ ] Fused path fix — numerik stabilite, decompress path ile tutarlı
+- [ ] Real-model PPL benchmark — Qwen 2.5 7B Q4_K_M, 4K/8K/16K context
+- [ ] arXiv submission — LaTeX compile + upload
+- [ ] HN Show post — submit docs/hn-launch.md
+- [ ] X thread launch — docs/x-launch-tweets.md + twitter-visuals.html
+
+## Open — Performance (Next Sprint)
+
+- [ ] llama.cpp Q4_K_M baseline — record tok/s on same hardware (RTX 3080)
 - [ ] Benchmark: target within 3x of llama.cpp on short context (≤4K)
 - [ ] Benchmark: FASTER than llama.cpp on 16K+ context (TQ advantage)
-- [ ] Blog: technical deep-dive (SIMD performance story)
-- [ ] "v2 update" HN/Reddit post with performance results
+- [ ] K/V Asymmetric compression — values 8-bit, keys 4-bit (2x extra savings)
+- [ ] Per-channel key scaling — SmoothQuant-style, reduce compound error further
+- [ ] tok/s, TTFT, memory profiling benchmarks
 
-## Open — Phase 3: Developer Experience (Week 3-4)
+## Open — Developer Experience
 
 - [ ] `.with_turbo_quant(bits)` API — builder pattern on candle models
 - [ ] Auto quality gate — if PPL > +2% threshold, auto-promote to next bit width
-- [ ] tok/s, TTFT, memory profiling benchmarks
+- [ ] GitHub Actions CI/CD
 
-## Open — Launch
+## Open — Launch & Community
 
-- [ ] HN post (docs/hn-launch.md ready — submit when timing is right)
 - [ ] Reddit posts: r/rust + r/LocalLLaMA
 - [ ] candle-examples PR (TurboQuant KV cache example)
+- [ ] Blog: technical deep-dive (SIMD performance story)
 
 ## Future / Exploratory
 
-- [ ] GitHub Actions CI/CD
-- [ ] Web playground demo (after CLI demo validates UX)
-- [ ] Claude Code local integration — TQ as MCP tool or local inference helper
+- [ ] Temporal decay — older tokens compressed more aggressively (TheTom: 30-34% savings)
+- [ ] Layer-adaptive bitwidth — early layers 2-bit, late layers 4-bit
+- [ ] Calibrated codebook — Lloyd-Max from Q4 model activations (not assumed Gaussian)
+- [ ] Learned rotation — SpinQuant-style (up to 45% better than random Hadamard)
+- [ ] Softmax bias correction — Bondarenko (arXiv:2309.01729) pre-compensation
+- [ ] Flash Attention tiling for fused TQ attention
 - [ ] Metal shader (Apple Silicon) — deferred, needs Apple hardware
 - [ ] PyO3 Python binding — deferred, no demand evidence yet
-- [ ] Re-evaluate QJL as default — SRHT brings overhead to 2x (was 29x), +4.5 dB SNR. Consider enabling by default at 2-bit.
-- [ ] Adaptive QJL — context-length-based threshold
-- [ ] Layer-adaptive bitwidth — early layers 2-bit, late layers 4-bit
-- [ ] Flash Attention tiling for fused TQ attention
 - [ ] Qwen3.5 architecture support (GGUF arch = "qwen35", needs testing)
+- [ ] Web playground demo
+- [ ] Claude Code local integration — TQ as MCP tool
