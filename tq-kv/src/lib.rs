@@ -1103,6 +1103,39 @@ unsafe fn sparse_v_accumulate_avx2(output: &mut [f32], v_row: &[f32], weight: f3
     }
 }
 
+/// Softmax bias correction (Bondarenko, arXiv:2309.01729).
+///
+/// Quantization introduces systematic bias in attention scores: `<q, k_quant> ≠ <q, k_orig>`.
+/// The expected bias per key position is estimated from the quantization error variance:
+///   `bias[i] ≈ -0.5 * d * sigma_err^2 / sigma_score`
+/// where `sigma_err` depends on bit width and `sigma_score` depends on head_dim.
+///
+/// Subtracting this bias before softmax partially compensates the quantization-induced
+/// attention drift. Most effective at 2-bit where error variance is highest.
+///
+/// Returns per-position bias corrections (one per cached key).
+pub fn softmax_bias_correction(
+    compressed: &CompressedKeys,
+    head_dim: usize,
+) -> Vec<f32> {
+    // Quantization MSE per centroid level (empirical from Lloyd-Max N(0,1))
+    let mse_per_dim = match compressed.bits {
+        2 => 0.1175f32,  // 4 centroids — highest error
+        3 => 0.0344f32,  // 8 centroids
+        4 => 0.0094f32,  // 16 centroids — lowest error
+        _ => 0.0094f32,
+    };
+
+    // Bias correction: for each key, the expected score shift from quantization
+    // is proportional to the key's norm and the per-dimension MSE.
+    // bias ≈ -0.5 * (dim * mse_per_dim * norm^2 / dim) = -0.5 * mse_per_dim * norm^2
+    // Scaled by 1/sqrt(d) for attention scale consistency.
+    let scale = 0.5 * mse_per_dim / (head_dim as f32).sqrt();
+    compressed.norms.iter().map(|&norm| {
+        -scale * norm * norm / (head_dim as f32)
+    }).collect()
+}
+
 /// Statistics from a sparse V multiply: how many positions were active vs skipped.
 pub struct SparseVStats {
     /// Total sequence positions

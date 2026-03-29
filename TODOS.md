@@ -81,13 +81,13 @@
 
 ## Future / Exploratory
 
-- [ ] Layer-adaptive bitwidth — early layers 2-bit, late layers 4-bit
+- [x] Layer-adaptive bitwidth — TQ_LAYER_BITS="4-15:2,16-27:4" per-layer bit width
 - [ ] Calibrated codebook — Lloyd-Max from Q4 model activations (not assumed Gaussian)
 - [ ] Learned rotation — SpinQuant-style (up to 45% better than random Hadamard)
-- [ ] Softmax bias correction — Bondarenko (arXiv:2309.01729) pre-compensation
+- [x] Softmax bias correction — Bondarenko pre-compensation (TQ_BIAS_CORRECT=1)
 - [ ] Flash Attention tiling for fused TQ attention
 - [ ] Metal shader (Apple Silicon) — deferred, needs Apple hardware
 - [ ] PyO3 Python binding — deferred, no demand evidence yet
-- [ ] Qwen3.5 architecture support (GGUF arch = "qwen35", needs testing)
+- [x] Qwen3.5 architecture support — catalog entry qwen3:9b, auto-detected
 - [ ] Web playground demo
 - [ ] Claude Code local integration — TQ as MCP tool

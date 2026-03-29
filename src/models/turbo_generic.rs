@@ -374,6 +374,39 @@ fn get_skip_layers() -> usize {
         .unwrap_or(TQ_SKIP_FIRST_LAYERS)
 }
 
+/// Layer-adaptive bitwidth: assign different bit widths to different layer ranges.
+/// Format: "start-end:bits[,start-end:bits]" e.g. "4-15:2,16-27:4"
+/// Unspecified layers use the default TQ bits. Layers below TQ_SKIP are uncompressed.
+/// Override with TQ_LAYER_BITS env var.
+fn get_layer_bits(layer_idx: usize, default_bits: u8) -> Option<u8> {
+    let skip = get_skip_layers();
+    if layer_idx < skip {
+        return None; // uncompressed
+    }
+
+    if let Ok(val) = std::env::var("TQ_LAYER_BITS") {
+        for part in val.split(',') {
+            let parts: Vec<&str> = part.trim().split(':').collect();
+            if parts.len() == 2 {
+                let range_parts: Vec<&str> = parts[0].split('-').collect();
+                if range_parts.len() == 2 {
+                    if let (Ok(start), Ok(end), Ok(bits)) = (
+                        range_parts[0].parse::<usize>(),
+                        range_parts[1].parse::<usize>(),
+                        parts[1].parse::<u8>(),
+                    ) {
+                        if layer_idx >= start && layer_idx <= end {
+                            return Some(bits);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(default_bits)
+}
+
 /// Sparse V threshold. Softmax weights below this are skipped in V multiply.
 /// Set TQ_SPARSE_V=0 to disable. Default: 1e-6.
 /// Override with TQ_SPARSE_V env var (e.g. TQ_SPARSE_V=1e-5).
@@ -391,6 +424,15 @@ fn get_sparse_v_threshold() -> f32 {
 /// Set TQ_FUSED=1 to enable. Default: off (decompress path).
 fn get_use_fused() -> bool {
     std::env::var("TQ_FUSED")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Softmax bias correction: pre-compensate quantization-induced attention drift.
+/// Set TQ_BIAS_CORRECT=1 to enable. Default: off.
+fn get_bias_correction() -> bool {
+    std::env::var("TQ_BIAS_CORRECT")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -538,10 +580,18 @@ impl LayerWeights {
 
         // Selective compression: first TQ_SKIP_FIRST_LAYERS use standard fp16 KV cache,
         // remaining layers use TurboQuant compression.
-        let use_compression = self.layer_idx >= get_skip_layers();
+        let layer_bits = get_layer_bits(self.layer_idx, self.tq_config.bits);
+        let use_compression = layer_bits.is_some();
         let n_rep = self.n_head / self.n_kv_head;
 
         if use_compression {
+            // Apply per-layer bit width if different from default
+            let effective_bits = layer_bits.unwrap();
+            let layer_tq_config = if effective_bits != self.tq_config.bits {
+                tq_kv::TurboQuantConfig { bits: effective_bits, ..self.tq_config.clone() }
+            } else {
+                self.tq_config.clone()
+            };
             // COMPRESSED PATH: TurboQuant KV cache with 3-fix quality enhancement
             //
             // Three paper-backed techniques to handle compound error (W4+KV4):
@@ -564,7 +614,7 @@ impl LayerWeights {
                 let mut k_per_head = Vec::with_capacity(self.n_kv_head);
                 for _ in 0..self.n_kv_head {
                     k_per_head.push(tq_kv::CompressedKeys::new_empty(
-                        self.tq_config.bits, self.padded_head_dim, self.tq_config.rotation_seed,
+                        effective_bits, self.padded_head_dim, layer_tq_config.rotation_seed,
                     ));
                 }
                 let (v_raw, v_compressed) = if vbits == 0 {
@@ -664,12 +714,12 @@ impl LayerWeights {
                             let mut padded = vec![0.0f32; self.padded_head_dim];
                             padded[..hdim].copy_from_slice(key_vec);
                             let (packed, norm) = tq_kv::compress_single_key_with_signs(
-                                &padded, self.padded_head_dim, &self.tq_config, &self.signs,
+                                &padded, self.padded_head_dim, &layer_tq_config, &self.signs,
                             );
                             cache.k_per_head[h].append_raw(&packed, norm);
                         } else {
                             let (packed, norm) = tq_kv::compress_single_key_with_signs(
-                                key_vec, hdim, &self.tq_config, &self.signs,
+                                key_vec, hdim, &layer_tq_config, &self.signs,
                             );
                             cache.k_per_head[h].append_raw(&packed, norm);
                         }
@@ -704,7 +754,7 @@ impl LayerWeights {
                                     let mut cold = Vec::with_capacity(self.n_kv_head);
                                     for _ in 0..self.n_kv_head {
                                         cold.push(tq_kv::CompressedKeys::new_empty(
-                                            tier.bits, self.padded_head_dim, self.tq_config.rotation_seed,
+                                            tier.bits, self.padded_head_dim, layer_tq_config.rotation_seed,
                                         ));
                                     }
                                     cache.k_cold = Some(cold);
@@ -785,7 +835,7 @@ impl LayerWeights {
 
                             // Segment 3: Hot compressed keys (excluding last = current)
                             if n_past_compressed > 0 {
-                                let hot_cb = tq_kv::codebook::get_centroids(self.tq_config.bits);
+                                let hot_cb = tq_kv::codebook::get_centroids(effective_bits);
                                 let hot = &cache.k_per_head[kv_h];
                                 let dim = hot.dim;
                                 let bpv = hot.bytes_per_vector();
@@ -845,7 +895,7 @@ impl LayerWeights {
                         if cold[0].count > 0 {
                             let k_cold = decompress_compressed_keys(
                                 cold, self.n_kv_head,
-                                self.padded_head_dim, DType::F32, q.device(), &self.tq_config,
+                                self.padded_head_dim, DType::F32, q.device(), &layer_tq_config,
                             )?;
                             let k_cold = if self.padded_head_dim > self.head_dim {
                                 k_cold.narrow(3, 0, self.head_dim)?
@@ -860,7 +910,7 @@ impl LayerWeights {
                     if n_past_compressed > 0 {
                         let k_decomp = decompress_compressed_keys(
                             &cache.k_per_head, self.n_kv_head,
-                            self.padded_head_dim, DType::F32, q.device(), &self.tq_config,
+                            self.padded_head_dim, DType::F32, q.device(), &layer_tq_config,
                         )?;
                         let k_decomp = if self.padded_head_dim > self.head_dim {
                             k_decomp.narrow(3, 0, self.head_dim)?
@@ -884,7 +934,25 @@ impl LayerWeights {
                     };
 
                     let k_full = repeat_kv(k_full, n_rep)?;
-                    let att = (q_f32.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+                    let mut att = (q_f32.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+
+                    // Softmax bias correction: compensate quantization-induced attention drift
+                    if get_bias_correction() && n_past_compressed > 0 {
+                        let bias = tq_kv::softmax_bias_correction(
+                            &cache.k_per_head[0], self.head_dim,
+                        );
+                        // Build full bias vector: [sink=0, cold=0, hot_bias, current=0]
+                        let mut full_bias = vec![0.0f32; total_len];
+                        let hot_start = cache.sink_len + cache.cold_len;
+                        for (i, &b) in bias.iter().take(n_past_compressed).enumerate() {
+                            full_bias[hot_start + i] = b;
+                        }
+                        let bias_tensor = Tensor::from_vec(
+                            full_bias, (1, 1, 1, total_len), q.device(),
+                        )?;
+                        att = att.broadcast_add(&bias_tensor)?;
+                    }
+
                     softmax_last_dim(&att)?
                 };
 

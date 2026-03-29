@@ -69,6 +69,16 @@ pub const CATALOG: &[CatalogEntry] = &[
         size_gb: 5.4,
         arch: "gemma2",
     },
+    CatalogEntry {
+        name: "qwen3",
+        tag: "9b",
+        display: "Qwen3.5 9B",
+        hf_repo: "unsloth/Qwen3.5-9B-GGUF",
+        filename: "Qwen3.5-9B.Q4_K_M.gguf",
+        tokenizer_repo: "Qwen/Qwen3.5-9B",
+        size_gb: 5.5,
+        arch: "qwen3",
+    },
 ];
 
 /// Find catalog entry by "name:tag" or just "name" (defaults to smallest tag).
