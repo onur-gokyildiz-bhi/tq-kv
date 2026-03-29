@@ -47,47 +47,56 @@
 - [x] HN + X launch content (docs/hn-launch.md, docs/x-launch-tweets.md)
 
 ### Post-v0.5.0 Sprint (Mar 29, 2026)
-- [x] Sparse V — skip V rows when softmax < threshold (TQ_SPARSE_V, AVX2 SIMD, 3 tests)
-- [x] K/V Asymmetric — values 8-bit absmax, keys 4-bit (TQ_VBITS=8, ~1.9x V savings, 4 tests)
-- [x] Temporal Decay — older tokens demoted to 2-bit via index remap (TQ_DECAY=512:2, >30% savings, 6 tests)
-- [x] Fused attention path — TQ_FUSED=1, scores from compressed indices (no decompress), rayon parallel, sink/cold/hot/current segments, cos_sim > 0.99 vs decompress (1 test)
+- [x] Sparse V — skip V rows when softmax < threshold (TQ_SPARSE_V, AVX2 SIMD)
+- [x] K/V Asymmetric — values 8-bit absmax, keys 4-bit (TQ_VBITS=8, ~1.9x V savings)
+- [x] Temporal Decay — older tokens demoted to 2-bit via index remap (TQ_DECAY=512:2)
+- [x] Fused attention path — TQ_FUSED=1, scores from compressed indices
+- [x] Multi-turn chat bug fix — build_prompt() replaces extract_prompts()
+- [x] Sink token shape mismatch fix — POQ current key only when n_compressed > 0
+- [x] README + BENCHMARK + version bump (tq-engine 0.4.0)
+- [x] PPL benchmark — Qwen 2.5 7B Q4_K_M (baseline 5.088, 4-bit 6.042 +18.7%)
+- [x] CUDA throughput — Qwen 28.2 tok/s, Llama 19.2 tok/s
+- [x] --tq-only bench flag
+- [x] Per-channel key scaling — SmoothQuant-style (calibrate_channel_scales)
+- [x] Engine::builder() API — .with_turbo_quant(bits), .with_quality_gate()
+- [x] Auto quality gate — QualityGate monitors running PPL during generation
+- [x] Layer-adaptive bitwidth — TQ_LAYER_BITS per-layer bit width ranges
+- [x] Softmax bias correction — Bondarenko pre-compensation (TQ_BIAS_CORRECT=1)
+- [x] Qwen3.5 9B support — catalog entry qwen3:9b
 
-## Open — Immediate
+## Open — Next Sprint: Safetensors/FP16 Support
 
-- [ ] Real-model PPL benchmark — Qwen 2.5 7B Q4_K_M, 4K/8K/16K context
+> Goal: tq-kv works on FP16 models, not just GGUF. Eliminates compound error,
+> enables fair comparison with RotorQuant/Alican/TheTom, opens HF ecosystem.
+
+- [ ] Safetensors model loader — candle safetensors reader for FP16/BF16 models
+- [ ] FP16 TurboModel — GenericTurboModel variant using FP16 weights (no QMatMul)
+- [ ] FP16 PPL benchmark — Qwen 2.5 7B FP16 vs TQ 4-bit (expect PPL <+1%)
+- [ ] HuggingFace model hub integration — load by repo name (e.g. "Qwen/Qwen2.5-7B")
+
+## Open — Launch (en son)
+
 - [ ] arXiv submission — LaTeX compile + upload
 - [ ] HN Show post — submit docs/hn-launch.md
 - [ ] X thread launch — docs/x-launch-tweets.md + twitter-visuals.html
-
-## Open — Performance
-
-- [ ] llama.cpp Q4_K_M baseline — record tok/s on same hardware (RTX 3080)
-- [ ] Benchmark: target within 3x of llama.cpp on short context (≤4K)
-- [ ] Benchmark: FASTER than llama.cpp on 16K+ context (TQ advantage)
-- [x] Per-channel key scaling — SmoothQuant-style (calibrate_channel_scales, applied before Hadamard)
-- [ ] tok/s, TTFT, memory profiling benchmarks
-
-## Open — Developer Experience
-
-- [x] `.with_turbo_quant(bits)` API — Engine::builder() + TurboQuantConfig builder methods
-- [x] Auto quality gate — QualityGate monitors running PPL, warns if threshold exceeded
-- [ ] GitHub Actions CI/CD
-
-## Open — Launch & Community
-
 - [ ] Reddit posts: r/rust + r/LocalLLaMA
 - [ ] candle-examples PR (TurboQuant KV cache example)
 - [ ] Blog: technical deep-dive (SIMD performance story)
 
+## Open — Performance
+
+- [ ] llama.cpp Q4_K_M baseline — record tok/s on same hardware
+- [ ] Benchmark: target within 3x of llama.cpp on short context (≤4K)
+- [ ] Benchmark: FASTER than llama.cpp on 16K+ context (TQ advantage)
+- [ ] tok/s, TTFT, memory profiling benchmarks
+- [ ] GitHub Actions CI/CD
+
 ## Future / Exploratory
 
-- [x] Layer-adaptive bitwidth — TQ_LAYER_BITS="4-15:2,16-27:4" per-layer bit width
-- [ ] Calibrated codebook — Lloyd-Max from Q4 model activations (not assumed Gaussian)
+- [ ] Calibrated codebook — Lloyd-Max from model activations (not assumed Gaussian)
 - [ ] Learned rotation — SpinQuant-style (up to 45% better than random Hadamard)
-- [x] Softmax bias correction — Bondarenko pre-compensation (TQ_BIAS_CORRECT=1)
 - [ ] Flash Attention tiling for fused TQ attention
 - [ ] Metal shader (Apple Silicon) — deferred, needs Apple hardware
 - [ ] PyO3 Python binding — deferred, no demand evidence yet
-- [x] Qwen3.5 architecture support — catalog entry qwen3:9b, auto-detected
 - [ ] Web playground demo
 - [ ] Claude Code local integration — TQ as MCP tool
