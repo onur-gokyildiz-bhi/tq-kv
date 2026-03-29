@@ -47,7 +47,7 @@ impl Module for RmsNorm {
         let variance = x.sqr()?.mean_keepdim(x.rank() - 1)?;
         let rms = (variance + self.eps)?.sqrt()?;
         let normalized = x.broadcast_div(&rms)?;
-        normalized.broadcast_mul(&self.weight)?.to_dtype(x_dtype)
+        normalized.broadcast_mul(&self.weight.to_dtype(DType::F32)?)?.to_dtype(x_dtype)
     }
 }
 
@@ -1449,11 +1449,17 @@ impl GenericTurboModel {
         }
         eprintln!("  Loaded {} tensors from {} safetensors file(s)", tensors.len(), entries.len());
 
-        // Helper to get a tensor by name
+        // Helper to get a tensor by name, casting BF16→F32 for CPU compat
         let get = |name: &str| -> Result<Tensor> {
-            tensors.get(name)
+            let t = tensors.get(name)
                 .cloned()
-                .ok_or_else(|| candle_core::Error::Msg(format!("Missing tensor: {name}")))
+                .ok_or_else(|| candle_core::Error::Msg(format!("Missing tensor: {name}")))?;
+            // BF16 has no CPU matmul — cast to F16 (CUDA) or F32 (CPU)
+            if t.dtype() == DType::BF16 && device.is_cpu() {
+                t.to_dtype(DType::F32)
+            } else {
+                Ok(t)
+            }
         };
 
         // 3. Pre-compute shared state
@@ -1491,9 +1497,9 @@ impl GenericTurboModel {
             };
 
             // Biases (optional — Qwen2 has them)
-            let bq = tensors.get(&format!("{p}.self_attn.q_proj.bias")).cloned();
-            let bk = tensors.get(&format!("{p}.self_attn.k_proj.bias")).cloned();
-            let bv = tensors.get(&format!("{p}.self_attn.v_proj.bias")).cloned();
+            let bq = get(&format!("{p}.self_attn.q_proj.bias")).ok();
+            let bk = get(&format!("{p}.self_attn.k_proj.bias")).ok();
+            let bv = get(&format!("{p}.self_attn.v_proj.bias")).ok();
 
             // MLP
             let mlp_or_moe = if let Ok(gate) = get(&format!("{p}.mlp.gate_proj.weight")) {
@@ -1520,10 +1526,10 @@ impl GenericTurboModel {
             let ffn_norm = RmsNorm { weight: ffn_norm_w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") };
 
             // Post norms (Gemma2)
-            let post_attn_norm = tensors.get(&format!("{p}.post_attention_layernorm_2.weight"))
-                .map(|w| RmsNorm { weight: w.clone(), eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") });
-            let post_ffn_norm = tensors.get(&format!("{p}.post_feedforward_layernorm.weight"))
-                .map(|w| RmsNorm { weight: w.clone(), eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") });
+            let post_attn_norm = get(&format!("{p}.post_attention_layernorm_2.weight")).ok()
+                .map(|w| RmsNorm { weight: w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") });
+            let post_ffn_norm = get(&format!("{p}.post_feedforward_layernorm.weight")).ok()
+                .map(|w| RmsNorm { weight: w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") });
 
             layers.push(LayerWeights {
                 qkv,

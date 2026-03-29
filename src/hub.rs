@@ -296,13 +296,23 @@ pub fn resolve(query: &str) -> Result<(PathBuf, Option<PathBuf>)> {
         return Ok((meta.gguf_path, meta.tokenizer_path));
     }
 
+    // Try as HuggingFace repo name (e.g. "Qwen/Qwen2.5-7B-Instruct")
+    if query.contains('/') {
+        eprintln!("Resolving HuggingFace repo: {}", query);
+        let safetensors_dir = resolve_hf_safetensors(query)?;
+        // Return directory path — engine will detect safetensors format
+        let tok = safetensors_dir.join("tokenizer.json");
+        let tok_path = if tok.exists() { Some(tok) } else { None };
+        return Ok((safetensors_dir, tok_path));
+    }
+
     bail!(
         "Unknown model: '{}'\n\
          \n\
          Available models (use `tq list --available` or `tq pull <name>`):\n\
          {}\n\
          \n\
-         Or pass a path to a GGUF file directly.",
+         Or pass a GGUF file path, model dir, or HF repo name (e.g. Qwen/Qwen2.5-7B).",
         query,
         catalog::list_available()
             .iter()
@@ -310,4 +320,90 @@ pub fn resolve(query: &str) -> Result<(PathBuf, Option<PathBuf>)> {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// Download safetensors model from HuggingFace hub.
+///
+/// Downloads config.json, tokenizer.json, and all model*.safetensors files.
+/// Returns the local directory containing all files.
+pub fn resolve_hf_safetensors(repo_name: &str) -> Result<PathBuf> {
+    let api = make_api()?;
+    let repo = api.model(repo_name.to_string());
+
+    // Download config.json (required)
+    let config_path = repo.get("config.json")
+        .with_context(|| format!("Cannot download config.json from {}", repo_name))?;
+    let model_dir = config_path.parent()
+        .ok_or_else(|| anyhow::anyhow!("Invalid config.json path"))?
+        .to_path_buf();
+
+    eprintln!("  Config: {}", config_path.display());
+
+    // Download tokenizer.json (optional)
+    match repo.get("tokenizer.json") {
+        Ok(p) => eprintln!("  Tokenizer: {}", p.display()),
+        Err(_) => eprintln!("  Warning: no tokenizer.json found"),
+    }
+
+    // Find and download safetensors files
+    // HF hub API: list repo files, filter *.safetensors
+    let info = api.model(repo_name.to_string());
+
+    // Try common single-file pattern first
+    let single = repo.get("model.safetensors");
+    if single.is_ok() {
+        eprintln!("  Model: model.safetensors");
+        return Ok(model_dir);
+    }
+
+    // Try sharded pattern: model-00001-of-NNNNN.safetensors
+    let mut found = false;
+    for i in 1..=100 {
+        let name = format!("model-{:05}-of-", i);
+        // We don't know the total, so just try to get the index file first
+        let idx_file = format!("model.safetensors.index.json");
+        if !found {
+            if let Ok(idx_path) = repo.get(&idx_file) {
+                eprintln!("  Index: {}", idx_path.display());
+                // Read index to find all shard files
+                if let Ok(idx_str) = std::fs::read_to_string(&idx_path) {
+                    if let Ok(idx_json) = serde_json::from_str::<serde_json::Value>(&idx_str) {
+                        if let Some(map) = idx_json.get("weight_map").and_then(|m| m.as_object()) {
+                            let mut shard_files: Vec<String> = map.values()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                            shard_files.sort();
+                            shard_files.dedup();
+                            eprintln!("  Downloading {} shard(s)...", shard_files.len());
+                            for shard in &shard_files {
+                                let pb = ProgressBar::new_spinner();
+                                pb.set_style(
+                                    ProgressStyle::default_spinner()
+                                        .template("{spinner:.green} {msg}")
+                                        .unwrap(),
+                                );
+                                pb.set_message(format!("  {}", shard));
+                                pb.enable_steady_tick(std::time::Duration::from_millis(100));
+                                repo.get(shard)
+                                    .with_context(|| format!("Failed to download {}", shard))?;
+                                pb.finish_with_message(format!("  {} ✓", shard));
+                            }
+                            found = true;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if !found {
+        bail!(
+            "No safetensors files found in {}. \
+             The repo may not contain safetensors format weights.",
+            repo_name
+        );
+    }
+
+    Ok(model_dir)
 }
