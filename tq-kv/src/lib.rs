@@ -110,6 +110,11 @@ pub struct TurboQuantConfig {
     /// to equalize outlier magnitudes across channels. `None` = disabled.
     /// Length must equal head_dim. Use `calibrate_channel_scales()` to compute from data.
     pub channel_scales: Option<Vec<f32>>,
+    /// Group size for per-group quantization. Each group of `group_size` dimensions gets
+    /// its own scale (sigma), giving finer-grained adaptation than per-vector sigma.
+    /// 0 = per-vector sigma (legacy, single norm). Default: 32.
+    /// Supported: 0, 32, 64, 128. Smaller = better quality, slightly more storage.
+    pub group_size: usize,
 
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
@@ -128,6 +133,7 @@ impl Default for TurboQuantConfig {
             sparse_v_threshold: 1e-6,
             value_bits: 0,
             channel_scales: None,
+            group_size: 32,
         }
     }
 }
@@ -292,7 +298,9 @@ pub fn decompress_vectors(compressed: &CompressedVectors) -> Vec<f32> {
 pub struct CompressedKeys {
     /// Packed quantized indices (bit-packed)
     pub packed_indices: Vec<u8>,
-    /// Per-vector norms (for QJL correction)
+    /// Per-vector or per-group norms. Layout:
+    /// - group_size=0: one f32 per vector (legacy per-vector sigma)
+    /// - group_size>0: `dim/group_size` f32 per vector (per-group sigma)
     pub norms: Vec<f32>,
     /// QJL corrections (optional)
     pub qjl_corrections: Option<Vec<qjl::QjlCorrection>>,
@@ -304,11 +312,18 @@ pub struct CompressedKeys {
     pub count: usize,
     /// Rotation seed
     pub rotation_seed: u64,
+    /// Group size for per-group quantization (0 = per-vector legacy)
+    pub group_size: usize,
 }
 
 impl CompressedKeys {
     /// Create empty compressed keys (for incremental append).
     pub fn new_empty(bits: u8, dim: usize, rotation_seed: u64) -> Self {
+        Self::new_empty_grouped(bits, dim, rotation_seed, 0)
+    }
+
+    /// Create empty compressed keys with group quantization.
+    pub fn new_empty_grouped(bits: u8, dim: usize, rotation_seed: u64, group_size: usize) -> Self {
         Self {
             packed_indices: Vec::new(),
             norms: Vec::new(),
@@ -317,16 +332,27 @@ impl CompressedKeys {
             dim,
             count: 0,
             rotation_seed,
+            group_size,
         }
     }
 
-    /// Append a single compressed key to the cache.
-    /// `packed`: pack_indices output (for a single vector)
-    /// `norm`: L2 norm of the vector (in rotated domain)
+    /// Append a single compressed key to the cache (legacy per-vector norm).
     pub fn append_raw(&mut self, packed: &[u8], norm: f32) {
         self.packed_indices.extend_from_slice(packed);
         self.norms.push(norm);
         self.count += 1;
+    }
+
+    /// Append a single compressed key with per-group norms.
+    pub fn append_raw_grouped(&mut self, packed: &[u8], group_norms: &[f32]) {
+        self.packed_indices.extend_from_slice(packed);
+        self.norms.extend_from_slice(group_norms);
+        self.count += 1;
+    }
+
+    /// Number of norms stored per vector.
+    pub fn norms_per_vector(&self) -> usize {
+        if self.group_size == 0 { 1 } else { self.dim / self.group_size }
     }
 
     /// Number of bytes per vector in packed format.
@@ -371,18 +397,22 @@ impl CompressedKeys {
         let bpv = self.bytes_per_vector();
         let byte_split = n * bpv;
 
+        let npv = self.norms_per_vector();
+        let norm_split = n * npv;
+
         let front = CompressedKeys {
             packed_indices: self.packed_indices[..byte_split].to_vec(),
-            norms: self.norms[..n].to_vec(),
-            qjl_corrections: None, // QJL corrections are dropped during decay
+            norms: self.norms[..norm_split].to_vec(),
+            qjl_corrections: None,
             bits: self.bits,
             dim: self.dim,
             count: n,
             rotation_seed: self.rotation_seed,
+            group_size: self.group_size,
         };
 
         self.packed_indices = self.packed_indices[byte_split..].to_vec();
-        self.norms = self.norms[n..].to_vec();
+        self.norms = self.norms[norm_split..].to_vec();
         self.qjl_corrections = None;
         self.count -= n;
 
@@ -417,6 +447,7 @@ impl CompressedKeys {
             dim: self.dim,
             count: self.count,
             rotation_seed: self.rotation_seed,
+            group_size: self.group_size,
         }
     }
 
@@ -672,6 +703,7 @@ pub fn compress_keys(
         dim,
         count,
         rotation_seed: config.rotation_seed,
+        group_size: 0, // batch compress_keys uses per-vector sigma (legacy)
     }
 }
 
@@ -845,6 +877,118 @@ pub fn compress_single_key_with_signs(
 
     let packed = codebook::pack_indices(&indices, config.bits);
     (packed, corrected_norm)
+}
+
+/// Compress a single key with per-group quantization.
+///
+/// Instead of one sigma for the entire vector, each group of `group_size` dimensions
+/// gets its own sigma = group_norm / sqrt(group_size). This captures within-vector
+/// magnitude variation that per-vector sigma misses.
+///
+/// Returns: (packed_indices, group_norms) where group_norms has `dim/group_size` entries.
+pub fn compress_single_key_grouped(
+    key: &[f32],
+    dim: usize,
+    config: &TurboQuantConfig,
+    signs: &[f32],
+) -> (Vec<u8>, Vec<f32>) {
+    assert_eq!(key.len(), dim);
+    let gs = config.group_size;
+    assert!(gs > 0 && dim % gs == 0, "dim {} must be divisible by group_size {}", dim, gs);
+
+    let mut rotated = key.to_vec();
+
+    if let Some(ref scales) = config.channel_scales {
+        for (val, &s) in rotated.iter_mut().zip(scales.iter()) {
+            *val *= s;
+        }
+    }
+
+    hadamard::randomized_hadamard_with_signs(&mut rotated, signs);
+
+    let base_cb = codebook::Codebook::new(config.bits, dim);
+    let n_groups = dim / gs;
+    let mut indices = Vec::with_capacity(dim);
+    let mut group_norms = Vec::with_capacity(n_groups);
+
+    for g in 0..n_groups {
+        let start = g * gs;
+        let group = &rotated[start..start + gs];
+        let group_norm: f32 = group.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+        if group_norm < 1e-10 {
+            indices.extend(std::iter::repeat(0u8).take(gs));
+            group_norms.push(0.0);
+        } else {
+            let sigma = group_norm / (gs as f32).sqrt();
+            let cb = codebook::Codebook { sigma, ..base_cb.clone() };
+
+            let group_indices: Vec<u8> = group.iter().map(|&v| cb.quantize(v)).collect();
+
+            // Norm correction per group
+            let recon_norm: f32 = group_indices.iter()
+                .map(|&idx| { let v = cb.dequantize(idx); v * v })
+                .sum::<f32>().sqrt();
+            let corrected = if recon_norm > 1e-10 { group_norm * group_norm / recon_norm } else { group_norm };
+
+            indices.extend_from_slice(&group_indices);
+            group_norms.push(corrected);
+        }
+    }
+
+    let packed = codebook::pack_indices(&indices, config.bits);
+    (packed, group_norms)
+}
+
+/// Decompress keys with per-group norms.
+pub fn decompress_keys_grouped(compressed: &CompressedKeys, config: &TurboQuantConfig) -> Vec<f32> {
+    let gs = compressed.group_size;
+    if gs == 0 {
+        return decompress_keys(compressed, config);
+    }
+
+    let base_cb = codebook::Codebook::new(compressed.bits, compressed.dim);
+    let dim = compressed.dim;
+    let n_groups = dim / gs;
+    let npv = compressed.norms_per_vector();
+
+    let all_indices = codebook::unpack_indices(
+        &compressed.packed_indices, compressed.count * dim, compressed.bits,
+    );
+
+    let mut result = Vec::with_capacity(compressed.count * dim);
+    for i in 0..compressed.count {
+        let norm_offset = i * npv;
+        let idx_offset = i * dim;
+
+        for g in 0..n_groups {
+            let group_norm = compressed.norms[norm_offset + g];
+            let sigma = if group_norm > 1e-10 { group_norm / (gs as f32).sqrt() } else { 1.0 };
+            let cb = codebook::Codebook { sigma, ..base_cb.clone() };
+
+            let gstart = idx_offset + g * gs;
+            for j in 0..gs {
+                let idx = all_indices[gstart + j];
+                result.push(cb.dequantize(idx));
+            }
+        }
+    }
+
+    // Inverse Hadamard
+    for chunk in result.chunks_exact_mut(dim) {
+        hadamard::inverse_randomized_hadamard(chunk, compressed.rotation_seed);
+    }
+
+    // Inverse channel scaling
+    if let Some(ref scales) = config.channel_scales {
+        for chunk in result.chunks_exact_mut(dim) {
+            for (val, &s) in chunk.iter_mut().zip(scales.iter()) {
+                if s.abs() > 1e-10 { *val /= s; }
+            }
+        }
+    }
+
+    result
 }
 
 /// Compute attention score between pre-rotated query and compressed key.

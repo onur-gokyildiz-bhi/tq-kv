@@ -270,7 +270,11 @@ fn decompress_compressed_keys(
     };
     let mut all_data = Vec::with_capacity(n_kv_head * compressed_len * head_dim);
     for compressed in k_per_head.iter().take(n_kv_head) {
-        let decompressed = tq_kv::decompress_keys(compressed, config);
+        let decompressed = if compressed.group_size > 0 {
+            tq_kv::decompress_keys_grouped(compressed, config)
+        } else {
+            tq_kv::decompress_keys(compressed, config)
+        };
         all_data.extend(decompressed);
     }
     Tensor::from_vec(all_data, (1, n_kv_head, compressed_len, head_dim), device)?.to_dtype(dtype)
@@ -618,9 +622,10 @@ impl LayerWeights {
             let vbits = get_value_bits();
             if self.kv_compressed.is_none() {
                 let mut k_per_head = Vec::with_capacity(self.n_kv_head);
+                let gs = layer_tq_config.group_size;
                 for _ in 0..self.n_kv_head {
-                    k_per_head.push(tq_kv::CompressedKeys::new_empty(
-                        effective_bits, self.padded_head_dim, layer_tq_config.rotation_seed,
+                    k_per_head.push(tq_kv::CompressedKeys::new_empty_grouped(
+                        effective_bits, self.padded_head_dim, layer_tq_config.rotation_seed, gs,
                     ));
                 }
                 let (v_raw, v_compressed) = if vbits == 0 {
@@ -712,11 +717,17 @@ impl LayerWeights {
                 let k_to_compress = k.narrow(2, compress_start, tokens_to_compress)?;
                 let k_flat = k_to_compress.contiguous()?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
                 let hdim = self.head_dim;
+                let use_grouped = layer_tq_config.group_size > 0 && hdim % layer_tq_config.group_size == 0;
                 for h in 0..self.n_kv_head {
                     for s in 0..tokens_to_compress {
                         let offset = (h * tokens_to_compress + s) * hdim;
                         let key_vec = &k_flat[offset..offset + hdim];
-                        if self.padded_head_dim > hdim {
+                        if use_grouped {
+                            let (packed, gnorms) = tq_kv::compress_single_key_grouped(
+                                key_vec, hdim, &layer_tq_config, &self.signs,
+                            );
+                            cache.k_per_head[h].append_raw_grouped(&packed, &gnorms);
+                        } else if self.padded_head_dim > hdim {
                             let mut padded = vec![0.0f32; self.padded_head_dim];
                             padded[..hdim].copy_from_slice(key_vec);
                             let (packed, norm) = tq_kv::compress_single_key_with_signs(
