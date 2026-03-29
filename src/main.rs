@@ -191,11 +191,17 @@ async fn main() -> Result<()> {
 
 fn resolve_tq_config(turbo_quant: bool, tq_bits: u8) -> Option<tq_kv::TurboQuantConfig> {
     if turbo_quant {
-        let config = match tq_bits {
+        let mut config = match tq_bits {
             2 => tq_kv::TurboQuantConfig::extreme(),
             3 => tq_kv::TurboQuantConfig::aggressive(),
             _ => tq_kv::TurboQuantConfig::balanced(),
         };
+        // TQ_RESIDUAL=2 enables 2-bit residual quantization
+        if let Ok(val) = std::env::var("TQ_RESIDUAL") {
+            if let Ok(bits) = val.parse::<u8>() {
+                config.residual_bits = bits;
+            }
+        }
         Some(config)
     } else {
         None

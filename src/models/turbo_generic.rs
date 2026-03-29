@@ -723,10 +723,14 @@ impl LayerWeights {
                         let offset = (h * tokens_to_compress + s) * hdim;
                         let key_vec = &k_flat[offset..offset + hdim];
                         if use_grouped {
-                            let (packed, gnorms) = tq_kv::compress_single_key_grouped(
+                            let (packed, gnorms, residual) = tq_kv::compress_single_key_grouped(
                                 key_vec, hdim, &layer_tq_config, &self.signs,
                             );
-                            cache.k_per_head[h].append_raw_grouped(&packed, &gnorms);
+                            // Set residual_bits on first append
+                            if cache.k_per_head[h].residual_bits == 0 && residual.is_some() {
+                                cache.k_per_head[h].residual_bits = layer_tq_config.residual_bits;
+                            }
+                            cache.k_per_head[h].append_raw_grouped(&packed, &gnorms, residual);
                         } else if self.padded_head_dim > hdim {
                             let mut padded = vec![0.0f32; self.padded_head_dim];
                             padded[..hdim].copy_from_slice(key_vec);

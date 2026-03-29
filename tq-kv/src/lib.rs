@@ -115,6 +115,11 @@ pub struct TurboQuantConfig {
     /// 0 = per-vector sigma (legacy, single norm). Default: 32.
     /// Supported: 0, 32, 64, 128. Smaller = better quality, slightly more storage.
     pub group_size: usize,
+    /// Residual quantization bits. If > 0, after first-pass quantization at `bits`,
+    /// the residual (error) is quantized at `residual_bits`. Total storage = bits + residual_bits
+    /// but quality is much better than direct (bits + residual_bits)-bit.
+    /// 0 = disabled. Default: 0. Typical: 2 (for 2+2=4 bit total).
+    pub residual_bits: u8,
 
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
@@ -134,6 +139,7 @@ impl Default for TurboQuantConfig {
             value_bits: 0,
             channel_scales: None,
             group_size: 32,
+            residual_bits: 0,
         }
     }
 }
@@ -314,6 +320,12 @@ pub struct CompressedKeys {
     pub rotation_seed: u64,
     /// Group size for per-group quantization (0 = per-vector legacy)
     pub group_size: usize,
+    /// Residual quantization: packed indices for second pass (error correction)
+    pub residual_indices: Option<Vec<u8>>,
+    /// Residual norms (per-group or per-vector, matching group_size)
+    pub residual_norms: Option<Vec<f32>>,
+    /// Residual bit width (0 = no residual)
+    pub residual_bits: u8,
 }
 
 impl CompressedKeys {
@@ -333,6 +345,9 @@ impl CompressedKeys {
             count: 0,
             rotation_seed,
             group_size,
+            residual_indices: None,
+            residual_norms: None,
+            residual_bits: 0,
         }
     }
 
@@ -343,10 +358,23 @@ impl CompressedKeys {
         self.count += 1;
     }
 
-    /// Append a single compressed key with per-group norms.
-    pub fn append_raw_grouped(&mut self, packed: &[u8], group_norms: &[f32]) {
+    /// Append a single compressed key with per-group norms and optional residual.
+    pub fn append_raw_grouped(
+        &mut self,
+        packed: &[u8],
+        group_norms: &[f32],
+        residual: Option<(Vec<u8>, Vec<f32>)>,
+    ) {
         self.packed_indices.extend_from_slice(packed);
         self.norms.extend_from_slice(group_norms);
+        if let Some((res_packed, res_norms)) = residual {
+            if self.residual_indices.is_none() {
+                self.residual_indices = Some(Vec::new());
+                self.residual_norms = Some(Vec::new());
+            }
+            self.residual_indices.as_mut().unwrap().extend_from_slice(&res_packed);
+            self.residual_norms.as_mut().unwrap().extend_from_slice(&res_norms);
+        }
         self.count += 1;
     }
 
@@ -409,6 +437,9 @@ impl CompressedKeys {
             count: n,
             rotation_seed: self.rotation_seed,
             group_size: self.group_size,
+            residual_indices: None,
+            residual_norms: None,
+            residual_bits: 0,
         };
 
         self.packed_indices = self.packed_indices[byte_split..].to_vec();
@@ -448,6 +479,9 @@ impl CompressedKeys {
             count: self.count,
             rotation_seed: self.rotation_seed,
             group_size: self.group_size,
+            residual_indices: None,
+            residual_norms: None,
+            residual_bits: 0,
         }
     }
 
@@ -704,6 +738,9 @@ pub fn compress_keys(
         count,
         rotation_seed: config.rotation_seed,
         group_size: 0, // batch compress_keys uses per-vector sigma (legacy)
+        residual_indices: None,
+        residual_norms: None,
+        residual_bits: 0,
     }
 }
 
@@ -885,13 +922,14 @@ pub fn compress_single_key_with_signs(
 /// gets its own sigma = group_norm / sqrt(group_size). This captures within-vector
 /// magnitude variation that per-vector sigma misses.
 ///
-/// Returns: (packed_indices, group_norms) where group_norms has `dim/group_size` entries.
+/// Returns: (packed_indices, group_norms, residual) where residual is
+/// `Some((residual_packed, residual_norms))` if `config.residual_bits > 0`.
 pub fn compress_single_key_grouped(
     key: &[f32],
     dim: usize,
     config: &TurboQuantConfig,
     signs: &[f32],
-) -> (Vec<u8>, Vec<f32>) {
+) -> (Vec<u8>, Vec<f32>, Option<(Vec<u8>, Vec<f32>)>) {
     assert_eq!(key.len(), dim);
     let gs = config.group_size;
     assert!(gs > 0 && dim % gs == 0, "dim {} must be divisible by group_size {}", dim, gs);
@@ -937,7 +975,55 @@ pub fn compress_single_key_grouped(
     }
 
     let packed = codebook::pack_indices(&indices, config.bits);
-    (packed, group_norms)
+
+    // Residual quantization: quantize the first-pass error
+    let residual = if config.residual_bits > 0 {
+        let res_cb = codebook::Codebook::new(config.residual_bits, dim);
+        let mut res_indices = Vec::with_capacity(dim);
+        let mut res_norms = Vec::with_capacity(n_groups);
+
+        for g in 0..n_groups {
+            let start = g * gs;
+            let group = &rotated[start..start + gs];
+            let gn = group_norms[g];
+            let sigma = if gn > 1e-10 { gn / (gs as f32).sqrt() } else { 1.0 };
+            let cb = codebook::Codebook { sigma, ..base_cb.clone() };
+
+            // Compute residual: original_rotated - first_pass_reconstruction
+            let mut residual_group = Vec::with_capacity(gs);
+            for j in 0..gs {
+                let recon = cb.dequantize(indices[start + j]);
+                residual_group.push(group[j] - recon);
+            }
+
+            // Quantize residual with its own sigma
+            let res_norm: f32 = residual_group.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if res_norm < 1e-10 {
+                res_indices.extend(std::iter::repeat(0u8).take(gs));
+                res_norms.push(0.0);
+            } else {
+                let res_sigma = res_norm / (gs as f32).sqrt();
+                let rcb = codebook::Codebook { sigma: res_sigma, ..res_cb.clone() };
+                let ri: Vec<u8> = residual_group.iter().map(|&v| rcb.quantize(v)).collect();
+
+                // Norm correction for residual
+                let res_recon_norm: f32 = ri.iter()
+                    .map(|&idx| { let v = rcb.dequantize(idx); v * v })
+                    .sum::<f32>().sqrt();
+                let corrected = if res_recon_norm > 1e-10 { res_norm * res_norm / res_recon_norm } else { res_norm };
+
+                res_indices.extend_from_slice(&ri);
+                res_norms.push(corrected);
+            }
+        }
+
+        let res_packed = codebook::pack_indices(&res_indices, config.residual_bits);
+        Some((res_packed, res_norms))
+    } else {
+        None
+    };
+
+    (packed, group_norms, residual)
 }
 
 /// Decompress keys with per-group norms.
@@ -970,6 +1056,32 @@ pub fn decompress_keys_grouped(compressed: &CompressedKeys, config: &TurboQuantC
             for j in 0..gs {
                 let idx = all_indices[gstart + j];
                 result.push(cb.dequantize(idx));
+            }
+        }
+    }
+
+    // Add residual correction (in rotated domain, before inverse Hadamard)
+    if let (Some(ref res_packed), Some(ref res_norms)) =
+        (&compressed.residual_indices, &compressed.residual_norms)
+    {
+        let res_bits = compressed.residual_bits;
+        if res_bits > 0 {
+            let res_cb = codebook::Codebook::new(res_bits, dim);
+            let res_indices = codebook::unpack_indices(res_packed, compressed.count * dim, res_bits);
+
+            for i in 0..compressed.count {
+                let norm_offset = i * npv;
+                let idx_offset = i * dim;
+                for g in 0..n_groups {
+                    let res_norm = res_norms[norm_offset + g];
+                    let sigma = if res_norm > 1e-10 { res_norm / (gs as f32).sqrt() } else { 1.0 };
+                    let rcb = codebook::Codebook { sigma, ..res_cb.clone() };
+                    let gstart = idx_offset + g * gs;
+                    for j in 0..gs {
+                        let idx = res_indices[gstart + j];
+                        result[idx_offset + g * gs + j] += rcb.dequantize(idx);
+                    }
+                }
             }
         }
     }
