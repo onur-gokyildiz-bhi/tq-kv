@@ -251,29 +251,57 @@ impl Engine {
         eprintln!("Device: {}", if device.is_cuda() { "CUDA GPU" } else { "CPU" });
 
         eprintln!("Loading model: {}", model_path.display());
-        let mut file = std::fs::File::open(model_path)
-            .with_context(|| format!("Cannot open model: {}", model_path.display()))?;
 
-        let content = gguf_file::Content::read(&mut file)
-            .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
+        // Detect format: safetensors directory or GGUF file
+        let is_safetensors = model_path.is_dir()
+            || model_path.extension().map_or(false, |ext| ext == "safetensors");
 
-        let model = match (arch, tq_config) {
-            (_, Some(tq)) => {
-                // TurboQuant: use generic model for ANY architecture
-                eprintln!("TurboQuant Generic: {}-bit KV cache (auto-detecting architecture from GGUF)", tq.bits);
-                let w = turbo_generic::GenericTurboModel::from_gguf(content, &mut file, &device, tq)
-                    .map_err(|e| anyhow::anyhow!("TurboGeneric load error: {}", e))?;
-                ModelWeights::TurboGeneric(w)
+        let model = if is_safetensors {
+            // Safetensors (FP16/BF16) path
+            let model_dir = if model_path.is_dir() {
+                model_path.to_path_buf()
+            } else {
+                model_path.parent().unwrap_or(model_path).to_path_buf()
+            };
+            match tq_config {
+                Some(tq) => {
+                    eprintln!("TurboQuant FP16: {}-bit KV cache", tq.bits);
+                    let w = turbo_generic::GenericTurboModel::from_safetensors(&model_dir, &device, tq)
+                        .map_err(|e| anyhow::anyhow!("Safetensors load error: {}", e))?;
+                    ModelWeights::TurboGeneric(w)
+                }
+                None => {
+                    anyhow::bail!(
+                        "Safetensors FP16 models require --turbo-quant. \
+                         Stock candle models only support GGUF format."
+                    );
+                }
             }
-            (ModelArch::Llama, None) => {
-                let w = qlm::ModelWeights::from_gguf(content, &mut file, &device)
-                    .map_err(|e| anyhow::anyhow!("Llama load error: {}", e))?;
-                ModelWeights::Llama(w)
-            }
-            (ModelArch::Qwen2, None) => {
-                let w = qqw::ModelWeights::from_gguf(content, &mut file, &device)
-                    .map_err(|e| anyhow::anyhow!("Qwen2 load error: {}", e))?;
-                ModelWeights::Qwen2(w)
+        } else {
+            // GGUF path
+            let mut file = std::fs::File::open(model_path)
+                .with_context(|| format!("Cannot open model: {}", model_path.display()))?;
+
+            let content = gguf_file::Content::read(&mut file)
+                .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
+
+            match (arch, tq_config) {
+                (_, Some(tq)) => {
+                    eprintln!("TurboQuant Generic: {}-bit KV cache (auto-detecting architecture from GGUF)", tq.bits);
+                    let w = turbo_generic::GenericTurboModel::from_gguf(content, &mut file, &device, tq)
+                        .map_err(|e| anyhow::anyhow!("TurboGeneric load error: {}", e))?;
+                    ModelWeights::TurboGeneric(w)
+                }
+                (ModelArch::Llama, None) => {
+                    let w = qlm::ModelWeights::from_gguf(content, &mut file, &device)
+                        .map_err(|e| anyhow::anyhow!("Llama load error: {}", e))?;
+                    ModelWeights::Llama(w)
+                }
+                (ModelArch::Qwen2, None) => {
+                    let w = qqw::ModelWeights::from_gguf(content, &mut file, &device)
+                        .map_err(|e| anyhow::anyhow!("Qwen2 load error: {}", e))?;
+                    ModelWeights::Qwen2(w)
+                }
             }
         };
         eprintln!("Model loaded!");

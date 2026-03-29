@@ -2966,6 +2966,7 @@ dependencies = [
  "hf-hub",
  "indicatif",
  "rayon",
+ "safetensors 0.4.5",
  "serde",
  "serde_json",
  "tokenizers",

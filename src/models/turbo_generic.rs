@@ -79,6 +79,12 @@ impl QMatMul {
         Ok(Self { inner, span })
     }
 
+    fn from_tensor(tensor: Tensor) -> Self {
+        let inner = candle_core::quantized::QMatMul::Tensor(tensor);
+        let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
+        Self { inner, span }
+    }
+
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         self.inner.forward(xs)
@@ -1375,5 +1381,191 @@ impl GenericTurboModel {
         let x = x.i((.., seq_len - 1, ..))?;
         let _enter = self.span_output.enter();
         self.output.forward(&x)
+    }
+
+    /// Load from safetensors file(s) + config.json (FP16/BF16 models).
+    ///
+    /// Unlike GGUF, safetensors stores full-precision weights. No QMatMul quantization
+    /// overhead — this is the ideal path for measuring TurboQuant's true quality impact
+    /// (single quantization layer instead of compound Q4+TQ).
+    ///
+    /// # Arguments
+    /// * `model_dir` - Directory containing config.json + model*.safetensors files
+    /// * `device` - Target device
+    /// * `tq_config` - TurboQuant configuration
+    pub fn from_safetensors(
+        model_dir: &std::path::Path,
+        device: &Device,
+        tq_config: TurboQuantConfig,
+    ) -> Result<Self> {
+        use candle_core::DType;
+
+        // 1. Read config.json
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| candle_core::Error::Msg(format!("Cannot read config.json: {e}")))?;
+        let config: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| candle_core::Error::Msg(format!("Invalid config.json: {e}")))?;
+
+        let head_count = config["num_attention_heads"].as_u64().unwrap_or(32) as usize;
+        let head_count_kv = config["num_key_value_heads"].as_u64().unwrap_or(head_count as u64) as usize;
+        let block_count = config["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
+        let embedding_length = config["hidden_size"].as_u64().unwrap_or(4096) as usize;
+        let rms_norm_eps = config["rms_norm_eps"].as_f64().unwrap_or(1e-6);
+        let rope_freq_base = config["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
+        let context_length = config["max_position_embeddings"].as_u64().unwrap_or(4096) as usize;
+        let head_dim = config["head_dim"].as_u64()
+            .map(|v| v as usize)
+            .unwrap_or(embedding_length / head_count);
+
+        if !head_dim.is_power_of_two() {
+            candle_core::bail!("TurboQuant requires power-of-2 head_dim, got {}", head_dim);
+        }
+
+        let arch = config["model_type"].as_str().unwrap_or("llama").to_string();
+        let rope_style = detect_rope_style(&arch);
+        let rope_dim = head_dim; // safetensors models typically use full head_dim for RoPE
+
+        eprintln!(
+            "TurboQuant FP16 [{}]: {} layers, {} heads (kv={}), head_dim={}, emb={}, {}-bit KV cache",
+            arch, block_count, head_count, head_count_kv, head_dim, embedding_length, tq_config.bits,
+        );
+
+        // 2. Load all safetensors files
+        let mut tensors = std::collections::HashMap::new();
+        let entries: Vec<_> = std::fs::read_dir(model_dir)
+            .map_err(|e| candle_core::Error::Msg(format!("Cannot read model dir: {e}")))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "safetensors"))
+            .collect();
+
+        if entries.is_empty() {
+            candle_core::bail!("No .safetensors files found in {}", model_dir.display());
+        }
+
+        for entry in &entries {
+            let loaded = candle_core::safetensors::load(entry.path(), device)?;
+            tensors.extend(loaded);
+        }
+        eprintln!("  Loaded {} tensors from {} safetensors file(s)", tensors.len(), entries.len());
+
+        // Helper to get a tensor by name
+        let get = |name: &str| -> Result<Tensor> {
+            tensors.get(name)
+                .cloned()
+                .ok_or_else(|| candle_core::Error::Msg(format!("Missing tensor: {name}")))
+        };
+
+        // 3. Pre-compute shared state
+        let padded_head_dim = head_dim;
+        let signs = tq_kv::hadamard::generate_signs(padded_head_dim, tq_config.rotation_seed);
+        let (cos, sin) = precompute_freqs_cis(rope_dim, rope_freq_base, context_length, device)?;
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
+
+        // 4. Embeddings + output
+        let tok_embeddings = get("model.embed_tokens.weight")?;
+        let norm_w = get("model.norm.weight")?;
+        let norm = RmsNorm { weight: norm_w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") };
+
+        let output = if let Ok(t) = get("lm_head.weight") {
+            QMatMul::from_tensor(t)
+        } else {
+            eprintln!("  (tie_word_embeddings: reusing embed_tokens.weight for lm_head)");
+            QMatMul::from_tensor(tok_embeddings.clone())
+        };
+
+        // 5. Load layers
+        let mut layers = Vec::with_capacity(block_count);
+        for i in 0..block_count {
+            let p = format!("model.layers.{i}");
+
+            let wq = get(&format!("{p}.self_attn.q_proj.weight"))?;
+            let wk = get(&format!("{p}.self_attn.k_proj.weight"))?;
+            let wv = get(&format!("{p}.self_attn.v_proj.weight"))?;
+            let wo = get(&format!("{p}.self_attn.o_proj.weight"))?;
+
+            let qkv = QkvWeights::Separate {
+                wq: QMatMul::from_tensor(wq),
+                wk: QMatMul::from_tensor(wk),
+                wv: QMatMul::from_tensor(wv),
+            };
+
+            // Biases (optional — Qwen2 has them)
+            let bq = tensors.get(&format!("{p}.self_attn.q_proj.bias")).cloned();
+            let bk = tensors.get(&format!("{p}.self_attn.k_proj.bias")).cloned();
+            let bv = tensors.get(&format!("{p}.self_attn.v_proj.bias")).cloned();
+
+            // MLP
+            let mlp_or_moe = if let Ok(gate) = get(&format!("{p}.mlp.gate_proj.weight")) {
+                let down = get(&format!("{p}.mlp.down_proj.weight"))?;
+                let up = get(&format!("{p}.mlp.up_proj.weight"))?;
+                MlpOrMoe::Mlp(Mlp {
+                    feed_forward_w1: QMatMul::from_tensor(gate),
+                    feed_forward_w2: QMatMul::from_tensor(down),
+                    feed_forward_w3: QMatMul::from_tensor(up),
+                })
+            } else {
+                let up = get(&format!("{p}.mlp.up_proj.weight"))?;
+                let down = get(&format!("{p}.mlp.down_proj.weight"))?;
+                MlpOrMoe::UpDown(MlpUpDown {
+                    ffn_up: QMatMul::from_tensor(up),
+                    ffn_down: QMatMul::from_tensor(down),
+                })
+            };
+
+            let attn_norm_w = get(&format!("{p}.input_layernorm.weight"))?;
+            let ffn_norm_w = get(&format!("{p}.post_attention_layernorm.weight"))?;
+
+            let attn_norm = RmsNorm { weight: attn_norm_w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") };
+            let ffn_norm = RmsNorm { weight: ffn_norm_w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") };
+
+            // Post norms (Gemma2)
+            let post_attn_norm = tensors.get(&format!("{p}.post_attention_layernorm_2.weight"))
+                .map(|w| RmsNorm { weight: w.clone(), eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") });
+            let post_ffn_norm = tensors.get(&format!("{p}.post_feedforward_layernorm.weight"))
+                .map(|w| RmsNorm { weight: w.clone(), eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") });
+
+            layers.push(LayerWeights {
+                qkv,
+                attention_wo: QMatMul::from_tensor(wo),
+                attention_bq: bq,
+                attention_bk: bk,
+                attention_bv: bv,
+                attention_norm: attn_norm,
+                ffn_norm,
+                mlp_or_moe,
+                n_head: head_count,
+                n_kv_head: head_count_kv,
+                head_dim,
+                cos: cos.clone(),
+                sin: sin.clone(),
+                neg_inf: neg_inf.clone(),
+                rope_style,
+                rope_dim,
+                padded_head_dim,
+                post_attention_norm: post_attn_norm,
+                post_ffn_norm,
+                layer_idx: i,
+                kv_cache: None,
+                kv_compressed: None,
+                tq_config: tq_config.clone(),
+                signs: signs.clone(),
+                span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
+                span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
+                span_mlp: tracing::span!(tracing::Level::TRACE, "mlp"),
+            });
+        }
+
+        eprintln!("FP16 model loaded! {} layers", block_count);
+
+        Ok(Self {
+            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            layers,
+            norm,
+            output,
+            masks: HashMap::new(),
+            span: tracing::span!(tracing::Level::TRACE, "model"),
+            span_output: tracing::span!(tracing::Level::TRACE, "output"),
+        })
     }
 }
