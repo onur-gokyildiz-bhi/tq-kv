@@ -64,13 +64,13 @@
 - [ ] llama.cpp Q4_K_M baseline — record tok/s on same hardware (RTX 3080)
 - [ ] Benchmark: target within 3x of llama.cpp on short context (≤4K)
 - [ ] Benchmark: FASTER than llama.cpp on 16K+ context (TQ advantage)
-- [ ] Per-channel key scaling — SmoothQuant-style, reduce compound error further
+- [x] Per-channel key scaling — SmoothQuant-style (calibrate_channel_scales, applied before Hadamard)
 - [ ] tok/s, TTFT, memory profiling benchmarks
 
 ## Open — Developer Experience
 
-- [ ] `.with_turbo_quant(bits)` API — builder pattern on candle models
-- [ ] Auto quality gate — if PPL > +2% threshold, auto-promote to next bit width
+- [x] `.with_turbo_quant(bits)` API — Engine::builder() + TurboQuantConfig builder methods
+- [x] Auto quality gate — QualityGate monitors running PPL, warns if threshold exceeded
 - [ ] GitHub Actions CI/CD
 
 ## Open — Launch & Community

@@ -106,6 +106,10 @@ pub struct TurboQuantConfig {
     /// Value cache quantization bit width. 0 = uncompressed (fp16), 8 = 8-bit absmax.
     /// Keys use `bits` field; values use this. Default: 0 (uncompressed, matches paper).
     pub value_bits: u8,
+    /// Per-channel scaling factors (SmoothQuant-style). Applied BEFORE Hadamard rotation
+    /// to equalize outlier magnitudes across channels. `None` = disabled.
+    /// Length must equal head_dim. Use `calibrate_channel_scales()` to compute from data.
+    pub channel_scales: Option<Vec<f32>>,
 
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
@@ -123,6 +127,7 @@ impl Default for TurboQuantConfig {
             qjl_seed: 0x0051_4A4C_4232,
             sparse_v_threshold: 1e-6,
             value_bits: 0,
+            channel_scales: None,
         }
     }
 }
@@ -154,6 +159,32 @@ impl TurboQuantConfig {
             qjl_mode: QjlMode::Adaptive { threshold: 4096 },
             ..Default::default()
         }
+    }
+
+    // --- Builder-style methods ---
+
+    /// Set value compression bits (0 = fp16, 8 = 8-bit absmax).
+    pub fn with_value_bits(mut self, bits: u8) -> Self {
+        self.value_bits = bits;
+        self
+    }
+
+    /// Set sparse V threshold (0.0 = disabled).
+    pub fn with_sparse_v(mut self, threshold: f32) -> Self {
+        self.sparse_v_threshold = threshold;
+        self
+    }
+
+    /// Set QJL mode.
+    pub fn with_qjl(mut self, mode: QjlMode) -> Self {
+        self.qjl_mode = mode;
+        self
+    }
+
+    /// Set per-channel scaling factors.
+    pub fn with_channel_scales(mut self, scales: Vec<f32>) -> Self {
+        self.channel_scales = Some(scales);
+        self
     }
 
     /// Check if QJL should be active given current cache length.
@@ -560,8 +591,16 @@ pub fn compress_keys(
 
     let count = data.len() / dim;
 
-    // 1. Hadamard rotation
+    // 1. Per-channel scaling + Hadamard rotation
     let mut rotated = data.to_vec();
+    if let Some(ref scales) = config.channel_scales {
+        debug_assert_eq!(scales.len(), dim);
+        for chunk in rotated.chunks_exact_mut(dim) {
+            for (val, &s) in chunk.iter_mut().zip(scales.iter()) {
+                *val *= s;
+            }
+        }
+    }
     for chunk in rotated.chunks_exact_mut(dim) {
         hadamard::randomized_hadamard(chunk, config.rotation_seed);
     }
@@ -672,6 +711,15 @@ pub fn decompress_keys(compressed: &CompressedKeys, _config: &TurboQuantConfig) 
         hadamard::inverse_randomized_hadamard(chunk, compressed.rotation_seed);
     }
 
+    // Inverse per-channel scaling
+    if let Some(ref scales) = _config.channel_scales {
+        for chunk in result.chunks_exact_mut(dim) {
+            for (val, &s) in chunk.iter_mut().zip(scales.iter()) {
+                if s.abs() > 1e-10 { *val /= s; }
+            }
+        }
+    }
+
     result
 }
 
@@ -705,6 +753,11 @@ pub fn compress_single_key(
     assert_eq!(key.len(), dim);
 
     let mut rotated = key.to_vec();
+    if let Some(ref scales) = config.channel_scales {
+        for (val, &s) in rotated.iter_mut().zip(scales.iter()) {
+            *val *= s;
+        }
+    }
     hadamard::randomized_hadamard(&mut rotated, config.rotation_seed);
 
     let norm: f32 = rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -750,6 +803,15 @@ pub fn compress_single_key_with_signs(
     assert_eq!(key.len(), dim);
 
     let mut rotated = key.to_vec();
+
+    // Per-channel scaling (SmoothQuant): equalize outlier magnitudes before rotation
+    if let Some(ref scales) = config.channel_scales {
+        debug_assert_eq!(scales.len(), dim);
+        for (val, &s) in rotated.iter_mut().zip(scales.iter()) {
+            *val *= s;
+        }
+    }
+
     hadamard::randomized_hadamard_with_signs(&mut rotated, signs);
 
     let norm: f32 = rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1061,6 +1123,40 @@ impl SparseVStats {
 pub fn sparse_v_stats(attn_weights: &[f32], threshold: f32) -> SparseVStats {
     let active = attn_weights.iter().filter(|&&w| w >= threshold).count();
     SparseVStats { total: attn_weights.len(), active }
+}
+
+/// Calibrate per-channel scaling factors from a batch of key vectors.
+///
+/// Computes `scale[i] = median_absmax / absmax[i]` for each channel, so that
+/// channels with large outliers are scaled down and channels with small values
+/// are scaled up. This equalizes the magnitude distribution before Hadamard
+/// rotation, reducing quantization error on outlier channels.
+///
+/// Returns a Vec of length `dim` — pass to `TurboQuantConfig::channel_scales`.
+pub fn calibrate_channel_scales(data: &[f32], dim: usize) -> Vec<f32> {
+    assert_eq!(data.len() % dim, 0);
+    let count = data.len() / dim;
+    if count == 0 {
+        return vec![1.0; dim];
+    }
+
+    // Compute absmax per channel
+    let mut channel_absmax = vec![0.0f32; dim];
+    for chunk in data.chunks_exact(dim) {
+        for (i, &v) in chunk.iter().enumerate() {
+            channel_absmax[i] = channel_absmax[i].max(v.abs());
+        }
+    }
+
+    // Compute median absmax
+    let mut sorted = channel_absmax.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = sorted[sorted.len() / 2];
+
+    // Scale = median / absmax (brings all channels to similar magnitude)
+    channel_absmax.iter().map(|&m| {
+        if m > 1e-10 { median / m } else { 1.0 }
+    }).collect()
 }
 
 /// Evaluate V2 compression quality.
@@ -1837,5 +1933,69 @@ mod tests {
         let savings_pct = (1.0 - mem_2bit as f32 / mem_4bit as f32) * 100.0;
         assert!(savings_pct > 30.0,
             "4→2 decay should save >30% memory, got {:.1}%", savings_pct);
+    }
+
+    // ========================================
+    // Per-Channel Scaling Tests
+    // ========================================
+
+    #[test]
+    fn test_channel_scales_improve_outlier_quality() {
+        let dim = 128;
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Create data with outlier channels (channels 0,1 have 10x larger values)
+        let mut data = Vec::with_capacity(32 * dim);
+        for _ in 0..32 {
+            for i in 0..dim {
+                let base: f32 = rng.gen::<f32>() * 2.0 - 1.0;
+                let scale = if i < 2 { 10.0 } else { 1.0 };
+                data.push(base * scale);
+            }
+        }
+
+        // Compress WITHOUT channel scaling
+        let config_plain = TurboQuantConfig::balanced();
+        let compressed_plain = compress_keys(&data, dim, &config_plain);
+        let stats_plain = evaluate_keys(&data, &compressed_plain, &config_plain);
+
+        // Calibrate and compress WITH channel scaling
+        let scales = calibrate_channel_scales(&data, dim);
+        assert_eq!(scales.len(), dim);
+        // Outlier channels should have scales < 1 (scaling down)
+        assert!(scales[0] < 0.5, "Outlier channel 0 should be scaled down, got {}", scales[0]);
+
+        let config_smooth = TurboQuantConfig {
+            channel_scales: Some(scales),
+            ..TurboQuantConfig::balanced()
+        };
+        let compressed_smooth = compress_keys(&data, dim, &config_smooth);
+        let stats_smooth = evaluate_keys(&data, &compressed_smooth, &config_smooth);
+
+        // Channel scaling should improve SNR on outlier data
+        assert!(stats_smooth.snr_db > stats_plain.snr_db,
+            "Channel scaling should improve SNR: {:.1} vs {:.1} dB",
+            stats_smooth.snr_db, stats_plain.snr_db);
+    }
+
+    #[test]
+    fn test_channel_scales_roundtrip() {
+        let dim = 64;
+        let data = random_vectors(8, dim, 77);
+        let scales = calibrate_channel_scales(&data, dim);
+
+        let config = TurboQuantConfig {
+            channel_scales: Some(scales),
+            ..TurboQuantConfig::balanced()
+        };
+        let compressed = compress_keys(&data, dim, &config);
+        let decompressed = decompress_keys(&compressed, &config);
+
+        // Should still achieve reasonable cosine similarity
+        let dot: f32 = data.iter().zip(decompressed.iter()).map(|(a, b)| a * b).sum();
+        let n_a: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let n_b: f32 = decompressed.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos_sim = dot / (n_a * n_b + 1e-10);
+        assert!(cos_sim > 0.90, "Channel-scaled roundtrip cos_sim should be > 0.90, got {:.4}", cos_sim);
     }
 }

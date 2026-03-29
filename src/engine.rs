@@ -56,6 +56,67 @@ impl Default for GenerationParams {
     }
 }
 
+/// Runtime quality monitoring for TurboQuant compressed inference.
+///
+/// Tracks running perplexity estimate during generation. If PPL exceeds
+/// the threshold, logs a warning suggesting higher bit width.
+#[derive(Clone, Debug)]
+pub struct QualityGate {
+    /// PPL threshold — if exceeded, emit warning. Default: baseline * 1.5.
+    pub ppl_threshold: f64,
+    /// Check every N tokens (lightweight). Default: 50.
+    pub check_interval: usize,
+    /// Running NLL accumulator
+    nll_sum: f64,
+    /// Tokens evaluated
+    nll_count: usize,
+    /// Has already warned (avoid spam)
+    warned: bool,
+}
+
+impl QualityGate {
+    /// Create a quality gate with the given PPL threshold.
+    pub fn new(ppl_threshold: f64) -> Self {
+        Self {
+            ppl_threshold,
+            check_interval: 50,
+            nll_sum: 0.0,
+            nll_count: 0,
+            warned: false,
+        }
+    }
+
+    /// Update with a new token's NLL and check threshold.
+    /// Returns `Some(current_ppl)` if threshold exceeded (first time only).
+    pub fn update(&mut self, logits: &[f32], next_token: u32) -> Option<f64> {
+        self.nll_count += 1;
+        let nll = compute_nll(logits, next_token as usize);
+        self.nll_sum += nll;
+
+        if self.nll_count % self.check_interval == 0 && !self.warned {
+            let current_ppl = (self.nll_sum / self.nll_count as f64).exp();
+            if current_ppl > self.ppl_threshold {
+                self.warned = true;
+                return Some(current_ppl);
+            }
+        }
+        None
+    }
+
+    /// Current running PPL estimate.
+    pub fn current_ppl(&self) -> f64 {
+        if self.nll_count == 0 { return 0.0; }
+        (self.nll_sum / self.nll_count as f64).exp()
+    }
+
+    /// Reset for a new generation.
+    pub fn reset(&mut self) {
+        self.nll_sum = 0.0;
+        self.nll_count = 0;
+        self.warned = false;
+    }
+}
+
 /// Unified inference engine.
 pub struct Engine {
     model: ModelWeights,
@@ -63,9 +124,107 @@ pub struct Engine {
     device: Device,
     position: usize,
     eos_token_id: u32,
+    /// Optional quality gate for runtime PPL monitoring.
+    pub quality_gate: Option<QualityGate>,
+}
+
+/// Fluent builder for Engine configuration.
+///
+/// ```ignore
+/// let engine = Engine::builder()
+///     .model("models/qwen2-7b.gguf")
+///     .tokenizer("models/tokenizer.json")
+///     .with_turbo_quant(4)  // 4-bit KV cache compression
+///     .build()?;
+/// ```
+pub struct EngineBuilder {
+    model_path: Option<std::path::PathBuf>,
+    tokenizer_path: Option<std::path::PathBuf>,
+    arch: Option<ModelArch>,
+    tq_config: Option<TurboQuantConfig>,
+    force_cpu: bool,
+    quality_gate_threshold: Option<f64>,
+}
+
+impl EngineBuilder {
+    /// Set GGUF model file path.
+    pub fn model(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.model_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set tokenizer JSON file path.
+    pub fn tokenizer(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.tokenizer_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set model architecture (auto-detected from GGUF if not set).
+    pub fn arch(mut self, arch: ModelArch) -> Self {
+        self.arch = Some(arch);
+        self
+    }
+
+    /// Enable TurboQuant with specified bit width (2, 3, or 4).
+    pub fn with_turbo_quant(mut self, bits: u8) -> Self {
+        self.tq_config = Some(match bits {
+            2 => TurboQuantConfig::extreme(),
+            3 => TurboQuantConfig::aggressive(),
+            _ => TurboQuantConfig::balanced(),
+        });
+        self
+    }
+
+    /// Enable TurboQuant with full config.
+    pub fn with_turbo_quant_config(mut self, config: TurboQuantConfig) -> Self {
+        self.tq_config = Some(config);
+        self
+    }
+
+    /// Force CPU inference (disable CUDA).
+    pub fn cpu(mut self) -> Self {
+        self.force_cpu = true;
+        self
+    }
+
+    /// Enable quality gate — warn if PPL exceeds threshold during generation.
+    pub fn with_quality_gate(mut self, ppl_threshold: f64) -> Self {
+        self.quality_gate_threshold = Some(ppl_threshold);
+        self
+    }
+
+    /// Build the Engine.
+    pub fn build(self) -> Result<Engine> {
+        let model_path = self.model_path
+            .ok_or_else(|| anyhow::anyhow!("model path not set — call .model()"))?;
+        let tokenizer_path = self.tokenizer_path
+            .ok_or_else(|| anyhow::anyhow!("tokenizer path not set — call .tokenizer()"))?;
+        let arch = self.arch.unwrap_or(
+            crate::config::detect_arch(&model_path.to_string_lossy())
+        );
+        let mut engine = Engine::load_with_device(
+            &model_path, &tokenizer_path, arch, self.tq_config, self.force_cpu,
+        )?;
+        if let Some(threshold) = self.quality_gate_threshold {
+            engine.enable_quality_gate(threshold);
+        }
+        Ok(engine)
+    }
 }
 
 impl Engine {
+    /// Create a fluent builder for Engine configuration.
+    pub fn builder() -> EngineBuilder {
+        EngineBuilder {
+            model_path: None,
+            tokenizer_path: None,
+            arch: None,
+            tq_config: None,
+            force_cpu: false,
+            quality_gate_threshold: None,
+        }
+    }
+
     /// Load GGUF model and tokenizer.
     /// Pass `tq_config` to enable TurboQuant compressed KV cache.
     pub fn load(
@@ -129,12 +288,18 @@ impl Engine {
             .or_else(|| tokenizer.token_to_id("</s>"))
             .unwrap_or(2);
 
-        Ok(Self { model, tokenizer, device, position: 0, eos_token_id })
+        Ok(Self { model, tokenizer, device, position: 0, eos_token_id, quality_gate: None })
     }
 
     /// Clear KV cache.
     pub fn clear_cache(&mut self) {
         self.position = 0;
+    }
+
+    /// Enable quality gate — monitors running PPL during generation.
+    /// If PPL exceeds `threshold`, logs a warning suggesting higher bit width.
+    pub fn enable_quality_gate(&mut self, ppl_threshold: f64) {
+        self.quality_gate = Some(QualityGate::new(ppl_threshold));
     }
 
     /// Generate text with streaming callback.
@@ -230,7 +395,24 @@ impl Engine {
                 .sample(&logits)
                 .map_err(|e| anyhow::anyhow!("Sampling error: {}", e))?;
 
+            // Quality gate: monitor running PPL
+            if let Some(ref mut gate) = self.quality_gate {
+                let logits_vec = logits.to_vec1::<f32>()?;
+                if let Some(ppl) = gate.update(&logits_vec, next_token) {
+                    eprintln!(
+                        "⚠ Quality gate: PPL {:.1} exceeds threshold {:.1} at token {}. \
+                         Consider using higher bit width (--tq-bits 4) or fewer compressed layers (TQ_SKIP).",
+                        ppl, gate.ppl_threshold, n_generated,
+                    );
+                }
+            }
+
             n_generated += 1;
+        }
+
+        // Reset quality gate for next generation
+        if let Some(ref mut gate) = self.quality_gate {
+            gate.reset();
         }
 
         Ok(output)
