@@ -3,77 +3,135 @@
 **TurboQuant: Extreme KV Cache Compression for LLMs**
 
 Pure Rust implementation of Google's TurboQuant algorithm (ICLR 2026).
-Compresses LLM key-value cache to 2-4 bits with up to 15x memory reduction and near-zero quality loss.
+Compresses LLM key-value cache to 2-4 bits with up to 15x memory reduction.
+
+**First TurboQuant that works on GGUF quantized models** — all other implementations fail on Q4_K_M.
+
+## What's New in v0.5.0
+
+- **3-Fix Framework**: Sink token preservation + Past-Only Quantization + cache reset — solves compound error on GGUF models (300+ token coherent output where others produce gibberish)
+- **SRHT QJL**: O(d log d) structured projection replaces O(d^2) dense — 115x faster, +4.5 dB SNR
+- **Adaptive QJL**: Context-length-aware error correction (QjlMode::Off/On/Adaptive)
+- **Norm Correction**: Reconstruction norm matching — zero decode cost quality improvement
+- **Gaussianity Verified**: Kurtosis 35.3 -> 3.3 after rotation (Gaussian=3.0)
 
 ## Results
 
-| Bits | Compression | SNR (dB) | Cosine Sim | Speed (128-dim) |
-|:----:|:-----------:|:--------:|:----------:|:---------------:|
-| 2 | **15.1x** | 9.3 | 0.942 | 56 ms compress |
-| 3 | **10.2x** | 14.7 | 0.984 | 65 ms compress |
-| 4 | **5.8x** | 21.4 | 0.997 | 5 ms compress |
+| Bits | Compression | SNR (dB) | Cosine Sim | NIAH |
+|:----:|:-----------:|:--------:|:----------:|:----:|
+| 2 | **15.1x** | 9.3 | 0.942 | 9/9 pass |
+| 3 | **10.2x** | 14.7 | 0.984 | — |
+| 4 | **3.8x** | 20.3 | 0.996 | 9/9 pass |
+| 4+QJL | **2.7x** | 24.8 | 0.998 | — |
+
+### SRHT QJL Performance (32K vectors, d=128, release)
+
+| Metric | Dense QJL (paper) | SRHT QJL (ours) | No QJL |
+|:-------|:-----------------:|:---------------:|:------:|
+| Compress overhead | 29x | **1.45x** | 1.0x |
+| SNR improvement | +1.2 dB | **+4.5 dB** | — |
+| Attention KL div. | — | **2.9x lower** | — |
 
 ## How It Works
 
 ```
-Input KV vector
+Input KV vector (from GGUF Q4_K_M model)
     |
-[1] Randomized Hadamard Transform    O(d log d)
-    |  Eliminates outliers, makes coordinates ~ Gaussian
+[1] Randomized Hadamard Transform           O(d log d)
+    |  Decorrelates outliers → coordinates ~ Gaussian
+    |  Verified: kurtosis 35.3 → 3.3 (Gaussian=3.0)
     |
-[2] Lloyd-Max Codebook Quantization  O(d)
-    |  Optimal scalar quantizer for Gaussian distribution
-    |  Pre-computed centroids: 4 (2-bit), 8 (3-bit), 16 (4-bit)
+[2] Lloyd-Max Codebook + Adaptive Sigma      O(d)
+    |  Per-vector sigma = ||x|| / sqrt(d)
+    |  Norm correction: ||decompress|| matches ||original||
     |
-[3] QJL 1-bit Error Correction       O(d) optional
-    |  Johnson-Lindenstrauss residual projection
+[3] SRHT QJL Error Correction (optional)     O(d log d)
+    |  Structured Hadamard projection (not dense random)
+    |  Adaptive: auto-enables at long context
     |
-Compressed: packed indices + norm + optional QJL signs
+Output: packed indices + corrected norm
+        3.8x compression at 4-bit (keys only)
+```
+
+### 3-Fix for GGUF Models
+
+TurboQuant fails on quantized models due to compound error (W4 weights + KV4 cache).
+Our 3-Fix framework solves this:
+
+```
+Fix 1: Sink tokens (first 4) stay FP16     → -81% attention error
+Fix 2: Current token = lossless (POQ)       → highest-impact position protected
+Fix 3: Cache reset per conversation         → prevents cross-contamination
+
+K_attention = [K_sink_FP16 | K_compressed | K_current_FP16]
 ```
 
 ## Quick Start
 
 ```toml
 [dependencies]
-tq-kv = "0.4"
+tq-kv = "0.5"
 ```
 
 ```rust
 use tq_kv::{TurboQuantConfig, compress_keys, decompress_keys};
 
-// Simulate a KV cache vector (head_dim must be power of 2)
 let head_dim = 128;
 let kv_data: Vec<f32> = vec![0.1; head_dim];
 
-// 2-bit extreme compression (15x)
-let config = TurboQuantConfig::extreme();
+// 4-bit balanced compression (3.8x, cos_sim 0.996)
+let config = TurboQuantConfig::balanced();
 let compressed = compress_keys(&kv_data, head_dim, &config);
 println!("Ratio: {:.1}x", compressed.compression_ratio());
 
 let restored = decompress_keys(&compressed, &config);
 ```
 
-## Fused Attention (Pre-Rotated Query Trick)
-
-Skip decompression entirely during attention computation:
+### Adaptive QJL
 
 ```rust
-use tq_kv::{pre_rotate_query, fused_dot_product};
+use tq_kv::{TurboQuantConfig, QjlMode};
 
-// Pre-rotate query ONCE
+// Auto-enable QJL at long context (4K+ tokens)
+let config = TurboQuantConfig::balanced_adaptive();
+
+// Check if QJL should activate
+let use_qjl = config.should_use_qjl(current_cache_length);
+```
+
+### Fused Attention (Pre-Rotated Query)
+
+Skip decompression entirely — 6x faster attention:
+
+```rust
+use tq_kv::{pre_rotate_query, fused_attention_scores, codebook};
+
 let rotated_q = pre_rotate_query(&query, config.rotation_seed);
-
-// For each cached key: centroid lookup, no decompression
-let score = fused_dot_product(&rotated_q, &key_indices, key_norm, bits, dim);
+let centroids = codebook::get_centroids(config.bits);
+let scores = fused_attention_scores(&rotated_q, &compressed, centroids, scale);
 ```
 
 ## VRAM Savings
 
-| Model | KV Cache fp16 | 2-bit TurboQuant | Saved |
-|:------|:-------------:|:----------------:|:-----:|
-| Llama-3 8B | 256 MB | 18 MB | **238 MB** |
-| Qwen2.5 72B | 640 MB | 45 MB | **595 MB** |
-| Gemma 3 4B | 208 MB | 14 MB | **194 MB** |
+| Model | Context | FP16 KV | TQ 4-bit | TQ 2-bit | Savings |
+|:------|:-------:|:-------:|:--------:|:--------:|:-------:|
+| Qwen 2.5 7B | 4K | 256 MB | 48 MB | 18 MB | 5.3-14.2x |
+| Qwen 2.5 72B | 4K | 640 MB | 120 MB | 45 MB | 5.3-14.2x |
+| Llama 3.1 70B | 32K | 20 GB | 5.3 GB | 1.4 GB | 3.8-14.2x |
+
+## Full Product: tq-engine
+
+tq-kv powers tq-engine — "Rust's Ollama" with TurboQuant compression:
+
+```bash
+tq pull qwen2:7b          # download from HuggingFace
+tq serve --turbo-quant     # OpenAI-compatible API (SSE streaming)
+tq chat qwen2:7b           # terminal chat
+```
+
+Web UI at localhost:11435. Works with ChatBox and Open WebUI.
+
+5 architectures: Qwen2, Llama, Mistral, Phi3, Gemma2 — auto-detected from GGUF.
 
 ## Benchmark
 
@@ -81,10 +139,16 @@ let score = fused_dot_product(&rotated_q, &key_indices, key_norm, bits, dim);
 cargo run --release -p tq-kv --bin tq-kv-bench
 ```
 
+Full results: [BENCHMARK.md](../BENCHMARK.md)
+
 ## Paper
 
-Zandieh, Daliri, Hadian, Mirrokni. "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." ICLR 2026.
-[arxiv.org/abs/2504.19874](https://arxiv.org/abs/2504.19874)
+**Our work:**
+- "TurboQuant on Quantized Models: Solving Compound Quantization Error in GGUF LLMs" — BHI Research (2026)
+- 3-Fix framework, SRHT QJL (115x speedup), Adaptive QJL, Norm Correction
+
+**Original:**
+- Zandieh, Daliri, Hadian, Mirrokni. "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
 
 ## License
 

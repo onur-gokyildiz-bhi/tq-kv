@@ -2954,7 +2954,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tq-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2980,7 +2980,7 @@ dependencies = [
 
 [[package]]
 name = "tq-kv"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "candle-core",
  "cbindgen",

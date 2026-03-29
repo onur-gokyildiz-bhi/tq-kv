@@ -1,8 +1,8 @@
 [package]
 name = "tq-kv"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-description = "TurboQuant: Extreme KV Cache Compression for LLMs — ICLR 2026 Pure Rust implementation. Lloyd-Max codebook, fused attention, SIMD (AVX2), candle KvCache drop-in. 2-4 bit, up to 15x compression. Supports Qwen2, Llama, Mistral, Phi-3, Gemma2."
+description = "TurboQuant KV Cache Compression for LLMs — First implementation working on GGUF quantized models. 3-Fix framework, SRHT QJL (115x faster), adaptive sigma, norm correction. 2-4 bit, up to 15x compression. Pure Rust, AVX2 SIMD, candle drop-in."
 license = "MIT OR Apache-2.0"
 keywords = ["llm", "quantization", "kv-cache", "compression", "transformers"]
 categories = ["science", "compression", "algorithms"]

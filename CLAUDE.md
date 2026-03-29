@@ -4,8 +4,8 @@
 
 **tq-kv** — Pure Rust implementation of Google's TurboQuant (ICLR 2026) KV cache compression algorithm. Workspace with two crates:
 
-- `turbo-quant/` — standalone compression library `tq-kv` (crates.io ready)
-- `tq-engine` (root) — LLM inference engine showcasing TurboQuant with candle backend
+- `tq-kv/` — standalone compression library (crates.io v0.5.0)
+- `tq-engine` (root) — "Rust's Ollama" inference engine with TurboQuant + candle backend
 
 ## Build
 

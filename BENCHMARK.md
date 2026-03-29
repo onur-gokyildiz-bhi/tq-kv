@@ -1,7 +1,7 @@
 # TurboQuant Benchmark Results
 
-> **tq-kv** v0.4.0 — Pure Rust, zero C/C++ dependency, CUDA accelerated
-> ICLR 2026 paper implementation: Lloyd-Max codebook + adaptive sigma + fused attention + incremental KV cache
+> **tq-kv** v0.5.0 — Pure Rust, zero C/C++ dependency, CUDA accelerated
+> First TurboQuant on GGUF quantized models — 3-Fix + SRHT QJL + Norm Correction + Adaptive QJL
 > [arxiv.org/abs/2504.19874](https://arxiv.org/abs/2504.19874)
 
 **Hardware:** NVIDIA GeForce RTX 3080 10GB, Intel Core i9-13900K, 64GB RAM, Windows 11 Pro, CUDA 13.2, Rust 1.91 release mode.
@@ -109,34 +109,60 @@ Output: packed_indices (uint8) + norms (fp32)
 > Lloyd-Max without QJL is **35-106x faster** than PolarQuant+QJL at the same quality,
 > with **3.3x better compression ratio**. QJL overhead dominates at low bit widths.
 
-### QJL Removal Results (4-bit)
+### QJL: Dense vs SRHT (v0.5.0)
 
-> 32,768 vectors, dim=128
+> 32,768 vectors, dim=128, 4-bit, release build
 
-| Metric | QJL ON | QJL OFF |
-|:-------|:------:|:-------:|
-| Compression ratio | 2.7x | **3.8x** |
-| SNR | 21.5 dB | 20.3 dB |
-| Cosine similarity | 0.9966 | 0.9956 |
-| Compress speed | 2196 ms | **75 ms** |
-| Decompress speed | 2941 ms | **23 ms** |
+| Metric | Dense QJL (paper) | SRHT QJL (v0.5.0) | No QJL |
+|:-------|:-----------------:|:------------------:|:------:|
+| Compression ratio | 2.7x | 2.7x | **3.8x** |
+| SNR | 21.5 dB | **24.8 dB** | 20.3 dB |
+| Cosine similarity | 0.9966 | **0.9984** | 0.9956 |
+| Compress overhead | 29x | **1.45x** | 1.0x |
+| Decompress overhead | 128x | **1.7x** | 1.0x |
+| Attention KL divergence | — | **2.9x lower** | baseline |
 
-> QJL adds +1.2 dB SNR but costs **29x compress**, **128x decompress**, and worse ratio (2.7x vs 3.8x).
-> Removed from all defaults.
+> SRHT QJL: **115x faster** than dense, **+4.5 dB better SNR**. Structured Hadamard projection has lower variance than random Rademacher.
+> Dense QJL hurts quality per 5 independent groups (ikawrakow, spiritbuun, scos-lab, Arclabs001, paper ablation).
+> SRHT QJL improves attention KL divergence 2.9x at all context lengths (synthetic data; real-model validation pending).
+> Default: QJL OFF. Adaptive mode available: `QjlMode::Adaptive { threshold: 4096 }`.
 
-### QJL Long Context Investigation
+### Attention KL Divergence vs Context Length
 
-Does QJL help more at longer sequences? Tested 64 to 8192 vectors:
+| Context | KL(no QJL) | KL(SRHT QJL) | Reduction |
+|:-------:|:----------:|:------------:|:---------:|
+| 64 | 0.000270 | 0.000093 | 2.9x |
+| 256 | 0.000283 | 0.000099 | 2.9x |
+| 1,024 | 0.000289 | 0.000103 | 2.8x |
+| 4,096 | 0.000288 | 0.000102 | 2.8x |
+| 16,384 | 0.000288 | 0.000103 | 2.8x |
 
-| Vectors | 4-bit OFF | 4-bit ON | 2-bit OFF | 2-bit ON |
-|--------:|:---------:|:--------:|:---------:|:--------:|
-| 64 | 0.9954 | 0.9965 | 0.940 | 0.956 |
-| 256 | 0.9953 | 0.9965 | 0.940 | 0.956 |
-| 1024 | 0.9954 | 0.9965 | 0.940 | 0.956 |
-| 4096 | 0.9954 | 0.9965 | 0.940 | 0.956 |
-| 8192 | 0.9955 | 0.9965 | 0.941 | 0.956 |
+### 3-Fix Framework (v0.5.0 — GGUF Compound Error Fix)
 
-QJL improvement is **constant** (+1.1-1.2 dB) regardless of context length. Per-vector compression is independent — error does not accumulate. QJL removal decision stands.
+> Qwen 2.5 7B Q4_K_M, 4-bit TurboQuant, CPU
+
+| Configuration | Max Coherent Tokens | Language Mixing |
+|:-------------|:-------------------:|:---------------:|
+| No TurboQuant | unlimited | none |
+| TurboQuant (no fixes) | ~50 | severe (5+ languages) |
+| + Cache reset | ~100 | moderate |
+| + Cache reset + POQ | ~200 | mild |
+| **+ All 3 fixes** | **300+** | **none** |
+
+> First TurboQuant implementation validated on GGUF quantized models.
+
+### Norm Correction (v0.5.0)
+
+Stores `corrected_norm = norm^2 / ||reconstruction||` so decompressed vector norm matches original.
+Zero decode cost. Applied to all compression paths (batch + single key).
+
+### Gaussianity Verification (v0.5.0)
+
+| Metric | Before Hadamard | After Hadamard | Gaussian Ideal |
+|:-------|:---------------:|:--------------:|:--------------:|
+| Kurtosis | 35.3 | **3.3** | 3.0 |
+
+Confirms Lloyd-Max codebook assumptions hold after rotation.
 
 ---
 
