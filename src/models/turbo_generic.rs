@@ -809,7 +809,8 @@ impl LayerWeights {
                             }
 
                             // Segment 4: Current token key (FP16 original — POQ)
-                            {
+                            // Only if current token was compressed (not still in sink range)
+                            if n_compressed > 0 {
                                 let k_f32 = k.to_dtype(DType::F32).unwrap();
                                 let k_flat = k_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
                                 let k_vec = &k_flat[kv_h * self.head_dim..(kv_h + 1) * self.head_dim];
@@ -871,7 +872,10 @@ impl LayerWeights {
                     }
 
                     // Part 3: Current token key (FP16 original — POQ lossless)
-                    k_parts.push(k.to_dtype(DType::F32)?);
+                    // Only add if current token was compressed (not still in sink range)
+                    if n_compressed > 0 {
+                        k_parts.push(k.to_dtype(DType::F32)?);
+                    }
 
                     let k_full = if k_parts.len() == 1 {
                         k_parts.remove(0)
