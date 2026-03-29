@@ -164,6 +164,21 @@ Zero decode cost. Applied to all compression paths (batch + single key).
 
 Confirms Lloyd-Max codebook assumptions hold after rotation.
 
+### Perplexity — Qwen 2.5 7B Instruct Q4_K_M (v0.5.0+)
+
+> wikitext-2, 2328 tokens, CUDA (RTX 3080), TQ_SINK=0
+
+| Mode | PPL | vs Baseline |
+|:-----|----:|:----------:|
+| Baseline (no TQ) | 5.088 | — |
+| TQ 4-bit | 6.831 | +34.3% |
+| TQ 3-bit | 6.600 | +29.7% |
+| TQ 2-bit | 7.004 | +37.6% |
+
+> **Note:** Higher PPL delta vs Llama-3 8B (+0.8%) due to compound quantization error
+> (Q4_K_M weights × TQ keys). Sink tokens (TQ_SINK=4) expected to reduce this gap
+> but currently have a shape mismatch bug in token-by-token PPL eval mode.
+
 ---
 
 ## Fused Attention vs Decompress Path
