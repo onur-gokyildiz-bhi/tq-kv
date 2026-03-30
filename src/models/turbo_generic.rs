@@ -1010,19 +1010,39 @@ impl LayerWeights {
                 }
             } else {
                 // PREFILL: use original uncompressed keys for attention (standard path)
-                // Keys are already compressed into cache above, but attention uses originals
                 let k = repeat_kv(k, n_rep)?;
                 let v_for_attn = repeat_kv(v, n_rep)?;
-                let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-                let att = match mask {
-                    None => att,
-                    Some(mask) => {
-                        let mask = mask.broadcast_as(att.shape())?;
-                        masked_fill(&att, &mask, &self.neg_inf)?
+
+                // Try Flash Attention for prefill (memory efficient, faster for long prompts)
+                if q.device().is_cpu() && mask.is_none() {
+                    let scale = 1.0 / (self.head_dim as f32).sqrt();
+                    let q_fa = q.to_dtype(DType::F32)?;
+                    let k_fa = k.to_dtype(DType::F32)?;
+                    let v_fa = v_for_attn.to_dtype(DType::F32)?.contiguous()?;
+                    match candle_nn::cpu_flash_attention::run_flash_attn_cpu::<f32>(
+                        &q_fa, &k_fa, &v_fa, None, scale, None, None,
+                    ) {
+                        Ok(y) => y.to_dtype(q.dtype())?,
+                        Err(_) => {
+                            // Fallback to manual
+                            let att = softmax_last_dim(
+                                &(q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?
+                            )?;
+                            att.matmul(&v_for_attn.contiguous()?)?
+                        }
                     }
-                };
-                let att = softmax_last_dim(&att)?;
-                att.matmul(&v_for_attn.contiguous()?)?
+                } else {
+                    let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+                    let att = match mask {
+                        None => att,
+                        Some(mask) => {
+                            let mask = mask.broadcast_as(att.shape())?;
+                            masked_fill(&att, &mask, &self.neg_inf)?
+                        }
+                    };
+                    let att = softmax_last_dim(&att)?;
+                    att.matmul(&v_for_attn.contiguous()?)?
+                }
             };
 
             let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
