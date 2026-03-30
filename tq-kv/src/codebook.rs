@@ -301,6 +301,126 @@ pub fn remap_table(from_bits: u8, to_bits: u8) -> Vec<u8> {
     }).collect()
 }
 
+/// Calibrated codebook: optimal centroids learned from actual data distribution.
+///
+/// Instead of assuming N(0,1) Gaussian, runs Lloyd-Max iterations on collected
+/// activation samples to find centroids that minimize MSE for the real distribution.
+#[derive(Clone, Debug)]
+pub struct CalibratedCodebook {
+    /// Optimal centroids (sorted ascending)
+    pub centroids: Vec<f32>,
+    /// Decision boundaries between centroids
+    pub boundaries: Vec<f32>,
+    /// Number of bits
+    pub bits: u8,
+}
+
+impl CalibratedCodebook {
+    /// Run Lloyd-Max optimization on sample data.
+    ///
+    /// `samples`: normalized post-Hadamard coordinate values (divided by sigma).
+    /// `bits`: target quantization bits (2, 3, or 4).
+    /// `iterations`: number of Lloyd-Max iterations (default: 100).
+    pub fn calibrate(samples: &[f32], bits: u8, iterations: usize) -> Self {
+        let n_centroids = 1usize << bits;
+
+        // Initialize centroids from the standard Gaussian codebook
+        let init = get_centroids(bits);
+        let mut centroids: Vec<f32> = init.to_vec();
+
+        for _ in 0..iterations {
+            // Assignment step: assign each sample to nearest centroid
+            let mut sums = vec![0.0f64; n_centroids];
+            let mut counts = vec![0usize; n_centroids];
+
+            for &s in samples {
+                let mut best = 0;
+                let mut best_dist = f32::MAX;
+                for (j, &c) in centroids.iter().enumerate() {
+                    let d = (s - c).abs();
+                    if d < best_dist {
+                        best_dist = d;
+                        best = j;
+                    }
+                }
+                sums[best] += s as f64;
+                counts[best] += 1;
+            }
+
+            // Update step: move centroids to mean of assigned samples
+            let mut changed = false;
+            for j in 0..n_centroids {
+                if counts[j] > 0 {
+                    let new_c = (sums[j] / counts[j] as f64) as f32;
+                    if (new_c - centroids[j]).abs() > 1e-7 {
+                        centroids[j] = new_c;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed { break; }
+        }
+
+        // Sort centroids and compute boundaries (midpoints)
+        centroids.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut boundaries = Vec::with_capacity(n_centroids - 1);
+        for i in 0..n_centroids - 1 {
+            boundaries.push((centroids[i] + centroids[i + 1]) / 2.0);
+        }
+
+        Self { centroids, boundaries, bits }
+    }
+
+    /// Quantize a normalized value → centroid index.
+    #[inline]
+    pub fn quantize(&self, normalized: f32) -> u8 {
+        let mut idx = 0u8;
+        for &b in &self.boundaries {
+            if normalized > b { idx += 1; } else { break; }
+        }
+        idx
+    }
+
+    /// Centroid index → normalized value.
+    #[inline]
+    pub fn dequantize(&self, index: u8) -> f32 {
+        self.centroids[index as usize]
+    }
+
+    /// Compute MSE improvement vs standard Gaussian codebook on given samples.
+    pub fn improvement_vs_gaussian(&self, samples: &[f32], bits: u8) -> (f32, f32) {
+        let gaussian_cb = get_centroids(bits);
+        let gaussian_bounds = match bits {
+            2 => BOUNDARIES_2BIT,
+            3 => BOUNDARIES_3BIT,
+            4 => BOUNDARIES_4BIT,
+            _ => BOUNDARIES_4BIT,
+        };
+
+        let mut mse_gaussian = 0.0f64;
+        let mut mse_calibrated = 0.0f64;
+
+        for &s in samples {
+            // Gaussian quantization
+            let mut gi = 0u8;
+            for &b in gaussian_bounds { if s > b { gi += 1; } else { break; } }
+            let g_err = s - gaussian_cb[gi as usize];
+            mse_gaussian += (g_err * g_err) as f64;
+
+            // Calibrated quantization
+            let ci = self.quantize(s);
+            let c_err = s - self.centroids[ci as usize];
+            mse_calibrated += (c_err * c_err) as f64;
+        }
+
+        let n = samples.len() as f64;
+        (
+            (mse_gaussian / n) as f32,
+            (mse_calibrated / n) as f32,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -63,6 +63,11 @@ pub mod candle_kv;
 #[doc(hidden)]
 pub mod bench;
 
+/// Python bindings via PyO3.
+/// Build with `maturin develop --features python` or `cargo build --features python`.
+#[cfg(feature = "python")]
+pub mod python;
+
 /// QJL activation mode.
 #[derive(Clone, Debug, PartialEq)]
 pub enum QjlMode {
@@ -124,6 +129,10 @@ pub struct TurboQuantConfig {
     /// These entries are zeroed before quantization and restored on decompress.
     /// 0 = disabled. Default: 0. Typical: 2 (top-2 outliers per 128-dim vector).
     pub outlier_k: usize,
+    /// Calibrated codebook: optimal centroids from real model activations.
+    /// If Some, used instead of standard Gaussian Lloyd-Max centroids.
+    /// Calibrate with `CalibratedCodebook::calibrate()`.
+    pub calibrated_codebook: Option<codebook::CalibratedCodebook>,
 
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
@@ -145,6 +154,7 @@ impl Default for TurboQuantConfig {
             group_size: 32,
             residual_bits: 0,
             outlier_k: 0,
+            calibrated_codebook: None,
         }
     }
 }
@@ -1476,6 +1486,34 @@ pub fn sparse_v_stats(attn_weights: &[f32], threshold: f32) -> SparseVStats {
     SparseVStats { total: attn_weights.len(), active }
 }
 
+/// Calibrate codebook from a batch of key vectors.
+///
+/// Collects post-Hadamard, normalized coordinate samples and runs Lloyd-Max
+/// to find optimal centroids for the actual distribution.
+///
+/// Returns a CalibratedCodebook — set it on `TurboQuantConfig::calibrated_codebook`.
+pub fn calibrate_codebook(data: &[f32], dim: usize, bits: u8, rotation_seed: u64) -> codebook::CalibratedCodebook {
+    assert_eq!(data.len() % dim, 0);
+
+    // Rotate all vectors
+    let mut rotated = data.to_vec();
+    for chunk in rotated.chunks_exact_mut(dim) {
+        hadamard::randomized_hadamard(chunk, rotation_seed);
+    }
+
+    // Normalize: divide each coordinate by its vector's sigma
+    let mut normalized = Vec::with_capacity(rotated.len());
+    for chunk in rotated.chunks_exact(dim) {
+        let norm: f32 = chunk.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let sigma = if norm > 1e-10 { norm / (dim as f32).sqrt() } else { 1.0 };
+        for &v in chunk {
+            normalized.push(v / sigma);
+        }
+    }
+
+    codebook::CalibratedCodebook::calibrate(&normalized, bits, 100)
+}
+
 /// Calibrate per-channel scaling factors from a batch of key vectors.
 ///
 /// Computes `scale[i] = median_absmax / absmax[i]` for each channel, so that
@@ -2348,5 +2386,37 @@ mod tests {
         let n_b: f32 = decompressed.iter().map(|x| x * x).sum::<f32>().sqrt();
         let cos_sim = dot / (n_a * n_b + 1e-10);
         assert!(cos_sim > 0.90, "Channel-scaled roundtrip cos_sim should be > 0.90, got {:.4}", cos_sim);
+    }
+
+    #[test]
+    fn test_calibrated_codebook() {
+        let dim = 128;
+        let data = random_vectors(256, dim, 42);
+        let cb = calibrate_codebook(&data, dim, 4, 0x0054_5552_4230);
+
+        assert_eq!(cb.centroids.len(), 16); // 4-bit = 16 centroids
+        assert_eq!(cb.boundaries.len(), 15);
+
+        // Centroids should be sorted
+        for i in 0..cb.centroids.len() - 1 {
+            assert!(cb.centroids[i] <= cb.centroids[i + 1],
+                "Centroids not sorted: [{}]={} > [{}]={}", i, cb.centroids[i], i+1, cb.centroids[i+1]);
+        }
+
+        // Should improve or match Gaussian MSE
+        let mut rotated = data.clone();
+        for chunk in rotated.chunks_exact_mut(dim) {
+            hadamard::randomized_hadamard(chunk, 0x0054_5552_4230);
+        }
+        let mut normalized = Vec::new();
+        for chunk in rotated.chunks_exact(dim) {
+            let norm: f32 = chunk.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let sigma = norm / (dim as f32).sqrt();
+            for &v in chunk { normalized.push(v / sigma); }
+        }
+
+        let (mse_gaussian, mse_calibrated) = cb.improvement_vs_gaussian(&normalized, 4);
+        assert!(mse_calibrated <= mse_gaussian * 1.01,
+            "Calibrated should be ≤ Gaussian MSE: {:.6} vs {:.6}", mse_calibrated, mse_gaussian);
     }
 }
