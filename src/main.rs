@@ -1,4 +1,5 @@
 mod auto_tq;
+mod calibrate;
 mod catalog;
 mod chat;
 mod config;
@@ -138,6 +139,17 @@ enum Commands {
     },
     /// Check system compatibility
     Doctor,
+    /// Calibrate TurboQuant for a model (computes optimal codebook, rotation, scales)
+    Calibrate {
+        /// Model name (e.g., qwen2:7b, llama:8b)
+        model: String,
+        /// Text file for calibration data (default: embedded wikitext sample)
+        #[arg(long)]
+        text: Option<PathBuf>,
+        /// Number of key vectors to collect (default: 4096)
+        #[arg(long, default_value = "4096")]
+        samples: usize,
+    },
     /// Run perplexity evaluation
     Perplexity {
         /// Model name (e.g., qwen72b, llama3-8b)
@@ -158,6 +170,20 @@ enum Commands {
         #[arg(long)]
         turbo_quant: bool,
     },
+    /// Run ablation study — sweep TQ configs and measure PPL for each
+    Ablate {
+        /// Model name (e.g., qwen2:7b, llama:8b)
+        model: String,
+        /// Text file for evaluation
+        #[arg(long)]
+        file: PathBuf,
+        /// Quick mode (fewer configs)
+        #[arg(long)]
+        quick: bool,
+        /// Output CSV file
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -167,12 +193,14 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Serve { .. }) => cmd_serve(&cli).await,
         Some(Commands::Chat { .. }) => cmd_chat(&cli),
+        Some(Commands::Calibrate { .. }) => cmd_calibrate(&cli),
         Some(Commands::Doctor) => cmd_doctor(),
         Some(Commands::Perplexity { .. }) => cmd_perplexity(&cli),
         Some(Commands::Pull { ref model }) => cmd_pull(model),
         Some(Commands::List { available }) => cmd_list(available),
         Some(Commands::Rm { ref model }) => cmd_rm(model),
         Some(Commands::Bench { .. }) => cmd_bench(&cli),
+        Some(Commands::Ablate { .. }) => cmd_ablate_study(&cli),
         None => {
             // Legacy mode: if prompt given, run like old tq-engine
             if cli.prompt.is_some() {
@@ -190,6 +218,10 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn resolve_tq_config(turbo_quant: bool, tq_bits: u8) -> Option<tq_kv::TurboQuantConfig> {
+    resolve_tq_config_for_model(turbo_quant, tq_bits, None)
+}
+
+fn resolve_tq_config_for_model(turbo_quant: bool, tq_bits: u8, model_name: Option<&str>) -> Option<tq_kv::TurboQuantConfig> {
     if turbo_quant {
         let mut config = match tq_bits {
             2 => tq_kv::TurboQuantConfig::extreme(),
@@ -206,6 +238,16 @@ fn resolve_tq_config(turbo_quant: bool, tq_bits: u8) -> Option<tq_kv::TurboQuant
         if let Ok(val) = std::env::var("TQ_OUTLIER") {
             if let Ok(k) = val.parse::<usize>() {
                 config.outlier_k = k;
+            }
+        }
+        // Auto-load calibration data if available (unless TQ_NO_CAL=1)
+        let no_cal = std::env::var("TQ_NO_CAL").ok().map_or(false, |v| v == "1");
+        if !no_cal {
+            if let Some(name) = model_name {
+                if let Some(cal_data) = calibrate::load_calibration_for_model(name) {
+                    eprintln!("Using calibrated codebook + rotation + channel scales");
+                    cal_data.apply_to_config(&mut config);
+                }
             }
         }
         Some(config)
@@ -566,6 +608,259 @@ fn cmd_doctor() -> Result<()> {
     Ok(())
 }
 
+fn cmd_calibrate(cli: &Cli) -> Result<()> {
+    let (model_name, text_file, max_samples) = match &cli.command {
+        Some(Commands::Calibrate { model, text, samples }) => {
+            (model.as_str(), text.clone(), *samples)
+        }
+        _ => unreachable!(),
+    };
+
+    eprintln!("=== TurboQuant Calibration ===");
+    eprintln!("Model: {}", model_name);
+    eprintln!("Samples: {}", max_samples);
+
+    // Resolve model
+    let (gguf_path, tokenizer_path) = hub::resolve(model_name)?;
+    let tok_path = tokenizer_path.ok_or_else(|| {
+        anyhow::anyhow!("No tokenizer found for model '{}'", model_name)
+    })?;
+
+    let mf = gguf_path.to_string_lossy().to_string();
+    let arch = config::detect_arch(&mf);
+
+    // Load calibration text
+    let cal_text = if let Some(ref path) = text_file {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("Cannot read calibration text: {}", path.display()))?
+    } else {
+        // Default calibration text (short representative sample)
+        "The tower is 324 metres tall, about the same height as an 81-storey building, \
+         and the tallest structure in Paris. Its base is square, measuring 125 metres on \
+         each side. During its construction, the Eiffel Tower surpassed the Washington \
+         Monument to become the tallest human-made structure in the world, a title it held \
+         for 41 years until the Chrysler Building in New York City was finished in 1930. \
+         It was the first structure in the world to surpass both the 200-metre and 300-metre \
+         mark in height. Due to the addition of a broadcasting aerial at the top of the tower \
+         in 1957, it is now taller than the Chrysler Building by 5.2 metres. Excluding \
+         transmitters, the Eiffel Tower is the second tallest free-standing structure in France \
+         after the Millau Viaduct. The tower has three levels for visitors, with restaurants on \
+         the first and second levels. The top level observation deck is 276 m above the ground, \
+         the highest observation deck accessible to the public in the European Union. Tickets \
+         can be purchased to ascend by stairs or lift to the first and second levels. The climb \
+         from ground level to the first level is over 300 steps, as is the climb from the first \
+         level to the second, making the entire ascent a physical challenge. Although there is a \
+         staircase to the top level, it is usually accessible only by lift. The tower was designed \
+         by the French civil engineer Gustave Eiffel and built by his engineering company. It was \
+         constructed from 1887 to 1889 as the centerpiece of the 1889 World's Fair. Although \
+         initially criticised by some of France's leading artists and intellectuals for its design, \
+         it has since become a global cultural icon of France and one of the most recognisable \
+         structures in the world. The Eiffel Tower is the most visited paid monument in the world; \
+         6.91 million people ascended it in 2015. It has been named after its designer, engineer \
+         Gustave Eiffel, and is colloquially known as the Iron Lady.".to_string()
+    };
+
+    // Determine head_dim from GGUF metadata
+    let head_dim = {
+        let mut file = std::fs::File::open(&gguf_path)?;
+        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
+        let n_embd = content.metadata.get("llama.embedding_length")
+            .or_else(|| content.metadata.get("qwen2.embedding_length"))
+            .or_else(|| content.metadata.get("phi3.embedding_length"))
+            .or_else(|| content.metadata.get("gemma.embedding_length"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(4096) as usize;
+        let n_head = content.metadata.get("llama.attention.head_count")
+            .or_else(|| content.metadata.get("qwen2.attention.head_count"))
+            .or_else(|| content.metadata.get("phi3.attention.head_count"))
+            .or_else(|| content.metadata.get("gemma.attention.head_count"))
+            .and_then(|v| v.to_u32().ok())
+            .unwrap_or(32) as usize;
+        n_embd / n_head
+    };
+
+    eprintln!("Head dim: {}", head_dim);
+
+    // Initialize calibration collector
+    let collector = calibrate::init_collector(head_dim, max_samples);
+
+    // Load engine WITHOUT TurboQuant (collect raw activations)
+    // We use TQ with skip=999 to run through turbo_generic path but skip compression
+    let tq_config = tq_kv::TurboQuantConfig {
+        bits: 4,
+        ..Default::default()
+    };
+
+    // Set TQ_SKIP very high so all layers are uncompressed but still go through
+    // the turbo_generic code path (which has our collection hook)
+    std::env::set_var("TQ_SKIP", "999");
+
+    let mut engine = Engine::load_with_device(
+        &gguf_path, &tok_path, arch, Some(tq_config.clone()), cli.cpu,
+    )?;
+
+    // Run prefill to collect activations
+    eprintln!("Running prefill to collect KV activations...");
+    let params = engine::GenerationParams {
+        max_tokens: 1, // just prefill, don't generate
+        temperature: 0.0,
+        ..Default::default()
+    };
+    let _ = engine.generate_silent(&cal_text, &params);
+
+    // Remove the skip override
+    std::env::remove_var("TQ_SKIP");
+
+    // Get collected samples
+    let c = collector.lock().map_err(|e| anyhow::anyhow!("Collector lock error: {}", e))?;
+    eprintln!("Collected {} key vectors", c.count);
+
+    if c.count < 100 {
+        anyhow::bail!("Too few samples collected ({}). Need at least 100. Try longer calibration text.", c.count);
+    }
+
+    // Compute calibration
+    let cal_data = calibrate::compute_calibration(&c, model_name, tq_config.rotation_seed);
+
+    // Save
+    let entry = crate::catalog::find(model_name);
+    let (name, tag) = if let Some(e) = entry {
+        (e.name.to_string(), e.tag.to_string())
+    } else if let Some((n, t)) = model_name.split_once(':') {
+        (n.to_string(), t.to_string())
+    } else {
+        (model_name.to_string(), "default".to_string())
+    };
+
+    let path = calibrate::calibration_path(&name, &tag);
+    calibrate::save_calibration(&cal_data, &path)?;
+
+    eprintln!("\n=== Calibration Complete ===");
+    eprintln!("Channel scales: {} values", cal_data.channel_scales.len());
+    eprintln!("Rotation matrix: {}x{}", head_dim, head_dim);
+    eprintln!("Codebooks: 2-bit, 3-bit, 4-bit");
+    eprintln!("\nCalibration will be auto-loaded on next inference run.");
+
+    Ok(())
+}
+
+fn cmd_ablate_study(cli: &Cli) -> Result<()> {
+    let (model_name, file_path, quick, output_path) = match &cli.command {
+        Some(Commands::Ablate { model, file, quick, output }) => {
+            (model.as_str(), file.clone(), *quick, output.clone())
+        }
+        _ => unreachable!(),
+    };
+
+    let eval_text = std::fs::read_to_string(&file_path)
+        .with_context(|| format!("Cannot read eval file: {}", file_path.display()))?;
+
+    eprintln!("=== TurboQuant Ablation Study ===");
+    eprintln!("Model: {}", model_name);
+    eprintln!("Eval text: {} chars", eval_text.len());
+    eprintln!("Mode: {}", if quick { "quick" } else { "full" });
+
+    let (gguf_path, tokenizer_path) = hub::resolve(model_name)?;
+    let tok_path = tokenizer_path.ok_or_else(|| anyhow::anyhow!("No tokenizer found"))?;
+    let mf = gguf_path.to_string_lossy().to_string();
+    let arch = config::detect_arch(&mf);
+
+    // Check if calibration exists
+    let has_calibration = calibrate::load_calibration_for_model(model_name).is_some();
+
+    // Define sweep
+    let bits_sweep: Vec<u8> = if quick { vec![2, 4] } else { vec![2, 3, 4] };
+    let skip_sweep: Vec<usize> = if quick { vec![0, 4] } else { vec![0, 2, 4, 8] };
+    let sink_sweep: Vec<usize> = if quick { vec![0, 4] } else { vec![0, 2, 4] };
+    let cal_sweep: Vec<bool> = if has_calibration { vec![false, true] } else { vec![false] };
+
+    let mut results: Vec<(String, f64, f64)> = Vec::new(); // (config_label, ppl, seconds)
+
+    // Baseline: no TQ
+    {
+        eprintln!("\n--- Baseline (no TQ) ---");
+        let start = Instant::now();
+        let mut engine = Engine::load_with_device(&gguf_path, &tok_path, arch, None, cli.cpu)?;
+        let ppl = engine.compute_perplexity(&eval_text, 512)?;
+        let elapsed = start.elapsed().as_secs_f64();
+        eprintln!("  PPL: {:.3} ({:.1}s)", ppl, elapsed);
+        results.push(("baseline".to_string(), ppl, elapsed));
+    }
+
+    let baseline_ppl = results[0].1;
+
+    // Sweep TQ configs
+    let total = bits_sweep.len() * skip_sweep.len() * sink_sweep.len() * cal_sweep.len();
+    let mut run = 0;
+
+    for &bits in &bits_sweep {
+        for &skip in &skip_sweep {
+            for &sink in &sink_sweep {
+                for &use_cal in &cal_sweep {
+                    run += 1;
+                    let label = format!("{}bit_skip{}_sink{}{}", bits, skip, sink,
+                        if use_cal { "_cal" } else { "" });
+                    eprintln!("\n--- [{}/{}] {} ---", run, total, label);
+
+                    let mut tq = match bits {
+                        2 => tq_kv::TurboQuantConfig::extreme(),
+                        3 => tq_kv::TurboQuantConfig::aggressive(),
+                        _ => tq_kv::TurboQuantConfig::balanced(),
+                    };
+                    tq.skip_layers = Some(skip);
+                    tq.sink_tokens = Some(sink);
+
+                    if use_cal {
+                        if let Some(cal_data) = calibrate::load_calibration_for_model(model_name) {
+                            cal_data.apply_to_config(&mut tq);
+                        }
+                    }
+
+                    let start = Instant::now();
+                    let mut engine = Engine::load_with_device(
+                        &gguf_path, &tok_path, arch, Some(tq), cli.cpu,
+                    )?;
+                    let ppl = engine.compute_perplexity(&eval_text, 512)?;
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let delta = (ppl - baseline_ppl) / baseline_ppl * 100.0;
+                    eprintln!("  PPL: {:.3} (delta: {:+.2}%, {:.1}s)", ppl, delta, elapsed);
+                    results.push((label, ppl, elapsed));
+                }
+            }
+        }
+    }
+
+    // Print summary table
+    eprintln!("\n╔══════════════════════════════════════════════════════╗");
+    eprintln!("║              ABLATION RESULTS                       ║");
+    eprintln!("╠══════════════════════╦════════╦═══════════╦══════════╣");
+    eprintln!("║ Config               ║  PPL   ║ Delta PPL ║ Time (s) ║");
+    eprintln!("╠══════════════════════╬════════╬═══════════╬══════════╣");
+    for (label, ppl, secs) in &results {
+        let delta = if label == "baseline" {
+            "   ---   ".to_string()
+        } else {
+            format!("{:+.2}%", (ppl - baseline_ppl) / baseline_ppl * 100.0)
+        };
+        eprintln!("║ {:20} ║ {:6.3} ║ {:>9} ║ {:7.1}s ║", label, ppl, delta, secs);
+    }
+    eprintln!("╚══════════════════════╩════════╩═══════════╩══════════╝");
+
+    // Write CSV if requested
+    if let Some(ref csv_path) = output_path {
+        let mut csv = String::from("config,ppl,delta_ppl_pct,time_s\n");
+        for (label, ppl, secs) in &results {
+            let delta = if label == "baseline" { 0.0 } else { (ppl - baseline_ppl) / baseline_ppl * 100.0 };
+            csv.push_str(&format!("{},{:.4},{:.4},{:.2}\n", label, ppl, delta, secs));
+        }
+        std::fs::write(csv_path, &csv)?;
+        eprintln!("\nCSV saved: {}", csv_path.display());
+    }
+
+    Ok(())
+}
+
 fn cmd_perplexity(cli: &Cli) -> Result<()> {
     let (model_name, model_path_override, tokenizer_repo_override, file, chunk, turbo_quant) =
         match &cli.command {
@@ -578,7 +873,7 @@ fn cmd_perplexity(cli: &Cli) -> Result<()> {
             _ => unreachable!(),
         };
 
-    let tq_config = resolve_tq_config(turbo_quant, cli.tq_bits);
+    let tq_config = resolve_tq_config_for_model(turbo_quant, cli.tq_bits, Some(model_name));
 
     // Try legacy config first, then fall back to hub resolution
     let mut engine = if let Some(model_config) = config::get_model(model_name) {

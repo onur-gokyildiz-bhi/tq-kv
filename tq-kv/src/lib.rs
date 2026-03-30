@@ -137,6 +137,12 @@ pub struct TurboQuantConfig {
     /// random Hadamard. Row-major [dim × dim]. Must be orthogonal.
     /// Generate with `hadamard::random_orthogonal()` or load learned matrix.
     pub rotation_matrix: Option<Vec<f32>>,
+    /// Number of initial layers to skip (uncompressed fp16 KV cache).
+    /// If None, falls back to TQ_SKIP env var (default: 4).
+    pub skip_layers: Option<usize>,
+    /// Number of sink tokens to preserve at full precision.
+    /// If None, falls back to TQ_SINK env var (default: 4).
+    pub sink_tokens: Option<usize>,
 
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
@@ -160,6 +166,8 @@ impl Default for TurboQuantConfig {
             outlier_k: 0,
             calibrated_codebook: None,
             rotation_matrix: None,
+            skip_layers: None,
+            sink_tokens: None,
         }
     }
 }
@@ -860,6 +868,13 @@ pub fn pre_rotate_query_with_signs(query: &[f32], signs: &[f32]) -> Vec<f32> {
     rotated
 }
 
+/// Pre-rotate query with a custom rotation matrix (SpinQuant/PCA).
+pub fn pre_rotate_query_with_matrix(query: &[f32], matrix: &[f32]) -> Vec<f32> {
+    let mut rotated = query.to_vec();
+    hadamard::apply_rotation(&mut rotated, matrix);
+    rotated
+}
+
 /// Compress a single key vector. For incremental KV cache.
 /// Returns: (packed_indices, corrected_norm)
 pub fn compress_single_key(
@@ -929,7 +944,12 @@ pub fn compress_single_key_with_signs(
         }
     }
 
-    hadamard::randomized_hadamard_with_signs(&mut rotated, signs);
+    // Apply rotation: custom matrix (SpinQuant) or randomized Hadamard
+    if let Some(ref matrix) = config.rotation_matrix {
+        hadamard::apply_rotation(&mut rotated, matrix);
+    } else {
+        hadamard::randomized_hadamard_with_signs(&mut rotated, signs);
+    }
 
     let norm: f32 = rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
     let base_cb = codebook::Codebook::new(config.bits, dim);
@@ -938,22 +958,27 @@ pub fn compress_single_key_with_signs(
         vec![0u8; dim]
     } else {
         let sigma = norm / (dim as f32).sqrt();
-        let cb = codebook::Codebook { sigma, ..base_cb };
-        rotated.iter().map(|&v| cb.quantize(v)).collect()
+        if let Some(ref cal_cb) = config.calibrated_codebook {
+            rotated.iter().map(|&v| cal_cb.quantize(v / sigma)).collect()
+        } else {
+            let cb = codebook::Codebook { sigma, ..base_cb };
+            rotated.iter().map(|&v| cb.quantize(v)).collect()
+        }
     };
 
-    // Norm correction: compute reconstruction norm from indices, then adjust stored norm
-    // so that decompress produces a vector with the ORIGINAL norm.
-    // Decompression scales each centroid by (stored_norm / sqrt(d)), so:
-    //   ||recon|| = stored_norm * sqrt(sum(centroid[idx_i]^2)) / sqrt(d)
-    // We want ||recon|| = norm, so:
-    //   corrected_norm = norm * norm / recon_norm_from_indices
+    // Norm correction
     let corrected_norm = if norm > 1e-10 {
         let sigma = norm / (dim as f32).sqrt();
-        let cb = codebook::Codebook { sigma, ..base_cb };
-        let recon_norm_sq: f32 = indices.iter()
-            .map(|&idx| { let v = cb.dequantize(idx); v * v })
-            .sum();
+        let recon_norm_sq: f32 = if let Some(ref cal_cb) = config.calibrated_codebook {
+            indices.iter()
+                .map(|&idx| { let v = cal_cb.dequantize(idx) * sigma; v * v })
+                .sum()
+        } else {
+            let cb = codebook::Codebook { sigma, ..base_cb };
+            indices.iter()
+                .map(|&idx| { let v = cb.dequantize(idx); v * v })
+                .sum()
+        };
         let recon_norm = recon_norm_sq.sqrt();
         if recon_norm > 1e-10 { norm * norm / recon_norm } else { norm }
     } else {
@@ -1033,14 +1058,26 @@ pub fn compress_single_key_grouped(
             group_norms.push(0.0);
         } else {
             let sigma = group_norm / (gs as f32).sqrt();
-            let cb = codebook::Codebook { sigma, ..base_cb.clone() };
 
-            let group_indices: Vec<u8> = group.iter().map(|&v| cb.quantize(v)).collect();
+            let group_indices: Vec<u8> = if let Some(ref cal_cb) = config.calibrated_codebook {
+                // Calibrated codebook: quantize normalized values (v / sigma)
+                group.iter().map(|&v| cal_cb.quantize(v / sigma)).collect()
+            } else {
+                let cb = codebook::Codebook { sigma, ..base_cb.clone() };
+                group.iter().map(|&v| cb.quantize(v)).collect()
+            };
 
             // Norm correction per group
-            let recon_norm: f32 = group_indices.iter()
-                .map(|&idx| { let v = cb.dequantize(idx); v * v })
-                .sum::<f32>().sqrt();
+            let recon_norm: f32 = if let Some(ref cal_cb) = config.calibrated_codebook {
+                group_indices.iter()
+                    .map(|&idx| { let v = cal_cb.dequantize(idx) * sigma; v * v })
+                    .sum::<f32>().sqrt()
+            } else {
+                let cb = codebook::Codebook { sigma, ..base_cb.clone() };
+                group_indices.iter()
+                    .map(|&idx| { let v = cb.dequantize(idx); v * v })
+                    .sum::<f32>().sqrt()
+            };
             let corrected = if recon_norm > 1e-10 { group_norm * group_norm / recon_norm } else { group_norm };
 
             indices.extend_from_slice(&group_indices);
@@ -1124,12 +1161,19 @@ pub fn decompress_keys_grouped(compressed: &CompressedKeys, config: &TurboQuantC
         for g in 0..n_groups {
             let group_norm = compressed.norms[norm_offset + g];
             let sigma = if group_norm > 1e-10 { group_norm / (gs as f32).sqrt() } else { 1.0 };
-            let cb = codebook::Codebook { sigma, ..base_cb.clone() };
 
             let gstart = idx_offset + g * gs;
-            for j in 0..gs {
-                let idx = all_indices[gstart + j];
-                result.push(cb.dequantize(idx));
+            if let Some(ref cal_cb) = config.calibrated_codebook {
+                for j in 0..gs {
+                    let idx = all_indices[gstart + j];
+                    result.push(cal_cb.dequantize(idx) * sigma);
+                }
+            } else {
+                let cb = codebook::Codebook { sigma, ..base_cb.clone() };
+                for j in 0..gs {
+                    let idx = all_indices[gstart + j];
+                    result.push(cb.dequantize(idx));
+                }
             }
         }
     }

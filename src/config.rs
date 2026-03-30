@@ -45,6 +45,7 @@ pub fn get_model(name: &str) -> Option<&'static ModelConfig> {
 /// Note: when --turbo-quant is used, the GenericTurboModel reads
 /// the actual architecture from GGUF metadata, so this enum only
 /// matters for the standard (non-TQ) candle-transformers path.
+#[derive(Clone, Copy)]
 pub enum ModelArch {
     Llama,
     Qwen2,

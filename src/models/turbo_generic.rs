@@ -218,7 +218,10 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Ten
 /// Override with TQ_SINK env var.
 const TQ_SINK_TOKENS: usize = 4;
 
-fn get_sink_tokens() -> usize {
+fn get_sink_tokens(config: &tq_kv::TurboQuantConfig) -> usize {
+    if let Some(sink) = config.sink_tokens {
+        return sink;
+    }
     std::env::var("TQ_SINK")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -376,7 +379,11 @@ enum RopeStyle {
 /// Override with TQ_SKIP env var (e.g. TQ_SKIP=8 for first 8 layers uncompressed).
 const TQ_SKIP_FIRST_LAYERS: usize = 4;
 
-fn get_skip_layers() -> usize {
+fn get_skip_layers(config: &tq_kv::TurboQuantConfig) -> usize {
+    // Config field takes priority, then env var, then default
+    if let Some(skip) = config.skip_layers {
+        return skip;
+    }
     std::env::var("TQ_SKIP")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -414,8 +421,8 @@ fn parse_layer_bits() -> &'static Vec<(usize, usize, u8)> {
 /// Format: "start-end:bits[,start-end:bits]" e.g. "4-15:2,16-27:4"
 /// Unspecified layers use the default TQ bits. Layers below TQ_SKIP are uncompressed.
 /// Override with TQ_LAYER_BITS env var.
-fn get_layer_bits(layer_idx: usize, default_bits: u8) -> Option<u8> {
-    let skip = get_skip_layers();
+fn get_layer_bits(layer_idx: usize, default_bits: u8, config: &tq_kv::TurboQuantConfig) -> Option<u8> {
+    let skip = get_skip_layers(config);
     if layer_idx < skip {
         return None; // uncompressed
     }
@@ -601,9 +608,16 @@ impl LayerWeights {
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
+        // Calibration hook: collect raw post-RoPE key vectors if calibration is active
+        if crate::calibrate::CALIBRATION_COLLECTOR.get().is_some() {
+            if let Ok(k_f32) = k.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>() {
+                crate::calibrate::maybe_collect(&k_f32, self.n_kv_head, seq_len, self.head_dim);
+            }
+        }
+
         // Selective compression: first TQ_SKIP_FIRST_LAYERS use standard fp16 KV cache,
         // remaining layers use TurboQuant compression.
-        let layer_bits = get_layer_bits(self.layer_idx, self.tq_config.bits);
+        let layer_bits = get_layer_bits(self.layer_idx, self.tq_config.bits, &self.tq_config);
         let use_compression = layer_bits.is_some();
         let n_rep = self.n_head / self.n_kv_head;
 
@@ -629,7 +643,7 @@ impl LayerWeights {
             }
 
             let cache_dtype = k.dtype();
-            let sink_n = get_sink_tokens();
+            let sink_n = get_sink_tokens(&self.tq_config);
 
             // Initialize cache on first call
             let vbits = get_value_bits();
@@ -844,6 +858,9 @@ impl LayerWeights {
                     // and centroid table lookup (AVX2 SIMD when available).
                     let q_flat = q_f32.flatten_all()?.to_vec1::<f32>()?;
                     let scale = 1.0 / (self.head_dim as f32).sqrt();
+                    // Use calibrated centroids if available, else standard Gaussian
+                    let cal_centroids_owned: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
+                        .as_ref().map(|cb| cb.centroids.clone());
                     let cold_centroids = cache.k_cold.as_ref()
                         .map(|c| tq_kv::codebook::get_centroids(c[0].bits));
 
@@ -853,7 +870,11 @@ impl LayerWeights {
                         .map(|qh| {
                             let kv_h = qh / n_rep;
                             let q_vec = &q_flat[qh * self.head_dim..(qh + 1) * self.head_dim];
-                            let rotated_q = tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs);
+                            let rotated_q = if let Some(ref matrix) = self.tq_config.rotation_matrix {
+                                tq_kv::pre_rotate_query_with_matrix(q_vec, matrix)
+                            } else {
+                                tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs)
+                            };
                             let mut scores = Vec::with_capacity(total_len);
 
                             // Segment 1: Sink keys (standard dot product, not compressed)
@@ -881,7 +902,8 @@ impl LayerWeights {
 
                             // Segment 3: Hot compressed keys (excluding last = current)
                             if n_past_compressed > 0 {
-                                let hot_cb = tq_kv::codebook::get_centroids(effective_bits);
+                                let hot_cb: &[f32] = cal_centroids_owned.as_deref()
+                                    .unwrap_or_else(|| tq_kv::codebook::get_centroids(effective_bits));
                                 let hot = &cache.k_per_head[kv_h];
                                 let dim = hot.dim;
                                 let bpv = hot.bytes_per_vector();
