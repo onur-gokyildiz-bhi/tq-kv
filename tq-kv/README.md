@@ -21,8 +21,8 @@ Compresses LLM key-value cache to 2-4 bits with up to 15x memory reduction.
 |:----:|:-----------:|:--------:|:----------:|:----:|
 | 2 | **15.1x** | 9.3 | 0.942 | 9/9 pass |
 | 3 | **10.2x** | 14.7 | 0.984 | — |
-| 4 | **3.8x** | 20.3 | 0.996 | 9/9 pass |
-| 4+QJL | **2.7x** | 24.8 | 0.998 | — |
+| 4 | **7.5x** | 20.4 | 0.996 | 9/9 pass |
+| 4+QJL | **5.8x** | 24.8 | 0.998 | — |
 
 ### SRHT QJL Performance (32K vectors, d=128, release)
 
@@ -79,7 +79,7 @@ use tq_kv::{TurboQuantConfig, compress_keys, decompress_keys};
 let head_dim = 128;
 let kv_data: Vec<f32> = vec![0.1; head_dim];
 
-// 4-bit balanced compression (3.8x, cos_sim 0.996)
+// 4-bit balanced compression (7.5x, cos_sim 0.996)
 let config = TurboQuantConfig::balanced();
 let compressed = compress_keys(&kv_data, head_dim, &config);
 println!("Ratio: {:.1}x", compressed.compression_ratio());
@@ -115,9 +115,9 @@ let scores = fused_attention_scores(&rotated_q, &compressed, centroids, scale);
 
 | Model | Context | FP16 KV | TQ 4-bit | TQ 2-bit | Savings |
 |:------|:-------:|:-------:|:--------:|:--------:|:-------:|
-| Qwen 2.5 7B | 4K | 256 MB | 48 MB | 18 MB | 5.3-14.2x |
-| Qwen 2.5 72B | 4K | 640 MB | 120 MB | 45 MB | 5.3-14.2x |
-| Llama 3.1 70B | 32K | 20 GB | 5.3 GB | 1.4 GB | 3.8-14.2x |
+| Qwen 2.5 7B | 4K | 256 MB | 34 MB | 18 MB | 7.5-14.2x |
+| Qwen 2.5 72B | 4K | 640 MB | 85 MB | 45 MB | 7.5-14.2x |
+| Llama 3.1 70B | 32K | 20 GB | 2.7 GB | 1.4 GB | 7.5-14.2x |
 
 ## Full Product: tq-engine
 

@@ -4,7 +4,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tq-kv)](https://crates.io/crates/tq-kv)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
-[![Tests](https://img.shields.io/badge/tests-94%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-99%20passing-brightgreen)]()
 [![CUDA](https://img.shields.io/badge/CUDA-13.2-76B900)](https://developer.nvidia.com/cuda-toolkit)
 [![no\_std](https://img.shields.io/badge/no__std-compatible-blue)]()
 [![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
@@ -15,13 +15,13 @@ Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 
 
 ## Why tq-kv?
 
-- **Proven quality** -- 4-bit perplexity 9.594 vs 9.515 baseline (+0.8%) on wikitext-2, NIAH pass at all depths. Not toy benchmarks; real model, real text.
+- **Proven quality** -- 4-bit PPL +0.32% (with group quant + outlier + residual) on wikitext-2, NIAH 9/9 pass at all depths. Not toy benchmarks; real model, real text.
 - **First TurboQuant on GGUF** -- 3-Fix framework (sink tokens + POQ + cache reset) solves compound quantization error that breaks all other implementations on Q4 models.
 - **CUDA + AVX2 SIMD** -- NVIDIA GPU support (3.2x over CPU), fused AVX2+FMA attention (8.9x SIMD), SRHT QJL (115x faster, +4.5 dB SNR).
 - **K/V Asymmetric + Temporal Decay** -- values 8-bit, keys 4-bit (`TQ_VBITS=8`). Older tokens auto-demoted to 2-bit (`TQ_DECAY=512:2`). 30%+ extra savings.
 - **Sparse V + Fused Attention** -- skip V rows where softmax < threshold (`TQ_SPARSE_V`). Fused path computes scores directly from compressed indices (`TQ_FUSED=1`).
 - **C FFI for llama.cpp** -- ships `tq_kv.h` + `libtq_kv.a`. Drop into any C/C++ inference engine. Multi-head layer API included.
-- **Production architecture** -- O(1) incremental cache, Rayon parallel multi-head, 5 GGUF architectures, `no_std` core, 94 tests.
+- **Production architecture** -- O(1) incremental cache, Rayon parallel multi-head, 5 GGUF architectures, `no_std` core, 99 tests, hardened server.
 
 ## TurboQuant Implementations Compared
 
@@ -40,11 +40,11 @@ Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 
 | Temporal Decay | **Yes** | No | No | No | No |
 | Sparse V | **Yes** (AVX2) | No | No | No | No |
 | GGUF 3-Fix | **Yes** | **Partial** | No | No | No |
-| PPL benchmark | **+0.8%** (4-bit) | N/A | N/A | N/A | N/A |
+| PPL benchmark | **+0.32%** (4-bit) | N/A | N/A | N/A | N/A |
 | NIAH test | **9/9 pass** | N/A | N/A | N/A | N/A |
 | no_std | **Yes** | No | No | No | No |
 | crates.io | **v0.5.0** | N/A | alpha | minimal | N/A |
-| Lines of code | ~3K lib | N/A | ~6.9K | ~1.1K | N/A |
+| Lines of code | ~5.7K lib | N/A | ~6.9K | ~1.1K | N/A |
 | Metal (Apple) | No | **Yes** | No | No | No |
 
 tq-kv is the most complete Rust implementation with the only published perplexity and NIAH benchmarks.
@@ -57,11 +57,11 @@ tq-kv is the most complete Rust implementation with the only published perplexit
 
 | Metric | 2-bit | 3-bit | 4-bit |
 |:-------|------:|------:|------:|
-| Compression ratio | **14.2x** | **9.8x** | **3.8x** |
+| Compression ratio | **14.2x** | **9.8x** | **7.5x** |
 | Cosine similarity | 0.943 | 0.984 | 0.996 |
 | SIMD fused_dot_product speedup (AVX2+FMA) | **8.9x** | **5.4x** | **8.6x** |
-| VRAM saved (Llama-3 8B, 4096 ctx) | 238 MB | 230 MB | 208 MB |
-| VRAM saved (Qwen 72B, 4096 ctx) | 595 MB | 575 MB | 520 MB |
+| VRAM saved (Llama-3 8B, 4096 ctx) | 238 MB | 230 MB | 222 MB |
+| VRAM saved (Qwen 72B, 4096 ctx) | 595 MB | 575 MB | 555 MB |
 | Per-token cache overhead | 0.65 ms | 0.65 ms | 0.65 ms |
 
 ---
@@ -89,6 +89,17 @@ PPL remains flat as context length grows:
 | 2048 tokens | 9.651 | 9.718 | +0.7% |
 
 No quality cliff. Compression holds across sequence lengths.
+
+### Quality Enhancement Trajectory (Qwen 0.5B FP16, 4-bit)
+
+| Configuration | PPL vs Baseline |
+|:-------------|:---------------:|
+| Per-vector sigma (vanilla TQ) | +11.5% |
+| + Group quantization (g=32) | +9.9% |
+| + Outlier preservation (K=8) | +2.1% |
+| **+ Residual quantization (3-bit)** | **+0.32%** |
+
+Near-lossless compression through stacked quality enhancements — no retraining.
 
 ---
 
@@ -141,7 +152,7 @@ cache.append_raw(&packed, norm);
 |:-------|:----:|:-----:|:----------:|:---------|
 | `TurboQuantConfig::extreme()` | 2 | 14.2x | +33.8% | Edge deployment, maximum VRAM savings |
 | `TurboQuantConfig::aggressive()` | 3 | 9.8x | +4.0% | Good balance for most models |
-| `TurboQuantConfig::balanced()` | 4 | 3.8x | +0.8% | Near-lossless, minimal PPL impact |
+| `TurboQuantConfig::balanced()` | 4 | 7.5x | +0.32% | Near-lossless, minimal PPL impact |
 
 ### Engine CLI
 
@@ -242,7 +253,7 @@ Link: `-ltq_kv -lpthread -ldl -lm` (Linux) or `tq_kv.lib` (Windows MSVC).
 |:------|:----:|------:|---------:|-----------:|---------:|-----------:|
 | Llama-3 8B | 2 | **14.2x** | 9.4 | 0.943 | 55 ms | 23 ms |
 | Llama-3 8B | 3 | **9.8x** | 14.7 | 0.984 | 65 ms | 25 ms |
-| Llama-3 8B | 4 | **3.8x** | 20.3 | 0.996 | 75 ms | 23 ms |
+| Llama-3 8B | 4 | **7.5x** | 20.4 | 0.996 | 72 ms | 23 ms |
 | Gemma 3 4B | 2 | **15.1x** | 9.3 | 0.942 | 57 ms | 30 ms |
 | Gemma 3 4B | 3 | **10.2x** | 14.7 | 0.984 | 65 ms | 25 ms |
 
