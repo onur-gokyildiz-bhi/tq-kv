@@ -122,6 +122,89 @@ pub fn inverse_randomized_hadamard_with_signs(x: &mut [f32], signs: &[f32]) {
     random_sign_flip(x, signs);
 }
 
+/// Apply a dense orthogonal rotation matrix to a vector (matrix-vector multiply).
+/// `matrix`: row-major [dim × dim] orthogonal matrix.
+/// `x`: vector of length dim (modified in-place).
+pub fn apply_rotation(x: &mut [f32], matrix: &[f32]) {
+    let dim = x.len();
+    debug_assert_eq!(matrix.len(), dim * dim);
+    let input = x.to_vec();
+    for i in 0..dim {
+        let mut sum = 0.0f32;
+        let row = &matrix[i * dim..(i + 1) * dim];
+        for (j, &val) in input.iter().enumerate() {
+            sum += row[j] * val;
+        }
+        x[i] = sum;
+    }
+}
+
+/// Apply inverse (transpose) of an orthogonal rotation matrix.
+/// For orthogonal R: R^{-1} = R^T.
+pub fn apply_inverse_rotation(x: &mut [f32], matrix: &[f32]) {
+    let dim = x.len();
+    debug_assert_eq!(matrix.len(), dim * dim);
+    let input = x.to_vec();
+    for i in 0..dim {
+        let mut sum = 0.0f32;
+        for j in 0..dim {
+            sum += matrix[j * dim + i] * input[j]; // column of R = row of R^T
+        }
+        x[i] = sum;
+    }
+}
+
+/// Generate a random orthogonal matrix using Cayley transform.
+///
+/// Cayley(A) = (I - A)(I + A)^{-1} where A is skew-symmetric.
+/// This is the SpinQuant parametrization — can be optimized via gradient descent
+/// on the skew-symmetric parameters.
+///
+/// For now: generates a random orthogonal matrix as a starting point.
+#[cfg(feature = "std")]
+pub fn random_orthogonal(dim: usize, seed: u64) -> Vec<f32> {
+    use rand::SeedableRng;
+    use rand::Rng;
+    use rand_chacha::ChaCha8Rng;
+
+    // Simple approach: QR decomposition of random matrix
+    // We use a simpler method: random Householder reflections
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+    // Start with identity
+    let mut q = vec![0.0f32; dim * dim];
+    for i in 0..dim {
+        q[i * dim + i] = 1.0;
+    }
+
+    // Apply dim random Householder reflections: Q = H_1 * H_2 * ... * H_dim
+    for k in 0..dim {
+        // Random unit vector
+        let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-10 {
+            for val in &mut v { *val /= norm; }
+        }
+
+        // Apply Householder: Q = (I - 2*v*v^T) * Q
+        let mut new_q = vec![0.0f32; dim * dim];
+        for i in 0..dim {
+            for j in 0..dim {
+                let mut sum = 0.0f32;
+                // (I - 2*v*v^T)[i,k] * Q[k,j]
+                for m in 0..dim {
+                    let h_im = if i == m { 1.0 } else { 0.0 } - 2.0 * v[i] * v[m];
+                    sum += h_im * q[m * dim + j];
+                }
+                new_q[i * dim + j] = sum;
+            }
+        }
+        q = new_q;
+    }
+
+    q
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

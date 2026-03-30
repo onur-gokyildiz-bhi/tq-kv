@@ -133,6 +133,10 @@ pub struct TurboQuantConfig {
     /// If Some, used instead of standard Gaussian Lloyd-Max centroids.
     /// Calibrate with `CalibratedCodebook::calibrate()`.
     pub calibrated_codebook: Option<codebook::CalibratedCodebook>,
+    /// Custom rotation matrix (SpinQuant-style). If Some, used instead of
+    /// random Hadamard. Row-major [dim × dim]. Must be orthogonal.
+    /// Generate with `hadamard::random_orthogonal()` or load learned matrix.
+    pub rotation_matrix: Option<Vec<f32>>,
 
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
@@ -155,6 +159,7 @@ impl Default for TurboQuantConfig {
             residual_bits: 0,
             outlier_k: 0,
             calibrated_codebook: None,
+            rotation_matrix: None,
         }
     }
 }
@@ -975,7 +980,12 @@ pub fn compress_single_key_grouped(
         }
     }
 
-    hadamard::randomized_hadamard_with_signs(&mut rotated, signs);
+    // Apply rotation: custom matrix (SpinQuant) or randomized Hadamard
+    if let Some(ref matrix) = config.rotation_matrix {
+        hadamard::apply_rotation(&mut rotated, matrix);
+    } else {
+        hadamard::randomized_hadamard_with_signs(&mut rotated, signs);
+    }
 
     // Outlier extraction: find top-K by absolute value, save, zero out
     let outliers = if config.outlier_k > 0 {
@@ -1158,9 +1168,15 @@ pub fn decompress_keys_grouped(compressed: &CompressedKeys, config: &TurboQuantC
         }
     }
 
-    // Inverse Hadamard
-    for chunk in result.chunks_exact_mut(dim) {
-        hadamard::inverse_randomized_hadamard(chunk, compressed.rotation_seed);
+    // Inverse rotation
+    if let Some(ref matrix) = config.rotation_matrix {
+        for chunk in result.chunks_exact_mut(dim) {
+            hadamard::apply_inverse_rotation(chunk, matrix);
+        }
+    } else {
+        for chunk in result.chunks_exact_mut(dim) {
+            hadamard::inverse_randomized_hadamard(chunk, compressed.rotation_seed);
+        }
     }
 
     // Inverse channel scaling
