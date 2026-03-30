@@ -237,8 +237,12 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
-    let current_model = state.model_name.lock().unwrap().clone();
+async fn list_models(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<ModelListResponse>, (StatusCode, Json<ErrorBody>)> {
+    let current_model = state.model_name.lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?
+        .clone();
     let downloaded = hub::list_downloaded();
 
     let mut models: Vec<ModelEntry> = downloaded
@@ -274,19 +278,28 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListRespon
         );
     }
 
-    Json(ModelListResponse {
+    Ok(Json(ModelListResponse {
         object: "list".into(),
         data: models,
-    })
+    }))
 }
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, Json<ErrorBody>)> {
+    // Validate message count
+    if req.messages.len() > 1000 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Too many messages (max 1000)",
+        ));
+    }
+
     // Check if engine is loaded
     {
-        let engine_guard = state.engine.lock().unwrap();
+        let engine_guard = state.engine.lock()
+            .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?;
         if engine_guard.is_none() {
             return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -298,7 +311,9 @@ async fn chat_completions(
     let stream = req.stream.unwrap_or(false);
 
     // Build prompt from messages (multi-turn aware)
-    let template = state.template.lock().unwrap().clone();
+    let template = state.template.lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?
+        .clone();
     let formatted = build_prompt(&template, &req.messages);
 
     let params = GenerationParams {
@@ -309,7 +324,9 @@ async fn chat_completions(
     };
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-    let model_name = state.model_name.lock().unwrap().clone();
+    let model_name = state.model_name.lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?
+        .clone();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -322,14 +339,23 @@ async fn chat_completions(
         let model = model_name.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut guard = state.engine.lock().unwrap();
+            let mut guard = match state.engine.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("Engine lock poisoned: {}", e);
+                    return;
+                }
+            };
             if let Some(ref mut engine) = *guard {
                 engine.clear_cache();
                 let _ = engine.generate(&formatted, &params, |token| {
+                    // Stop generation if client disconnected
+                    if tx.is_closed() {
+                        return;
+                    }
                     let _ = tx.blocking_send(token.to_string());
                 });
             }
-            // Signal end
             drop(tx);
         });
 
@@ -357,7 +383,8 @@ async fn chat_completions(
         // Non-streaming path
         let state_clone = state.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let mut guard = state_clone.engine.lock().unwrap();
+            let mut guard = state_clone.engine.lock()
+                .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {}", e))?;
             match guard.as_mut() {
                 Some(engine) => {
                     engine.clear_cache();
@@ -427,7 +454,9 @@ async fn legacy_infer(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LegacyInferRequest>,
 ) -> std::result::Result<Json<LegacyInferResponse>, (StatusCode, Json<ErrorBody>)> {
-    let template = state.template.lock().unwrap().clone();
+    let template = state.template.lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?
+        .clone();
     let formatted = chat::format_chat(&template, &req.system, &req.prompt);
 
     let params = GenerationParams {
@@ -440,7 +469,8 @@ async fn legacy_infer(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut guard = state.engine.lock().unwrap();
+        let mut guard = state.engine.lock()
+            .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {}", e))?;
         match guard.as_mut() {
             Some(engine) => {
                 engine.clear_cache();
@@ -464,12 +494,8 @@ async fn load_model(
     let tq_config = state.tq_config.clone();
     let force_cpu = state.force_cpu;
 
-    // Set engine to None while loading (signals "loading" to other endpoints)
-    {
-        let mut guard = state.engine.lock().unwrap();
-        *guard = None;
-    }
-
+    // Atomic model swap: load new model FIRST, then replace old one.
+    // This keeps the old model available for requests during loading.
     let state_clone = state.clone();
     let query = model_query.clone();
 
@@ -500,16 +526,20 @@ async fn load_model(
     match result {
         Ok((engine, model_file, display_name)) => {
             let template = ChatTemplate::detect(&model_file);
+            // Swap atomically: old model is dropped only after new one is ready
             {
-                let mut guard = state_clone.engine.lock().unwrap();
+                let mut guard = state_clone.engine.lock()
+                    .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?;
                 *guard = Some(engine);
             }
             {
-                let mut t = state_clone.template.lock().unwrap();
+                let mut t = state_clone.template.lock()
+                    .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?;
                 *t = template;
             }
             {
-                let mut n = state_clone.model_name.lock().unwrap();
+                let mut n = state_clone.model_name.lock()
+                    .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?;
                 *n = display_name.clone();
             }
 
@@ -520,9 +550,7 @@ async fn load_model(
             }))
         }
         Err(e) => {
-            // Loading failed — engine stays None. The user should retry or
-            // load a different model. We leave model_name unchanged so
-            // the UI can show what was previously loaded.
+            // Loading failed — old model is still available (not set to None).
             Err(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("Failed to load model '{}': {}", model_query, e),
@@ -533,19 +561,22 @@ async fn load_model(
 
 async fn model_status(
     State(state): State<Arc<AppState>>,
-) -> Json<ModelStatusResponse> {
-    let model_name = state.model_name.lock().unwrap().clone();
-    let engine_guard = state.engine.lock().unwrap();
+) -> std::result::Result<Json<ModelStatusResponse>, (StatusCode, Json<ErrorBody>)> {
+    let model_name = state.model_name.lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?
+        .clone();
+    let engine_guard = state.engine.lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal state error"))?;
     let status = if engine_guard.is_some() {
         "ready"
     } else {
         "loading"
     };
 
-    Json(ModelStatusResponse {
+    Ok(Json(ModelStatusResponse {
         model: model_name,
         status: status.into(),
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------

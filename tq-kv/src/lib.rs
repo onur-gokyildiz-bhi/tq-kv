@@ -749,7 +749,12 @@ pub fn compress_keys(
         for (i, chunk) in rotated.chunks_exact(dim).enumerate() {
             let start = i * dim;
             let indices = &all_indices[start..start + dim];
-            let adaptive_sigma = norms[i] / (dim as f32).sqrt();
+            let norm = norms[i];
+            if norm < 1e-10 {
+                errors.extend(std::iter::repeat(0.0f32).take(dim));
+                continue;
+            }
+            let adaptive_sigma = norm / (dim as f32).sqrt();
             let cb = codebook::Codebook {
                 sigma: adaptive_sigma,
                 ..base_cb.clone()
@@ -799,6 +804,10 @@ pub fn decompress_keys(compressed: &CompressedKeys, _config: &TurboQuantConfig) 
         let start = i * dim;
         let indices = &all_indices[start..start + dim];
         let norm = compressed.norms[i];
+        if norm < 1e-10 {
+            result.extend(std::iter::repeat(0.0f32).take(dim));
+            continue;
+        }
         let adaptive_sigma = norm / (dim as f32).sqrt();
         let cb = codebook::Codebook {
             sigma: adaptive_sigma,
@@ -1583,7 +1592,7 @@ pub fn evaluate_keys(original: &[f32], compressed: &CompressedKeys, config: &Tur
     let decompressed = decompress_keys(compressed, config);
     let mse = polar::compute_mse(original, &decompressed);
     let signal_power: f32 = original.iter().map(|x| x * x).sum::<f32>() / original.len() as f32;
-    let snr_db = if mse > 0.0 { 10.0 * (signal_power / mse).log10() } else { f32::INFINITY };
+    let snr_db = if signal_power > 0.0 && mse > 0.0 { 10.0 * (signal_power / mse).log10() } else if mse == 0.0 { f32::INFINITY } else { 0.0 };
     let max_error = original.iter().zip(decompressed.iter())
         .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     CompressionStats { mse, snr_db, ratio: compressed.compression_ratio(), max_error }
@@ -1604,7 +1613,7 @@ pub fn evaluate(original: &[f32], compressed: &CompressedVectors) -> Compression
     let decompressed = decompress_vectors(compressed);
     let mse = polar::compute_mse(original, &decompressed);
     let signal_power: f32 = original.iter().map(|x| x * x).sum::<f32>() / original.len() as f32;
-    let snr_db = if mse > 0.0 { 10.0 * (signal_power / mse).log10() } else { f32::INFINITY };
+    let snr_db = if signal_power > 0.0 && mse > 0.0 { 10.0 * (signal_power / mse).log10() } else if mse == 0.0 { f32::INFINITY } else { 0.0 };
     let max_error = original.iter().zip(decompressed.iter())
         .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     CompressionStats { mse, snr_db, ratio: compressed.compression_ratio(), max_error }

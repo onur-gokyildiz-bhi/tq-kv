@@ -276,6 +276,14 @@ pub fn resolve(query: &str) -> Result<(PathBuf, Option<PathBuf>)> {
     // Check if query is a file path
     let as_path = Path::new(query);
     if as_path.exists() && as_path.is_file() {
+        // Validate the file has a recognized model extension to prevent arbitrary file access
+        let ext = as_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !matches!(ext, "gguf" | "safetensors" | "bin") {
+            bail!(
+                "File '{}' does not have a recognized model extension (.gguf, .safetensors, .bin)",
+                query
+            );
+        }
         // Look for tokenizer.json next to the model file
         let tok = as_path.parent().map(|p| p.join("tokenizer.json")).filter(|p| p.exists());
         return Ok((as_path.to_path_buf(), tok));

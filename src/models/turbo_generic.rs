@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 
 use candle_core::quantized::gguf_file;
-use rayon::prelude::*;
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
 use tq_kv::TurboQuantConfig;
@@ -384,6 +383,33 @@ fn get_skip_layers() -> usize {
         .unwrap_or(TQ_SKIP_FIRST_LAYERS)
 }
 
+/// Parsed layer bit ranges, cached at first use.
+static LAYER_BITS_CACHE: std::sync::OnceLock<Vec<(usize, usize, u8)>> = std::sync::OnceLock::new();
+
+fn parse_layer_bits() -> &'static Vec<(usize, usize, u8)> {
+    LAYER_BITS_CACHE.get_or_init(|| {
+        let mut ranges = Vec::new();
+        if let Ok(val) = std::env::var("TQ_LAYER_BITS") {
+            for part in val.split(',') {
+                let parts: Vec<&str> = part.trim().split(':').collect();
+                if parts.len() == 2 {
+                    let range_parts: Vec<&str> = parts[0].split('-').collect();
+                    if range_parts.len() == 2 {
+                        if let (Ok(start), Ok(end), Ok(bits)) = (
+                            range_parts[0].parse::<usize>(),
+                            range_parts[1].parse::<usize>(),
+                            parts[1].parse::<u8>(),
+                        ) {
+                            ranges.push((start, end, bits));
+                        }
+                    }
+                }
+            }
+        }
+        ranges
+    })
+}
+
 /// Layer-adaptive bitwidth: assign different bit widths to different layer ranges.
 /// Format: "start-end:bits[,start-end:bits]" e.g. "4-15:2,16-27:4"
 /// Unspecified layers use the default TQ bits. Layers below TQ_SKIP are uncompressed.
@@ -394,23 +420,10 @@ fn get_layer_bits(layer_idx: usize, default_bits: u8) -> Option<u8> {
         return None; // uncompressed
     }
 
-    if let Ok(val) = std::env::var("TQ_LAYER_BITS") {
-        for part in val.split(',') {
-            let parts: Vec<&str> = part.trim().split(':').collect();
-            if parts.len() == 2 {
-                let range_parts: Vec<&str> = parts[0].split('-').collect();
-                if range_parts.len() == 2 {
-                    if let (Ok(start), Ok(end), Ok(bits)) = (
-                        range_parts[0].parse::<usize>(),
-                        range_parts[1].parse::<usize>(),
-                        parts[1].parse::<u8>(),
-                    ) {
-                        if layer_idx >= start && layer_idx <= end {
-                            return Some(bits);
-                        }
-                    }
-                }
-            }
+    let ranges = parse_layer_bits();
+    for &(start, end, bits) in ranges {
+        if layer_idx >= start && layer_idx <= end {
+            return Some(bits);
         }
     }
 
@@ -845,8 +858,8 @@ impl LayerWeights {
 
                             // Segment 1: Sink keys (standard dot product, not compressed)
                             if let Some(ref sink) = cache.sink_k {
-                                let sink_f32 = sink.to_dtype(DType::F32).unwrap();
-                                let sink_flat = sink_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                let sink_f32 = sink.to_dtype(DType::F32).expect("sink to_dtype");
+                                let sink_flat = sink_f32.flatten_all().expect("sink flatten").to_vec1::<f32>().expect("sink to_vec1");
                                 let sink_count = cache.sink_len;
                                 for s in 0..sink_count {
                                     let offset = (kv_h * sink_count + s) * self.head_dim;
@@ -894,8 +907,8 @@ impl LayerWeights {
                             // Segment 4: Current token key (FP16 original — POQ)
                             // Only if current token was compressed (not still in sink range)
                             if n_compressed > 0 {
-                                let k_f32 = k.to_dtype(DType::F32).unwrap();
-                                let k_flat = k_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                                let k_f32 = k.to_dtype(DType::F32).expect("k to_dtype");
+                                let k_flat = k_f32.flatten_all().expect("k flatten").to_vec1::<f32>().expect("k to_vec1");
                                 let k_vec = &k_flat[kv_h * self.head_dim..(kv_h + 1) * self.head_dim];
                                 let dot: f32 = q_vec.iter().zip(k_vec.iter())
                                     .map(|(&qi, &ki)| qi * ki).sum();

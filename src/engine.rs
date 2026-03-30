@@ -546,7 +546,7 @@ fn compute_nll(logits: &[f32], target_id: usize) -> f64 {
 
 fn extract_last_logits(logits: &Tensor) -> candle_core::Result<Tensor> {
     let dims = logits.dims();
-    if dims.len() == 2 {
+    if dims.len() == 2 && dims[0] > 0 {
         logits.get(dims[0] - 1)
     } else {
         Ok(logits.clone())
