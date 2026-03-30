@@ -723,12 +723,24 @@ impl LayerWeights {
                         let offset = (h * tokens_to_compress + s) * hdim;
                         let key_vec = &k_flat[offset..offset + hdim];
                         if use_grouped {
-                            let (packed, gnorms, residual) = tq_kv::compress_single_key_grouped(
+                            let (packed, gnorms, residual, outliers) = tq_kv::compress_single_key_grouped(
                                 key_vec, hdim, &layer_tq_config, &self.signs,
                             );
-                            // Set residual_bits on first append
+                            // Set residual/outlier bits on first append
                             if cache.k_per_head[h].residual_bits == 0 && residual.is_some() {
                                 cache.k_per_head[h].residual_bits = layer_tq_config.residual_bits;
+                            }
+                            if cache.k_per_head[h].outlier_k == 0 && outliers.is_some() {
+                                cache.k_per_head[h].outlier_k = layer_tq_config.outlier_k;
+                            }
+                            // Append outliers
+                            if let Some((oi, ov)) = outliers {
+                                if cache.k_per_head[h].outlier_indices.is_none() {
+                                    cache.k_per_head[h].outlier_indices = Some(Vec::new());
+                                    cache.k_per_head[h].outlier_values = Some(Vec::new());
+                                }
+                                cache.k_per_head[h].outlier_indices.as_mut().unwrap().extend_from_slice(&oi);
+                                cache.k_per_head[h].outlier_values.as_mut().unwrap().extend_from_slice(&ov);
                             }
                             cache.k_per_head[h].append_raw_grouped(&packed, &gnorms, residual);
                         } else if self.padded_head_dim > hdim {

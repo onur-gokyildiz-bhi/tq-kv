@@ -202,6 +202,12 @@ fn resolve_tq_config(turbo_quant: bool, tq_bits: u8) -> Option<tq_kv::TurboQuant
                 config.residual_bits = bits;
             }
         }
+        // TQ_OUTLIER=2 preserves top-2 outlier entries per vector at full precision
+        if let Ok(val) = std::env::var("TQ_OUTLIER") {
+            if let Ok(k) = val.parse::<usize>() {
+                config.outlier_k = k;
+            }
+        }
         Some(config)
     } else {
         None

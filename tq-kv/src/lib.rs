@@ -120,6 +120,10 @@ pub struct TurboQuantConfig {
     /// but quality is much better than direct (bits + residual_bits)-bit.
     /// 0 = disabled. Default: 0. Typical: 2 (for 2+2=4 bit total).
     pub residual_bits: u8,
+    /// Outlier preservation: top-K entries per vector stored at full precision.
+    /// These entries are zeroed before quantization and restored on decompress.
+    /// 0 = disabled. Default: 0. Typical: 2 (top-2 outliers per 128-dim vector).
+    pub outlier_k: usize,
 
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
@@ -140,6 +144,7 @@ impl Default for TurboQuantConfig {
             channel_scales: None,
             group_size: 32,
             residual_bits: 0,
+            outlier_k: 0,
         }
     }
 }
@@ -326,6 +331,13 @@ pub struct CompressedKeys {
     pub residual_norms: Option<Vec<f32>>,
     /// Residual bit width (0 = no residual)
     pub residual_bits: u8,
+    /// Sparse outliers: (dim_index, value) pairs per vector, stored flat.
+    /// Layout: [vec0_idx0, vec0_val0, vec0_idx1, vec0_val1, ..., vec1_idx0, ...]
+    /// Each entry = 1 byte index + 4 bytes f32 = 5 bytes.
+    pub outlier_indices: Option<Vec<u8>>,
+    pub outlier_values: Option<Vec<f32>>,
+    /// Number of outliers per vector
+    pub outlier_k: usize,
 }
 
 impl CompressedKeys {
@@ -348,6 +360,9 @@ impl CompressedKeys {
             residual_indices: None,
             residual_norms: None,
             residual_bits: 0,
+            outlier_indices: None,
+            outlier_values: None,
+            outlier_k: 0,
         }
     }
 
@@ -440,6 +455,9 @@ impl CompressedKeys {
             residual_indices: None,
             residual_norms: None,
             residual_bits: 0,
+            outlier_indices: None,
+            outlier_values: None,
+            outlier_k: 0,
         };
 
         self.packed_indices = self.packed_indices[byte_split..].to_vec();
@@ -482,6 +500,9 @@ impl CompressedKeys {
             residual_indices: None,
             residual_norms: None,
             residual_bits: 0,
+            outlier_indices: None,
+            outlier_values: None,
+            outlier_k: 0,
         }
     }
 
@@ -741,6 +762,9 @@ pub fn compress_keys(
         residual_indices: None,
         residual_norms: None,
         residual_bits: 0,
+        outlier_indices: None,
+        outlier_values: None,
+        outlier_k: 0,
     }
 }
 
@@ -922,14 +946,13 @@ pub fn compress_single_key_with_signs(
 /// gets its own sigma = group_norm / sqrt(group_size). This captures within-vector
 /// magnitude variation that per-vector sigma misses.
 ///
-/// Returns: (packed_indices, group_norms, residual) where residual is
-/// `Some((residual_packed, residual_norms))` if `config.residual_bits > 0`.
+/// Returns: (packed_indices, group_norms, residual, outliers)
 pub fn compress_single_key_grouped(
     key: &[f32],
     dim: usize,
     config: &TurboQuantConfig,
     signs: &[f32],
-) -> (Vec<u8>, Vec<f32>, Option<(Vec<u8>, Vec<f32>)>) {
+) -> (Vec<u8>, Vec<f32>, Option<(Vec<u8>, Vec<f32>)>, Option<(Vec<u8>, Vec<f32>)>) {
     assert_eq!(key.len(), dim);
     let gs = config.group_size;
     assert!(gs > 0 && dim % gs == 0, "dim {} must be divisible by group_size {}", dim, gs);
@@ -943,6 +966,28 @@ pub fn compress_single_key_grouped(
     }
 
     hadamard::randomized_hadamard_with_signs(&mut rotated, signs);
+
+    // Outlier extraction: find top-K by absolute value, save, zero out
+    let outliers = if config.outlier_k > 0 {
+        let k = config.outlier_k.min(dim);
+        // Find indices of top-K abs values
+        let mut abs_indexed: Vec<(usize, f32)> = rotated.iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v.abs()))
+            .collect();
+        abs_indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let mut out_indices = Vec::with_capacity(k);
+        let mut out_values = Vec::with_capacity(k);
+        for &(idx, _) in abs_indexed.iter().take(k) {
+            out_indices.push(idx as u8);
+            out_values.push(rotated[idx]);
+            rotated[idx] = 0.0; // zero out outlier before quantization
+        }
+        Some((out_indices, out_values))
+    } else {
+        None
+    };
 
     let base_cb = codebook::Codebook::new(config.bits, dim);
     let n_groups = dim / gs;
@@ -1023,7 +1068,7 @@ pub fn compress_single_key_grouped(
         None
     };
 
-    (packed, group_norms, residual)
+    (packed, group_norms, residual, outliers)
 }
 
 /// Decompress keys with per-group norms.
@@ -1081,6 +1126,23 @@ pub fn decompress_keys_grouped(compressed: &CompressedKeys, config: &TurboQuantC
                         let idx = res_indices[gstart + j];
                         result[idx_offset + g * gs + j] += rcb.dequantize(idx);
                     }
+                }
+            }
+        }
+    }
+
+    // Restore sparse outliers (in rotated domain, before inverse Hadamard)
+    if let (Some(ref out_idx), Some(ref out_val)) =
+        (&compressed.outlier_indices, &compressed.outlier_values)
+    {
+        let k = compressed.outlier_k;
+        if k > 0 {
+            for i in 0..compressed.count {
+                let vec_offset = i * dim;
+                let sparse_offset = i * k;
+                for j in 0..k {
+                    let idx = out_idx[sparse_offset + j] as usize;
+                    result[vec_offset + idx] = out_val[sparse_offset + j];
                 }
             }
         }
