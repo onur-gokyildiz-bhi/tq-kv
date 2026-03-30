@@ -207,6 +207,21 @@ Fused attention computes attention scores directly from compressed key indices v
 | Llama 3.1 8B | 200 | 4.20 | 3.47 | -17% | 2.69s | 2.75s |
 
 > TQ overhead decreases with longer generation (amortized compression cost).
+
+### vs llama.cpp (CPU, Q4_K_M, same hardware)
+
+| Engine | Model | Decode tok/s | Prompt tok/s (pp512) |
+|:-------|:------|:-----------:|:-------------------:|
+| **llama.cpp** | Qwen 2.5 7B | **16.7** | **105** |
+| **llama.cpp** | Llama 3.1 8B | **15.1** | **90** |
+| tq-engine (standard) | Qwen 2.5 7B | 5.9 | — |
+| tq-engine (TQ 4-bit) | Qwen 2.5 7B | 5.8 | — |
+| tq-engine (standard) | Llama 3.1 8B | 4.2 | — |
+| tq-engine (TQ 4-bit) | Llama 3.1 8B | 3.5 | — |
+
+> Decode gap (~2.8x) is candle vs GGML framework overhead, not TQ-specific.
+> TQ overhead within tq-engine is only 2-11% depending on generation length.
+> CUDA TQ: Qwen 28.2 tok/s, Llama 19.2 tok/s (approaches llama.cpp CPU).
 > At 200 tokens, Qwen gap is only 8%. Memory bandwidth savings offset compression cost.
 
 ### CUDA Throughput (TQ 4-bit, RTX 3080)
