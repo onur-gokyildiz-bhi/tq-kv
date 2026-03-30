@@ -205,6 +205,130 @@ pub fn random_orthogonal(dim: usize, seed: u64) -> Vec<f32> {
     q
 }
 
+/// Compute PCA rotation from data covariance (SpinQuant-style).
+///
+/// Collects the covariance matrix of the data, eigendecomposes it,
+/// and returns the eigenvector matrix as an optimal rotation.
+/// This decorrelates coordinates — optimal for scalar quantization.
+///
+/// `data`: flat f32 array of vectors (length = count × dim).
+/// `dim`: vector dimension.
+///
+/// Returns: row-major [dim × dim] orthogonal rotation matrix.
+/// Use with `TurboQuantConfig::rotation_matrix`.
+#[cfg(feature = "std")]
+pub fn calibrate_pca_rotation(data: &[f32], dim: usize) -> Vec<f32> {
+    assert_eq!(data.len() % dim, 0);
+    let n = data.len() / dim;
+    assert!(n > 0, "Need at least one vector for PCA");
+
+    // 1. Compute covariance matrix C = X^T X / n (dim × dim)
+    let mut cov = vec![0.0f64; dim * dim];
+    for chunk in data.chunks_exact(dim) {
+        for i in 0..dim {
+            for j in i..dim {
+                let val = chunk[i] as f64 * chunk[j] as f64;
+                cov[i * dim + j] += val;
+                if i != j {
+                    cov[j * dim + i] += val;
+                }
+            }
+        }
+    }
+    let inv_n = 1.0 / n as f64;
+    for v in &mut cov { *v *= inv_n; }
+
+    // 2. Jacobi eigenvalue algorithm (symmetric matrix → eigenvalues + eigenvectors)
+    let eigenvectors = jacobi_eigen(&mut cov, dim);
+
+    // 3. Return eigenvectors as rotation matrix (f32)
+    eigenvectors.iter().map(|&v| v as f32).collect()
+}
+
+/// Jacobi eigenvalue algorithm for symmetric matrices.
+/// Returns eigenvector matrix (row-major, rows = eigenvectors sorted by eigenvalue descending).
+fn jacobi_eigen(a: &mut [f64], n: usize) -> Vec<f64> {
+    // Initialize V = Identity
+    let mut v = vec![0.0f64; n * n];
+    for i in 0..n { v[i * n + i] = 1.0; }
+
+    let max_iter = 100 * n * n;
+    for _ in 0..max_iter {
+        // Find largest off-diagonal element
+        let mut max_val = 0.0f64;
+        let mut p = 0;
+        let mut q = 1;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let aij = a[i * n + j].abs();
+                if aij > max_val {
+                    max_val = aij;
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+
+        // Convergence check
+        if max_val < 1e-10 { break; }
+
+        // Compute rotation angle
+        let app = a[p * n + p];
+        let aqq = a[q * n + q];
+        let apq = a[p * n + q];
+
+        let theta = if (app - aqq).abs() < 1e-15 {
+            std::f64::consts::FRAC_PI_4
+        } else {
+            0.5 * (2.0 * apq / (app - aqq)).atan()
+        };
+
+        let (sin_t, cos_t) = theta.sin_cos();
+
+        // Apply Givens rotation to A
+        for i in 0..n {
+            if i == p || i == q { continue; }
+            let aip = a[i * n + p];
+            let aiq = a[i * n + q];
+            a[i * n + p] = cos_t * aip + sin_t * aiq;
+            a[p * n + i] = a[i * n + p];
+            a[i * n + q] = -sin_t * aip + cos_t * aiq;
+            a[q * n + i] = a[i * n + q];
+        }
+
+        let new_pp = cos_t * cos_t * app + 2.0 * sin_t * cos_t * apq + sin_t * sin_t * aqq;
+        let new_qq = sin_t * sin_t * app - 2.0 * sin_t * cos_t * apq + cos_t * cos_t * aqq;
+        a[p * n + p] = new_pp;
+        a[q * n + q] = new_qq;
+        a[p * n + q] = 0.0;
+        a[q * n + p] = 0.0;
+
+        // Update eigenvectors
+        for i in 0..n {
+            let vip = v[i * n + p];
+            let viq = v[i * n + q];
+            v[i * n + p] = cos_t * vip + sin_t * viq;
+            v[i * n + q] = -sin_t * vip + cos_t * viq;
+        }
+    }
+
+    // Sort eigenvectors by eigenvalue (descending)
+    let mut eigen_pairs: Vec<(f64, usize)> = (0..n)
+        .map(|i| (a[i * n + i], i))
+        .collect();
+    eigen_pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+    // Build sorted eigenvector matrix (row-major: each ROW is an eigenvector)
+    let mut result = vec![0.0f64; n * n];
+    for (row, &(_, col_idx)) in eigen_pairs.iter().enumerate() {
+        for j in 0..n {
+            result[row * n + j] = v[j * n + col_idx];
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
