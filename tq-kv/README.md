@@ -7,13 +7,21 @@ Compresses LLM key-value cache to 2-4 bits with up to 15x memory reduction.
 
 **First TurboQuant that works on GGUF quantized models** — all other implementations fail on Q4_K_M.
 
-## What's New in v0.5.0
+## What's New in v0.6.0
 
-- **3-Fix Framework**: Sink token preservation + Past-Only Quantization + cache reset — solves compound error on GGUF models (300+ token coherent output where others produce gibberish)
-- **SRHT QJL**: O(d log d) structured projection replaces O(d^2) dense — 115x faster, +4.5 dB SNR
-- **Adaptive QJL**: Context-length-aware error correction (QjlMode::Off/On/Adaptive)
-- **Norm Correction**: Reconstruction norm matching — zero decode cost quality improvement
-- **Gaussianity Verified**: Kurtosis 35.3 -> 3.3 after rotation (Gaussian=3.0)
+- **KV Compaction**: Attention-matching token reduction (Zweiger 2026). 50x token count reduction, orthogonal to quantization. Combined: 400x total compression potential.
+- **Per-head adaptive bitwidth**: Different KV heads get different bit widths based on attention pattern sensitivity. Static (`TQ_HEAD_BITS`) or auto-calibrated.
+- **4-bit value compression**: Per-group symmetric absmax quantization + fused sparse decompress. `TQ_VBITS=4` for 3.2x value savings.
+- **Calibration pipeline**: `tq calibrate <model>` — learns optimal codebook, PCA rotation, channel scales, key bias from real activations. Auto-loaded at inference.
+- **Pre-Rotation Centering**: Subtract per-channel key bias before Hadamard to restore Gaussian assumption on GGUF models.
+- **SmoothAttention**: Q/K outlier migration infrastructure (experimental).
+- **Unified model backend**: Single GenericTurboModel for all GGUF+safetensors, GPU+CPU.
+
+### Previous (v0.5.0)
+
+- **3-Fix Framework**: Sink tokens + POQ + cache reset — first working TurboQuant on GGUF
+- **SRHT QJL**: 115x faster, +4.5 dB SNR
+- **Norm Correction**: Zero-cost reconstruction norm matching
 
 ## Results
 
@@ -70,7 +78,7 @@ K_attention = [K_sink_FP16 | K_compressed | K_current_FP16]
 
 ```toml
 [dependencies]
-tq-kv = "0.5"
+tq-kv = "0.6"
 ```
 
 ```rust

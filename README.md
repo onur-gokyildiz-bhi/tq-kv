@@ -4,7 +4,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tq-kv)](https://crates.io/crates/tq-kv)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
-[![Tests](https://img.shields.io/badge/tests-111%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-114%20passing-brightgreen)]()
 [![CUDA](https://img.shields.io/badge/CUDA-13.2-76B900)](https://developer.nvidia.com/cuda-toolkit)
 [![no\_std](https://img.shields.io/badge/no__std-compatible-blue)]()
 
@@ -88,7 +88,7 @@ Key insight matching turboquant_plus findings: softmax amplifies K errors expone
 
 ```toml
 [dependencies]
-tq-kv = "0.5"
+tq-kv = "0.6"
 ```
 
 ### CLI (tq-engine)
@@ -217,7 +217,7 @@ Hard reset of compressed KV state on new conversations. Prevents cross-conversat
 ## System Architecture
 
 ```
-tq-kv/                              Compression library (crates.io v0.5.0)
+tq-kv/                              Compression library (crates.io v0.6.0)
   src/lib.rs                         compress_keys, fused_attention, sparse_attn_v_mul
   src/codebook.rs                    Lloyd-Max 2/3/4-bit + CalibratedCodebook
   src/hadamard.rs                    Fast Walsh-Hadamard + PCA rotation calibration
