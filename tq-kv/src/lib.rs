@@ -138,6 +138,12 @@ pub struct TurboQuantConfig {
     /// random Hadamard. Row-major [dim × dim]. Must be orthogonal.
     /// Generate with `hadamard::random_orthogonal()` or load learned matrix.
     pub rotation_matrix: Option<Vec<f32>>,
+    /// Per-channel key bias for Pre-Rotation Centering.
+    /// Subtract from key vectors BEFORE Hadamard rotation to remove systematic
+    /// weight quantization bias. Restores N(0, σ) assumption for Lloyd-Max.
+    /// On decompress, bias is added back after inverse rotation.
+    /// Length must equal head_dim. Computed during calibration.
+    pub key_channel_bias: Option<Vec<f32>>,
     /// Number of initial layers to skip (uncompressed fp16 KV cache).
     /// If None, falls back to TQ_SKIP env var (default: 4).
     pub skip_layers: Option<usize>,
@@ -172,6 +178,7 @@ impl Default for TurboQuantConfig {
             outlier_k: 0,
             calibrated_codebook: None,
             rotation_matrix: None,
+            key_channel_bias: None,
             skip_layers: None,
             sink_tokens: None,
             per_head_bits: None,
@@ -1052,6 +1059,15 @@ pub fn decompress_keys(compressed: &CompressedKeys, _config: &TurboQuantConfig) 
         }
     }
 
+    // Inverse Pre-Rotation Centering: add bias back
+    if let Some(ref bias) = _config.key_channel_bias {
+        for chunk in result.chunks_exact_mut(dim) {
+            for (val, &b) in chunk.iter_mut().zip(bias.iter()) {
+                *val += b;
+            }
+        }
+    }
+
     result
 }
 
@@ -1143,6 +1159,13 @@ pub fn compress_single_key_with_signs(
 
     let mut rotated = key.to_vec();
 
+    // Pre-Rotation Centering: subtract weight quantization bias
+    if let Some(ref bias) = config.key_channel_bias {
+        for (val, &b) in rotated.iter_mut().zip(bias.iter()) {
+            *val -= b;
+        }
+    }
+
     // Per-channel scaling (SmoothQuant): equalize outlier magnitudes before rotation
     if let Some(ref scales) = config.channel_scales {
         debug_assert_eq!(scales.len(), dim);
@@ -1214,6 +1237,15 @@ pub fn compress_single_key_grouped(
     assert!(gs > 0 && dim % gs == 0, "dim {} must be divisible by group_size {}", dim, gs);
 
     let mut rotated = key.to_vec();
+
+    // Pre-Rotation Centering: subtract per-channel key bias from weight quantization.
+    // This restores the zero-mean assumption that Lloyd-Max codebook requires.
+    // On FP16 models, bias ≈ 0 (no effect). On GGUF Q4_K_M, removes systematic shift.
+    if let Some(ref bias) = config.key_channel_bias {
+        for (val, &b) in rotated.iter_mut().zip(bias.iter()) {
+            *val -= b;
+        }
+    }
 
     if let Some(ref scales) = config.channel_scales {
         for (val, &s) in rotated.iter_mut().zip(scales.iter()) {
@@ -1444,6 +1476,15 @@ pub fn decompress_keys_grouped(compressed: &CompressedKeys, config: &TurboQuantC
         for chunk in result.chunks_exact_mut(dim) {
             for (val, &s) in chunk.iter_mut().zip(scales.iter()) {
                 if s.abs() > 1e-10 { *val /= s; }
+            }
+        }
+    }
+
+    // Inverse Pre-Rotation Centering: add bias back
+    if let Some(ref bias) = config.key_channel_bias {
+        for chunk in result.chunks_exact_mut(dim) {
+            for (val, &b) in chunk.iter_mut().zip(bias.iter()) {
+                *val += b;
             }
         }
     }

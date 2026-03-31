@@ -54,6 +54,12 @@ pub struct CalibrationData {
     /// Auto-assigned per-head bit widths from importance scoring.
     #[serde(default)]
     pub auto_head_bits: Option<Vec<u8>>,
+    /// Per-channel key bias — mean of post-RoPE key coordinates across calibration tokens.
+    /// On GGUF models, weight quantization creates a systematic per-channel bias that
+    /// breaks the zero-mean Gaussian assumption of Lloyd-Max codebook.
+    /// Subtracting this bias before Hadamard rotation restores the Gaussian assumption.
+    #[serde(default)]
+    pub key_channel_bias: Option<Vec<f32>>,
 }
 
 impl CalibrationData {
@@ -73,8 +79,20 @@ impl CalibrationData {
     /// SmoothAttention (Q/K outlier migration). Codebook and rotation are
     /// disabled by default — enable with TQ_CAL_CODEBOOK=1 and TQ_CAL_ROTATION=1.
     pub fn apply_to_config(&self, config: &mut tq_kv::TurboQuantConfig) {
-        // Channel scales: enable SmoothAttention (Q*sqrt(s), K/sqrt(s))
-        config.channel_scales = Some(self.channel_scales.clone());
+        // Key channel bias: Pre-Rotation Centering.
+        // Only apply if bias is small relative to typical key norms.
+        // Large bias (>1.0 mean) indicates RoPE contamination — skip.
+        if let Some(ref bias) = self.key_channel_bias {
+            let mean_abs_bias: f32 = bias.iter().map(|b| b.abs()).sum::<f32>() / bias.len() as f32;
+            if mean_abs_bias < 1.0 {
+                config.key_channel_bias = Some(bias.clone());
+                eprintln!("  Pre-Rotation Centering enabled (mean |bias|={:.4})", mean_abs_bias);
+            } else {
+                eprintln!("  Pre-Rotation Centering SKIPPED (mean |bias|={:.4} — too large, likely RoPE contamination)", mean_abs_bias);
+            }
+        }
+        // Channel scales: reserved for SmoothAttention (currently disabled for Q4_K_M quality)
+        // config.channel_scales = Some(self.channel_scales.clone());
         // Calibrated codebook: experimental, disabled by default
         if std::env::var("TQ_CAL_CODEBOOK").ok().map_or(false, |v| v == "1") {
             if let Some(cb) = self.codebook_for_bits(config.bits) {
@@ -245,6 +263,34 @@ pub fn auto_assign_head_bits(
 }
 
 // ---------------------------------------------------------------------------
+// Pre-Rotation Centering — key channel bias
+// ---------------------------------------------------------------------------
+
+/// Compute per-channel mean of key vectors.
+///
+/// On GGUF Q4_K_M models, quantized weight matrices produce keys with a
+/// systematic per-channel bias (non-zero mean). This bias breaks the N(0, σ)
+/// assumption that makes Lloyd-Max codebook optimal.
+///
+/// Subtracting this bias before Hadamard rotation restores the assumption,
+/// improving quantization quality. On FP16 models, bias ≈ 0 (no effect).
+pub fn compute_key_channel_bias(data: &[f32], head_dim: usize) -> Vec<f32> {
+    let count = data.len() / head_dim;
+    if count == 0 {
+        return vec![0.0; head_dim];
+    }
+
+    let mut sums = vec![0.0f64; head_dim];
+    for chunk in data.chunks_exact(head_dim) {
+        for (i, &v) in chunk.iter().enumerate() {
+            sums[i] += v as f64;
+        }
+    }
+
+    sums.iter().map(|&s| (s / count as f64) as f32).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Compute calibration from collected samples
 // ---------------------------------------------------------------------------
 
@@ -259,6 +305,15 @@ pub fn compute_calibration(
     let n_samples = collector.count;
 
     eprintln!("Computing calibration from {} samples (head_dim={})...", n_samples, head_dim);
+
+    // 0. Per-channel key bias (Pre-Rotation Centering)
+    // On GGUF Q4_K_M models, weight quantization creates a systematic per-channel
+    // bias in key vectors. Subtracting this before Hadamard rotation restores the
+    // zero-mean Gaussian assumption that Lloyd-Max codebook requires.
+    eprintln!("  Key channel bias (Pre-Rotation Centering)...");
+    let key_channel_bias = compute_key_channel_bias(data, head_dim);
+    let bias_magnitude: f32 = key_channel_bias.iter().map(|b| b.abs()).sum::<f32>() / head_dim as f32;
+    eprintln!("    Mean |bias|: {:.6} (higher = more weight quant artifacts)", bias_magnitude);
 
     // 1. Channel scales
     eprintln!("  Channel scales...");
@@ -324,6 +379,7 @@ pub fn compute_calibration(
         rotation_matrix,
         head_importance,
         auto_head_bits,
+        key_channel_bias: Some(key_channel_bias),
     }
 }
 
