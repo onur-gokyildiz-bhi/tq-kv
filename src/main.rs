@@ -777,9 +777,9 @@ fn cmd_ablate_study(cli: &Cli) -> Result<()> {
 
     let mut results: Vec<(String, f64, f64)> = Vec::new(); // (config_label, ppl, seconds)
 
-    // Baseline: no TQ
+    // Baseline: no compression (GenericTurboModel handles GPU/CPU transparently)
     {
-        eprintln!("\n--- Baseline (no TQ) ---");
+        eprintln!("\n--- Baseline (no compression) ---");
         let start = Instant::now();
         let mut engine = Engine::load_with_device(&gguf_path, &tok_path, arch, None, cli.cpu)?;
         let ppl = engine.compute_perplexity(&eval_text, 512)?;

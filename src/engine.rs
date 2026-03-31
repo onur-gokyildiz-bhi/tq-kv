@@ -8,28 +8,20 @@ use anyhow::{Context, Result};
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::quantized_llama as qlm;
-use candle_transformers::models::quantized_qwen2 as qqw;
 use tokenizers::Tokenizer;
 use tq_kv::TurboQuantConfig;
 
 use crate::config::ModelArch;
 use crate::models::turbo_generic;
 
-/// Model variants — standard or TurboQuant enhanced.
-enum ModelWeights {
-    Llama(qlm::ModelWeights),
-    Qwen2(qqw::ModelWeights),
-    TurboGeneric(turbo_generic::GenericTurboModel),
-}
+/// Unified model backend — GenericTurboModel handles all GGUF architectures
+/// with CUDA-compatible ops (RmsNorm, RoPE, softmax). When TQ is disabled,
+/// all layers use uncompressed fp16 KV cache through the same code path.
+struct ModelWeights(turbo_generic::GenericTurboModel);
 
 impl ModelWeights {
     fn forward(&mut self, x: &Tensor, pos: usize) -> candle_core::Result<Tensor> {
-        match self {
-            Self::Llama(m) => m.forward(x, pos),
-            Self::Qwen2(m) => m.forward(x, pos),
-            Self::TurboGeneric(m) => m.forward(x, pos),
-        }
+        self.0.forward(x, pos)
     }
 }
 
@@ -239,7 +231,7 @@ impl Engine {
     pub fn load_with_device(
         model_path: &std::path::Path,
         tokenizer_path: &std::path::Path,
-        arch: ModelArch,
+        _arch: ModelArch,
         tq_config: Option<TurboQuantConfig>,
         force_cpu: bool,
     ) -> Result<Self> {
@@ -263,20 +255,19 @@ impl Engine {
             } else {
                 model_path.parent().unwrap_or(model_path).to_path_buf()
             };
-            match tq_config {
-                Some(tq) => {
-                    eprintln!("TurboQuant FP16: {}-bit KV cache", tq.bits);
-                    let w = turbo_generic::GenericTurboModel::from_safetensors(&model_dir, &device, tq)
-                        .map_err(|e| anyhow::anyhow!("Safetensors load error: {}", e))?;
-                    ModelWeights::TurboGeneric(w)
-                }
-                None => {
-                    anyhow::bail!(
-                        "Safetensors FP16 models require --turbo-quant. \
-                         Stock candle models only support GGUF format."
-                    );
-                }
+            let tq = tq_config.unwrap_or_else(|| {
+                let mut cfg = TurboQuantConfig::balanced();
+                cfg.skip_layers = Some(999);
+                cfg.sink_tokens = Some(0);
+                cfg
+            });
+            let compressed = tq.skip_layers != Some(999);
+            if compressed {
+                eprintln!("TurboQuant FP16: {}-bit KV cache", tq.bits);
             }
+            let w = turbo_generic::GenericTurboModel::from_safetensors(&model_dir, &device, tq)
+                .map_err(|e| anyhow::anyhow!("Safetensors load error: {}", e))?;
+            ModelWeights(w)
         } else {
             // GGUF path
             let mut file = std::fs::File::open(model_path)
@@ -285,24 +276,22 @@ impl Engine {
             let content = gguf_file::Content::read(&mut file)
                 .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
 
-            match (arch, tq_config) {
-                (_, Some(tq)) => {
-                    eprintln!("TurboQuant Generic: {}-bit KV cache (auto-detecting architecture from GGUF)", tq.bits);
-                    let w = turbo_generic::GenericTurboModel::from_gguf(content, &mut file, &device, tq)
-                        .map_err(|e| anyhow::anyhow!("TurboGeneric load error: {}", e))?;
-                    ModelWeights::TurboGeneric(w)
-                }
-                (ModelArch::Llama, None) => {
-                    let w = qlm::ModelWeights::from_gguf(content, &mut file, &device)
-                        .map_err(|e| anyhow::anyhow!("Llama load error: {}", e))?;
-                    ModelWeights::Llama(w)
-                }
-                (ModelArch::Qwen2, None) => {
-                    let w = qqw::ModelWeights::from_gguf(content, &mut file, &device)
-                        .map_err(|e| anyhow::anyhow!("Qwen2 load error: {}", e))?;
-                    ModelWeights::Qwen2(w)
-                }
+            // GenericTurboModel is the unified GGUF loader — CUDA-compatible ops
+            // (custom RmsNorm, RoPE, softmax) work on both CPU and GPU.
+            // When tq_config is None, all layers use uncompressed fp16 KV cache.
+            let tq = tq_config.unwrap_or_else(|| {
+                let mut cfg = TurboQuantConfig::balanced();
+                cfg.skip_layers = Some(999);
+                cfg.sink_tokens = Some(0);
+                cfg
+            });
+            let compressed = tq.skip_layers != Some(999);
+            if compressed {
+                eprintln!("TurboQuant: {}-bit KV cache", tq.bits);
             }
+            let w = turbo_generic::GenericTurboModel::from_gguf(content, &mut file, &device, tq)
+                .map_err(|e| anyhow::anyhow!("Model load error: {}", e))?;
+            ModelWeights(w)
         };
         eprintln!("Model loaded!");
 
