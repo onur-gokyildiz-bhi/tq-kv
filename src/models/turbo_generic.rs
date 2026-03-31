@@ -559,6 +559,47 @@ fn get_decay_config() -> Option<tq_kv::TemporalDecayConfig> {
     Some(tq_kv::TemporalDecayConfig { tiers, decay_interval: 128 })
 }
 
+/// Compute SmoothAttention scales from calibration channel_scales.
+///
+/// SmoothAttention migrates K outliers to Q: K /= lambda, Q *= lambda.
+/// When `for_query=true`: returns lambda (multiply Q by this).
+/// When `for_query=false`: returns 1/lambda (multiply K by this — shrinks outliers).
+///
+/// If no channel_scales in config, returns None (SmoothAttention disabled).
+/// Compute SmoothAttention scales from calibration channel_scales.
+///
+/// SmoothAttention replaces the old channel_scales-in-compression approach.
+/// Instead of scaling K inside the compression pipeline (which changes K and
+/// requires inverse on decompress), we migrate outliers from K to Q at the
+/// tensor level. Q stays fp32 so this is lossless. K becomes smoother,
+/// improving quantization quality.
+///
+/// Returns None if no channel_scales in config (SmoothAttention disabled).
+fn compute_smooth_scales(
+    config: &TurboQuantConfig,
+    head_dim: usize,
+    device: &Device,
+    for_query: bool,
+) -> Option<Tensor> {
+    // Only enable SmoothAttention if we have calibrated channel_scales
+    // AND compression is active (skip_layers != 999)
+    let scales = config.channel_scales.as_ref()?;
+    if scales.len() != head_dim || config.skip_layers == Some(999) {
+        return None;
+    }
+
+    // For Q: multiply by sqrt(scale) — absorb half the outlier
+    // For K: multiply by 1/sqrt(scale) — smooth down outliers
+    // Invariance: (Q*sqrt(s)) * (K/sqrt(s))^T = Q*K^T
+    let vals: Vec<f32> = if for_query {
+        scales.iter().map(|&s| s.max(0.01).sqrt()).collect()
+    } else {
+        scales.iter().map(|&s| 1.0 / s.max(0.01).sqrt()).collect()
+    };
+
+    Tensor::from_vec(vals, head_dim, device).ok()
+}
+
 /// QKV weight layout — separate tensors (most models) or merged single tensor (Phi-3.5).
 #[derive(Debug, Clone)]
 enum QkvWeights {
@@ -597,6 +638,11 @@ struct LayerWeights {
     kv_compressed: Option<CompressedKvCache>,
     tq_config: TurboQuantConfig,
     signs: Vec<f32>,
+    /// SmoothAttention: per-channel scales to migrate K outliers to Q.
+    /// K is divided by these scales (reducing outliers), Q is multiplied (lossless since Q stays fp32).
+    /// Computed during calibration or from running statistics.
+    smooth_k_scales: Option<Tensor>,  // [1, 1, 1, head_dim]
+    smooth_q_scales: Option<Tensor>,  // [1, 1, 1, head_dim]
     span_attn: tracing::Span,
     span_rot: tracing::Span,
     span_mlp: tracing::Span,
@@ -665,6 +711,18 @@ impl LayerWeights {
         let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let v = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
 
+        // SmoothAttention: migrate K outliers to Q BEFORE RoPE.
+        // After reshape, shapes are [batch, n_heads, seq_len, head_dim].
+        // Scales shape is [head_dim], broadcasts over last dim.
+        // K *= 1/sqrt(s) (reduces outlier magnitude for quantization)
+        // Q *= sqrt(s) (absorbs the scale — Q stays fp32, no precision loss)
+        // Mathematical equivalence: (Q*sqrt(s)) * (K/sqrt(s))^T = Q * K^T
+        let (q, k) = if let (Some(ref q_scales), Some(ref k_scales)) = (&self.smooth_q_scales, &self.smooth_k_scales) {
+            (q.broadcast_mul(q_scales)?, k.broadcast_mul(k_scales)?)
+        } else {
+            (q, k)
+        };
+
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
@@ -684,11 +742,16 @@ impl LayerWeights {
         if use_compression {
             // Apply per-layer bit width if different from default
             let effective_bits = layer_bits.unwrap();
-            let layer_tq_config = if effective_bits != self.tq_config.bits {
+            let mut layer_tq_config = if effective_bits != self.tq_config.bits {
                 tq_kv::TurboQuantConfig { bits: effective_bits, ..self.tq_config.clone() }
             } else {
                 self.tq_config.clone()
             };
+            // When SmoothAttention is active, disable channel_scales in compression
+            // to avoid double-application (SmoothAttention already handled the scaling)
+            if self.smooth_k_scales.is_some() {
+                layer_tq_config.channel_scales = None;
+            }
             // Per-head adaptive bitwidth: resolve from TQ_HEAD_BITS env var or config
             let per_head_bits = resolve_per_head_bits(self.n_kv_head, effective_bits)
                 .or_else(|| self.tq_config.per_head_bits.clone());
@@ -1525,6 +1588,8 @@ impl GenericTurboModel {
                 kv_compressed: None,
                 tq_config: tq_config.clone(),
                 signs: signs.clone(),
+                smooth_k_scales: compute_smooth_scales(&tq_config, head_dim, device, false),
+                smooth_q_scales: compute_smooth_scales(&tq_config, head_dim, device, true),
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
                 span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
                 span_mlp: tracing::span!(tracing::Level::TRACE, "attn-mlp"),
@@ -1767,6 +1832,8 @@ impl GenericTurboModel {
                 kv_compressed: None,
                 tq_config: tq_config.clone(),
                 signs: signs.clone(),
+                smooth_k_scales: compute_smooth_scales(&tq_config, head_dim, device, false),
+                smooth_q_scales: compute_smooth_scales(&tq_config, head_dim, device, true),
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
                 span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
                 span_mlp: tracing::span!(tracing::Level::TRACE, "mlp"),

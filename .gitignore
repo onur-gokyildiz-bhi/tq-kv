@@ -7,3 +7,4 @@
 *.docx
 /docs/
 .claude/
+target2/

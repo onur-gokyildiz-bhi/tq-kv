@@ -68,13 +68,24 @@ impl CalibrationData {
     }
 
     /// Apply calibration data to a TurboQuantConfig.
+    ///
+    /// Calibration features are currently experimental. Channel_scales enables
+    /// SmoothAttention (Q/K outlier migration). Codebook and rotation are
+    /// disabled by default — enable with TQ_CAL_CODEBOOK=1 and TQ_CAL_ROTATION=1.
     pub fn apply_to_config(&self, config: &mut tq_kv::TurboQuantConfig) {
+        // Channel scales: enable SmoothAttention (Q*sqrt(s), K/sqrt(s))
         config.channel_scales = Some(self.channel_scales.clone());
-        if let Some(cb) = self.codebook_for_bits(config.bits) {
-            config.calibrated_codebook = Some(cb);
+        // Calibrated codebook: experimental, disabled by default
+        if std::env::var("TQ_CAL_CODEBOOK").ok().map_or(false, |v| v == "1") {
+            if let Some(cb) = self.codebook_for_bits(config.bits) {
+                config.calibrated_codebook = Some(cb);
+            }
         }
-        if !self.rotation_matrix.is_empty() {
-            config.rotation_matrix = Some(self.rotation_matrix.clone());
+        // PCA rotation: experimental, disabled by default
+        if std::env::var("TQ_CAL_ROTATION").ok().map_or(false, |v| v == "1") {
+            if !self.rotation_matrix.is_empty() {
+                config.rotation_matrix = Some(self.rotation_matrix.clone());
+            }
         }
         // Apply auto-assigned per-head bits from calibration (env var TQ_HEAD_BITS overrides)
         if config.per_head_bits.is_none() {
