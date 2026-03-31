@@ -165,18 +165,30 @@ pub fn compute_calibration(
     eprintln!("  Channel scales...");
     let channel_scales = tq_kv::calibrate_channel_scales(data, head_dim);
 
-    // 2. PCA rotation matrix
-    eprintln!("  PCA rotation...");
-    let rotation_matrix = tq_kv::hadamard::calibrate_pca_rotation(data, head_dim);
+    // 2. Apply channel scales to data before computing rotation + codebook
+    // This matches the runtime order: scale → rotate → quantize
+    let scaled_data: Vec<f32> = data.chunks_exact(head_dim)
+        .flat_map(|chunk| {
+            chunk.iter().zip(channel_scales.iter())
+                .map(|(&v, &s)| v * s)
+        })
+        .collect();
 
-    // 3. Calibrated codebooks (2, 3, 4 bit)
+    // 3. PCA rotation matrix (computed on scaled data)
+    eprintln!("  PCA rotation...");
+    let rotation_matrix = tq_kv::hadamard::calibrate_pca_rotation(&scaled_data, head_dim);
+
+    // 4. Calibrated codebooks (2, 3, 4 bit)
+    // Use the PCA rotation matrix for codebook calibration so that
+    // the codebook is fitted to the same rotation used at runtime.
+    let rot_ref = if rotation_matrix.is_empty() { None } else { Some(rotation_matrix.as_slice()) };
     let mut codebook_2bit = None;
     let mut codebook_3bit = None;
     let mut codebook_4bit = None;
 
     for bits in [2u8, 3, 4] {
         eprintln!("  Codebook {}bit...", bits);
-        let cb = tq_kv::calibrate_codebook(data, head_dim, bits, rotation_seed);
+        let cb = tq_kv::calibrate_codebook_with_rotation(&scaled_data, head_dim, bits, rotation_seed, rot_ref);
         let cal = CodebookCalibration {
             centroids: cb.centroids.clone(),
             boundaries: cb.boundaries.clone(),

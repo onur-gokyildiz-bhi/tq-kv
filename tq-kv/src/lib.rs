@@ -1576,12 +1576,26 @@ pub fn calibrate_rotation(data: &[f32], dim: usize) -> Vec<f32> {
 ///
 /// Returns a CalibratedCodebook — set it on `TurboQuantConfig::calibrated_codebook`.
 pub fn calibrate_codebook(data: &[f32], dim: usize, bits: u8, rotation_seed: u64) -> codebook::CalibratedCodebook {
+    calibrate_codebook_with_rotation(data, dim, bits, rotation_seed, None)
+}
+
+/// Calibrate codebook with optional custom rotation matrix.
+/// If rotation_matrix is Some, uses that instead of randomized Hadamard.
+/// This ensures the codebook is fitted to the same rotation used at runtime.
+pub fn calibrate_codebook_with_rotation(
+    data: &[f32], dim: usize, bits: u8, rotation_seed: u64,
+    rotation_matrix: Option<&[f32]>,
+) -> codebook::CalibratedCodebook {
     assert_eq!(data.len() % dim, 0);
 
-    // Rotate all vectors
+    // Rotate all vectors using the SAME rotation that will be used at runtime
     let mut rotated = data.to_vec();
     for chunk in rotated.chunks_exact_mut(dim) {
-        hadamard::randomized_hadamard(chunk, rotation_seed);
+        if let Some(matrix) = rotation_matrix {
+            hadamard::apply_rotation(chunk, matrix);
+        } else {
+            hadamard::randomized_hadamard(chunk, rotation_seed);
+        }
     }
 
     // Normalize: divide each coordinate by its vector's sigma
@@ -1626,8 +1640,9 @@ pub fn calibrate_channel_scales(data: &[f32], dim: usize) -> Vec<f32> {
     let median = sorted[sorted.len() / 2];
 
     // Scale = median / absmax (brings all channels to similar magnitude)
+    // Clip to [0.1, 10.0] to avoid extreme scaling that destroys information
     channel_absmax.iter().map(|&m| {
-        if m > 1e-10 { median / m } else { 1.0 }
+        if m > 1e-10 { (median / m).clamp(0.1, 10.0) } else { 1.0 }
     }).collect()
 }
 
