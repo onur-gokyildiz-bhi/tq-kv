@@ -144,6 +144,11 @@ pub struct TurboQuantConfig {
     /// If None, falls back to TQ_SINK env var (default: 4).
     pub sink_tokens: Option<usize>,
 
+    /// Per-head bit width assignments. If Some, each KV head uses its own bit width.
+    /// Length must equal n_kv_heads. Each entry must be 2, 3, or 4.
+    /// Overrides `bits` on a per-head basis. None = all heads use `bits`.
+    pub per_head_bits: Option<Vec<u8>>,
+
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
     pub use_qjl: bool,
@@ -168,6 +173,7 @@ impl Default for TurboQuantConfig {
             rotation_matrix: None,
             skip_layers: None,
             sink_tokens: None,
+            per_head_bits: None,
         }
     }
 }
@@ -225,6 +231,21 @@ impl TurboQuantConfig {
     pub fn with_channel_scales(mut self, scales: Vec<f32>) -> Self {
         self.channel_scales = Some(scales);
         self
+    }
+
+    /// Set per-head bit width assignments.
+    pub fn with_per_head_bits(mut self, bits: Vec<u8>) -> Self {
+        self.per_head_bits = Some(bits);
+        self
+    }
+
+    /// Get effective bits for a specific KV head.
+    /// Returns per_head_bits[head_idx] if set, otherwise falls back to `self.bits`.
+    pub fn bits_for_head(&self, head_idx: usize) -> u8 {
+        self.per_head_bits
+            .as_ref()
+            .and_then(|phb| phb.get(head_idx).copied())
+            .unwrap_or(self.bits)
     }
 
     /// Check if QJL should be active given current cache length.
@@ -2562,5 +2583,101 @@ mod tests {
         let n_b: f32 = decompressed.iter().map(|x| x * x).sum::<f32>().sqrt();
         let cos_sim = dot / (n_a * n_b + 1e-10);
         assert!(cos_sim > 0.85, "PCA rotation cos_sim should be > 0.85, got {:.4}", cos_sim);
+    }
+
+    #[test]
+    fn test_bits_for_head() {
+        let config = TurboQuantConfig::balanced(); // bits=4
+        assert_eq!(config.bits_for_head(0), 4);
+        assert_eq!(config.bits_for_head(7), 4);
+
+        let config = config.with_per_head_bits(vec![2, 4, 2, 4, 3, 3, 2, 4]);
+        assert_eq!(config.bits_for_head(0), 2);
+        assert_eq!(config.bits_for_head(1), 4);
+        assert_eq!(config.bits_for_head(4), 3);
+        // Out of range falls back to default bits
+        assert_eq!(config.bits_for_head(100), 4);
+    }
+
+    #[test]
+    fn test_mixed_bitwidth_compress_decompress() {
+        let dim = 128;
+        let data = random_vectors(16, dim, 42);
+
+        // Compress same data at 2-bit and 4-bit
+        let config_2 = TurboQuantConfig::extreme();
+        let config_4 = TurboQuantConfig::balanced();
+
+        let compressed_2 = compress_keys(&data, dim, &config_2);
+        let compressed_4 = compress_keys(&data, dim, &config_4);
+
+        assert_eq!(compressed_2.bits, 2);
+        assert_eq!(compressed_4.bits, 4);
+
+        let decompressed_2 = decompress_keys(&compressed_2, &config_2);
+        let decompressed_4 = decompress_keys(&compressed_4, &config_4);
+
+        // Both should decompress to correct length
+        assert_eq!(decompressed_2.len(), data.len());
+        assert_eq!(decompressed_4.len(), data.len());
+
+        // 4-bit should have higher cosine similarity than 2-bit
+        fn cos_sim(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb + 1e-10)
+        }
+
+        let sim_2 = cos_sim(&data, &decompressed_2);
+        let sim_4 = cos_sim(&data, &decompressed_4);
+        assert!(sim_4 > sim_2, "4-bit ({:.4}) should have higher cos_sim than 2-bit ({:.4})", sim_4, sim_2);
+        assert!(sim_2 > 0.85, "2-bit cos_sim should be > 0.85, got {:.4}", sim_2);
+        assert!(sim_4 > 0.95, "4-bit cos_sim should be > 0.95, got {:.4}", sim_4);
+    }
+
+    #[test]
+    fn test_fused_attention_mixed_bits() {
+        let dim = 128;
+        let data = random_vectors(8, dim, 42);
+
+        // Simulate two heads with different bit widths
+        let config_2 = TurboQuantConfig::extreme();
+        let config_4 = TurboQuantConfig::balanced();
+
+        let compressed_h0 = compress_keys(&data[..4 * dim], dim, &config_2);
+        let compressed_h1 = compress_keys(&data[4 * dim..], dim, &config_4);
+
+        // Each head should use correct centroids
+        let centroids_2 = codebook::get_centroids(compressed_h0.bits);
+        let centroids_4 = codebook::get_centroids(compressed_h1.bits);
+
+        assert_eq!(centroids_2.len(), 4);  // 2^2
+        assert_eq!(centroids_4.len(), 16); // 2^4
+
+        // Fused dot product should work with each head's centroids
+        let query = random_vectors(1, dim, 99);
+        let mut rotated_q = query.clone();
+        hadamard::randomized_hadamard(&mut rotated_q, config_2.rotation_seed);
+
+        let mut idx_buf = vec![0u8; dim];
+
+        // Head 0: 2-bit
+        let bpv_0 = compressed_h0.bytes_per_vector();
+        codebook::unpack_indices_into(&compressed_h0.packed_indices[..bpv_0], &mut idx_buf, 2);
+        let score_0 = fused_dot_product_with_centroids(
+            &rotated_q, &idx_buf, compressed_h0.norms[0], centroids_2, dim,
+        );
+
+        // Head 1: 4-bit
+        let bpv_1 = compressed_h1.bytes_per_vector();
+        codebook::unpack_indices_into(&compressed_h1.packed_indices[..bpv_1], &mut idx_buf, 4);
+        let score_1 = fused_dot_product_with_centroids(
+            &rotated_q, &idx_buf, compressed_h1.norms[0], centroids_4, dim,
+        );
+
+        // Both should produce finite, non-zero scores
+        assert!(score_0.is_finite(), "2-bit fused score should be finite");
+        assert!(score_1.is_finite(), "4-bit fused score should be finite");
     }
 }

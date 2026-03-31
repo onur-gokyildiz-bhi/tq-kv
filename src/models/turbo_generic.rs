@@ -437,6 +437,50 @@ fn get_layer_bits(layer_idx: usize, default_bits: u8, config: &tq_kv::TurboQuant
     Some(default_bits)
 }
 
+/// Parsed head bit ranges, cached at first use.
+static HEAD_BITS_CACHE: std::sync::OnceLock<Vec<(usize, usize, u8)>> = std::sync::OnceLock::new();
+
+/// Parse TQ_HEAD_BITS env var. Format: "0-3:4,4-7:2" (same syntax as TQ_LAYER_BITS).
+fn parse_head_bits() -> &'static Vec<(usize, usize, u8)> {
+    HEAD_BITS_CACHE.get_or_init(|| {
+        let mut ranges = Vec::new();
+        if let Ok(val) = std::env::var("TQ_HEAD_BITS") {
+            for part in val.split(',') {
+                let parts: Vec<&str> = part.trim().split(':').collect();
+                if parts.len() == 2 {
+                    let range_parts: Vec<&str> = parts[0].split('-').collect();
+                    if range_parts.len() == 2 {
+                        if let (Ok(start), Ok(end), Ok(bits)) = (
+                            range_parts[0].parse::<usize>(),
+                            range_parts[1].parse::<usize>(),
+                            parts[1].parse::<u8>(),
+                        ) {
+                            ranges.push((start, end, bits));
+                        }
+                    }
+                }
+            }
+        }
+        ranges
+    })
+}
+
+/// Resolve per-head bit widths from TQ_HEAD_BITS env var.
+/// Returns None if no TQ_HEAD_BITS is set (all heads use default_bits).
+fn resolve_per_head_bits(n_kv_head: usize, default_bits: u8) -> Option<Vec<u8>> {
+    let ranges = parse_head_bits();
+    if ranges.is_empty() {
+        return None;
+    }
+    let mut bits = vec![default_bits; n_kv_head];
+    for &(start, end, b) in ranges {
+        for h in start..=end.min(n_kv_head.saturating_sub(1)) {
+            bits[h] = b;
+        }
+    }
+    Some(bits)
+}
+
 /// Sparse V threshold. Softmax weights below this are skipped in V multiply.
 /// Set TQ_SPARSE_V=0 to disable. Default: 1e-6.
 /// Override with TQ_SPARSE_V env var (e.g. TQ_SPARSE_V=1e-5).
@@ -629,6 +673,9 @@ impl LayerWeights {
             } else {
                 self.tq_config.clone()
             };
+            // Per-head adaptive bitwidth: resolve from TQ_HEAD_BITS env var or config
+            let per_head_bits = resolve_per_head_bits(self.n_kv_head, effective_bits)
+                .or_else(|| self.tq_config.per_head_bits.clone());
             // COMPRESSED PATH: TurboQuant KV cache with 3-fix quality enhancement
             //
             // Three paper-backed techniques to handle compound error (W4+KV4):
@@ -650,9 +697,12 @@ impl LayerWeights {
             if self.kv_compressed.is_none() {
                 let mut k_per_head = Vec::with_capacity(self.n_kv_head);
                 let gs = layer_tq_config.group_size;
-                for _ in 0..self.n_kv_head {
+                for h in 0..self.n_kv_head {
+                    let hbits = per_head_bits.as_ref()
+                        .map(|phb| phb[h])
+                        .unwrap_or(effective_bits);
                     k_per_head.push(tq_kv::CompressedKeys::new_empty_grouped(
-                        effective_bits, self.padded_head_dim, layer_tq_config.rotation_seed, gs,
+                        hbits, self.padded_head_dim, layer_tq_config.rotation_seed, gs,
                     ));
                 }
                 let (v_raw, v_compressed) = if vbits == 0 {
@@ -746,19 +796,32 @@ impl LayerWeights {
                 let hdim = self.head_dim;
                 let use_grouped = layer_tq_config.group_size > 0 && hdim % layer_tq_config.group_size == 0;
                 for h in 0..self.n_kv_head {
+                    // Per-head adaptive bitwidth: use head-specific config if assigned
+                    let head_config = match per_head_bits {
+                        Some(ref phb) if phb[h] != layer_tq_config.bits => {
+                            // Clear calibrated codebook if bit width differs — it was
+                            // calibrated for layer_tq_config.bits, not for this head's bits.
+                            tq_kv::TurboQuantConfig {
+                                bits: phb[h],
+                                calibrated_codebook: None,
+                                ..layer_tq_config.clone()
+                            }
+                        }
+                        _ => layer_tq_config.clone(),
+                    };
                     for s in 0..tokens_to_compress {
                         let offset = (h * tokens_to_compress + s) * hdim;
                         let key_vec = &k_flat[offset..offset + hdim];
                         if use_grouped {
                             let (packed, gnorms, residual, outliers) = tq_kv::compress_single_key_grouped(
-                                key_vec, hdim, &layer_tq_config, &self.signs,
+                                key_vec, hdim, &head_config, &self.signs,
                             );
                             // Set residual/outlier bits on first append
                             if cache.k_per_head[h].residual_bits == 0 && residual.is_some() {
-                                cache.k_per_head[h].residual_bits = layer_tq_config.residual_bits;
+                                cache.k_per_head[h].residual_bits = head_config.residual_bits;
                             }
                             if cache.k_per_head[h].outlier_k == 0 && outliers.is_some() {
-                                cache.k_per_head[h].outlier_k = layer_tq_config.outlier_k;
+                                cache.k_per_head[h].outlier_k = head_config.outlier_k;
                             }
                             // Append outliers
                             if let Some((oi, ov)) = outliers {
@@ -774,12 +837,12 @@ impl LayerWeights {
                             let mut padded = vec![0.0f32; self.padded_head_dim];
                             padded[..hdim].copy_from_slice(key_vec);
                             let (packed, norm) = tq_kv::compress_single_key_with_signs(
-                                &padded, self.padded_head_dim, &layer_tq_config, &self.signs,
+                                &padded, self.padded_head_dim, &head_config, &self.signs,
                             );
                             cache.k_per_head[h].append_raw(&packed, norm);
                         } else {
                             let (packed, norm) = tq_kv::compress_single_key_with_signs(
-                                key_vec, hdim, &layer_tq_config, &self.signs,
+                                key_vec, hdim, &head_config, &self.signs,
                             );
                             cache.k_per_head[h].append_raw(&packed, norm);
                         }
@@ -861,8 +924,7 @@ impl LayerWeights {
                     // Use calibrated centroids if available, else standard Gaussian
                     let cal_centroids_owned: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
                         .as_ref().map(|cb| cb.centroids.clone());
-                    let cold_centroids = cache.k_cold.as_ref()
-                        .map(|c| tq_kv::codebook::get_centroids(c[0].bits));
+                    // Note: cold centroids looked up per-head inside the loop (mixed bits)
 
                     use rayon::prelude::*;
                     let head_scores: Vec<Vec<f32>> = (0..self.n_head)
@@ -891,9 +953,9 @@ impl LayerWeights {
                                 }
                             }
 
-                            // Segment 2: Cold (decayed) keys — fused at cold bit width
+                            // Segment 2: Cold (decayed) keys — fused at cold bit width (per-head)
                             if let Some(ref cold) = cache.k_cold {
-                                let cold_cb = cold_centroids.unwrap();
+                                let cold_cb = tq_kv::codebook::get_centroids(cold[kv_h].bits);
                                 let cold_scores = tq_kv::fused_attention_scores(
                                     &rotated_q, &cold[kv_h], cold_cb, scale,
                                 );
@@ -902,8 +964,12 @@ impl LayerWeights {
 
                             // Segment 3: Hot compressed keys (excluding last = current)
                             if n_past_compressed > 0 {
-                                let hot_cb: &[f32] = cal_centroids_owned.as_deref()
-                                    .unwrap_or_else(|| tq_kv::codebook::get_centroids(effective_bits));
+                                // Use calibrated centroids only if they match the head's bit width
+                                let head_bits = cache.k_per_head[kv_h].bits;
+                                let hot_cb: &[f32] = match cal_centroids_owned.as_deref() {
+                                    Some(cal) if head_bits == layer_tq_config.bits => cal,
+                                    _ => tq_kv::codebook::get_centroids(head_bits),
+                                };
                                 let hot = &cache.k_per_head[kv_h];
                                 let dim = hot.dim;
                                 let bpv = hot.bytes_per_vector();

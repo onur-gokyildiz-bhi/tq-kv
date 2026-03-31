@@ -48,6 +48,12 @@ pub struct CalibrationData {
     pub codebook_3bit: Option<CodebookCalibration>,
     pub codebook_4bit: Option<CodebookCalibration>,
     pub rotation_matrix: Vec<f32>,
+    /// Per-head importance scores (key norm std-dev). Higher = more important head.
+    #[serde(default)]
+    pub head_importance: Option<Vec<f32>>,
+    /// Auto-assigned per-head bit widths from importance scoring.
+    #[serde(default)]
+    pub auto_head_bits: Option<Vec<u8>>,
 }
 
 impl CalibrationData {
@@ -70,6 +76,12 @@ impl CalibrationData {
         if !self.rotation_matrix.is_empty() {
             config.rotation_matrix = Some(self.rotation_matrix.clone());
         }
+        // Apply auto-assigned per-head bits from calibration (env var TQ_HEAD_BITS overrides)
+        if config.per_head_bits.is_none() {
+            if let Some(ref ahb) = self.auto_head_bits {
+                config.per_head_bits = Some(ahb.clone());
+            }
+        }
     }
 }
 
@@ -86,6 +98,11 @@ pub struct CalibrationCollector {
     pub head_dim: usize,
     pub max_samples: usize,
     pub count: usize,
+    /// Per-head key norm accumulators for importance scoring
+    pub head_norm_sums: Vec<f64>,
+    pub head_norm_sq_sums: Vec<f64>,
+    pub head_sample_counts: Vec<usize>,
+    pub n_kv_heads: usize,
 }
 
 impl CalibrationCollector {
@@ -95,16 +112,46 @@ impl CalibrationCollector {
             head_dim,
             max_samples,
             count: 0,
+            head_norm_sums: Vec::new(),
+            head_norm_sq_sums: Vec::new(),
+            head_sample_counts: Vec::new(),
+            n_kv_heads: 0,
         }
     }
 
     /// Collect key vectors from a k tensor [batch, n_kv_heads, seq_len, head_dim].
-    /// Only collects from the first KV head to avoid redundancy across GQA groups.
+    /// Collects samples from first KV head for codebook calibration,
+    /// and per-head norm stats from ALL heads for importance scoring.
     pub fn collect_from_tensor(&mut self, k_flat: &[f32], n_kv_heads: usize, seq_len: usize, head_dim: usize) {
+        // Initialize per-head accumulators on first call
+        if self.n_kv_heads == 0 && n_kv_heads > 0 {
+            self.n_kv_heads = n_kv_heads;
+            self.head_norm_sums = vec![0.0; n_kv_heads];
+            self.head_norm_sq_sums = vec![0.0; n_kv_heads];
+            self.head_sample_counts = vec![0; n_kv_heads];
+        }
+
+        // Collect per-head norm stats from ALL heads (cheap, always runs)
+        for h in 0..n_kv_heads.min(self.n_kv_heads) {
+            for s in 0..seq_len {
+                let offset = (h * seq_len + s) * head_dim;
+                if offset + head_dim <= k_flat.len() {
+                    let norm = k_flat[offset..offset + head_dim]
+                        .iter()
+                        .map(|x| (*x as f64) * (*x as f64))
+                        .sum::<f64>()
+                        .sqrt();
+                    self.head_norm_sums[h] += norm;
+                    self.head_norm_sq_sums[h] += norm * norm;
+                    self.head_sample_counts[h] += 1;
+                }
+            }
+        }
+
+        // Collect samples from first KV head for codebook calibration
         if self.count >= self.max_samples {
             return;
         }
-        // Collect from first KV head only (representative of the distribution)
         let remaining = self.max_samples - self.count;
         let to_collect = seq_len.min(remaining);
         for s in 0..to_collect {
@@ -143,6 +190,47 @@ pub fn maybe_collect(k_flat: &[f32], n_kv_heads: usize, seq_len: usize, head_dim
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-head importance scoring
+// ---------------------------------------------------------------------------
+
+/// Compute head importance scores based on key norm variance.
+/// Higher std-dev = head uses attention more selectively (global) = more important.
+pub fn compute_head_importance(collector: &CalibrationCollector) -> Vec<f32> {
+    let mut scores = Vec::with_capacity(collector.n_kv_heads);
+    for h in 0..collector.n_kv_heads {
+        let n = collector.head_sample_counts[h] as f64;
+        if n < 2.0 {
+            scores.push(1.0);
+            continue;
+        }
+        let mean = collector.head_norm_sums[h] / n;
+        let variance = (collector.head_norm_sq_sums[h] / n) - mean * mean;
+        scores.push(variance.max(0.0).sqrt() as f32);
+    }
+    scores
+}
+
+/// Auto-assign per-head bit widths based on importance scores.
+/// Top `high_frac` fraction of heads (by importance) get `high_bits`,
+/// the rest get `low_bits`.
+pub fn auto_assign_head_bits(
+    scores: &[f32],
+    high_bits: u8,
+    low_bits: u8,
+    high_frac: f32,
+) -> Vec<u8> {
+    let n = scores.len();
+    let n_high = ((n as f32) * high_frac).ceil() as usize;
+    let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut bits = vec![low_bits; n];
+    for &(idx, _) in indexed.iter().take(n_high) {
+        bits[idx] = high_bits;
+    }
+    bits
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +290,18 @@ pub fn compute_calibration(
         }
     }
 
+    // 5. Per-head importance scoring (if per-head stats were collected)
+    let (head_importance, auto_head_bits) = if collector.n_kv_heads > 0 {
+        let importance = compute_head_importance(collector);
+        eprintln!("  Head importance scores: {:?}", importance);
+        // Default: top 50% get 4-bit, rest get 2-bit
+        let auto_bits = auto_assign_head_bits(&importance, 4, 2, 0.5);
+        eprintln!("  Auto head bits: {:?}", auto_bits);
+        (Some(importance), Some(auto_bits))
+    } else {
+        (None, None)
+    };
+
     CalibrationData {
         model: model_name.to_string(),
         head_dim,
@@ -211,6 +311,8 @@ pub fn compute_calibration(
         codebook_3bit,
         codebook_4bit,
         rotation_matrix,
+        head_importance,
+        auto_head_bits,
     }
 }
 
