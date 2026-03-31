@@ -228,6 +228,13 @@ fn get_sink_tokens(config: &tq_kv::TurboQuantConfig) -> usize {
         .unwrap_or(TQ_SINK_TOKENS)
 }
 
+/// Compressed value store — either 8-bit per-vector or 4-bit per-group absmax.
+#[derive(Clone, Debug)]
+enum CompressedValueStore {
+    Bits8(Vec<tq_kv::CompressedValues>),
+    Bits4(Vec<tq_kv::CompressedValues4Bit>),
+}
+
 #[derive(Clone, Debug)]
 struct CompressedKvCache {
     /// Compressed keys per KV head (hot tier, recent tokens at original bit width)
@@ -247,9 +254,9 @@ struct CompressedKvCache {
     sink_len: usize,
     /// Value cache — uncompressed path (value_bits=0)
     v_raw: Option<Tensor>,
-    /// Value cache — compressed path (value_bits=8), per KV head
-    v_compressed: Option<Vec<tq_kv::CompressedValues>>,
-    /// Value quantization bits (0=fp16, 8=absmax)
+    /// Value cache — compressed path (value_bits=4 or 8), per KV head
+    v_compressed: Option<CompressedValueStore>,
+    /// Value quantization bits (0=fp16, 4=4-bit per-group, 8=8-bit absmax)
     value_bits: u8,
     /// Total cached length (sink + compressed + current)
     cached_len: usize,
@@ -283,17 +290,25 @@ fn decompress_compressed_keys(
 }
 
 /// Decompress compressed values to F32 tensor: (1, n_kv_head, seq_len, head_dim).
-fn decompress_values(
-    v_per_head: &[tq_kv::CompressedValues],
+fn decompress_values_store(
+    store: &CompressedValueStore,
     n_kv_head: usize,
     head_dim: usize,
     seq_len: usize,
     device: &Device,
 ) -> Result<Tensor> {
     let mut all_data = Vec::with_capacity(n_kv_head * seq_len * head_dim);
-    for compressed in v_per_head.iter().take(n_kv_head) {
-        let decompressed = compressed.decompress();
-        all_data.extend(decompressed);
+    match store {
+        CompressedValueStore::Bits8(v_per_head) => {
+            for compressed in v_per_head.iter().take(n_kv_head) {
+                all_data.extend(compressed.decompress());
+            }
+        }
+        CompressedValueStore::Bits4(v_per_head) => {
+            for compressed in v_per_head.iter().take(n_kv_head) {
+                all_data.extend(compressed.decompress());
+            }
+        }
     }
     Tensor::from_vec(all_data, (1, n_kv_head, seq_len, head_dim), device)
 }
@@ -512,8 +527,9 @@ fn get_bias_correction() -> bool {
         .unwrap_or(false)
 }
 
-/// Value cache quantization bits. 0 = uncompressed fp16, 8 = 8-bit absmax.
-/// Override with TQ_VBITS env var (e.g. TQ_VBITS=8 for 2x value savings).
+/// Value cache quantization bits. 0 = uncompressed fp16, 4 = 4-bit per-group (~3.2x),
+/// 8 = 8-bit per-vector absmax (~1.9x).
+/// Override with TQ_VBITS env var (e.g. TQ_VBITS=4 for 3.2x value savings).
 const TQ_VBITS_DEFAULT: u8 = 0;
 
 fn get_value_bits() -> u8 {
@@ -705,14 +721,24 @@ impl LayerWeights {
                         hbits, self.padded_head_dim, layer_tq_config.rotation_seed, gs,
                     ));
                 }
-                let (v_raw, v_compressed) = if vbits == 0 {
-                    (None, None)
-                } else {
-                    let mut v_heads: Vec<tq_kv::CompressedValues> = Vec::with_capacity(self.n_kv_head);
-                    for _ in 0..self.n_kv_head {
-                        v_heads.push(tq_kv::CompressedValues::new_empty(self.head_dim));
+                let (v_raw, v_compressed) = match vbits {
+                    0 => (None, None),
+                    4 => {
+                        let gs = layer_tq_config.group_size.max(32);
+                        let mut v_heads: Vec<tq_kv::CompressedValues4Bit> = Vec::with_capacity(self.n_kv_head);
+                        for _ in 0..self.n_kv_head {
+                            v_heads.push(tq_kv::CompressedValues4Bit::new_empty(self.head_dim, gs));
+                        }
+                        (None, Some(CompressedValueStore::Bits4(v_heads)))
                     }
-                    (None, Some(v_heads))
+                    _ => {
+                        // 8-bit (default for any non-zero, non-4 value)
+                        let mut v_heads: Vec<tq_kv::CompressedValues> = Vec::with_capacity(self.n_kv_head);
+                        for _ in 0..self.n_kv_head {
+                            v_heads.push(tq_kv::CompressedValues::new_empty(self.head_dim));
+                        }
+                        (None, Some(CompressedValueStore::Bits8(v_heads)))
+                    }
                 };
                 self.kv_compressed = Some(CompressedKvCache {
                     k_per_head,
@@ -750,13 +776,25 @@ impl LayerWeights {
                     cache.v_raw = Some(v.clone());
                 }
             } else {
-                // Compressed 8-bit path: quantize per head × position
+                // Compressed path: quantize per head × position
                 let v_f32 = v.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-                let v_comp = cache.v_compressed.as_mut().unwrap();
-                for h in 0..self.n_kv_head {
-                    for s in 0..seq_len {
-                        let offset = (h * seq_len + s) * self.head_dim;
-                        v_comp[h].append(&v_f32[offset..offset + self.head_dim]);
+                let v_store = cache.v_compressed.as_mut().unwrap();
+                match v_store {
+                    CompressedValueStore::Bits8(v_comp) => {
+                        for h in 0..self.n_kv_head {
+                            for s in 0..seq_len {
+                                let offset = (h * seq_len + s) * self.head_dim;
+                                v_comp[h].append(&v_f32[offset..offset + self.head_dim]);
+                            }
+                        }
+                    }
+                    CompressedValueStore::Bits4(v_comp) => {
+                        for h in 0..self.n_kv_head {
+                            for s in 0..seq_len {
+                                let offset = (h * seq_len + s) * self.head_dim;
+                                v_comp[h].append(&v_f32[offset..offset + self.head_dim]);
+                            }
+                        }
                     }
                 }
             }
@@ -1091,23 +1129,48 @@ impl LayerWeights {
                 };
 
                 // --- Compute attention output: att @ V ---
-                let v_f32 = if cache.value_bits == 0 {
-                    repeat_kv(cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?, n_rep)?
-                } else {
-                    let v_tensor = decompress_values(
-                        cache.v_compressed.as_ref().unwrap(),
-                        self.n_kv_head, self.head_dim, total_len, q.device(),
-                    )?;
-                    repeat_kv(v_tensor, n_rep)?
-                };
-
-                // Sparse V: skip V rows where softmax weight < threshold (CPU only)
                 let sparse_thresh = get_sparse_v_threshold();
-                if sparse_thresh > 0.0 && att.device().is_cpu() {
-                    sparse_attn_v(&att, &v_f32, self.n_head, self.head_dim, sparse_thresh)?
+
+                // Fused sparse-decompress path: decompress only active V rows
+                if sparse_thresh > 0.0 && att.device().is_cpu() && cache.value_bits > 0 {
+                    let att_flat = att.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let v_store = cache.v_compressed.as_ref().unwrap();
+                    let head_dim = self.head_dim;
+                    let mut output = Vec::with_capacity(self.n_head * head_dim);
+
+                    for h in 0..self.n_head {
+                        let kv_h = h / n_rep; // GQA head mapping
+                        let att_row = &att_flat[h * total_len..(h + 1) * total_len];
+
+                        let head_out = match v_store {
+                            CompressedValueStore::Bits4(ref v) =>
+                                tq_kv::sparse_attn_v_mul_compressed_4bit(att_row, &v[kv_h], sparse_thresh),
+                            CompressedValueStore::Bits8(ref v) =>
+                                tq_kv::sparse_attn_v_mul_compressed_8bit(att_row, &v[kv_h], sparse_thresh),
+                        };
+                        output.extend_from_slice(&head_out);
+                    }
+
+                    Tensor::from_vec(output, (1, self.n_head, 1, head_dim), att.device())?
                         .to_dtype(cache.dtype)?
                 } else {
-                    att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)?
+                    // Standard path: decompress all values, matmul or sparse multiply
+                    let v_f32 = if cache.value_bits == 0 {
+                        repeat_kv(cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?, n_rep)?
+                    } else {
+                        let v_tensor = decompress_values_store(
+                            cache.v_compressed.as_ref().unwrap(),
+                            self.n_kv_head, self.head_dim, total_len, q.device(),
+                        )?;
+                        repeat_kv(v_tensor, n_rep)?
+                    };
+
+                    if sparse_thresh > 0.0 && att.device().is_cpu() {
+                        sparse_attn_v(&att, &v_f32, self.n_head, self.head_dim, sparse_thresh)?
+                            .to_dtype(cache.dtype)?
+                    } else {
+                        att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)?
+                    }
                 }
             } else {
                 // PREFILL: use original uncompressed keys for attention (standard path)
@@ -1602,8 +1665,8 @@ impl GenericTurboModel {
             let t = tensors.get(name)
                 .cloned()
                 .ok_or_else(|| candle_core::Error::Msg(format!("Missing tensor: {name}")))?;
-            // BF16 has no CPU matmul — cast to F16 (CUDA) or F32 (CPU)
-            if t.dtype() == DType::BF16 && device.is_cpu() {
+            // BF16 lacks many kernels — cast to F32 for reliable compute on both CPU and GPU
+            if t.dtype() == DType::BF16 {
                 t.to_dtype(DType::F32)
             } else {
                 Ok(t)
