@@ -696,6 +696,17 @@ impl LayerWeights {
             }
         };
 
+        // Calibration hook: collect RAW key vectors (before attention bias, before RoPE).
+        // These have consistent per-channel statistics — no positional or bias contamination.
+        // Ideal for computing per-channel bias and scale calibration.
+        if crate::calibrate::CALIBRATION_COLLECTOR.get().is_some() {
+            let k_for_cal = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?.contiguous()?;
+            if let Ok(k_f32) = k_for_cal.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>() {
+                crate::calibrate::maybe_collect(&k_f32, self.n_kv_head, seq_len, self.head_dim);
+            }
+        }
+
         // Apply biases if present (Qwen2 has them, Llama/Phi/Gemma don't)
         if let Some(bq) = &self.attention_bq {
             q = q.broadcast_add(bq)?;
@@ -712,11 +723,7 @@ impl LayerWeights {
         let v = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
 
         // SmoothAttention: migrate K outliers to Q BEFORE RoPE.
-        // After reshape, shapes are [batch, n_heads, seq_len, head_dim].
-        // Scales shape is [head_dim], broadcasts over last dim.
-        // K *= 1/sqrt(s) (reduces outlier magnitude for quantization)
-        // Q *= sqrt(s) (absorbs the scale — Q stays fp32, no precision loss)
-        // Mathematical equivalence: (Q*sqrt(s)) * (K/sqrt(s))^T = Q * K^T
+        // K *= 1/sqrt(s), Q *= sqrt(s). Invariance: (Q*sqrt(s)) * (K/sqrt(s))^T = Q * K^T
         let (q, k) = if let (Some(ref q_scales), Some(ref k_scales)) = (&self.smooth_q_scales, &self.smooth_k_scales) {
             (q.broadcast_mul(q_scales)?, k.broadcast_mul(k_scales)?)
         } else {
@@ -725,13 +732,6 @@ impl LayerWeights {
 
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
-
-        // Calibration hook: collect raw post-RoPE key vectors if calibration is active
-        if crate::calibrate::CALIBRATION_COLLECTOR.get().is_some() {
-            if let Ok(k_f32) = k.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>() {
-                crate::calibrate::maybe_collect(&k_f32, self.n_kv_head, seq_len, self.head_dim);
-            }
-        }
 
         // Selective compression: first TQ_SKIP_FIRST_LAYERS use standard fp16 KV cache,
         // remaining layers use TurboQuant compression.
