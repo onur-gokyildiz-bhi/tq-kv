@@ -42,6 +42,8 @@
 
 /// Lloyd-Max codebook quantization (2/3/4-bit optimal centroids).
 pub mod codebook;
+/// KV cache compaction — reduce token count via attention matching.
+pub mod compaction;
 /// Fast Walsh-Hadamard Transform for decorrelation.
 pub mod hadamard;
 
