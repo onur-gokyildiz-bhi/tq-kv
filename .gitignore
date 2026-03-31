@@ -1,10 +1,16 @@
 /target
+/target2
 /models
 *.log
 *.txt
 *.obj
 !Cargo.lock
 *.docx
+*.pdf
 /docs/
 .claude/
-target2/
+candle-patches/
+TODOS.md
+CLAUDE.md
+*.ps1
+build_test_ffi.bat
