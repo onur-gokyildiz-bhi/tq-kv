@@ -240,6 +240,12 @@ fn resolve_tq_config_for_model(turbo_quant: bool, tq_bits: u8, model_name: Optio
                 config.outlier_k = k;
             }
         }
+        // TQ_GROUP=0 disables group quantization (per-vector sigma)
+        if let Ok(val) = std::env::var("TQ_GROUP") {
+            if let Ok(gs) = val.parse::<usize>() {
+                config.group_size = gs;
+            }
+        }
         // Auto-load calibration data if available (unless TQ_NO_CAL=1)
         let no_cal = std::env::var("TQ_NO_CAL").ok().map_or(false, |v| v == "1");
         if !no_cal {
