@@ -1,145 +1,131 @@
 # tq-kv
 
-**Production-grade TurboQuant KV cache compression for LLM inference. Pure Rust. CUDA. C FFI.**
+**Pure Rust TurboQuant KV cache compression. CUDA. AVX2 SIMD. C FFI. crates.io.**
 
 [![Crates.io](https://img.shields.io/crates/v/tq-kv)](https://crates.io/crates/tq-kv)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
-[![Tests](https://img.shields.io/badge/tests-99%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-111%20passing-brightgreen)]()
 [![CUDA](https://img.shields.io/badge/CUDA-13.2-76B900)](https://developer.nvidia.com/cuda-toolkit)
 [![no\_std](https://img.shields.io/badge/no__std-compatible-blue)]()
-[![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)](https://www.rust-lang.org)
 
-Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) KV cache compression with architectural improvements. Compresses LLM attention keys to 2-4 bits with measured perplexity impact under 1%.
-
----
-
-## Why tq-kv?
-
-- **Proven quality** -- 4-bit PPL +0.32% (with group quant + outlier + residual) on wikitext-2, NIAH 9/9 pass at all depths. Not toy benchmarks; real model, real text.
-- **First TurboQuant on GGUF** -- 3-Fix framework (sink tokens + POQ + cache reset) solves compound quantization error that breaks all other implementations on Q4 models.
-- **CUDA + AVX2 SIMD** -- NVIDIA GPU support (3.2x over CPU), fused AVX2+FMA attention (8.9x SIMD), SRHT QJL (115x faster, +4.5 dB SNR).
-- **K/V Asymmetric + Temporal Decay** -- values 8-bit, keys 4-bit (`TQ_VBITS=8`). Older tokens auto-demoted to 2-bit (`TQ_DECAY=512:2`). 30%+ extra savings.
-- **Sparse V + Fused Attention** -- skip V rows where softmax < threshold (`TQ_SPARSE_V`). Fused path computes scores directly from compressed indices (`TQ_FUSED=1`).
-- **C FFI for llama.cpp** -- ships `tq_kv.h` + `libtq_kv.a`. Drop into any C/C++ inference engine. Multi-head layer API included.
-- **Production architecture** -- O(1) incremental cache, Rayon parallel multi-head, 5 GGUF architectures, `no_std` core, 99 tests, hardened server.
-
-## TurboQuant Implementations Compared
-
-> As of March 2026. TurboQuant (ICLR 2026, Google Research) has multiple community implementations.
-
-| Feature | **tq-kv** (this) | turboquant_plus | turboquant | turbo-quant | Dejan (Triton) |
-|:--------|:----------------:|:---------------:|:----------:|:-----------:|:--------------:|
-| Language | Rust | Python | Rust | Rust | Python/Triton |
-| CUDA GPU | **Yes** | No | No | No | **Yes** (Triton) |
-| AVX2 SIMD | **Yes** | No | No | No | No |
-| C FFI | **Yes** | No | No | No | No |
-| llama.cpp patch | **Yes** | **Yes** (ext. fork) | No | No | No |
-| vLLM integration | No | No | No | No | **Yes** |
-| Fused attention | **Yes** | No | No | No | **Yes** (Triton) |
-| Incremental cache | **Yes** | **Partial** | No | **Yes** | **Yes** |
-| K/V Asymmetric | **Yes** (4/8-bit V) | **Yes** | No | No | **Yes** (3K+2V) |
-| Temporal Decay | **Yes** | **Prototype** | No | No | No |
-| Sparse V | **Yes** (fused decompress) | **Yes** (+22.8%) | No | No | No |
-| Per-head bitwidth | **Yes** (static + calibrated) | No | No | No | No |
-| Calibration pipeline | **Yes** (codebook/rotation/scales) | No | No | No | No |
-| GGUF 3-Fix | **Yes** | **Partial** | No | No | No |
-| PPL benchmark | **+0.32%** (4-bit) | **+0.23%** (turbo4) | No | No | No |
-| NIAH test | **9/9 pass** | **9/9 pass** | No | No | No |
-| no_std | **Yes** | No | No | No | No |
-| crates.io | **v0.5.0** | N/A | alpha | minimal | N/A |
-| Lines of code | ~6.3K lib | ~4K Python | ~10K | ~1.5K | ~3.5K |
-| Metal (Apple) | No | **Yes** (ext. fork) | No | No | No |
-| Stars | — | 3,438 | 17 | 12 | 523 |
-| Activity | Active | Very active | Stale | Dead | Stale (GPL-3.0) |
-
-tq-kv is the most complete compiled implementation — the only one with native CUDA, SIMD, C FFI, per-head adaptive bitwidth, and calibration pipeline in a single crate.
+Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) with the **3-Fix framework** that makes it work on GGUF quantized models -- where every other implementation produces catastrophic output.
 
 ---
 
-## Key Results
+## The Compound Error Problem
 
-> Hardware: RTX 3080 10GB, i9-13900K, 64GB RAM, CUDA 13.2, Rust 1.91
+Every TurboQuant implementation assumes FP16 model weights. In practice, everyone runs GGUF quantized models (Q4_K_M). When you stack weight quantization + KV cache quantization, errors compound through softmax:
 
-| Metric | 2-bit | 3-bit | 4-bit |
-|:-------|------:|------:|------:|
-| Compression ratio | **14.2x** | **9.8x** | **7.5x** |
-| Cosine similarity | 0.943 | 0.984 | 0.996 |
-| SIMD fused_dot_product speedup (AVX2+FMA) | **8.9x** | **5.4x** | **8.6x** |
-| VRAM saved (Llama-3 8B, 4096 ctx) | 238 MB | 230 MB | 222 MB |
-| VRAM saved (Qwen 72B, 4096 ctx) | 595 MB | 575 MB | 555 MB |
-| Per-token cache overhead | 0.65 ms | 0.65 ms | 0.65 ms |
+| Implementation | Qwen 7B Q4_K_M PPL | Status |
+|:---------------|--------------------:|:-------|
+| No compression | 5.18 | Baseline |
+| turboquant_plus (symmetric) | 3,556 | **Catastrophic** |
+| **tq-kv (3-Fix)** | **6.07** | **Working (+17%)** |
+| turboquant_plus (asymmetric K=q8_0) | 6.64 | Working (+1%) but K uncompressed |
 
----
-
-## Perplexity -- Quality Proof
-
-> Trendyol Llama-3 8B, wikitext-2, 2249 tokens
-
-| Mode | PPL | vs Baseline |
-|:-----|----:|:----------:|
-| Standard (fp32 KV) | 9.515 | -- |
-| TurboQuant 4-bit | 9.594 | **+0.8%** |
-| TurboQuant 3-bit | 9.899 | +4.0% |
-| TurboQuant 2-bit | 12.730 | +33.8% |
-
-### Context Scaling (4-bit)
-
-PPL remains flat as context length grows:
-
-| Context Length | Standard | 4-bit | vs Baseline |
-|:--------------:|---------:|------:|:----------:|
-| 256 tokens | 13.863 | 14.076 | +1.5% |
-| 512 tokens | 11.368 | 11.585 | +1.9% |
-| 1024 tokens | 7.441 | 7.474 | +0.4% |
-| 2048 tokens | 9.651 | 9.718 | +0.7% |
-
-No quality cliff. Compression holds across sequence lengths.
-
-### Quality Enhancement Trajectory (Qwen 0.5B FP16, 4-bit)
-
-| Configuration | PPL vs Baseline |
-|:-------------|:---------------:|
-| Per-vector sigma (vanilla TQ) | +11.5% |
-| + Group quantization (g=32) | +9.9% |
-| + Outlier preservation (K=8) | +2.1% |
-| **+ Residual quantization (3-bit)** | **+0.32%** |
-
-Near-lossless compression through stacked quality enhancements — no retraining.
+**tq-kv is the only implementation that compresses keys on GGUF and produces coherent output.** Others either crash (symmetric turbo) or avoid K compression entirely (asymmetric K=q8_0).
 
 ---
 
-## NIAH -- Long Context Proof
+## Measured Quality (Honest Numbers)
 
-Needle-In-A-Haystack retrieval test: inject a target sentence at varying depths, measure whether the model retrieves it correctly through compressed KV cache.
+> All PPL measured on wikitext-2 with automated `tq perplexity` / `tq ablate`.
 
-| Bit Width | Depth 10% | Depth 25% | Depth 50% | Depth 75% | Depth 90% |
-|:---------:|:---------:|:---------:|:---------:|:---------:|:---------:|
+### FP16 Models (no compound error)
+
+> Qwen 2.5 0.5B FP16 safetensors, wikitext-2, 2366 tokens
+
+| Bits | PPL | vs Baseline | Compression |
+|:----:|----:|:-----------:|:-----------:|
+| Baseline | 10.740 | -- | 1.0x |
+| 4-bit | 11.967 | +11.4% | 7.5x |
+| 3-bit | 13.933 | +29.7% | 9.8x |
+| 2-bit | 27.696 | +157.9% | 14.2x |
+
+### GGUF Q4_K_M Models (compound error)
+
+> Qwen 2.5 7B Q4_K_M, wikitext-2, 2366 tokens, skip=4, sink=4
+
+| Config | PPL | vs Baseline | Notes |
+|:-------|----:|:-----------:|:------|
+| Baseline (no TQ) | 5.178 | -- | |
+| **K4-bit, V-fp16** | **6.065** | **+17.1%** | Default recommended |
+| K4-bit, V-8bit | 6.076 | +17.3% | V8 nearly free (+0.2%) |
+| K4-bit, V-4bit | 6.143 | +18.6% | V4 acceptable |
+| K4-bit, skip=16 | 6.005 | +16.0% | Fewer compressed layers |
+
+### Value Compression is Nearly Free
+
+Key insight matching turboquant_plus findings: softmax amplifies K errors exponentially, V errors scale linearly. Compressing values has minimal quality impact:
+
+| Value Config | Extra PPL vs K-only | Value Savings |
+|:-------------|:-------------------:|:-------------:|
+| V-fp16 (default) | -- | 1.0x |
+| V-8bit (`TQ_VBITS=8`) | +0.2% | 2.0x |
+| V-4bit (`TQ_VBITS=4`) | +1.3% | 3.2x |
+
+### Compression Quality (synthetic, per-layer)
+
+| Model | Bits | Ratio | SNR (dB) | Cosine Sim |
+|:------|:----:|------:|---------:|-----------:|
+| Llama-3 8B | 2 | **14.2x** | 9.2 | 0.943 |
+| Llama-3 8B | 3 | **9.8x** | 14.7 | 0.984 |
+| Llama-3 8B | 4 | **7.5x** | 20.4 | 0.996 |
+| Gemma 3 4B | 2 | **15.1x** | 9.2 | 0.943 |
+
+### NIAH (Needle-In-A-Haystack)
+
+| Bit Width | 10% | 25% | 50% | 75% | 90% |
+|:---------:|:---:|:---:|:---:|:---:|:---:|
 | 4-bit | PASS | PASS | PASS | PASS | PASS |
 | 2-bit | PASS | PASS | PASS | PASS | PASS |
-
-Compressed keys preserve retrieval accuracy at every depth.
 
 ---
 
 ## Quick Start
 
-### Library
+### Install
 
 ```toml
 [dependencies]
 tq-kv = "0.5"
 ```
 
+### CLI (tq-engine)
+
+```bash
+# Pull a model
+tq pull qwen2:7b
+
+# Chat with TurboQuant compression
+tq chat qwen2:7b --turbo-quant
+
+# Start OpenAI-compatible API server
+tq serve --model qwen2:7b --turbo-quant --port 11435
+
+# Evaluate perplexity
+tq perplexity --model qwen2:7b eval.txt --turbo-quant
+
+# Calibrate (optimal codebook + rotation from real activations)
+tq calibrate qwen2:7b --text calibration_data.txt
+
+# Run ablation study
+tq ablate qwen2:7b --file eval.txt --quick --output results.csv
+```
+
+### Library API
+
 ```rust
 use tq_kv::*;
 
-let config = TurboQuantConfig::extreme(); // 2-bit, ~14x compression
+let config = TurboQuantConfig::balanced(); // 4-bit, 7.5x compression
 let dim = 128;
 
-// Compress keys
+// Batch compress
 let compressed = compress_keys(&kv_data, dim, &config);
+println!("Ratio: {:.1}x", compressed.compression_ratio());
 
-// Fused attention -- no decompression, SIMD accelerated
+// Fused attention -- no decompression, AVX2+FMA SIMD
 let signs = hadamard::generate_signs(dim, config.rotation_seed);
 let centroids = codebook::get_centroids(config.bits);
 let rotated_q = pre_rotate_query_with_signs(&query, &signs);
@@ -151,96 +137,149 @@ let (packed, norm) = compress_single_key_with_signs(&new_key, dim, &config, &sig
 cache.append_raw(&packed, norm);
 ```
 
-**Presets:**
+---
 
-| Preset | Bits | Ratio | PPL Impact | Use Case |
-|:-------|:----:|:-----:|:----------:|:---------|
-| `TurboQuantConfig::extreme()` | 2 | 14.2x | +33.8% | Edge deployment, maximum VRAM savings |
-| `TurboQuantConfig::aggressive()` | 3 | 9.8x | +4.0% | Good balance for most models |
-| `TurboQuantConfig::balanced()` | 4 | 7.5x | +0.32% | Near-lossless, minimal PPL impact |
+## Configuration Guide
 
-### Engine CLI
+### Recommended Configs by Use Case
 
-```bash
-# Single prompt with 4-bit TurboQuant
-tq-engine "Explain quantum computing" --turbo-quant --tq-bits 4
+| Use Case | Key Bits | Value Bits | Skip | Sink | PPL Impact | Memory Savings |
+|:---------|:--------:|:----------:|:----:|:----:|:----------:|:--------------:|
+| **Quality-first (GGUF)** | 4 | fp16 | 4 | 4 | +17% | ~3.5x keys |
+| **Balanced (GGUF)** | 4 | 8 | 4 | 4 | +17.3% | ~3.5x K + 2x V |
+| **Maximum savings** | 4 | 4 | 4 | 4 | +18.6% | ~3.5x K + 3.2x V |
+| **FP16 models** | 4 | fp16 | 4 | 4 | +11.4% | ~3.5x keys |
+| **Long context** | 4 | 8 | 4 | 4 | ~+17% | Enables 2-4x longer ctx |
 
-# CUDA GPU inference
-tq-engine "Hello" --turbo-quant --tq-bits 2 --model-path model.gguf --tokenizer-repo org/model
+### Environment Variables
 
-# Perplexity evaluation
-tq-engine --perplexity wikitext2.txt --turbo-quant --tq-bits 4
+All TurboQuant behavior is runtime-configurable via environment variables:
 
-# HTTP API
-tq-engine --serve --port 8088 --turbo-quant --tq-bits 2
-```
+| Variable | Default | Description |
+|:---------|:-------:|:------------|
+| `TQ_SKIP` | 4 | Number of initial layers to keep uncompressed (fp16 KV). Higher = better quality, less savings. |
+| `TQ_SINK` | 4 | Number of initial tokens preserved at fp16. Attention sinks get disproportionate weight. |
+| `TQ_VBITS` | 0 | Value compression bits. 0=fp16, 4=4-bit, 8=8-bit. 8 recommended (nearly free). |
+| `TQ_SPARSE_V` | 1e-6 | Skip V rows where softmax weight < threshold. 0=disabled. CPU only. |
+| `TQ_FUSED` | 0 | Fused attention from compressed indices. 1=enabled. CPU only, 6-8.9x speedup. |
+| `TQ_DECAY` | off | Temporal decay. Format: "age:bits" e.g. "512:2". Old tokens auto-demoted. |
+| `TQ_LAYER_BITS` | -- | Per-layer bit width. Format: "start-end:bits" e.g. "4-15:2,16-27:4". |
+| `TQ_HEAD_BITS` | -- | Per-head bit width. Format: "0-3:4,4-7:2". |
+| `TQ_BIAS_CORRECT` | 0 | Softmax bias correction. 1=enabled. Experimental. |
+| `TQ_GROUP` | 32 | Group size for per-group sigma. 0=per-vector (legacy). 32 recommended. |
+| `TQ_RESIDUAL` | 0 | Residual quantization bits. e.g. 2 for 4+2=6 effective bits. |
+| `TQ_OUTLIER` | 0 | Top-K outlier entries preserved at full precision per vector. |
+| `TQ_NO_CAL` | 0 | 1=disable calibration auto-loading. |
 
-### no\_std
+### Tuning Tips
 
-```toml
-[dependencies]
-tq-kv = { version = "0.4", default-features = false }
-```
+**For GGUF Q4_K_M models:**
+- Start with defaults: `--turbo-quant --tq-bits 4` (skip=4, sink=4, group=32)
+- Add value compression: `TQ_VBITS=8` for ~2x extra savings at +0.2% PPL
+- On CPU, enable fused attention: `TQ_FUSED=1` for 6-8.9x attention speedup
+- For long context, enable sparse V: `TQ_SPARSE_V=1e-5` (skips 50-80% of V rows)
 
-Core compression/decompression works without allocator. The `_with_signs` variants accept pre-computed sign arrays for embedded and bare-metal targets.
+**For FP16 safetensors models:**
+- Same config works, lower PPL impact (+11% vs +17%)
+- Run `tq calibrate <model>` first for optimal codebook + rotation
+
+**For maximum quality:**
+- Increase skip: `TQ_SKIP=8` or `TQ_SKIP=16` (fewer layers compressed)
+- Add residual: `TQ_RESIDUAL=2` (second-pass error correction)
+- Add outlier preservation: `TQ_OUTLIER=4` (top-4 outliers kept at fp32)
+- Calibrate: `tq calibrate <model>` (learned codebook from real activations)
 
 ---
 
-## Algorithm
+## The 3-Fix Framework
+
+TurboQuant fails on GGUF models due to compound quantization error (W4 weights + KV4 cache). Our 3-Fix framework solves this:
+
+### Fix 1: Sink Token Preservation (`TQ_SINK`)
+
+First N tokens' keys stay fp16. Attention sinks receive disproportionate weight regardless of content -- quantizing them causes most of the attention distribution error.
+
+### Fix 2: Past-Only Quantization (POQ)
+
+During generation, the current token's key uses its fp16 original in attention. It gets compressed into cache for future tokens. This protects the highest-impact position (most recent context).
 
 ```
-Input key vector (fp16/fp32, dim=d)
-    |
-    v
-[1] Randomized Hadamard Transform                  O(d log d)
-    |  Walsh-Hadamard + random sign flip
-    |  Decorrelates outliers --> coordinates ~ Gaussian(0, sigma)
-    v
-[2] Adaptive Lloyd-Max Quantization                 O(d)
-    |  sigma = ||x|| / sqrt(d) per vector  (our improvement, not in paper)
-    |  Pre-computed optimal centroids for Gaussian distribution
-    |  Bit-packed: 2-bit = 4/byte, 3-bit = 8/3 bytes, 4-bit = 2/byte
-    v
-Output: packed_indices (u8) + norms (f32)
-
---- Fused Attention (zero decompression) ---
-
-  dot(q, k) = <R*q, centroids[idx]> * sigma
-  Pre-rotate query once, then per-key = centroid lookup + SIMD dot
-  AVX2+FMA: 8 floats/cycle, gather + fused multiply-add
+Time t:   [sink_FP16 | past_compressed | current_t_FP16]
+Time t+1: [sink_FP16 | past_compressed + current_t_compressed | current_{t+1}_FP16]
 ```
+
+### Fix 3: Cache State Management
+
+Hard reset of compressed KV state on new conversations. Prevents cross-conversation contamination from stale RoPE-mismatched keys.
 
 ---
 
-## C FFI -- Use from C/C++/llama.cpp
+## System Architecture
 
-Build with `cargo build --release --features ffi` to produce `libtq_kv.a` and the `tq_kv.h` header.
+```
+tq-kv/                              Compression library (crates.io v0.5.0)
+  src/lib.rs                         compress_keys, fused_attention, sparse_attn_v_mul
+  src/codebook.rs                    Lloyd-Max 2/3/4-bit + CalibratedCodebook
+  src/hadamard.rs                    Fast Walsh-Hadamard + PCA rotation calibration
+  src/qjl.rs                         SRHT QJL error correction (adaptive)
+  src/candle_kv.rs                   TurboKvCache (candle drop-in)
+  src/ffi.rs                         C FFI: single-head + multi-head layer API
+  include/tq_kv.h                    C header for llama.cpp integration
 
-### Single-head API
+src/                                 tq-engine inference binary ("tq")
+  engine.rs                          Unified GenericTurboModel backend (GPU/CPU)
+  models/turbo_generic.rs            5 GGUF architectures, auto-detected
+  calibrate.rs                       Calibration pipeline (codebook + rotation + scales)
+  serve.rs                           Hardened OpenAI-compatible HTTP API + Web UI
+  chat.rs                            Multi-turn templates (Llama3, Qwen, Phi3, Mistral, Gemma)
+  hub.rs                             HuggingFace model hub (pull/list/rm)
+```
+
+### Feature Summary
+
+| Feature | Status | Details |
+|:--------|:------:|:--------|
+| 2/3/4-bit Lloyd-Max quantization | Production | Per-group sigma (g=32), norm correction |
+| Fused attention (AVX2+FMA SIMD) | Production | 6-8.9x speedup, zero decompression |
+| 3-Fix Framework (GGUF) | Production | Sink + POQ + cache reset |
+| K/V asymmetric compression | Production | Keys 2-4 bit, values 4/8-bit or fp16 |
+| Sparse V multiply | Production | Fused decompress, skips inactive rows |
+| Temporal decay | Production | Auto-demote old tokens to lower bits |
+| Per-head adaptive bitwidth | Production | Static (env var) or calibration-based |
+| Calibration pipeline | Production | Codebook + PCA rotation + channel scales |
+| SRHT QJL | Available | 115x faster, +4.5 dB SNR (off by default) |
+| Residual quantization | Available | Second-pass error correction |
+| Outlier preservation | Available | Top-K entries kept at full precision |
+| O(1) incremental cache | Production | 935x vs naive recompression |
+| CUDA GPU | Production | Custom RmsNorm, RoPE, softmax |
+| C FFI | Production | `tq_kv.h` + `libtq_kv.a` for llama.cpp |
+| PyO3 Python bindings | Available | `--features python` |
+| `no_std` core | Available | For embedded/bare-metal targets |
+| 5 GGUF architectures | Production | Qwen2, Llama, Mistral, Phi3, Gemma2 |
+| Safetensors FP16 loading | Production | BF16 auto-cast |
+| OpenAI-compatible API | Production | SSE streaming, hardened server |
+| Web UI | Production | Embedded in binary |
+
+---
+
+## C FFI
+
+Build: `cargo build --release --features ffi` produces `libtq_kv.a` + `tq_kv.h`.
 
 ```c
 #include "tq_kv.h"
 
-TqContext *ctx = tq_init(2, 128, 0);              // 2-bit, head_dim=128
-tq_compress_and_append(ctx, key_data, 128);        // compress + cache
+// Single-head API
+TqContext *ctx = tq_init(4, 128, 0);              // 4-bit, head_dim=128
+tq_compress_and_append(ctx, key_data, 128);
 float scores[seq_len];
-tq_fused_attention(ctx, query_data, 128, scores, scale);  // no decompress
+tq_fused_attention(ctx, query_data, 128, scores, scale);
 tq_free(ctx);
-```
 
-### Multi-head layer API (designed for llama.cpp)
-
-```c
-// Llama-3 8B: 8 KV heads, head_dim=128
-TqLayerContext *layer = tq_layer_init(4, 8, 128, 0);  // 4-bit
-
-// Each token: compress all heads at once
+// Multi-head layer API (designed for llama.cpp GQA)
+TqLayerContext *layer = tq_layer_init(4, 8, 128, 0);  // 4-bit, 8 KV heads
 tq_layer_compress_and_append(layer, all_heads_key_data, 8 * 128);
-
-// Fused attention per query head (GQA: map query_head -> kv_head)
-float scores[tq_layer_cached_count(layer)];
 tq_layer_fused_attention(layer, kv_head_idx, query, 128, scores, scale);
-
 tq_layer_free(layer);
 ```
 
@@ -250,113 +289,54 @@ Link: `-ltq_kv -lpthread -ldl -lm` (Linux) or `tq_kv.lib` (Windows MSVC).
 
 ## Benchmarks
 
-> RTX 3080 10GB, i9-13900K, 64GB RAM, Windows 11, CUDA 13.2, Rust 1.91
-
-### Compression Quality
-
-| Model | Bits | Ratio | SNR (dB) | Cosine Sim | Compress | Decompress |
-|:------|:----:|------:|---------:|-----------:|---------:|-----------:|
-| Llama-3 8B | 2 | **14.2x** | 9.4 | 0.943 | 55 ms | 23 ms |
-| Llama-3 8B | 3 | **9.8x** | 14.7 | 0.984 | 65 ms | 25 ms |
-| Llama-3 8B | 4 | **7.5x** | 20.4 | 0.996 | 72 ms | 23 ms |
-| Gemma 3 4B | 2 | **15.1x** | 9.3 | 0.942 | 57 ms | 30 ms |
-| Gemma 3 4B | 3 | **10.2x** | 14.7 | 0.984 | 65 ms | 25 ms |
+```bash
+cargo run --release -p tq-kv --bin tq-kv-bench   # compression quality
+tq bench qwen2:7b                                  # tok/s, TTFT
+tq ablate qwen2:7b --file eval.txt                 # PPL sweep
+```
 
 ### Fused Attention (512 cached keys, AVX2+FMA)
 
 | Bits | Fused | Decompress+dot | Speedup |
 |:----:|------:|---------------:|--------:|
-| 2 | 82 us | 736 us | **8.9x** |
-| 3 | 133 us | 723 us | **5.4x** |
-| 4 | 84 us | 723 us | **8.6x** |
+| 2 | 46 us | 515 us | **8.9x** |
+| 4 | 46 us | 389 us | **8.6x** |
 
-### VRAM Savings (Keys only, 4096 context)
+### Incremental Cache
 
-| Model | KV fp16 | 2-bit | Saved |
-|:------|--------:|------:|------:|
-| Llama-3 8B (32L, 8 KV heads) | 256 MB | 18 MB | **238 MB** |
-| Qwen 72B (80L, 8 KV heads) | 640 MB | 45 MB | **595 MB** |
-| Gemma 3 4B (26L, 4 KV heads) | 208 MB | 14 MB | **194 MB** |
-
-### Incremental Cache (4096 context)
-
-| Architecture | Per-token cache cost | Scaling |
-|:-------------|---------------------:|:-------:|
-| Naive (decompress all + recompress) | ~608 ms | O(N) |
-| tq-kv (compress 1 + append) | ~0.65 ms | **O(1)** |
-| Improvement | | **935x** |
-
-### CUDA vs CPU (Llama-3 8B, 2-bit, 150 tokens)
-
-| Backend | Time | Speedup |
-|:--------|-----:|:-------:|
-| CUDA GPU | 7.4 s | **3.2x** |
-| CPU | 23.4 s | 1.0x |
-
-### Verified Models
-
-| Model | Parameters | Architecture | Status |
-|:------|:---------:|:------------:|:------:|
-| Trendyol Llama-3 8B | 8B | Llama | PPL verified, NIAH 9/9 |
-| Qwen2.5 72B Instruct | 72B | Qwen2 (GQA-8) | Correct output verified |
-| Qwen2.5 7B Instruct | 7B | Qwen2 | Correct output verified |
-| Gemma 2 9B | 9B | Gemma2 | Correct output verified |
-| Mistral 7B Instruct | 7B | Mistral | Correct output verified |
-
-Run benchmarks: `cargo run --release -p tq-kv --bin tq-kv-bench`
+| Method | Per-token cost | Scaling |
+|:-------|---------------:|:-------:|
+| Naive (decompress + recompress) | ~608 ms | O(N) |
+| tq-kv (compress + append) | ~0.65 ms | **O(1)** |
 
 ---
 
-## Architecture
+## Known Limitations
 
-```
-tq-kv/                              Compression library (crates.io)
-  src/lib.rs                         compress_keys, fused_attention_scores, sparse_attn_v_mul
-  src/codebook.rs                    Lloyd-Max 2/3/4-bit centroids + remap tables
-  src/hadamard.rs                    Fast Walsh-Hadamard Transform + sign caching
-  src/candle_kv.rs                   TurboKvCache — drop-in candle KvCache replacement
-  src/ffi.rs                         C FFI: tq_init, tq_fused_attention, tq_layer_*
-  include/tq_kv.h                    C header for llama.cpp integration
-
-src/                                 tq-engine inference binary ("tq")
-  engine.rs                          Dual-mode: stock candle or TurboQuant
-  models/turbo_generic.rs            GenericTurboModel — all GGUF architectures
-  config.rs                          Model configs, auto-detection from GGUF metadata
-  serve.rs                           OpenAI-compatible HTTP API + Web UI
-  chat.rs                            Multi-turn chat templates (Llama3, Qwen, Phi3, Mistral, Gemma)
-```
-
----
-
-## Innovations Beyond the Paper
-
-| Contribution | Impact |
-|:-------------|:-------|
-| **3-Fix Framework** -- sink tokens + POQ + cache reset | First TurboQuant working on GGUF quantized models |
-| **SRHT QJL** -- O(d log d) structured random projection | 115x faster than dense QJL, +4.5 dB SNR |
-| **Adaptive sigma** -- per-vector `sigma = \|\|x\|\| / sqrt(d)` | Matches actual post-rotation variance; paper uses fixed `1/sqrt(d)` |
-| **Norm Correction** -- `\|\|decompress\|\| = \|\|original\|\|` | Zero-cost at decode, fixes reconstruction bias |
-| **K/V Asymmetric** -- values 8-bit absmax, keys 2-4 bit | ~1.9x value cache savings (`TQ_VBITS=8`) |
-| **Temporal Decay** -- centroid index remap, no decompress | Older tokens demoted to 2-bit, >30% savings (`TQ_DECAY`) |
-| **Sparse V** -- skip V rows below softmax threshold | 50-80% V bandwidth savings at long context (`TQ_SPARSE_V`) |
-| **Fused Attention** -- scores from compressed indices | No key decompression, AVX2+FMA 8.9x, parallel heads (`TQ_FUSED`) |
-| **O(1) incremental cache** -- append-only packed indices | 935x overhead reduction vs naive |
-| **C FFI** -- `tq_kv.h` + layer API | Drop-in for llama.cpp and C++ engines |
-| **5 GGUF architectures** -- GenericTurboModel | Qwen2, Llama, Mistral, Phi3, Gemma2 — auto-detected |
-| **CUDA GGUF** -- custom RmsNorm, RoPE, softmax | 3.2x GPU speedup for candle quantized models |
+- **K compression on GGUF Q4_K_M adds +17% PPL.** This is the compound quantization error problem. No implementation has solved it at the algorithm level. tq-kv's 3-Fix framework is the only one that produces working output (others get PPL 3556+). Asymmetric K=uncompressed + V=turbo avoids the issue but doesn't compress keys.
+- **FP16 4-bit adds +11.4% PPL on small models (0.5B).** Larger models (7B+, 70B+) are more tolerant. TheTom reports +0.23% on 35B FP16.
+- **No Metal/Apple Silicon.** CUDA and CPU only.
+- **Calibration pipeline experimental.** Channel scales and PCA rotation can degrade quality on some models. Use `TQ_NO_CAL=1` to disable.
 
 ---
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
 
 ## Citation
 
 ```bibtex
-@inproceedings{ashkboos2026turboquant,
+@software{gokyildiz2026tqkv,
+  title={tq-kv: Production-Grade TurboQuant KV Cache Compression in Rust},
+  author={Gokyildiz, Onur},
+  year={2026},
+  url={https://github.com/onur-gokyildiz-bhi/tq-kv}
+}
+
+@inproceedings{zandieh2026turboquant,
   title={TurboQuant: Online Vector Quantization for Efficient KV-Cache Compression},
-  author={Ashkboos, Saleh and Zandieh, Amir and others},
+  author={Zandieh, Amir and Daliri, Majid and others},
   booktitle={ICLR},
   year={2026}
 }
