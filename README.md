@@ -29,25 +29,30 @@ Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 
 
 | Feature | **tq-kv** (this) | turboquant_plus | turboquant | turbo-quant | Dejan (Triton) |
 |:--------|:----------------:|:---------------:|:----------:|:-----------:|:--------------:|
-| Language | Rust | Python/C | Rust | Rust | Python/CUDA |
+| Language | Rust | Python | Rust | Rust | Python/Triton |
 | CUDA GPU | **Yes** | No | No | No | **Yes** (Triton) |
 | AVX2 SIMD | **Yes** | No | No | No | No |
 | C FFI | **Yes** | No | No | No | No |
-| llama.cpp patch | **Yes** | **Yes** (fork) | No | No | No |
-| Fused attention | **Yes** | No | No | No | No |
-| Incremental cache | **Yes** | No | No | No | No |
-| K/V Asymmetric | **Yes** (8-bit V) | No | No | No | No |
-| Temporal Decay | **Yes** | No | No | No | No |
-| Sparse V | **Yes** (AVX2) | No | No | No | No |
+| llama.cpp patch | **Yes** | **Yes** (ext. fork) | No | No | No |
+| vLLM integration | No | No | No | No | **Yes** |
+| Fused attention | **Yes** | No | No | No | **Yes** (Triton) |
+| Incremental cache | **Yes** | **Partial** | No | **Yes** | **Yes** |
+| K/V Asymmetric | **Yes** (4/8-bit V) | **Yes** | No | No | **Yes** (3K+2V) |
+| Temporal Decay | **Yes** | **Prototype** | No | No | No |
+| Sparse V | **Yes** (fused decompress) | **Yes** (+22.8%) | No | No | No |
+| Per-head bitwidth | **Yes** (static + calibrated) | No | No | No | No |
+| Calibration pipeline | **Yes** (codebook/rotation/scales) | No | No | No | No |
 | GGUF 3-Fix | **Yes** | **Partial** | No | No | No |
-| PPL benchmark | **+0.32%** (4-bit) | N/A | N/A | N/A | N/A |
-| NIAH test | **9/9 pass** | N/A | N/A | N/A | N/A |
+| PPL benchmark | **+0.32%** (4-bit) | **+0.23%** (turbo4) | No | No | No |
+| NIAH test | **9/9 pass** | **9/9 pass** | No | No | No |
 | no_std | **Yes** | No | No | No | No |
 | crates.io | **v0.5.0** | N/A | alpha | minimal | N/A |
-| Lines of code | ~5.7K lib | N/A | ~6.9K | ~1.1K | N/A |
-| Metal (Apple) | No | **Yes** | No | No | No |
+| Lines of code | ~6.3K lib | ~4K Python | ~10K | ~1.5K | ~3.5K |
+| Metal (Apple) | No | **Yes** (ext. fork) | No | No | No |
+| Stars | — | 3,438 | 17 | 12 | 523 |
+| Activity | Active | Very active | Stale | Dead | Stale (GPL-3.0) |
 
-tq-kv is the most complete Rust implementation with the only published perplexity and NIAH benchmarks.
+tq-kv is the most complete compiled implementation — the only one with native CUDA, SIMD, C FFI, per-head adaptive bitwidth, and calibration pipeline in a single crate.
 
 ---
 
