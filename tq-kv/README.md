@@ -7,15 +7,17 @@ Compresses LLM key-value cache to 2-4 bits with up to 15x memory reduction.
 
 **First TurboQuant that works on GGUF quantized models** — all other implementations fail on Q4_K_M.
 
-## What's New in v0.6.0
+## What's New in v0.7.0
 
-- **KV Compaction**: Attention-matching token reduction (Zweiger 2026). 50x token count reduction, orthogonal to quantization. Combined: 400x total compression potential.
-- **Per-head adaptive bitwidth**: Different KV heads get different bit widths based on attention pattern sensitivity. Static (`TQ_HEAD_BITS`) or auto-calibrated.
-- **4-bit value compression**: Per-group symmetric absmax quantization + fused sparse decompress. `TQ_VBITS=4` for 3.2x value savings.
-- **Calibration pipeline**: `tq calibrate <model>` — learns optimal codebook, PCA rotation, channel scales, key bias from real activations. Auto-loaded at inference.
-- **Pre-Rotation Centering**: Subtract per-channel key bias before Hadamard to restore Gaussian assumption on GGUF models.
-- **SmoothAttention**: Q/K outlier migration infrastructure (experimental).
-- **Unified model backend**: Single GenericTurboModel for all GGUF+safetensors, GPU+CPU.
+- **Pre-RoPE Key Quantization**: Compress keys BEFORE RoPE for position-independent per-channel statistics. 34-59% less PPL gap at identical compression ratio. `TQ_PRE_ROPE=1`.
+- **KV Compaction Engine**: Fully integrated attention-matching token reduction (Zweiger 2026). Multi-query reference, mean scoring, adaptive ridge regression. `TQ_COMPACT=N`.
+- **5-Segment Attention**: `[sink | cold | compacted+beta | hot | current]` — unified architecture.
+
+### Previous (v0.6.0)
+
+- **KV Compaction** library, **Per-head adaptive bitwidth**, **4-bit value compression**
+- **Calibration pipeline**, **Pre-Rotation Centering**, **SmoothAttention**
+- **Unified model backend**: Single GenericTurboModel for all GGUF+safetensors, GPU+CPU
 
 ### Previous (v0.5.0)
 
@@ -25,12 +27,22 @@ Compresses LLM key-value cache to 2-4 bits with up to 15x memory reduction.
 
 ## Results
 
+### Perplexity (Qwen 2.5 7B Q4_K_M, 2K modern text)
+
+| Config | PPL | Delta | Compression |
+|:-------|:---:|:-----:|:-----------:|
+| Baseline (no TQ) | 1.823 | — | 1x |
+| Standard TQ 4-bit | 1.925 | +5.6% | ~7.5x |
+| **Pre-RoPE 4-bit** | **1.890** | **+3.7%** | ~7.5x |
+| TQ + Compact (500t/30%) | 2.227 | +22.2% | ~25x |
+
+### Compression Quality (per-layer)
+
 | Bits | Compression | SNR (dB) | Cosine Sim | NIAH |
 |:----:|:-----------:|:--------:|:----------:|:----:|
 | 2 | **15.1x** | 9.3 | 0.942 | 9/9 pass |
 | 3 | **10.2x** | 14.7 | 0.984 | — |
 | 4 | **7.5x** | 20.4 | 0.996 | 9/9 pass |
-| 4+QJL | **5.8x** | 24.8 | 0.998 | — |
 
 ### SRHT QJL Performance (32K vectors, d=128, release)
 
