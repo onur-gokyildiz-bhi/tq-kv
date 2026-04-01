@@ -8,7 +8,7 @@
 [![CUDA](https://img.shields.io/badge/CUDA-13.2-76B900)](https://developer.nvidia.com/cuda-toolkit)
 [![no\_std](https://img.shields.io/badge/no__std-compatible-blue)]()
 
-Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) with the **3-Fix framework** that makes it work on GGUF quantized models -- where every other implementation produces catastrophic output.
+Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) with the **3-Fix framework** that enables aggressive key compression (4-bit, 7.5x) on GGUF quantized models -- where symmetric K compression produces catastrophic output.
 
 Now with **Pre-RoPE key quantization** (34-59% less PPL gap) and **KV Compaction** (up to 25x token reduction).
 
@@ -16,17 +16,19 @@ Now with **Pre-RoPE key quantization** (34-59% less PPL gap) and **KV Compaction
 
 ## The Compound Error Problem
 
-Every TurboQuant implementation assumes FP16 model weights. In practice, everyone runs GGUF quantized models (Q4_K_M). When you stack weight quantization + KV cache quantization, errors compound through softmax:
+Most TurboQuant implementations assume FP16 model weights. In practice, everyone runs GGUF quantized models (Q4_K_M). When you compress **both** K and V symmetrically on GGUF, errors compound through softmax:
 
-| Implementation | Qwen 7B Q4_K_M PPL | Status |
-|:---------------|--------------------:|:-------|
-| No compression | 5.18 | Baseline |
-| turboquant_plus (symmetric) | 3,556 | **Catastrophic** |
-| **tq-kv (3-Fix)** | **6.07** | **Working (+17%)** |
-| **tq-kv (Pre-RoPE)** | **5.40** | **Best (+5.6%)** |
-| turboquant_plus (asymmetric K=q8_0) | 6.64 | Working (+1%) but K uncompressed |
+| Implementation | K compression | Qwen 7B Q4_K_M PPL | Status |
+|:---------------|:-------------|--------------------:|:-------|
+| No compression | -- | 5.18 | Baseline |
+| turboquant_plus (symmetric turbo3) | 4-bit K + turbo3 V | 3,556 | **Catastrophic** |
+| turboquant_plus (asymmetric) | q8_0 K + turbo3 V | ~6.64 | **Working (+2%)** |
+| **tq-kv (3-Fix)** | **4-bit K** + V-fp16 | **6.07** | **Working (+17%)** |
+| **tq-kv (Pre-RoPE)** | **4-bit K** + V-fp16 | **5.40** | **Working (+4.2%)** |
 
-**tq-kv is the only implementation that compresses keys on GGUF and produces coherent output.** Pre-RoPE mode reduces the quality gap by 59%.
+Two solutions exist for compound error on GGUF:
+- **Asymmetric K/V** ([turboquant_plus](https://github.com/TheTom/turboquant_plus)): keep K at q8_0 (2x), compress V aggressively. Simple, effective, validated across 7 model families and 50+ testers.
+- **3-Fix + Pre-RoPE** (tq-kv): compress K to 4-bit (7.5x) with sink preservation, POQ, and pre-RoPE quantization. More complex, but 3.75x more K compression.
 
 ---
 
