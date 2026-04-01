@@ -82,14 +82,15 @@ pub fn compact_head(
         }
     }
 
-    // Phase 2: Score each key by max attention weight across queries
+    // Phase 2: Score each key by mean attention weight across queries.
+    // Mean is more robust than max — captures keys important to ALL queries, not just one.
     let mut key_scores = vec![0.0f32; seq_len];
     for ki in 0..seq_len {
-        let mut max_w = 0.0f32;
+        let mut sum_w = 0.0f32;
         for qi in 0..n_queries {
-            max_w = max_w.max(exp_scores[qi * seq_len + ki]);
+            sum_w += exp_scores[qi * seq_len + ki];
         }
-        key_scores[ki] = max_w;
+        key_scores[ki] = sum_w / n_queries as f32;
     }
 
     // Select top-t keys
@@ -175,7 +176,9 @@ pub fn compact_head(
     }
 
     // Solve X @ C2 = Y via ridge regression (Cholesky)
-    let c2 = solve_ridge(&x_mat, &y_mat, n_queries, t, head_dim, 1e-6);
+    // Lambda scales with 1/n_queries: more queries = more data = less regularization needed
+    let lambda = if n_queries > 1 { 1e-4 / (n_queries as f32) } else { 1e-3 };
+    let c2 = solve_ridge(&x_mat, &y_mat, n_queries, t, head_dim, lambda);
 
     CompactedHead {
         keys: c1,

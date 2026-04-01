@@ -158,6 +158,14 @@ pub struct TurboQuantConfig {
     /// Overrides `bits` on a per-head basis. None = all heads use `bits`.
     pub per_head_bits: Option<Vec<u8>>,
 
+    /// Pre-RoPE quantization mode (KVQuant approach).
+    /// When true, keys are compressed BEFORE RoPE application — pre-RoPE keys have
+    /// position-independent per-channel statistics, giving better codebook fit.
+    /// At decode time, keys are decompressed and RoPE is applied dynamically.
+    /// Incompatible with fused attention (falls back to decompress path).
+    /// Default: false (traditional post-RoPE compression).
+    pub pre_rope: bool,
+
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
     pub use_qjl: bool,
@@ -184,6 +192,7 @@ impl Default for TurboQuantConfig {
             skip_layers: None,
             sink_tokens: None,
             per_head_bits: None,
+            pre_rope: false,
         }
     }
 }
