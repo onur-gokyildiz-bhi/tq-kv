@@ -12,6 +12,10 @@ Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 
 
 Now with **Pre-RoPE key quantization** (34-59% less PPL gap) and **KV Compaction** (up to 25x token reduction).
 
+<p align="center">
+  <img src="docs/tq-demo.gif" alt="tq-engine Web UI demo — Qwen2.5 7B with TurboQuant 4-bit KV compression" width="720">
+</p>
+
 ---
 
 ## The Compound Error Problem

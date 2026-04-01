@@ -5,394 +5,1317 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>tq — TurboQuant Local LLM</title>
     <style>
+        :root {
+            --bg-primary: #0a0a12;
+            --bg-secondary: #111119;
+            --bg-tertiary: #18182a;
+            --bg-hover: #22223a;
+            --border: #2a2a42;
+            --border-active: #e94560;
+            --text-primary: #e8e8f0;
+            --text-secondary: #9999b0;
+            --text-muted: #606078;
+            --accent: #e94560;
+            --accent-hover: #c83b52;
+            --accent-soft: rgba(233, 69, 96, 0.10);
+            --accent-glow: rgba(233, 69, 96, 0.25);
+            --success: #22c55e;
+            --success-soft: rgba(34, 197, 94, 0.12);
+            --warning: #f59e0b;
+            --info: #3b82f6;
+            --info-soft: rgba(59, 130, 246, 0.10);
+            --code-bg: #0d0d18;
+            --scrollbar: #2a2a45;
+            --scrollbar-hover: #3a3a55;
+            --radius: 10px;
+            --radius-sm: 6px;
+            --radius-lg: 14px;
+            --shadow: 0 4px 24px rgba(0,0,0,0.4);
+            --transition: 0.2s ease;
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: #1a1a2e; color: #e0e0e0;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            height: 100vh; display: flex; flex-direction: column;
+
+        html, body {
+            height: 100%; overflow: hidden;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            font-size: 14px; line-height: 1.6;
         }
-        .header {
-            background: #16213e; padding: 12px 20px;
+
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
+
+        /* Layout */
+        .app { display: flex; height: 100vh; }
+
+        /* Sidebar */
+        .sidebar {
+            width: 260px; min-width: 260px;
+            background: var(--bg-secondary);
+            border-right: 1px solid var(--border);
+            display: flex; flex-direction: column;
+            transition: transform 0.3s ease, width 0.3s ease;
+            z-index: 50;
+        }
+        .sidebar.collapsed { width: 0; min-width: 0; overflow: hidden; border: none; }
+
+        .sidebar-header {
+            padding: 14px 16px; display: flex; align-items: center; justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+        }
+        .sidebar-header h1 {
+            font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 8px;
+            letter-spacing: -0.5px;
+        }
+        .sidebar-header h1 .logo {
+            background: linear-gradient(135deg, var(--accent), #ff6b6b);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            font-size: 22px;
+        }
+        .sidebar-header h1 small {
+            font-size: 10px; color: var(--text-muted); font-weight: 500;
+            background: var(--bg-tertiary); padding: 1px 6px; border-radius: 4px;
+        }
+
+        .new-chat-btn {
+            margin: 10px 12px; padding: 9px; border-radius: var(--radius);
+            background: var(--accent-soft); color: var(--accent);
+            border: 1px dashed rgba(233,69,96,0.3); cursor: pointer;
+            font-size: 13px; font-weight: 500; transition: all var(--transition);
+            display: flex; align-items: center; justify-content: center; gap: 6px;
+        }
+        .new-chat-btn:hover { background: var(--accent); color: white; border-color: var(--accent); }
+
+        .sessions-list { flex: 1; overflow-y: auto; padding: 4px 8px; }
+
+        .session-item {
+            padding: 9px 12px; border-radius: var(--radius-sm);
+            cursor: pointer; transition: background var(--transition);
+            display: flex; align-items: center; gap: 8px; margin-bottom: 2px;
+            position: relative;
+        }
+        .session-item:hover { background: var(--bg-hover); }
+        .session-item.active { background: var(--accent-soft); border-left: 2px solid var(--accent); }
+        .session-item .session-icon { font-size: 13px; opacity: 0.4; flex-shrink: 0; }
+        .session-item .session-title { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .session-item .session-model { font-size: 11px; color: var(--text-muted); }
+        .session-item .session-delete {
+            position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+            opacity: 0; background: none; border: none; color: var(--text-muted);
+            cursor: pointer; font-size: 14px; padding: 2px;
+        }
+        .session-item:hover .session-delete { opacity: 1; }
+        .session-item .session-delete:hover { color: var(--accent); }
+
+        .sidebar-footer {
+            padding: 12px 14px; border-top: 1px solid var(--border);
+            display: flex; flex-direction: column; gap: 8px;
+        }
+
+        .model-select-wrap { display: flex; align-items: center; gap: 8px; }
+        .model-select-wrap select {
+            flex: 1; background: var(--bg-tertiary); color: var(--text-primary);
+            border: 1px solid var(--border); border-radius: var(--radius-sm);
+            padding: 6px 10px; font-size: 12px; cursor: pointer; outline: none;
+        }
+        .model-select-wrap select:focus { border-color: var(--accent); }
+
+        .sidebar-stats { font-size: 11px; color: var(--text-muted); display: flex; gap: 10px; }
+        .sidebar-stats span { display: flex; align-items: center; gap: 4px; }
+        .stat-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+        .stat-dot.green { background: var(--success); box-shadow: 0 0 6px rgba(34,197,94,0.4); }
+        .stat-dot.red { background: var(--accent); }
+
+        /* Main */
+        .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+        /* TQ Stats Banner */
+        .tq-banner {
+            display: none; padding: 6px 20px;
+            background: linear-gradient(90deg, rgba(233,69,96,0.06) 0%, rgba(59,130,246,0.06) 100%);
+            border-bottom: 1px solid var(--border);
+            font-size: 12px; color: var(--text-secondary);
+            align-items: center; gap: 16px;
+        }
+        .tq-banner.active { display: flex; }
+        .tq-badge {
+            display: inline-flex; align-items: center; gap: 5px;
+            padding: 2px 8px; border-radius: 4px; font-weight: 600; font-size: 11px;
+        }
+        .tq-badge.on {
+            background: var(--accent-soft); color: var(--accent);
+            border: 1px solid rgba(233,69,96,0.2);
+        }
+        .tq-stat {
+            display: flex; align-items: center; gap: 4px;
+        }
+        .tq-stat .label { color: var(--text-muted); }
+        .tq-stat .value { color: var(--text-primary); font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+
+        .main-header {
+            padding: 8px 20px; display: flex; align-items: center; justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-secondary);
+        }
+        .main-header .left { display: flex; align-items: center; gap: 10px; }
+        .main-header .right { display: flex; align-items: center; gap: 6px; }
+
+        .icon-btn {
+            background: none; border: 1px solid var(--border); color: var(--text-secondary);
+            width: 32px; height: 32px; border-radius: var(--radius-sm);
+            cursor: pointer; display: flex; align-items: center; justify-content: center;
+            transition: all var(--transition); font-size: 15px;
+        }
+        .icon-btn:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--text-muted); }
+
+        .header-model-badge {
+            font-size: 12px; color: var(--text-secondary);
+            background: var(--bg-tertiary); padding: 4px 10px; border-radius: 20px;
+            border: 1px solid var(--border); display: flex; align-items: center; gap: 6px;
+        }
+        .header-model-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); }
+
+        /* Generation speed display */
+        .gen-speed-display {
+            display: none; align-items: center; gap: 6px;
+            padding: 4px 12px; border-radius: 20px;
+            background: var(--success-soft); border: 1px solid rgba(34,197,94,0.2);
+            font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600;
+            color: var(--success);
+            animation: pulseGlow 2s ease-in-out infinite;
+        }
+        .gen-speed-display.active { display: flex; }
+        @keyframes pulseGlow {
+            0%, 100% { box-shadow: 0 0 4px rgba(34,197,94,0.1); }
+            50% { box-shadow: 0 0 12px rgba(34,197,94,0.2); }
+        }
+
+        /* Messages */
+        .messages { flex: 1; overflow-y: auto; padding: 20px 0; }
+        .message-wrap { max-width: 820px; margin: 0 auto; padding: 0 24px; }
+
+        .message {
+            display: flex; gap: 14px; margin-bottom: 20px;
+            animation: msgIn 0.3s ease;
+        }
+        @keyframes msgIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+        .message-avatar {
+            width: 30px; height: 30px; border-radius: var(--radius-sm);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 13px; flex-shrink: 0; font-weight: 600;
+        }
+        .message.user .message-avatar { background: var(--accent-soft); color: var(--accent); }
+        .message.assistant .message-avatar { background: var(--info-soft); color: var(--info); }
+
+        .message-body { flex: 1; min-width: 0; }
+        .message-role { font-size: 11px; font-weight: 600; margin-bottom: 3px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+        .message.user .message-role { color: var(--accent); }
+
+        .message-content { font-size: 14px; line-height: 1.7; color: var(--text-primary); }
+        .message-content p { margin-bottom: 10px; }
+        .message-content p:last-child { margin-bottom: 0; }
+        .message-content strong { font-weight: 600; }
+        .message-content em { font-style: italic; color: var(--text-secondary); }
+        .message-content a { color: var(--accent); text-decoration: none; }
+        .message-content a:hover { text-decoration: underline; }
+        .message-content ul, .message-content ol { margin: 8px 0; padding-left: 20px; }
+        .message-content li { margin-bottom: 4px; }
+        .message-content blockquote {
+            border-left: 3px solid var(--accent); padding: 4px 12px; margin: 8px 0;
+            color: var(--text-secondary); background: var(--bg-tertiary); border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+        }
+        .message-content pre {
+            background: var(--code-bg); border: 1px solid var(--border);
+            border-radius: var(--radius); margin: 12px 0; overflow: hidden;
+        }
+        .code-header {
             display: flex; align-items: center; justify-content: space-between;
-            border-bottom: 1px solid #0f3460;
+            padding: 6px 12px; background: var(--bg-tertiary); border-bottom: 1px solid var(--border);
+            font-size: 11px; color: var(--text-muted);
         }
-        .header h1 { font-size: 18px; font-weight: 600; }
-        .header h1 span { color: #e94560; }
-        .header .model-area { display: flex; align-items: center; gap: 12px; }
-        .header .stats { font-size: 12px; color: #888; }
-        #modelSelect {
-            background: #1a1a2e; color: #e0e0e0; border: 1px solid #0f3460;
-            padding: 6px 10px; border-radius: 6px; font-size: 13px;
-            cursor: pointer; min-width: 160px;
+        .copy-btn {
+            background: none; border: 1px solid var(--border); color: var(--text-muted);
+            padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px;
+            transition: all var(--transition);
         }
-        #modelSelect:focus { outline: none; border-color: #e94560; }
-        #modelSelect:disabled { opacity: 0.5; cursor: not-allowed; }
-        .loading-overlay {
-            display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(26, 26, 46, 0.92); z-index: 100;
-            justify-content: center; align-items: center;
-            flex-direction: column; gap: 16px;
+        .copy-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+        .message-content pre code {
+            display: block; padding: 12px 16px; overflow-x: auto;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+            font-size: 13px; line-height: 1.5;
         }
-        .loading-overlay.active { display: flex; }
-        .loading-overlay .spinner {
-            width: 40px; height: 40px; border: 3px solid #0f3460;
-            border-top-color: #e94560; border-radius: 50%;
-            animation: spin 0.8s linear infinite;
+        .message-content code:not(pre code) {
+            background: var(--bg-tertiary); padding: 2px 6px; border-radius: 4px;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 13px;
+            border: 1px solid var(--border);
         }
-        .loading-overlay p { color: #e0e0e0; font-size: 16px; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .pull-hint { font-size: 11px; color: #555; }
-        .chat-container {
-            flex: 1; overflow-y: auto; padding: 20px;
-            display: flex; flex-direction: column; gap: 16px;
+        .message-content table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+        .message-content th, .message-content td {
+            padding: 8px 12px; border: 1px solid var(--border); text-align: left; font-size: 13px;
         }
-        .message { max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; }
-        .message.user {
-            align-self: flex-end; background: #0f3460;
-        }
-        .message.assistant {
-            align-self: flex-start; background: #16213e;
-            border: 1px solid #0f3460;
-        }
-        .message .content { white-space: pre-wrap; word-wrap: break-word; }
-        .message .role-label {
-            font-size: 11px; color: #888; margin-bottom: 4px; font-weight: 600;
-            text-transform: uppercase; letter-spacing: 0.5px;
-        }
-        .input-area {
-            padding: 16px 20px; background: #16213e;
-            border-top: 1px solid #0f3460;
-            display: flex; gap: 12px; align-items: flex-end;
-        }
-        .input-area textarea {
-            flex: 1; background: #1a1a2e; border: 1px solid #0f3460;
-            color: #e0e0e0; padding: 10px 14px; border-radius: 8px;
-            font-size: 14px; resize: none; height: 44px; max-height: 120px;
-            font-family: inherit; line-height: 1.4;
-        }
-        .input-area textarea:focus { outline: none; border-color: #e94560; }
-        .input-area button {
-            background: #e94560; color: white; border: none;
-            padding: 10px 20px; border-radius: 8px; cursor: pointer;
-            font-size: 14px; font-weight: 600; white-space: nowrap;
-            height: 44px;
-        }
-        .input-area button:hover { background: #c83b52; }
-        .input-area button:disabled { background: #444; cursor: not-allowed; }
-        .status-bar {
-            padding: 6px 20px; background: #0f0f23; font-size: 11px; color: #666;
-            display: flex; justify-content: space-between;
-        }
+        .message-content th { background: var(--bg-tertiary); font-weight: 600; }
+
+        /* Welcome Screen */
         .welcome {
-            text-align: center; color: #555; padding: 60px 20px;
-            display: flex; flex-direction: column; align-items: center; gap: 12px;
+            display: flex; flex-direction: column; align-items: center;
+            justify-content: center; height: 100%; text-align: center; padding: 40px;
+            animation: msgIn 0.5s ease;
         }
-        .welcome h2 { color: #e94560; font-size: 28px; font-weight: 700; }
-        .welcome p { max-width: 400px; line-height: 1.6; }
-        .typing-indicator { display: inline-block; }
-        .typing-indicator span {
-            display: inline-block; width: 6px; height: 6px;
-            background: #888; border-radius: 50%; margin: 0 2px;
+        .welcome-brand {
+            display: flex; align-items: center; gap: 12px; margin-bottom: 8px;
+        }
+        .welcome-brand .logo-icon {
+            width: 48px; height: 48px; border-radius: 12px;
+            background: linear-gradient(135deg, var(--accent), #ff6b6b);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 24px; box-shadow: 0 4px 20px var(--accent-glow);
+        }
+        .welcome-brand h2 {
+            font-size: 28px; font-weight: 800; letter-spacing: -1px;
+            background: linear-gradient(135deg, var(--text-primary), var(--text-secondary));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .welcome-sub {
+            color: var(--text-secondary); font-size: 14px; max-width: 500px; line-height: 1.6;
+            margin-bottom: 24px;
+        }
+
+        /* Stats cards */
+        .welcome-stats {
+            display: flex; gap: 12px; margin-bottom: 28px; flex-wrap: wrap; justify-content: center;
+        }
+        .stat-card {
+            padding: 12px 20px; background: var(--bg-secondary); border: 1px solid var(--border);
+            border-radius: var(--radius); text-align: center; min-width: 120px;
+            transition: all var(--transition);
+        }
+        .stat-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+        .stat-card .stat-value {
+            font-size: 22px; font-weight: 800; letter-spacing: -0.5px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .stat-card .stat-value.red { color: var(--accent); }
+        .stat-card .stat-value.green { color: var(--success); }
+        .stat-card .stat-value.blue { color: var(--info); }
+        .stat-card .stat-label { font-size: 11px; color: var(--text-muted); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+        .welcome-features {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 10px; max-width: 600px; width: 100%;
+        }
+        .welcome-feature {
+            padding: 14px; background: var(--bg-secondary); border: 1px solid var(--border);
+            border-radius: var(--radius); text-align: left; transition: all var(--transition);
+            cursor: pointer;
+        }
+        .welcome-feature:hover { border-color: var(--accent); background: var(--accent-soft); }
+        .welcome-feature .wf-title { font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+        .welcome-feature .wf-desc { font-size: 12px; color: var(--text-muted); }
+
+        /* Typing indicator */
+        .typing-dots { display: flex; gap: 4px; padding: 8px 0; }
+        .typing-dots span {
+            width: 7px; height: 7px; background: var(--text-muted); border-radius: 50%;
             animation: blink 1.4s infinite both;
         }
-        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
-        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
-        @keyframes blink {
-            0%, 80%, 100% { opacity: 0.3; }
-            40% { opacity: 1; }
+        .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes blink { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
+
+        /* Input Area */
+        .input-area {
+            padding: 14px 24px 16px; border-top: 1px solid var(--border);
+            background: var(--bg-secondary);
         }
-        @media (max-width: 600px) {
-            .message { max-width: 95%; }
-            .header h1 { font-size: 15px; }
-            .input-area { padding: 10px; gap: 8px; }
+        .input-wrap {
+            max-width: 820px; margin: 0 auto;
+            background: var(--bg-tertiary); border: 1px solid var(--border);
+            border-radius: var(--radius-lg); overflow: hidden;
+            transition: border-color var(--transition), box-shadow var(--transition);
+        }
+        .input-wrap:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+        .input-textarea {
+            width: 100%; background: none; border: none; color: var(--text-primary);
+            padding: 12px 16px 4px; font-size: 14px; resize: none; outline: none;
+            font-family: inherit; line-height: 1.5; min-height: 24px; max-height: 200px;
+        }
+        .input-textarea::placeholder { color: var(--text-muted); }
+
+        .input-toolbar {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 6px 12px;
+        }
+        .input-toolbar .left { display: flex; align-items: center; gap: 4px; }
+        .input-toolbar .right { display: flex; align-items: center; gap: 8px; }
+
+        .toolbar-btn {
+            background: none; border: none; color: var(--text-muted);
+            padding: 4px 8px; border-radius: 4px; cursor: pointer;
+            font-size: 13px; transition: all var(--transition);
+            display: flex; align-items: center; gap: 4px;
+        }
+        .toolbar-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
+
+        .send-btn {
+            background: var(--accent); color: white; border: none;
+            padding: 6px 16px; border-radius: var(--radius-sm);
+            cursor: pointer; font-size: 13px; font-weight: 600;
+            transition: all var(--transition);
+            display: flex; align-items: center; gap: 6px;
+        }
+        .send-btn:hover { background: var(--accent-hover); }
+        .send-btn:disabled { background: var(--bg-hover); color: var(--text-muted); cursor: not-allowed; }
+        .send-btn.stop { background: var(--warning); }
+
+        .input-hint { font-size: 11px; color: var(--text-muted); text-align: center; margin-top: 6px; }
+
+        /* Settings Panel */
+        .panel-overlay {
+            display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+            z-index: 100; animation: fadeIn 0.2s ease;
+        }
+        .panel-overlay.active { display: flex; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+        .panel {
+            position: fixed; right: -420px; top: 0; bottom: 0; width: 400px;
+            background: var(--bg-secondary); border-left: 1px solid var(--border);
+            z-index: 101; transition: right 0.3s ease;
+            display: flex; flex-direction: column; overflow-y: auto;
+        }
+        .panel.active { right: 0; }
+
+        .panel-header {
+            padding: 14px 20px; border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; justify-content: space-between;
+        }
+        .panel-header h2 { font-size: 16px; font-weight: 600; }
+
+        .panel-section { padding: 14px 20px; border-bottom: 1px solid var(--border); }
+        .panel-section h3 { font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+        .setting-row {
+            display: flex; align-items: center; justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        .setting-row label { font-size: 13px; color: var(--text-primary); }
+        .setting-row .desc { font-size: 11px; color: var(--text-muted); }
+
+        .setting-row input[type="number"], .setting-row input[type="text"] {
+            width: 100px; background: var(--bg-tertiary); border: 1px solid var(--border);
+            color: var(--text-primary); padding: 5px 8px; border-radius: var(--radius-sm);
+            font-size: 13px; outline: none; text-align: right;
+        }
+        .setting-row input:focus { border-color: var(--accent); }
+        .setting-row input[type="range"] { width: 120px; accent-color: var(--accent); }
+        .setting-row select {
+            background: var(--bg-tertiary); border: 1px solid var(--border);
+            color: var(--text-primary); padding: 5px 8px; border-radius: var(--radius-sm);
+            font-size: 13px; outline: none; cursor: pointer;
+        }
+
+        .toggle { position: relative; width: 40px; height: 22px; cursor: pointer; }
+        .toggle input { display: none; }
+        .toggle .slider {
+            position: absolute; inset: 0; background: var(--bg-tertiary);
+            border-radius: 11px; border: 1px solid var(--border);
+            transition: all var(--transition);
+        }
+        .toggle .slider::before {
+            content: ''; position: absolute; left: 2px; top: 2px;
+            width: 16px; height: 16px; border-radius: 50%;
+            background: var(--text-muted); transition: all var(--transition);
+        }
+        .toggle input:checked + .slider { background: var(--accent-soft); border-color: var(--accent); }
+        .toggle input:checked + .slider::before { left: 20px; background: var(--accent); }
+
+        /* Loading Overlay */
+        .loading-overlay {
+            display: none; position: fixed; inset: 0;
+            background: rgba(10, 10, 18, 0.92); z-index: 200;
+            justify-content: center; align-items: center; flex-direction: column; gap: 16px;
+        }
+        .loading-overlay.active { display: flex; }
+        .spinner {
+            width: 44px; height: 44px; border: 3px solid var(--border);
+            border-top-color: var(--accent); border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .loading-overlay p { color: var(--text-secondary); font-size: 15px; }
+
+        /* Status Bar */
+        .status-bar {
+            padding: 3px 16px; background: var(--bg-primary); border-top: 1px solid var(--border);
+            display: flex; align-items: center; justify-content: space-between;
+            font-size: 11px; color: var(--text-muted);
+        }
+        .status-bar .left, .status-bar .right { display: flex; align-items: center; gap: 10px; }
+        .status-bar .sep { opacity: 0.3; }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .sidebar { position: fixed; left: 0; top: 0; bottom: 0; }
+            .sidebar.collapsed { transform: translateX(-100%); }
+            .message-wrap { padding: 0 12px; }
+            .input-area { padding: 12px; }
+            .panel { width: 100%; right: -100%; }
+            .welcome-features { grid-template-columns: 1fr; }
+            .welcome-stats { flex-direction: column; align-items: center; }
+        }
+
+        .kbd {
+            display: inline-block; padding: 1px 5px; border-radius: 3px;
+            background: var(--bg-tertiary); border: 1px solid var(--border);
+            font-family: monospace; font-size: 11px; color: var(--text-muted);
         }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1><span>tq</span> — TurboQuant Local LLM</h1>
-        <div class="model-area">
-            <select id="modelSelect" disabled>
-                <option value="">Loading models...</option>
-            </select>
-            <div class="stats" id="stats">Connecting...</div>
+
+<div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <h1><span class="logo">tq</span> <small>v0.7</small></h1>
+            <button class="icon-btn" onclick="toggleSidebar()" title="Toggle sidebar">&#9664;</button>
+        </div>
+
+        <button class="new-chat-btn" onclick="newSession()">
+            + New Chat
+        </button>
+
+        <div class="sessions-list" id="sessionsList"></div>
+
+        <div class="sidebar-footer">
+            <div class="model-select-wrap">
+                <select id="modelSelect" disabled>
+                    <option value="">Loading...</option>
+                </select>
+            </div>
+            <div class="sidebar-stats" id="sidebarStats">
+                <span><span class="stat-dot green" id="connDot"></span> Connected</span>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+        <!-- TQ Stats Banner -->
+        <div class="tq-banner" id="tqBanner">
+            <span class="tq-badge on" id="tqBadge">TQ</span>
+            <div class="tq-stat"><span class="label">Keys</span> <span class="value" id="tqBits">4-bit</span></div>
+            <div class="tq-stat"><span class="label">Values</span> <span class="value" id="tqVBits">fp16</span></div>
+            <div class="tq-stat"><span class="label">Ratio</span> <span class="value" id="tqRatio">7.5x</span></div>
+            <div class="tq-stat"><span class="label">Mode</span> <span class="value" id="tqMode">Standard</span></div>
+        </div>
+
+        <div class="main-header">
+            <div class="left">
+                <button class="icon-btn" id="sidebarToggle" onclick="toggleSidebar()" title="Toggle sidebar (Ctrl+B)">&#9776;</button>
+                <div class="header-model-badge" id="headerBadge">
+                    <span class="dot"></span>
+                    <span id="headerModel">No model</span>
+                </div>
+            </div>
+            <div class="right">
+                <div class="gen-speed-display" id="genSpeedDisplay">
+                    <span id="genSpeedValue">0.0</span> tok/s
+                </div>
+                <button class="icon-btn" onclick="openSettings()" title="Settings (Ctrl+,)">&#9881;</button>
+                <button class="icon-btn" onclick="exportChat()" title="Export chat">&#128229;</button>
+            </div>
+        </div>
+
+        <div class="messages" id="messages">
+            <div class="welcome" id="welcomeScreen">
+                <div class="welcome-brand">
+                    <div class="logo-icon">tq</div>
+                    <h2>TurboQuant Engine</h2>
+                </div>
+                <p class="welcome-sub">
+                    Local LLM inference with KV cache compression.
+                    The only implementation that works on GGUF quantized models.
+                </p>
+
+                <div class="welcome-stats" id="welcomeStats">
+                    <div class="stat-card">
+                        <div class="stat-value red">7.5x</div>
+                        <div class="stat-label">KV Compression</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value green">+0.2%</div>
+                        <div class="stat-label">V8 PPL Cost</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value blue">86</div>
+                        <div class="stat-label">Tests Passing</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value red">3-Fix</div>
+                        <div class="stat-label">GGUF Framework</div>
+                    </div>
+                </div>
+
+                <div class="welcome-features">
+                    <div class="welcome-feature" onclick="fillInput('Explain how TurboQuant KV cache compression works')">
+                        <div class="wf-title">How TQ Works</div>
+                        <div class="wf-desc">Hadamard rotation, Lloyd-Max codebook, 3-Fix</div>
+                    </div>
+                    <div class="welcome-feature" onclick="fillInput('Write a Python function to compute cosine similarity between two vectors')">
+                        <div class="wf-title">Write Code</div>
+                        <div class="wf-desc">Generate, debug, or explain code</div>
+                    </div>
+                    <div class="welcome-feature" onclick="fillInput('What are the practical trade-offs between 2-bit and 4-bit KV cache quantization?')">
+                        <div class="wf-title">Compare Configs</div>
+                        <div class="wf-desc">2-bit vs 4-bit, Pre-RoPE, compaction</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="input-area">
+            <div class="input-wrap">
+                <textarea class="input-textarea" id="inputArea" placeholder="Send a message..." rows="1"></textarea>
+                <div class="input-toolbar">
+                    <div class="left">
+                        <button class="toolbar-btn" onclick="fillInput('')" title="Clear">&#128465;</button>
+                    </div>
+                    <div class="right">
+                        <span style="font-size: 11px; color: var(--text-muted);" id="tokenHint"></span>
+                        <button class="send-btn" id="sendBtn" onclick="handleSendBtn()">
+                            Send <span style="font-size:11px; opacity:0.7">&#8629;</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div class="input-hint">
+                <span class="kbd">Enter</span> to send &middot; <span class="kbd">Shift+Enter</span> for newline
+            </div>
+        </div>
+
+        <div class="status-bar">
+            <div class="left">
+                <span id="statusText">Ready</span>
+                <span class="sep">|</span>
+                <span id="sessionCount">0 sessions</span>
+            </div>
+            <div class="right">
+                <span id="statusTq">TurboQuant KV Compression</span>
+                <span class="sep">|</span>
+                <span id="statusEngine">tq-engine</span>
+            </div>
+        </div>
+    </main>
+</div>
+
+<!-- Settings Panel -->
+<div class="panel-overlay" id="panelOverlay" onclick="closeSettings()"></div>
+<div class="panel" id="settingsPanel">
+    <div class="panel-header">
+        <h2>Settings</h2>
+        <button class="icon-btn" onclick="closeSettings()">&#10005;</button>
+    </div>
+
+    <div class="panel-section">
+        <h3>Generation</h3>
+        <div class="setting-row">
+            <div><label>Temperature</label><div class="desc">Creativity (0.0-2.0)</div></div>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <input type="range" id="setTemp" min="0" max="200" value="70" oninput="updateRangeLabel(this, 'tempVal', 100)">
+                <span id="tempVal" style="font-size:12px; min-width:32px; text-align:right;">0.70</span>
+            </div>
+        </div>
+        <div class="setting-row">
+            <div><label>Max Tokens</label><div class="desc">Max response length</div></div>
+            <input type="number" id="setMaxTokens" value="2048" min="64" max="8192" step="64">
+        </div>
+        <div class="setting-row">
+            <div><label>Top P</label><div class="desc">Nucleus sampling</div></div>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <input type="range" id="setTopP" min="0" max="100" value="90" oninput="updateRangeLabel(this, 'topPVal', 100)">
+                <span id="topPVal" style="font-size:12px; min-width:32px; text-align:right;">0.90</span>
+            </div>
+        </div>
+        <div class="setting-row">
+            <div><label>Repeat Penalty</label><div class="desc">Penalize repeated tokens</div></div>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <input type="range" id="setRepeat" min="100" max="200" value="110" oninput="updateRangeLabel(this, 'repeatVal', 100)">
+                <span id="repeatVal" style="font-size:12px; min-width:32px; text-align:right;">1.10</span>
+            </div>
         </div>
     </div>
 
-    <div class="loading-overlay" id="loadingOverlay">
-        <div class="spinner"></div>
-        <p id="loadingMessage">Loading model...</p>
+    <div class="panel-section">
+        <h3>System Prompt</h3>
+        <textarea id="systemPrompt" style="width:100%; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text-primary); padding: 10px; border-radius: var(--radius-sm); font-size: 13px; font-family: inherit; resize: vertical; min-height: 80px; outline: none;" placeholder="You are a helpful assistant.">You are a helpful assistant.</textarea>
     </div>
 
-    <div class="chat-container" id="chat">
-        <div class="welcome">
-            <h2>tq</h2>
-            <p>TurboQuant-compressed local inference. Type a message to begin.</p>
+    <div class="panel-section">
+        <h3>Display</h3>
+        <div class="setting-row">
+            <label>Stream responses</label>
+            <label class="toggle"><input type="checkbox" id="setStream" checked><span class="slider"></span></label>
+        </div>
+        <div class="setting-row">
+            <label>Compact mode</label>
+            <label class="toggle"><input type="checkbox" id="setCompact"><span class="slider"></span></label>
         </div>
     </div>
 
-    <div class="input-area">
-        <textarea id="input" placeholder="Type a message... (Shift+Enter for newline)"
-                  rows="1"></textarea>
-        <button id="sendBtn">Send</button>
+    <div class="panel-section">
+        <h3>Keyboard Shortcuts</h3>
+        <div style="font-size: 12px; color: var(--text-secondary); line-height: 2;">
+            <div><span class="kbd">Enter</span> Send message</div>
+            <div><span class="kbd">Ctrl</span>+<span class="kbd">B</span> Toggle sidebar</div>
+            <div><span class="kbd">Ctrl</span>+<span class="kbd">,</span> Settings</div>
+            <div><span class="kbd">Ctrl</span>+<span class="kbd">Shift</span>+<span class="kbd">N</span> New chat</div>
+            <div><span class="kbd">Esc</span> Stop generating</div>
+        </div>
     </div>
+</div>
 
-    <div class="status-bar">
-        <span id="status">Ready</span>
-        <span>Powered by TurboQuant KV Compression</span>
-    </div>
+<!-- Loading Overlay -->
+<div class="loading-overlay" id="loadingOverlay">
+    <div class="spinner"></div>
+    <p id="loadingMsg">Loading model...</p>
+</div>
 
-    <script>
-        const chatEl = document.getElementById('chat');
-        const inputEl = document.getElementById('input');
-        const sendBtn = document.getElementById('sendBtn');
-        const statusEl = document.getElementById('status');
-        const statsEl = document.getElementById('stats');
-        const modelSelect = document.getElementById('modelSelect');
-        const loadingOverlay = document.getElementById('loadingOverlay');
-        const loadingMessage = document.getElementById('loadingMessage');
+<script>
+// ═══════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════
+const STATE = {
+    sessions: JSON.parse(localStorage.getItem('tq_sessions') || '[]'),
+    activeSessionId: localStorage.getItem('tq_active_session') || null,
+    model: null,
+    generating: false,
+    abortController: null,
+    connected: false,
+    genStartTime: 0,
+    genTokenCount: 0,
+    tq: null,
+};
 
-        let modelName = 'model';
-        let messages = [];
-        let generating = false;
+const $ = id => document.getElementById(id);
 
-        // Auto-resize textarea
-        inputEl.addEventListener('input', function() {
-            this.style.height = '44px';
-            this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+// ═══════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded', () => {
+    loadModelList();
+    renderSessions();
+    loadActiveSession();
+    checkHealth();
+    setInterval(checkHealth, 30000);
+
+    const ta = $('inputArea');
+    ta.addEventListener('input', () => {
+        ta.style.height = 'auto';
+        ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+    });
+    ta.addEventListener('keydown', handleKeydown);
+});
+
+function handleKeydown(e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey) {
+        e.preventDefault();
+        handleSendBtn();
+    } else if (e.key === 'Enter' && e.ctrlKey) {
+        e.preventDefault();
+        handleSendBtn();
+    } else if (e.key === 'Escape' && STATE.generating) {
+        stopGenerating();
+    }
+}
+
+function handleSendBtn() {
+    if (STATE.generating) stopGenerating();
+    else sendMessage();
+}
+
+document.addEventListener('keydown', e => {
+    if (e.ctrlKey && e.key === 'b') { e.preventDefault(); toggleSidebar(); }
+    if (e.ctrlKey && e.key === ',') { e.preventDefault(); openSettings(); }
+    if (e.ctrlKey && e.shiftKey && e.key === 'N') { e.preventDefault(); newSession(); }
+    if (e.key === 'Escape') closeSettings();
+});
+
+// ═══════════════════════════════════════════════════════════════
+// HEALTH & TQ STATUS
+// ═══════════════════════════════════════════════════════════════
+async function checkHealth() {
+    try {
+        const r = await fetch('/health');
+        if (r.ok) {
+            const data = await r.json();
+            STATE.connected = true;
+            $('connDot').className = 'stat-dot green';
+            $('statusText').textContent = 'Connected';
+
+            if (data.tq) {
+                STATE.tq = data.tq;
+                updateTqBanner(data.tq);
+            }
+        }
+    } catch {
+        STATE.connected = false;
+        $('connDot').className = 'stat-dot red';
+        $('statusText').textContent = 'Disconnected';
+    }
+}
+
+function updateTqBanner(tq) {
+    const banner = $('tqBanner');
+    if (!tq || !tq.enabled) { banner.classList.remove('active'); return; }
+
+    banner.classList.add('active');
+    $('tqBits').textContent = tq.bits + '-bit';
+    $('tqVBits').textContent = tq.value_bits === 0 ? 'fp16' : tq.value_bits + '-bit';
+    $('tqRatio').textContent = tq.compression_ratio;
+    $('tqMode').textContent = tq.pre_rope ? 'Pre-RoPE' : 'Standard';
+
+    // Update header badge with TQ info
+    const model = $('headerModel').textContent;
+    if (model && !model.includes('TQ')) {
+        $('statusTq').textContent = 'TQ ' + tq.bits + '-bit' + (tq.pre_rope ? ' Pre-RoPE' : '') + ' | ' + tq.compression_ratio + ' compression';
+    }
+
+    // Update welcome stats if visible
+    const statsEl = $('welcomeStats');
+    if (statsEl) {
+        const cards = statsEl.querySelectorAll('.stat-card');
+        if (cards[0]) cards[0].querySelector('.stat-value').textContent = tq.compression_ratio;
+        if (cards[1]) {
+            const vLabel = tq.value_bits === 0 ? 'fp16' : ('V' + tq.value_bits);
+            cards[1].querySelector('.stat-value').textContent = tq.value_bits === 8 ? '+0.2%' : tq.value_bits === 4 ? '+1.3%' : 'fp16';
+            cards[1].querySelector('.stat-label').textContent = vLabel + ' PPL Cost';
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MODELS
+// ═══════════════════════════════════════════════════════════════
+async function loadModelList() {
+    try {
+        const r = await fetch('/v1/models');
+        const data = await r.json();
+        const sel = $('modelSelect');
+        sel.innerHTML = '';
+
+        let activeModel = null;
+        for (const m of (data.data || [])) {
+            const opt = document.createElement('option');
+            opt.value = m.id;
+            opt.textContent = m.id + (m.size_gb ? ` (${m.size_gb.toFixed(1)} GB)` : '');
+            if (m.active) { opt.selected = true; activeModel = m.id; }
+            sel.appendChild(opt);
+        }
+        sel.disabled = false;
+        STATE.model = activeModel || (data.data?.[0]?.id || null);
+        $('headerModel').textContent = STATE.model || 'No model';
+        $('sidebarStats').querySelector('span:last-child')?.remove();
+        const count = document.createElement('span');
+        count.textContent = `${data.data?.length || 0} model(s)`;
+        $('sidebarStats').appendChild(count);
+    } catch {
+        $('modelSelect').innerHTML = '<option>Not connected</option>';
+        $('headerModel').textContent = 'Disconnected';
+    }
+}
+
+$('modelSelect').addEventListener('change', async function() {
+    const selected = this.value;
+    if (!selected || selected === STATE.model) return;
+
+    $('loadingMsg').textContent = `Loading ${selected}...`;
+    $('loadingOverlay').classList.add('active');
+    $('statusText').textContent = 'Switching model...';
+
+    try {
+        const r = await fetch('/v1/models/load', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: selected })
+        });
+        if (!r.ok) throw new Error('Failed to load model');
+        const res = await r.json();
+        STATE.model = selected;
+        $('headerModel').textContent = res.model || selected;
+        $('statusText').textContent = 'Model loaded';
+        await loadModelList();
+    } catch (err) {
+        this.value = STATE.model;
+        $('statusText').textContent = 'Error: ' + err.message;
+    } finally {
+        $('loadingOverlay').classList.remove('active');
+    }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// SESSIONS
+// ═══════════════════════════════════════════════════════════════
+function getSession(id) { return STATE.sessions.find(s => s.id === id); }
+function activeSession() { return getSession(STATE.activeSessionId); }
+
+function createSession() {
+    const s = {
+        id: 'sess_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        title: 'New Chat',
+        model: STATE.model,
+        messages: [],
+        created: Date.now(),
+    };
+    STATE.sessions.unshift(s);
+    saveSessions();
+    return s;
+}
+
+function newSession() {
+    const s = createSession();
+    STATE.activeSessionId = s.id;
+    saveSessions();
+    renderSessions();
+    showWelcome();
+}
+
+function switchSession(id) {
+    STATE.activeSessionId = id;
+    localStorage.setItem('tq_active_session', id);
+    renderSessions();
+    loadActiveSession();
+}
+
+function deleteSession(id, e) {
+    e.stopPropagation();
+    STATE.sessions = STATE.sessions.filter(s => s.id !== id);
+    if (STATE.activeSessionId === id) {
+        STATE.activeSessionId = STATE.sessions[0]?.id || null;
+        if (!STATE.activeSessionId) showWelcome();
+        else loadActiveSession();
+    }
+    saveSessions();
+    renderSessions();
+}
+
+function saveSessions() {
+    if (STATE.sessions.length > 50) STATE.sessions = STATE.sessions.slice(0, 50);
+    localStorage.setItem('tq_sessions', JSON.stringify(STATE.sessions));
+    localStorage.setItem('tq_active_session', STATE.activeSessionId || '');
+    $('sessionCount').textContent = STATE.sessions.length + ' session(s)';
+}
+
+function renderSessions() {
+    const list = $('sessionsList');
+    list.innerHTML = '';
+    for (const s of STATE.sessions) {
+        const div = document.createElement('div');
+        div.className = 'session-item' + (s.id === STATE.activeSessionId ? ' active' : '');
+        div.onclick = () => switchSession(s.id);
+        div.innerHTML = `
+            <span class="session-icon">&#128172;</span>
+            <div style="overflow:hidden;">
+                <div class="session-title">${escHtml(s.title)}</div>
+                <div class="session-model">${escHtml(s.model || 'local')} &middot; ${s.messages.length} msgs</div>
+            </div>
+            <button class="session-delete" title="Delete">&#10005;</button>
+        `;
+        div.querySelector('.session-delete').onclick = (e) => deleteSession(s.id, e);
+        list.appendChild(div);
+    }
+    $('sessionCount').textContent = STATE.sessions.length + ' session(s)';
+}
+
+function loadActiveSession() {
+    const s = activeSession();
+    if (!s) { showWelcome(); return; }
+    $('welcomeScreen')?.remove();
+
+    const msgs = $('messages');
+    msgs.querySelectorAll('.message-wrap').forEach(el => el.remove());
+
+    for (const m of s.messages) {
+        appendMessageDOM(m.role, m.content, false);
+    }
+    msgs.scrollTop = msgs.scrollHeight;
+}
+
+function showWelcome() {
+    const msgs = $('messages');
+    msgs.querySelectorAll('.message-wrap').forEach(el => el.remove());
+    if (!$('welcomeScreen')) {
+        msgs.innerHTML = `
+        <div class="welcome" id="welcomeScreen">
+            <div class="welcome-brand">
+                <div class="logo-icon">tq</div>
+                <h2>TurboQuant Engine</h2>
+            </div>
+            <p class="welcome-sub">
+                Local LLM inference with KV cache compression.
+                The only implementation that works on GGUF quantized models.
+            </p>
+            <div class="welcome-stats" id="welcomeStats">
+                <div class="stat-card">
+                    <div class="stat-value red">7.5x</div>
+                    <div class="stat-label">KV Compression</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value green">+0.2%</div>
+                    <div class="stat-label">V8 PPL Cost</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value blue">86</div>
+                    <div class="stat-label">Tests Passing</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value red">3-Fix</div>
+                    <div class="stat-label">GGUF Framework</div>
+                </div>
+            </div>
+            <div class="welcome-features">
+                <div class="welcome-feature" onclick="fillInput('Explain how TurboQuant KV cache compression works')">
+                    <div class="wf-title">How TQ Works</div>
+                    <div class="wf-desc">Hadamard rotation, Lloyd-Max codebook, 3-Fix</div>
+                </div>
+                <div class="welcome-feature" onclick="fillInput('Write a Python function to compute cosine similarity between two vectors')">
+                    <div class="wf-title">Write Code</div>
+                    <div class="wf-desc">Generate, debug, or explain code</div>
+                </div>
+                <div class="welcome-feature" onclick="fillInput('What are the practical trade-offs between 2-bit and 4-bit KV cache quantization?')">
+                    <div class="wf-title">Compare Configs</div>
+                    <div class="wf-desc">2-bit vs 4-bit, Pre-RoPE, compaction</div>
+                </div>
+            </div>
+        </div>`;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MESSAGING
+// ═══════════════════════════════════════════════════════════════
+function fillInput(text) {
+    $('inputArea').value = text;
+    $('inputArea').focus();
+}
+
+async function sendMessage() {
+    const text = $('inputArea').value.trim();
+    if (!text || STATE.generating) return;
+
+    if (!activeSession()) {
+        const s = createSession();
+        STATE.activeSessionId = s.id;
+        saveSessions();
+        renderSessions();
+    }
+
+    STATE.generating = true;
+    $('sendBtn').innerHTML = 'Stop &#9632;';
+    $('sendBtn').classList.add('stop');
+    $('statusText').textContent = 'Generating...';
+
+    $('inputArea').value = '';
+    $('inputArea').style.height = 'auto';
+
+    $('welcomeScreen')?.remove();
+
+    const session = activeSession();
+    session.messages.push({ role: 'user', content: text });
+    if (session.messages.length === 1) {
+        session.title = text.slice(0, 50) + (text.length > 50 ? '...' : '');
+    }
+    session.model = STATE.model;
+    saveSessions();
+    renderSessions();
+
+    appendMessageDOM('user', text, true);
+
+    const wrap = appendMessageDOM('assistant', '', true);
+    const contentEl = wrap.querySelector('.message-content');
+    contentEl.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
+
+    const systemPrompt = $('systemPrompt').value || 'You are a helpful assistant.';
+    const reqMessages = [
+        { role: 'system', content: systemPrompt },
+        ...session.messages.map(m => ({ role: m.role, content: m.content }))
+    ];
+
+    const useStream = $('setStream').checked;
+    STATE.genStartTime = performance.now();
+    STATE.genTokenCount = 0;
+
+    STATE.abortController = new AbortController();
+    const abortSignal = STATE.abortController.signal;
+
+    // Show speed display
+    $('genSpeedDisplay').classList.add('active');
+    $('genSpeedValue').textContent = '0.0';
+
+    try {
+        const resp = await fetch('/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: abortSignal,
+            body: JSON.stringify({
+                model: STATE.model,
+                messages: reqMessages,
+                stream: useStream,
+                max_tokens: parseInt($('setMaxTokens').value) || 2048,
+                temperature: parseInt($('setTemp').value) / 100,
+                top_p: parseInt($('setTopP').value) / 100,
+            })
         });
 
-        inputEl.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                sendMessage();
-            }
-        });
-
-        sendBtn.addEventListener('click', sendMessage);
-
-        // Fetch and populate model list
-        async function loadModelList() {
-            try {
-                const resp = await fetch('/v1/models');
-                const data = await resp.json();
-                if (!data.data || data.data.length === 0) {
-                    statsEl.textContent = 'No models available';
-                    return;
-                }
-
-                modelSelect.innerHTML = '';
-                let activeModel = null;
-
-                for (const m of data.data) {
-                    const opt = document.createElement('option');
-                    opt.value = m.id;
-                    let label = m.id;
-                    if (m.size_gb) label += ' (' + m.size_gb.toFixed(1) + ' GB)';
-                    opt.textContent = label;
-                    if (m.active) {
-                        opt.selected = true;
-                        activeModel = m.id;
-                    }
-                    modelSelect.appendChild(opt);
-                }
-
-                // Add hint option at the bottom
-                const hintOpt = document.createElement('option');
-                hintOpt.value = '';
-                hintOpt.disabled = true;
-                hintOpt.textContent = '--- tq pull <model> for more ---';
-                modelSelect.appendChild(hintOpt);
-
-                modelSelect.disabled = false;
-                modelName = activeModel || data.data[0].id;
-                statsEl.textContent = data.data.length + ' model' + (data.data.length !== 1 ? 's' : '') + ' available';
-            } catch (e) {
-                statsEl.textContent = 'Not connected';
-            }
+        if (!resp.ok) {
+            const errText = await resp.text();
+            throw new Error(`HTTP ${resp.status}: ${errText.slice(0, 200)}`);
         }
 
-        modelSelect.addEventListener('change', async function() {
-            const selected = this.value;
-            if (!selected || selected === modelName) return;
+        let fullText = '';
 
-            const previousModel = modelName;
+        if (useStream) {
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
 
-            // Show loading overlay
-            loadingMessage.textContent = 'Loading ' + selected + '...';
-            loadingOverlay.classList.add('active');
-            modelSelect.disabled = true;
-            sendBtn.disabled = true;
-            statusEl.textContent = 'Switching model...';
+            while (true) {
+                if (abortSignal.aborted) break;
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
 
-            try {
-                const resp = await fetch('/v1/models/load', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model: selected })
-                });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
 
-                if (!resp.ok) {
-                    const err = await resp.json().catch(() => ({ error: { message: 'Unknown error' } }));
-                    throw new Error(err.error?.message || 'Failed to load model');
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data: ')) continue;
+                    const data = trimmed.slice(6);
+                    if (data === '[DONE]') continue;
+                    try {
+                        const parsed = JSON.parse(data);
+                        const token = parsed.choices?.[0]?.delta?.content;
+                        if (token) {
+                            fullText += token;
+                            STATE.genTokenCount++;
+                            contentEl.innerHTML = renderMarkdown(fullText);
+                            $('messages').scrollTop = $('messages').scrollHeight;
+                            updateGenSpeed();
+                        }
+                    } catch {}
                 }
-
-                const result = await resp.json();
-                modelName = selected;
-
-                // Clear conversation on model switch
-                messages = [];
-                chatEl.innerHTML = '<div class="welcome"><h2>tq</h2>'
-                    + '<p>Switched to ' + result.model + '. Type a message to begin.</p></div>';
-
-                statusEl.textContent = 'Ready';
-                // Refresh model list to update active markers
-                await loadModelList();
-            } catch (err) {
-                // Revert selection
-                modelSelect.value = previousModel;
-                statusEl.textContent = 'Error: ' + err.message;
-                alert('Failed to load model: ' + err.message);
-            } finally {
-                loadingOverlay.classList.remove('active');
-                modelSelect.disabled = false;
-                sendBtn.disabled = false;
             }
-        });
-
-        loadModelList();
-
-        function addMessage(role, content) {
-            // Remove welcome on first message
-            const welcome = chatEl.querySelector('.welcome');
-            if (welcome) welcome.remove();
-
-            const div = document.createElement('div');
-            div.className = 'message ' + role;
-            const label = role === 'user' ? 'You' : 'Assistant';
-            div.innerHTML = '<div class="role-label">' + label + '</div>'
-                          + '<div class="content"></div>';
-            div.querySelector('.content').textContent = content;
-            chatEl.appendChild(div);
-            chatEl.scrollTop = chatEl.scrollHeight;
-            return div;
-        }
-
-        function scrollToBottom() {
-            chatEl.scrollTop = chatEl.scrollHeight;
-        }
-
-        async function sendMessage() {
-            const text = inputEl.value.trim();
-            if (!text || generating) return;
-
-            generating = true;
-            inputEl.value = '';
-            inputEl.style.height = '44px';
-            sendBtn.disabled = true;
-            statusEl.textContent = 'Generating...';
-
-            messages.push({ role: 'user', content: text });
-            addMessage('user', text);
-
-            // Create assistant message with typing indicator
-            const assistantDiv = addMessage('assistant', '');
-            const contentEl = assistantDiv.querySelector('.content');
-            contentEl.innerHTML = '<div class="typing-indicator">'
-                + '<span></span><span></span><span></span></div>';
-
-            // Build request messages with system prompt
-            const reqMessages = [
-                { role: 'system', content: 'You are a helpful assistant.' },
-                ...messages
-            ];
-
-            try {
-                const response = await fetch('/v1/chat/completions', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model: modelName,
-                        messages: reqMessages,
-                        stream: true,
-                        max_tokens: 1024
-                    })
-                });
-
-                if (!response.ok) {
-                    const err = await response.text();
-                    throw new Error('HTTP ' + response.status + ': ' + err);
+            if (buffer.trim().startsWith('data: ')) {
+                const data = buffer.trim().slice(6);
+                if (data !== '[DONE]') {
+                    try {
+                        const parsed = JSON.parse(data);
+                        const token = parsed.choices?.[0]?.delta?.content;
+                        if (token) fullText += token;
+                    } catch {}
                 }
-
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let fullText = '';
-                let buffer = '';
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop() || '';
-
-                    for (const line of lines) {
-                        const trimmed = line.trim();
-                        if (!trimmed.startsWith('data: ')) continue;
-                        const data = trimmed.slice(6);
-                        if (data === '[DONE]') continue;
-                        try {
-                            const parsed = JSON.parse(data);
-                            const token = parsed.choices
-                                && parsed.choices[0]
-                                && parsed.choices[0].delta
-                                && parsed.choices[0].delta.content;
-                            if (token) {
-                                fullText += token;
-                                contentEl.textContent = fullText;
-                                scrollToBottom();
-                            }
-                        } catch(e) { /* skip malformed chunks */ }
-                    }
-                }
-
-                // Process any remaining buffer
-                if (buffer.trim().startsWith('data: ')) {
-                    const data = buffer.trim().slice(6);
-                    if (data !== '[DONE]') {
-                        try {
-                            const parsed = JSON.parse(data);
-                            const token = parsed.choices
-                                && parsed.choices[0]
-                                && parsed.choices[0].delta
-                                && parsed.choices[0].delta.content;
-                            if (token) {
-                                fullText += token;
-                                contentEl.textContent = fullText;
-                            }
-                        } catch(e) {}
-                    }
-                }
-
-                if (!fullText) {
-                    contentEl.textContent = '(empty response)';
-                }
-
-                messages.push({ role: 'assistant', content: fullText });
-                statusEl.textContent = 'Ready';
-            } catch (err) {
-                contentEl.textContent = 'Error: ' + err.message;
-                statusEl.textContent = 'Error';
-                // Remove failed assistant message from history
             }
-
-            generating = false;
-            sendBtn.disabled = false;
-            inputEl.focus();
+        } else {
+            const result = await resp.json();
+            fullText = result.choices?.[0]?.message?.content || '';
+            STATE.genTokenCount = (result.usage?.completion_tokens) || estimateTokens(fullText);
         }
 
-        inputEl.focus();
-    </script>
+        if (!fullText) {
+            contentEl.textContent = '(empty response)';
+        } else {
+            contentEl.innerHTML = renderMarkdown(fullText);
+            addCopyButtons(contentEl);
+        }
+
+        session.messages.push({ role: 'assistant', content: fullText });
+        saveSessions();
+        $('statusText').textContent = 'Ready';
+
+        // Show final speed
+        const elapsed = (performance.now() - STATE.genStartTime) / 1000;
+        if (elapsed > 0.5 && STATE.genTokenCount > 0) {
+            const tps = (STATE.genTokenCount / elapsed).toFixed(1);
+            $('statusText').textContent = `${STATE.genTokenCount} tokens in ${elapsed.toFixed(1)}s (${tps} tok/s)`;
+        }
+
+    } catch (err) {
+        if (err.name === 'AbortError' || abortSignal.aborted) {
+            const partialText = contentEl.textContent || '';
+            if (partialText && partialText !== '(empty response)') {
+                contentEl.innerHTML = renderMarkdown(partialText);
+                addCopyButtons(contentEl);
+                session.messages.push({ role: 'assistant', content: partialText });
+                saveSessions();
+            }
+            $('statusText').textContent = 'Stopped';
+        } else {
+            contentEl.textContent = 'Error: ' + err.message;
+            $('statusText').textContent = 'Error';
+        }
+    }
+
+    STATE.generating = false;
+    STATE.abortController = null;
+    $('sendBtn').disabled = false;
+    $('sendBtn').innerHTML = 'Send <span style="font-size:11px; opacity:0.7">&#8629;</span>';
+    $('sendBtn').classList.remove('stop');
+    $('genSpeedDisplay').classList.remove('active');
+    $('inputArea').focus();
+}
+
+function stopGenerating() {
+    if (STATE.abortController) {
+        STATE.abortController.abort();
+        STATE.abortController = null;
+    }
+    STATE.generating = false;
+    $('sendBtn').disabled = false;
+    $('sendBtn').innerHTML = 'Send <span style="font-size:11px; opacity:0.7">&#8629;</span>';
+    $('sendBtn').classList.remove('stop');
+    $('genSpeedDisplay').classList.remove('active');
+    $('statusText').textContent = 'Stopped';
+}
+
+function updateGenSpeed() {
+    const elapsed = (performance.now() - STATE.genStartTime) / 1000;
+    if (elapsed > 0.3 && STATE.genTokenCount > 0) {
+        const tps = (STATE.genTokenCount / elapsed).toFixed(1);
+        $('genSpeedValue').textContent = tps;
+    }
+}
+
+function estimateTokens(text) { return Math.round(text.length / 4); }
+
+// ═══════════════════════════════════════════════════════════════
+// DOM
+// ═══════════════════════════════════════════════════════════════
+function appendMessageDOM(role, content, scroll) {
+    const wrap = document.createElement('div');
+    wrap.className = 'message-wrap';
+    const isUser = role === 'user';
+    const avatar = isUser ? '&#128100;' : 'tq';
+    const roleName = isUser ? 'You' : 'TQ Assistant';
+    wrap.innerHTML = `
+        <div class="message ${role}">
+            <div class="message-avatar">${avatar}</div>
+            <div class="message-body">
+                <div class="message-role">${roleName}</div>
+                <div class="message-content">${isUser ? escHtml(content).replace(/\n/g, '<br>') : renderMarkdown(content)}</div>
+            </div>
+        </div>`;
+    $('messages').appendChild(wrap);
+    if (!isUser && content) addCopyButtons(wrap.querySelector('.message-content'));
+    if (scroll) $('messages').scrollTop = $('messages').scrollHeight;
+    return wrap;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MARKDOWN RENDERER
+// ═══════════════════════════════════════════════════════════════
+function renderMarkdown(text) {
+    if (!text) return '';
+    let html = text;
+
+    html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+        const langLabel = lang || 'code';
+        const id = 'code_' + Math.random().toString(36).slice(2, 8);
+        return `<pre><div class="code-header"><span>${escHtml(langLabel)}</span><button class="copy-btn" onclick="copyCode('${id}')">Copy</button></div><code id="${id}">${code.trim()}</code></pre>`;
+    });
+
+    html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    html = html.replace(/^### (.+)$/gm, '<h4 style="font-size:15px;font-weight:600;margin:14px 0 6px;">$1</h4>');
+    html = html.replace(/^## (.+)$/gm, '<h3 style="font-size:16px;font-weight:600;margin:16px 0 8px;">$1</h3>');
+    html = html.replace(/^# (.+)$/gm, '<h2 style="font-size:18px;font-weight:700;margin:18px 0 10px;">$1</h2>');
+    html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
+    html = html.replace(/^[-*] (.+)$/gm, '<li>$1</li>');
+    html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+    html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+    html = html.replace(/^---$/gm, '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0;">');
+    html = html.replace(/\n\n/g, '</p><p>');
+    html = html.replace(/\n/g, '<br>');
+    html = '<p>' + html + '</p>';
+    html = html.replace(/<p>\s*<\/p>/g, '');
+    html = html.replace(/<p>\s*(<h[234]|<pre|<blockquote|<ul|<ol|<li|<hr)/g, '$1');
+    html = html.replace(/(<\/h[234]>|<\/pre>|<\/blockquote>|<\/ul>|<\/ol>|<hr[^>]*>)\s*<\/p>/g, '$1');
+
+    return html;
+}
+
+function addCopyButtons(container) {
+    container.querySelectorAll('pre').forEach(pre => {
+        if (pre.querySelector('.copy-btn')) return;
+        const code = pre.querySelector('code');
+        if (!code) return;
+        const id = 'code_' + Math.random().toString(36).slice(2, 8);
+        code.id = id;
+        const header = document.createElement('div');
+        header.className = 'code-header';
+        header.innerHTML = `<span>code</span><button class="copy-btn" onclick="copyCode('${id}')">Copy</button>`;
+        pre.insertBefore(header, pre.firstChild);
+    });
+}
+
+function copyCode(id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    navigator.clipboard.writeText(el.textContent).then(() => {
+        const btn = el.parentElement.querySelector('.copy-btn');
+        if (btn) { btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = 'Copy', 1500); }
+    });
+}
+
+function escHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SIDEBAR & PANELS
+// ═══════════════════════════════════════════════════════════════
+function toggleSidebar() { $('sidebar').classList.toggle('collapsed'); }
+function openSettings() { $('panelOverlay').classList.add('active'); $('settingsPanel').classList.add('active'); }
+function closeSettings() { $('panelOverlay').classList.remove('active'); $('settingsPanel').classList.remove('active'); }
+
+function updateRangeLabel(input, labelId, divisor) {
+    const val = (parseInt(input.value) / divisor).toFixed(2);
+    document.getElementById(labelId).textContent = val;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EXPORT
+// ═══════════════════════════════════════════════════════════════
+function exportChat() {
+    const s = activeSession();
+    if (!s || s.messages.length === 0) { alert('No messages to export.'); return; }
+    let md = `# Chat: ${s.title}\nModel: ${s.model}\nDate: ${new Date(s.created).toLocaleString()}\n\n---\n\n`;
+    for (const m of s.messages) {
+        md += `## ${m.role === 'user' ? 'You' : 'TQ Assistant'}\n\n${m.content}\n\n---\n\n`;
+    }
+    const blob = new Blob([md], { type: 'text/markdown' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `tq-chat-${s.id.slice(0, 12)}.md`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════
+if (!STATE.sessions.length) newSession();
+else { renderSessions(); loadActiveSession(); }
+</script>
 </body>
 </html>

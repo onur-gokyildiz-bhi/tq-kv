@@ -115,7 +115,7 @@ pub struct Engine {
     tokenizer: Tokenizer,
     device: Device,
     position: usize,
-    eos_token_id: u32,
+    eos_token_ids: Vec<u32>,
     /// Optional quality gate for runtime PPL monitoring.
     pub quality_gate: Option<QualityGate>,
 }
@@ -298,14 +298,24 @@ impl Engine {
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Tokenizer load error: {}", e))?;
 
-        let eos_token_id = tokenizer
-            .token_to_id("<|eot_id|>")
-            .or_else(|| tokenizer.token_to_id("<|im_end|>"))
-            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
-            .or_else(|| tokenizer.token_to_id("</s>"))
-            .unwrap_or(2);
+        let stop_tokens = [
+            "<|eot_id|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|end|>",
+            "<end_of_turn>",
+            "</s>",
+        ];
+        let mut eos_token_ids: Vec<u32> = stop_tokens
+            .iter()
+            .filter_map(|t| tokenizer.token_to_id(t))
+            .collect();
+        if eos_token_ids.is_empty() {
+            eos_token_ids.push(2); // fallback
+        }
+        eprintln!("EOS token IDs: {:?}", eos_token_ids);
 
-        Ok(Self { model, tokenizer, device, position: 0, eos_token_id, quality_gate: None })
+        Ok(Self { model, tokenizer, device, position: 0, eos_token_ids, quality_gate: None })
     }
 
     /// Clear KV cache.
@@ -368,7 +378,7 @@ impl Engine {
         let mut n_generated = 0u32;
 
         while n_generated < params.max_tokens {
-            if next_token == self.eos_token_id { break; }
+            if self.eos_token_ids.contains(&next_token) { break; }
 
             // Incremental decode: decode ALL generated tokens, then diff with previous.
             // This preserves spaces that sentencepiece tokenizers encode as part of

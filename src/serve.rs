@@ -152,6 +152,20 @@ struct ModelStatusResponse {
 struct HealthResponse {
     status: String,
     engine: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tq: Option<TqStatus>,
+}
+
+#[derive(Serialize)]
+struct TqStatus {
+    enabled: bool,
+    bits: u8,
+    pre_rope: bool,
+    value_bits: u8,
+    skip_layers: usize,
+    sink_tokens: usize,
+    compact_threshold: usize,
+    compression_ratio: String,
 }
 
 #[derive(Serialize)]
@@ -230,10 +244,42 @@ async fn serve_ui() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("web/index.html"))
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(
+    State(state): State<Arc<AppState>>,
+) -> Json<HealthResponse> {
+    let tq = state.tq_config.as_ref().map(|c| {
+        let ratio = match c.bits {
+            2 => "14.2x",
+            3 => "10.0x",
+            4 => "7.5x",
+            _ => "?",
+        };
+        let v_mult = match c.value_bits {
+            4 => 3.2,
+            8 => 2.0,
+            _ => 1.0,
+        };
+        let total = match ratio {
+            "14.2x" => 14.2 * v_mult,
+            "10.0x" => 10.0 * v_mult,
+            "7.5x" => 7.5 * v_mult,
+            _ => 1.0,
+        };
+        TqStatus {
+            enabled: true,
+            bits: c.bits,
+            pre_rope: c.pre_rope,
+            value_bits: c.value_bits,
+            skip_layers: c.skip_layers.unwrap_or(4),
+            sink_tokens: c.sink_tokens.unwrap_or(4),
+            compact_threshold: 0,
+            compression_ratio: format!("{:.1}x", total),
+        }
+    });
     Json(HealthResponse {
         status: "ok".into(),
         engine: "tq-kv".into(),
+        tq,
     })
 }
 

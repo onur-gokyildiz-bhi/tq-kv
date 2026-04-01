@@ -9,6 +9,7 @@
 *.pdf
 !paper/*.pdf
 /docs/
+!docs/tq-demo.gif
 .claude/
 candle-patches/
 TODOS.md
