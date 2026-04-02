@@ -2107,8 +2107,10 @@ impl GenericTurboModel {
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
         };
 
-        // Pre-warm all weight caches: dequant once at load time.
-        // Eliminates first-forward dequant latency (~15s for 7B model).
+        // Pre-warm weight caches: dequant at load time to eliminate first-forward latency.
+        // Uses ~5.7 GB RAM for 7B model. Disable with TQ_NO_WARMUP=1 on low-memory systems.
+        let do_warmup = std::env::var("TQ_NO_WARMUP").map(|v| v != "1").unwrap_or(true);
+        if do_warmup {
         eprintln!("  Pre-warming weight caches ({} layers)...", block_count);
         model.output.warmup();
         for layer in &model.layers {
@@ -2134,6 +2136,7 @@ impl GenericTurboModel {
             }
         }
         eprintln!("  Weight caches warmed.");
+        } // end if do_warmup
 
         Ok(model)
     }
