@@ -172,11 +172,10 @@ impl QMatMul {
         }
     }
 
-    /// CPU forward: dequantize weight, then parallel matmul via rayon.
+    /// CPU forward: dequantize weight, then optimized matmul.
     ///
-    /// For decode (batch=1): parallelizes over output rows (out_features).
-    /// 7B model: 4 matmuls/layer × 28 layers = 112 matmuls per token.
-    /// Each matmul: 3584 output rows × 3584 dot products — rayon splits across cores.
+    /// Decode (M=1): rayon parallel dot products (memory-bandwidth bound).
+    /// Prefill (M>1): matrixmultiply sgemm (AVX2 cache-tiled micro-kernels).
     fn forward_cpu(qw: &QWeight, x: &TqTensor) -> Result<TqTensor> {
         use rayon::prelude::*;
 
@@ -195,24 +194,41 @@ impl QMatMul {
 
         let batch_elements: usize = x_shape[..x_shape.len() - 1].iter().product();
         let x_data = x.as_slice();
-        // Lazy dequant cache: dequantize once, reuse for all subsequent tokens.
-        // 7B model: 112 weight matrices, each dequanted once at first token.
         let w_data = qw.cpu_cache.get_or_init(|| qw.dequantize());
-
-        // Parallel over output rows — each row is an independent dot product.
-        // For decode: batch=1, out_features=3584 → 3584 parallel tasks.
         let w_slice = w_data.as_slice();
         let mut output = vec![0.0f32; batch_elements * out_features];
 
-        for b in 0..batch_elements {
-            let x_row = &x_data[b * in_features..(b + 1) * in_features];
-            let out_chunk = &mut output[b * out_features..(b + 1) * out_features];
-            out_chunk.par_iter_mut().enumerate().for_each(|(o, out)| {
-                let w_row = &w_slice[o * in_features..(o + 1) * in_features];
-                *out = x_row.iter().zip(w_row.iter())
-                    .map(|(&xi, &wi)| xi * wi)
-                    .sum::<f32>();
-            });
+        if batch_elements <= 4 {
+            // Decode path: M=1 (or small batch).
+            // Rayon parallel over output rows — each dot product independent.
+            // Memory-bandwidth bound: each thread reads different w_rows.
+            for b in 0..batch_elements {
+                let x_row = &x_data[b * in_features..(b + 1) * in_features];
+                let out_chunk = &mut output[b * out_features..(b + 1) * out_features];
+                out_chunk.par_iter_mut().enumerate().for_each(|(o, out)| {
+                    let w_row = &w_slice[o * in_features..(o + 1) * in_features];
+                    *out = x_row.iter().zip(w_row.iter())
+                        .map(|(&xi, &wi)| xi * wi)
+                        .sum::<f32>();
+                });
+            }
+        } else {
+            // Prefill path: M>4.
+            // matrixmultiply sgemm: AVX2 cache-tiled, single-threaded but
+            // much better cache utilization than rayon for large M.
+            let m = batch_elements;
+            let k = in_features;
+            let n = out_features;
+            unsafe {
+                matrixmultiply::sgemm(
+                    m, k, n,
+                    1.0,
+                    x_data.as_ptr(), k as isize, 1,
+                    w_slice.as_ptr(), 1, k as isize,
+                    0.0,
+                    output.as_mut_ptr(), n as isize, 1,
+                );
+            }
         }
 
         let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();

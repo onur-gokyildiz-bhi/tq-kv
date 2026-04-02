@@ -4,7 +4,6 @@
 //! CPU path uses rayon for parallel matmul.
 
 use super::{TqTensor, Result, tq_bail};
-use rayon::prelude::*;
 
 /// Tensor operation implementations.
 pub struct TqOps;
@@ -45,29 +44,27 @@ impl TqOps {
         let a_batch_size: usize = a_batch.iter().product();
         let b_batch_size: usize = b_batch.iter().product();
 
-        // Parallel matmul: each output row computed independently via rayon.
-        // For 7B model decode: M=1, K=3584, N=3584 — row parallelism over N.
-        // For prefill: M=seq_len, batch parallelism over M rows.
-        let result: Vec<f32> = (0..batch_size)
-            .into_par_iter()
-            .flat_map(|batch| {
-                let a_batch_idx = if a_batch_size == 1 { 0 } else { batch };
-                let b_batch_idx = if b_batch_size == 1 { 0 } else { batch };
-                let a_off = a_batch_idx * a_batch_stride;
-                let b_off = b_batch_idx * b_batch_stride;
+        // BLAS-quality matmul via matrixmultiply crate (AVX2 micro-kernels).
+        let mut result = vec![0.0f32; batch_size * m * n];
 
-                (0..m).into_par_iter().flat_map(move |i| {
-                    let a_row = &a_data[a_off + i * k..a_off + (i + 1) * k];
-                    (0..n).map(move |j| {
-                        let mut sum = 0.0f32;
-                        for p in 0..k {
-                            sum += a_row[p] * b_data[b_off + p * n + j];
-                        }
-                        sum
-                    }).collect::<Vec<f32>>()
-                }).collect::<Vec<f32>>()
-            })
-            .collect();
+        for batch in 0..batch_size {
+            let a_batch_idx = if a_batch_size == 1 { 0 } else { batch };
+            let b_batch_idx = if b_batch_size == 1 { 0 } else { batch };
+            let a_off = a_batch_idx * a_batch_stride;
+            let b_off = b_batch_idx * b_batch_stride;
+            let c_off = batch * c_batch_stride;
+
+            unsafe {
+                matrixmultiply::sgemm(
+                    m, k, n,
+                    1.0,
+                    a_data[a_off..].as_ptr(), k as isize, 1,   // A [M,K] row-major
+                    b_data[b_off..].as_ptr(), n as isize, 1,    // B [K,N] row-major
+                    0.0,
+                    result[c_off..].as_mut_ptr(), n as isize, 1, // C [M,N] row-major
+                );
+            }
+        }
 
         let mut out_shape = batch_dims;
         out_shape.push(m);

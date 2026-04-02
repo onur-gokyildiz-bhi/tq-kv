@@ -31,6 +31,7 @@ dirs = "5"
 ureq = { version = "2", features = ["json"] }
 tracing = "0.1"
 rayon = "1.10"
+matrixmultiply = "0.3"
 uuid = { version = "1", features = ["v4"] }
 safetensors = "0.4"
 
