@@ -375,6 +375,7 @@ impl Engine {
 
         let logits = extract_last_logits(&logits)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
+
         let mut next_token = sampler.sample(&logits)
             .map_err(|e| anyhow::anyhow!("Sampling error: {}", e))?;
 
@@ -403,7 +404,6 @@ impl Engine {
 
             let logits = extract_last_logits(&logits)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-
             // Apply repetition penalty
             let logits = if params.repeat_penalty != 1.0 && !all_tokens.is_empty() {
                 let mut logits_vec = logits.to_vec1()
