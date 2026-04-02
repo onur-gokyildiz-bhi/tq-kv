@@ -15,7 +15,7 @@ Benchmark: `benchmarks/full_comparison.py` (10 tests, 8192 vectors, d=128)
 | V compression quality | 40.3 dB (V8) | 20.4 dB (turbo4) | **tq-kv** |
 | Real model PPL (GGUF) | +3.7% | +6.64% | **tq-kv** |
 | Model validation breadth | 0.5B-72B, 2 models | 1.5B-122B, 7+ models | **tq+** |
-| Platform (GPU) | CUDA only | Metal only | Tie (different) |
+| Platform (GPU) | CUDA + CPU (native) | Metal + CUDA (via llama.cpp) | **tq+** (broader) |
 | Production readiness | Research prototype | Production-tested | **tq+** |
 | Test coverage | 156 tests | 511+ tests | **tq+** |
 | Unique innovations | 7 | 3 | **tq-kv** |
@@ -145,16 +145,18 @@ turboquant_plus **7+ gerçek model** üzerinde validated:
 V compression'da turboquant_plus daha agresif ve daha iyi ratio/quality dengesi sunuyor.
 Onların TurboQuant-MSE V sıkıştırması, bizim basit absmax'tan algoritmik olarak üstün.
 
-### 3. Apple Metal GPU Support
+### 3. Multi-Platform GPU Support (Metal + CUDA)
 
-turboquant_plus Metal kernel'leri var:
+turboquant_plus llama.cpp fork olduğu için hem Metal hem CUDA backend'lerini miras alıyor.
+Ayrıca custom Metal kernel'leri var:
 - SET_ROWS (quantize), dequantize (centroid lookup + WHT)
 - 4-Magnitude LUT (+38-45% decode at long context)
 - Pre-Rotate-Queries (graph-level WHT amortization)
 - M5 Max'te turbo3 = **77.7 tok/s** generation
 
-**tq-kv:** Sadece CUDA. Mac kullanıcıları CPU'da kalır.
-Apple Silicon pazar payı göz ardı edilemez (özellikle developer market).
+**tq-kv:** Native CUDA kernel'leri (34 custom). Metal henüz yok.
+llama.cpp kullanıcıları C FFI plugin ile Metal'de de faydalanabilir, ama
+native Metal kernel'leri yazılmadı.
 
 ### 4. Test Coverage — 511+ vs 86
 
@@ -270,13 +272,13 @@ Bu bug'lar binlerce saat debug'dan geldi. tq-kv henüz production'a çıkmadı.
 2. **CUDA kernels uncompiled** — PTX not yet built (nvcc not triggered in CI)
 3. **No end-to-end GPU benchmark** — 28 tok/s is theoretical
 4. **llama.cpp incompatible** — Standalone engine, adoption barrier
-5. **No Metal support** — macOS market excluded
+5. **No native Metal kernels** — Mac GPU via C FFI only (CPU-side compression)
 6. **Single developer** — Bus factor 1
 
 ### turboquant_plus Risks
 1. **K at q8_0 only** — 2x compression ceiling for keys
 2. **Dense QJL dropped** — No QJL at all, leaving +0.8 dB on the table
-3. **Metal-only GPU** — NVIDIA users excluded
+3. **llama.cpp fork dependency** — upstream merge conflicts, fork maintenance
 4. **No compaction** — Token count grows linearly forever
 5. **Python core** — Performance ceiling for serving
 6. **llama.cpp fork** — Upstream merge conflicts
@@ -290,8 +292,8 @@ Bu bug'lar binlerce saat debug'dan geldi. tq-kv henüz production'a çıkmadı.
 1. **Gerçek model PPL** — Qwen 72B, Llama 70B, Command-R+ 104B üzerinde test
 2. **End-to-end GPU benchmark** — nvcc ile PTX build, gerçek tok/s ölçümü
 3. **V compression upgrade** — PolarQuant-MSE V (turboquant_plus'tan öğren)
-4. **Metal backend** — Apple Silicon kullanıcıları için cudarc alternatifi
-5. **llama.cpp bridge** — FFI C API ile entegrasyon veya GGML backend
+4. **Metal kernel'ler** — Apple Silicon için native GPU kernel'leri
+5. **llama.cpp entegrasyon guide** — C FFI plugin kullanım dokümanı
 
 ### turboquant_plus'tan Öğrenilecekler
 
