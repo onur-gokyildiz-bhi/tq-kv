@@ -17,7 +17,7 @@ Benchmark: `benchmarks/full_comparison.py` (10 tests, 8192 vectors, d=128)
 | Model validation breadth | 0.5B-72B, 2 models | 1.5B-122B, 7+ models | **tq+** |
 | Platform (GPU) | CUDA only | Metal only | Tie (different) |
 | Production readiness | Research prototype | Production-tested | **tq+** |
-| Test coverage | 86 tests | 511+ tests | **tq+** |
+| Test coverage | 156 tests | 511+ tests | **tq+** |
 | Unique innovations | 7 | 3 | **tq-kv** |
 | llama.cpp integration | No | Yes (fork) | **tq+** |
 | Community traction | New | 4,785 stars | **tq+** |
@@ -160,11 +160,11 @@ Apple Silicon pazar payı göz ardı edilemez (özellikle developer market).
 
 | Dimension | tq+ | tq-kv |
 |:----------|----:|------:|
-| Unit tests | 200+ | 77 |
+| Unit tests | 200+ | 134 |
 | Integration tests | 100+ | 9 |
 | Hardware simulation | 151K LOC | - |
-| Diagnostic tests | 21K LOC | - |
-| **Total** | **511+** | **86** |
+| Diagnostic tests | 21K LOC | 13 |
+| **Total** | **511+** | **156** |
 
 turboquant_plus'ın test altyapısı çok daha olgun. Özellikle `test_hw_replay.py` (21K LOC)
 ve `test_turbo_hardware_diag.py` (151K LOC) Metal kernel doğrulaması yapıyor.

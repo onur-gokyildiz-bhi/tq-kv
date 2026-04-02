@@ -458,7 +458,7 @@ def test_feature_matrix():
         ("Non-integer bits (2.5/3.5)", "Per-head mix", "OutlierQuant"),
         ("Platform", "CUDA + CPU", "Metal + CPU"),
         ("Language", "Rust (13.7K LOC)", "Python + C (Metal)"),
-        ("Tests", "86 tests", "511+ tests"),
+        ("Tests", "156 tests", "511+ tests"),
         ("Real model PPL (Q4_K_M 7B)", "+3.7% (Pre-RoPE)", "+6.64% (q8_0 K)"),
     ]
 
