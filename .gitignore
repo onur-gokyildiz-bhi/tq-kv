@@ -16,3 +16,7 @@ TODOS.md
 CLAUDE.md
 *.ps1
 build_test_ffi.bat
+
+# Codescope (graph-rag)
+.mcp.json
+.graph-rag/
