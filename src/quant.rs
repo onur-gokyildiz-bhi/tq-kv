@@ -5,6 +5,10 @@
 
 use crate::gguf::{GgmlDType, f16_to_f32};
 
+/// Global TQ4_1S rotation seed. Set from GGUF metadata "tq.weight_compress_seed"
+/// at model load time. Default: 42.
+pub static TQ4_1S_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(42);
+
 // ─── Q8_0: 34 bytes → 32 f32 values ──────────────────────────
 
 /// Dequantize Q8_0 blocks: [f16 d][i8 x 32] → f32.
@@ -233,7 +237,10 @@ pub fn dequantize(data: &[u8], dtype: GgmlDType, n_elements: usize) -> Vec<f32> 
         GgmlDType::Q6K => dequantize_q6k(data, n_elements),
         GgmlDType::TQ4_1S => {
             let blocks = tq_kv::weight_compress::bytes_to_blocks(data);
-            tq_kv::weight_compress::decompress_weights(&blocks, n_elements, 42) // seed=42 default
+            // Seed is stored in GGUF metadata "tq.weight_compress_seed".
+            // Default 42 matches compress_weights() default. Caller must ensure
+            // seed consistency — dequantize_tq4_1s() provides seeded variant.
+            tq_kv::weight_compress::decompress_weights(&blocks, n_elements, TQ4_1S_SEED.load(std::sync::atomic::Ordering::Relaxed))
         }
         _ => {
             eprintln!("WARNING: unsupported dequant for {:?}, returning zeros", dtype);

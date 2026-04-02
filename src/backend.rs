@@ -195,12 +195,18 @@ impl ComputeBackend for CpuBackend {
     }
 
     fn silu(&self, x: &[f32]) -> Vec<f32> {
-        x.iter().map(|&v| v / (1.0 + (-v).exp())).collect()
+        x.iter().map(|&v| {
+            let clamped = v.clamp(-20.0, 20.0); // avoid exp overflow
+            clamped / (1.0 + (-clamped).exp())
+        }).collect()
     }
 
     fn fused_silu_mul(&self, gate: &[f32], up: &[f32]) -> Vec<f32> {
         gate.iter().zip(up.iter())
-            .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+            .map(|(&g, &u)| {
+                let gc = g.clamp(-20.0, 20.0);
+                (gc / (1.0 + (-gc).exp())) * u
+            })
             .collect()
     }
 
@@ -289,10 +295,6 @@ pub struct CudaBackend {
     /// Keyed by raw pointer address of the source &[f32] slice.
     /// Safe because weight slices live in Tensor (stable Vec<f32> allocation).
     weight_cache: std::sync::Mutex<std::collections::HashMap<usize, cudarc::driver::CudaSlice<f32>>>,
-    /// Reusable GPU scratch buffers to avoid per-call cudaMalloc.
-    /// Grows on demand, never shrinks. Protected by mutex for Send+Sync.
-    scratch_input: std::sync::Mutex<Option<cudarc::driver::CudaSlice<f32>>>,
-    scratch_output: std::sync::Mutex<Option<cudarc::driver::CudaSlice<f32>>>,
     cpu: CpuBackend,
 }
 
@@ -308,8 +310,6 @@ impl CudaBackend {
         Ok(Self {
             stream, registry, cpu: CpuBackend::new(),
             weight_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
-            scratch_input: std::sync::Mutex::new(None),
-            scratch_output: std::sync::Mutex::new(None),
         })
     }
 
@@ -342,53 +342,6 @@ impl CudaBackend {
         let _ = self.cached_weight(data);
     }
 
-    /// Get a scratch input buffer of at least `n` f32 elements.
-    /// Reuses existing buffer if large enough, otherwise allocates a new one.
-    #[allow(dead_code)]
-    fn scratch_in(&self, n: usize) -> Option<cudarc::driver::CudaSlice<f32>> {
-        let mut guard = self.scratch_input.lock().unwrap();
-        if let Some(ref buf) = *guard {
-            if buf.len() >= n {
-                // Reuse existing buffer (may be larger than needed — that's fine)
-                return Some(buf.clone());
-            }
-        }
-        // Allocate new (larger) buffer
-        match self.stream.alloc_zeros::<f32>(n) {
-            Ok(buf) => {
-                let result = buf.clone();
-                *guard = Some(buf);
-                Some(result)
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// Get a scratch output buffer of at least `n` f32 elements.
-    #[allow(dead_code)]
-    fn scratch_out(&self, n: usize) -> Option<cudarc::driver::CudaSlice<f32>> {
-        let mut guard = self.scratch_output.lock().unwrap();
-        if let Some(ref buf) = *guard {
-            if buf.len() >= n {
-                return Some(buf.clone());
-            }
-        }
-        match self.stream.alloc_zeros::<f32>(n) {
-            Ok(buf) => {
-                let result = buf.clone();
-                *guard = Some(buf);
-                Some(result)
-            }
-            Err(_) => None,
-        }
-    }
-
-    /// Upload f32 data to a scratch GPU buffer. Avoids per-call cudaMalloc.
-    /// TODO: wire into ops when cudarc memcpy-into-existing is available.
-    #[allow(dead_code)]
-    fn upload_scratch(&self, data: &[f32]) -> Option<cudarc::driver::CudaSlice<f32>> {
-        self.stream.clone_htod(data).ok()
-    }
 }
 
 #[cfg(feature = "cuda")]
@@ -440,8 +393,28 @@ impl ComputeBackend for CudaBackend {
     }
 
     fn matmul(&self, x: &[f32], w: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-        // cuBLAS disabled pending validation — CPU fallback
-        self.cpu.matmul(x, w, m, k, n)
+        if m * k < 1024 {
+            return self.cpu.matmul(x, w, m, k, n);
+        }
+        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+        use cudarc::cublas::sys::cublasOperation_t;
+
+        let x_gpu = match self.stream.clone_htod(x) { Ok(v) => v, Err(_) => return self.cpu.matmul(x, w, m, k, n) };
+        let w_gpu = match self.cached_weight(w) { Some(v) => v, None => return self.cpu.matmul(x, w, m, k, n) };
+        let mut out_gpu = match self.stream.alloc_zeros::<f32>(m * n) { Ok(v) => v, Err(_) => return self.cpu.matmul(x, w, m, k, n) };
+        let blas = match CudaBlas::new(self.stream.clone()) { Ok(v) => v, Err(_) => return self.cpu.matmul(x, w, m, k, n) };
+
+        // x @ W^T: x[m,k], W[n,k] → C[m,n]. cuBLAS col-major: C^T[n,m] = W @ x^T
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_T,
+            m: n as i32, n: m as i32, k: k as i32,
+            alpha: 1.0f32, lda: k as i32, ldb: k as i32, beta: 0.0f32, ldc: n as i32,
+        };
+        if unsafe { blas.gemm(cfg, &w_gpu, &x_gpu, &mut out_gpu) }.is_err() {
+            return self.cpu.matmul(x, w, m, k, n);
+        }
+        self.stream.clone_dtoh(&out_gpu).unwrap_or_else(|_| self.cpu.matmul(x, w, m, k, n))
     }
 
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, n_tokens: usize, hidden: usize) -> Vec<f32> {

@@ -9,7 +9,7 @@
 //!
 //! Pipeline: dequant → normalize per-block → sign flip → WHT → 4-bit quantize → pack
 
-use crate::codebook::{Codebook, CENTROIDS_4BIT};
+use crate::codebook::Codebook;
 use crate::hadamard::{fast_wht, inverse_wht, random_sign_flip, generate_signs};
 
 /// Block size for weight compression (must be power of 2 for WHT).
@@ -55,15 +55,19 @@ pub fn compress_weights(
         let mut block = [0.0f32; WC_BLOCK_SIZE];
         block[..actual_len].copy_from_slice(&weights[start..end]);
 
-        // Compute block statistics
-        let mean: f32 = block.iter().sum::<f32>() / WC_BLOCK_SIZE as f32;
-        let rms: f32 = block.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>()
-            / WC_BLOCK_SIZE as f32;
+        // Compute block statistics over ACTUAL elements only (not zero padding)
+        let mean: f32 = block[..actual_len].iter().sum::<f32>() / actual_len as f32;
+        let rms: f32 = block[..actual_len].iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>()
+            / actual_len as f32;
         let scale = rms.sqrt().max(1e-10);
 
-        // Normalize: subtract mean, divide by scale
-        for v in block.iter_mut() {
+        // Normalize: subtract mean, divide by scale (padding stays zero → mean-shifted)
+        for v in block[..actual_len].iter_mut() {
             *v = (*v - mean) / scale;
+        }
+        // Zero-padded elements: set to 0 (neutral after WHT for unused positions)
+        for v in block[actual_len..].iter_mut() {
+            *v = 0.0;
         }
 
         // Random sign flip + WHT rotation
@@ -189,21 +193,25 @@ fn f32_to_f16_bits(val: f32) -> u16 {
     let exp = ((bits >> 23) & 0xFF) as i32;
     let frac = bits & 0x7FFFFF;
 
-    if exp == 0 {
-        // Zero or denorm → f16 zero
-        return sign as u16;
-    }
     if exp == 0xFF {
         // Inf or NaN
         return (sign | 0x7C00 | if frac != 0 { 0x200 } else { 0 }) as u16;
     }
 
+    // Reconstruct f32 value for subnormal handling
     let new_exp = exp - 127 + 15;
+
     if new_exp >= 31 {
         return (sign | 0x7C00) as u16; // overflow → inf
     }
     if new_exp <= 0 {
-        return sign as u16; // underflow → zero
+        // f16 subnormal range or underflow
+        if new_exp < -10 {
+            return sign as u16; // too small → zero
+        }
+        // Subnormal f16: shift mantissa with implicit leading 1
+        let mant = (frac | 0x800000) >> (1 - new_exp + 13);
+        return (sign | mant) as u16;
     }
 
     (sign | ((new_exp as u32) << 10) | (frac >> 13)) as u16

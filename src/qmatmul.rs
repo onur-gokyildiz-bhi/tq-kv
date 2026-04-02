@@ -109,11 +109,18 @@ impl QWeight {
 
     /// Get or initialize GPU cache of raw quantized bytes.
     /// Returns a reference to the CudaSlice<u8> for kernel launch.
+    /// Returns the cached slice, or uploads on first call. Panics on OOM are
+    /// avoided by returning a fallback empty slice on upload failure.
     #[cfg(feature = "cuda")]
     pub fn gpu_cache_or_upload(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> &CudaSlice<u8> {
         self.gpu_cache.get_or_init(|| {
-            stream.clone_htod(&self.raw_data)
-                .expect("QWeight GPU upload failed")
+            match stream.clone_htod(&self.raw_data) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("WARNING: QWeight GPU upload failed ({}), using empty placeholder", e);
+                    stream.alloc_zeros::<u8>(1).expect("cannot alloc 1 byte on GPU")
+                }
+            }
         })
     }
 

@@ -44,7 +44,9 @@ impl KernelRegistry {
     fn load_all_ptx(&mut self) -> Result<(), DriverError> {
         let ptx_sources: &[(&str, &str)] = &[
             ("elementwise", PTX_ELEMENTWISE),
-            ("flash_attention", PTX_FLASH_ATTENTION),
+            // flash_attention: compiled but not yet integrated into inference pipeline.
+            // Skipped to avoid PTX JIT warnings. Enable when flash attention dispatch is wired.
+            // ("flash_attention", PTX_FLASH_ATTENTION),
             ("fused_attention", PTX_FUSED_ATTENTION),
             ("fused_mlp", PTX_FUSED_MLP),
             ("fused_norm", PTX_FUSED_NORM),
@@ -102,7 +104,9 @@ pub fn launch_1d(n: usize) -> LaunchConfig {
 }
 
 /// 1D launch: 1 block per row, block_size threads.
+/// block_size must be a multiple of 32 (warp size) for correct warp shuffle.
 pub fn launch_per_row(n_rows: usize, block_size: usize) -> LaunchConfig {
+    debug_assert!(block_size % 32 == 0, "block_size must be multiple of 32, got {}", block_size);
     LaunchConfig {
         grid_dim: (n_rows as u32, 1, 1),
         block_dim: (block_size as u32, 1, 1),

@@ -470,7 +470,7 @@ impl Engine {
     ///
     /// Token-by-token evaluation: at each position, the model predicts the next token.
     /// PPL = exp(average negative log-likelihood).
-    pub fn compute_perplexity(&mut self, text: &str, _stride: usize) -> Result<f64> {
+    pub fn compute_perplexity(&mut self, text: &str) -> Result<f64> {
         let encoding = self.tokenizer
             .encode(text, false)
             .map_err(|e| anyhow::anyhow!("Tokenize error: {}", e))?;

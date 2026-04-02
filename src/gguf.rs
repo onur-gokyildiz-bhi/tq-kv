@@ -37,7 +37,8 @@ pub enum GgmlDType {
     BF16 = 30,
     /// TQ4_1S: TurboQuant 4-bit weight compression (WHT + 16 Lloyd-Max centroids).
     /// 32 elements → 20 bytes (5.0 BPW). Custom type, not in upstream GGML.
-    TQ4_1S = 1024,
+    /// Uses high range (50000+) to avoid collision with future GGML type IDs.
+    TQ4_1S = 50001,
 }
 
 impl GgmlDType {
@@ -58,7 +59,7 @@ impl GgmlDType {
             14 => Ok(GgmlDType::Q6K),
             15 => Ok(GgmlDType::Q8K),
             30 => Ok(GgmlDType::BF16),
-            1024 => Ok(GgmlDType::TQ4_1S),
+            50001 => Ok(GgmlDType::TQ4_1S),
             _ => Err(TqError::Msg(format!("unknown GGML dtype: {}", v))),
         }
     }

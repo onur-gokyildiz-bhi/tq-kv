@@ -797,7 +797,7 @@ fn cmd_ablate_study(cli: &Cli) -> Result<()> {
         eprintln!("\n--- Baseline (no compression) ---");
         let start = Instant::now();
         let mut engine = Engine::load_with_device(&gguf_path, &tok_path, arch, None, cli.cpu)?;
-        let ppl = engine.compute_perplexity(&eval_text, 512)?;
+        let ppl = engine.compute_perplexity(&eval_text)?;
         let elapsed = start.elapsed().as_secs_f64();
         eprintln!("  PPL: {:.3} ({:.1}s)", ppl, elapsed);
         results.push(("baseline".to_string(), ppl, elapsed));
@@ -836,7 +836,7 @@ fn cmd_ablate_study(cli: &Cli) -> Result<()> {
                     let mut engine = Engine::load_with_device(
                         &gguf_path, &tok_path, arch, Some(tq), cli.cpu,
                     )?;
-                    let ppl = engine.compute_perplexity(&eval_text, 512)?;
+                    let ppl = engine.compute_perplexity(&eval_text)?;
                     let elapsed = start.elapsed().as_secs_f64();
                     let delta = (ppl - baseline_ppl) / baseline_ppl * 100.0;
                     eprintln!("  PPL: {:.3} (delta: {:+.2}%, {:.1}s)", ppl, delta, elapsed);
@@ -877,13 +877,13 @@ fn cmd_ablate_study(cli: &Cli) -> Result<()> {
 }
 
 fn cmd_perplexity(cli: &Cli) -> Result<()> {
-    let (model_name, model_path_override, tokenizer_repo_override, file, chunk, turbo_quant) =
+    let (model_name, model_path_override, tokenizer_repo_override, file, turbo_quant) =
         match &cli.command {
             Some(Commands::Perplexity {
-                model, model_path, tokenizer_repo, file, chunk, turbo_quant,
+                model, model_path, tokenizer_repo, file, turbo_quant, ..
             }) => (
                 model.as_str(), model_path.as_deref(), tokenizer_repo.as_deref(),
-                file, *chunk, *turbo_quant,
+                file, *turbo_quant,
             ),
             _ => unreachable!(),
         };
@@ -927,7 +927,7 @@ fn cmd_perplexity(cli: &Cli) -> Result<()> {
 
     let text = std::fs::read_to_string(file)
         .with_context(|| format!("Cannot read perplexity file: {}", file.display()))?;
-    let ppl = engine.compute_perplexity(&text, chunk)?;
+    let ppl = engine.compute_perplexity(&text)?;
     println!("Perplexity: {:.3}", ppl);
     Ok(())
 }

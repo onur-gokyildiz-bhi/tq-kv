@@ -3,7 +3,9 @@
 //! Detects CUDA_PATH, compiles kernels/*.cu → PTX, generates src/cuda/ptx.rs
 //! with embedded PTX strings. Feature-gated: only runs with `--features cuda`.
 
+#[cfg(feature = "cuda")]
 use std::env;
+#[cfg(feature = "cuda")]
 use std::path::{Path, PathBuf};
 
 fn main() {
