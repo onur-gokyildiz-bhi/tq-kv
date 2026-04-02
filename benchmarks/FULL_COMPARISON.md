@@ -19,7 +19,7 @@ Benchmark: `benchmarks/full_comparison.py` (10 tests, 8192 vectors, d=128)
 | Production readiness | Research prototype | Production-tested | **tq+** |
 | Test coverage | 156 tests | 511+ tests | **tq+** |
 | Unique innovations | 7 | 3 | **tq-kv** |
-| llama.cpp integration | No | Yes (fork) | **tq+** |
+| llama.cpp integration | C FFI plugin (libtq_kv.a) | Fork | Different approach |
 | Community traction | New | 4,785 stars | **tq+** |
 
 *Dense QJL; their PolarQuant-only (no QJL) is 19.3 dB — close to ours.
@@ -169,16 +169,37 @@ Apple Silicon pazar payı göz ardı edilemez (özellikle developer market).
 turboquant_plus'ın test altyapısı çok daha olgun. Özellikle `test_hw_replay.py` (21K LOC)
 ve `test_turbo_hardware_diag.py` (151K LOC) Metal kernel doğrulaması yapıyor.
 
-### 5. llama.cpp Integration
+### 5. llama.cpp Approach
 
 turboquant_plus doğrudan llama.cpp fork'u:
 - `-ctk turbo3 -ctv turbo3` CLI flags
 - llama-server API üzerinden benchmark
 - Hybrid memory contexts (MoE)
 - GQA head concatenation handling
+- Dezavantaj: upstream merge conflicts, fork maintenance
 
-**tq-kv:** Bağımsız engine. llama.cpp entegrasyonu yok.
-Kullanıcıların mevcut toolchain'ini bırakmaları gerekiyor.
+**tq-kv:** İki yaklaşım sunuyor:
+1. **Bağımsız engine** — llama.cpp'nin yerini alan kendi runtime'ı
+2. **C FFI plugin** (`libtq_kv.a` + `tq_kv.h`) — llama.cpp'ye patch olarak eklenebilir
+
+FFI API (15 fonksiyon):
+```c
+// Single-head API
+TqContext *tq_init(bits, head_dim, seed);
+tq_compress_and_append(ctx, key_data, len);
+tq_fused_attention(ctx, query, len, scores_out, scale);
+tq_cached_count(ctx); tq_memory_bytes(ctx); tq_clear(ctx); tq_free(ctx);
+
+// Multi-head (layer) API — llama.cpp convenience
+TqLayerContext *tq_layer_init(bits, n_kv_heads, head_dim, seed);
+tq_layer_compress_and_append(ctx, key_data, len);
+tq_layer_fused_attention(ctx, kv_head_idx, query, len, scores_out, scale);
+tq_layer_cached_count(ctx); tq_layer_memory_bytes(ctx);
+tq_layer_clear(ctx); tq_layer_free(ctx);
+```
+
+Kullanıcılar mevcut llama.cpp'yi fork'lamadan, sadece `libtq_kv.a` linkleyerek
+KV cache compression ekleyebilir. Fork'a göre avantajı: upstream güncellemeler bozulmaz.
 
 ### 6. Speed Benchmarks — Validated Real Numbers
 

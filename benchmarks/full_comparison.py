@@ -456,6 +456,7 @@ def test_feature_matrix():
         ("CUDA Graph capture", "YES (2.3x)", "N/A"),
         ("Paged KV cache", "YES", "No"),
         ("Non-integer bits (2.5/3.5)", "Per-head mix", "OutlierQuant"),
+        ("llama.cpp approach", "C FFI plugin (15 fn)", "Fork (merge conflicts)"),
         ("Platform", "CUDA + CPU", "Metal + CPU"),
         ("Language", "Rust (13.7K LOC)", "Python + C (Metal)"),
         ("Tests", "156 tests", "511+ tests"),
