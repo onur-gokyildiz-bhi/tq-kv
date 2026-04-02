@@ -218,6 +218,7 @@ Fix 3: Cache reset per conversation         -> prevents cross-contamination
 | Variable | Default | Description |
 |:---------|:-------:|:------------|
 | `TQ_SKIP` | 4 | Initial layers kept uncompressed (fp16 KV) |
+| `TQ_PROTECT_LAST` | 0 | Final layers kept uncompressed (boundary protection) |
 | `TQ_SINK` | 4 | Initial tokens preserved at fp16 (attention sinks) |
 | `TQ_PRE_ROPE` | 0 | Pre-RoPE key quantization (1=enabled, best quality) |
 | `TQ_COMPACT` | 0 | Compaction threshold (0=off, e.g. 500=compact when >500 hot tokens) |

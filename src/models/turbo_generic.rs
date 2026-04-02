@@ -472,6 +472,21 @@ fn get_skip_layers(config: &tq_kv::TurboQuantConfig) -> usize {
         .unwrap_or(TQ_SKIP_FIRST_LAYERS)
 }
 
+/// Number of final layers to keep uncompressed (fp16 KV cache).
+/// turboquant_plus found last layers are disproportionately sensitive to
+/// quantization: last 8 layers account for ALL quality loss on some models.
+/// Boundary protection (first N + last M) recovers 37-91% of quality gap.
+/// Override with TQ_PROTECT_LAST env var (e.g. TQ_PROTECT_LAST=2).
+fn get_protect_last_layers(config: &tq_kv::TurboQuantConfig) -> usize {
+    if let Some(n) = config.protect_last_layers {
+        return n;
+    }
+    std::env::var("TQ_PROTECT_LAST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Parsed layer bit ranges, cached at first use.
 static LAYER_BITS_CACHE: std::sync::OnceLock<Vec<(usize, usize, u8)>> = std::sync::OnceLock::new();
 
@@ -501,12 +516,18 @@ fn parse_layer_bits() -> &'static Vec<(usize, usize, u8)> {
 
 /// Layer-adaptive bitwidth: assign different bit widths to different layer ranges.
 /// Format: "start-end:bits[,start-end:bits]" e.g. "4-15:2,16-27:4"
-/// Unspecified layers use the default TQ bits. Layers below TQ_SKIP are uncompressed.
+/// Unspecified layers use the default TQ bits. Layers below TQ_SKIP or within
+/// TQ_PROTECT_LAST of the final layer are uncompressed (fp16).
 /// Override with TQ_LAYER_BITS env var.
-fn get_layer_bits(layer_idx: usize, default_bits: u8, config: &tq_kv::TurboQuantConfig) -> Option<u8> {
+fn get_layer_bits(layer_idx: usize, default_bits: u8, config: &tq_kv::TurboQuantConfig, n_layers: usize) -> Option<u8> {
     let skip = get_skip_layers(config);
     if layer_idx < skip {
-        return None; // uncompressed
+        return None; // uncompressed — boundary protection (first N)
+    }
+
+    let protect_last = get_protect_last_layers(config);
+    if protect_last > 0 && n_layers > 0 && layer_idx >= n_layers - protect_last {
+        return None; // uncompressed — boundary protection (last M)
     }
 
     let ranges = parse_layer_bits();
@@ -727,6 +748,8 @@ struct LayerWeights {
     neg_inf: Tensor,
     /// Layer index (0-based) — used for selective compression
     layer_idx: usize,
+    /// Total number of layers — needed for boundary protection (TQ_PROTECT_LAST)
+    n_layers: usize,
     /// Standard KV cache for uncompressed layers
     kv_cache: Option<(Tensor, Tensor)>,
     kv_compressed: Option<CompressedKvCache>,
@@ -834,7 +857,7 @@ impl LayerWeights {
 
         // Selective compression: first TQ_SKIP_FIRST_LAYERS use standard fp16 KV cache,
         // remaining layers use TurboQuant compression.
-        let layer_bits = get_layer_bits(self.layer_idx, self.tq_config.bits, &self.tq_config);
+        let layer_bits = get_layer_bits(self.layer_idx, self.tq_config.bits, &self.tq_config, self.n_layers);
         let use_compression = layer_bits.is_some();
         let n_rep = self.n_head / self.n_kv_head;
 
@@ -1772,10 +1795,18 @@ impl GenericTurboModel {
             if n_expert > 1 { format!("{}of{}", n_expert_used, n_expert) } else { "no".into() },
             tq_config.bits,
         );
+        let protect_last = get_protect_last_layers(&tq_config);
+        let skip_first = get_skip_layers(&tq_config);
         eprintln!(
             "  qkv={}, mlp={}, post_attn_norm={}, post_ffn_norm={}",
             qkv_style, mlp_style, has_post_attn_norm, has_post_ffn_norm,
         );
+        if protect_last > 0 {
+            eprintln!(
+                "  boundary protection: first {} + last {} layers uncompressed ({} compressed)",
+                skip_first, protect_last, block_count.saturating_sub(skip_first + protect_last),
+            );
+        }
 
         // Pre-compute shared state
         let signs = tq_kv::hadamard::generate_signs(padded_head_dim, tq_config.rotation_seed);
@@ -1911,6 +1942,7 @@ impl GenericTurboModel {
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
                 layer_idx,
+                n_layers: block_count,
                 kv_cache: None,
                 kv_compressed: None,
                 tq_config: tq_config.clone(),
@@ -2155,6 +2187,7 @@ impl GenericTurboModel {
                 post_attention_norm: post_attn_norm,
                 post_ffn_norm,
                 layer_idx: i,
+                n_layers: block_count,
                 kv_cache: None,
                 kv_compressed: None,
                 tq_config: tq_config.clone(),

@@ -3,6 +3,11 @@ mod calibrate;
 mod catalog;
 mod chat;
 mod config;
+pub mod cuda;
+pub mod gguf;
+pub mod quant;
+pub mod qmatmul;
+pub mod sampling;
 mod diagnostics;
 mod download;
 mod engine;
@@ -288,7 +293,7 @@ fn resolve_tq_config_with_auto(
         return None;
     }
 
-    let device = match candle_core::Device::cuda_if_available(0) {
+    let device = match crate::cuda::TqDevice::cuda_if_available(0).map_err(|e| anyhow::anyhow!("{}", e)) {
         Ok(dev) if dev.is_cuda() => dev,
         _ => return None,
     };
@@ -576,7 +581,7 @@ fn cmd_doctor() -> Result<()> {
 
     // CUDA
     println!("\nGPU:");
-    match candle_core::Device::cuda_if_available(0) {
+    match crate::cuda::TqDevice::cuda_if_available(0).map_err(|e| anyhow::anyhow!("{}", e)) {
         Ok(dev) if dev.is_cuda() => println!("  CUDA:  yes (device 0)"),
         _ => println!("  CUDA:  no (CPU only)"),
     }
@@ -669,18 +674,18 @@ fn cmd_calibrate(cli: &Cli) -> Result<()> {
     // Determine head_dim from GGUF metadata
     let head_dim = {
         let mut file = std::fs::File::open(&gguf_path)?;
-        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+        let content = crate::gguf::GgufContent::read(&mut file)
             .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
-        let n_embd = content.metadata.get("llama.embedding_length")
-            .or_else(|| content.metadata.get("qwen2.embedding_length"))
-            .or_else(|| content.metadata.get("phi3.embedding_length"))
-            .or_else(|| content.metadata.get("gemma.embedding_length"))
+        let n_embd = content.get("llama.embedding_length")
+            .or_else(|| content.get("qwen2.embedding_length"))
+            .or_else(|| content.get("phi3.embedding_length"))
+            .or_else(|| content.get("gemma.embedding_length"))
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(4096) as usize;
-        let n_head = content.metadata.get("llama.attention.head_count")
-            .or_else(|| content.metadata.get("qwen2.attention.head_count"))
-            .or_else(|| content.metadata.get("phi3.attention.head_count"))
-            .or_else(|| content.metadata.get("gemma.attention.head_count"))
+        let n_head = content.get("llama.attention.head_count")
+            .or_else(|| content.get("qwen2.attention.head_count"))
+            .or_else(|| content.get("phi3.attention.head_count"))
+            .or_else(|| content.get("gemma.attention.head_count"))
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(32) as usize;
         n_embd / n_head

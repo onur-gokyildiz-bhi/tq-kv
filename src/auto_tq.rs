@@ -3,7 +3,7 @@
 //! When the user doesn't specify `--turbo-quant`, the system checks if the model
 //! fits in GPU VRAM and auto-enables compression if needed.
 
-use candle_core::Device;
+use crate::cuda::TqDevice as Device;
 
 /// Result of the auto-TQ decision.
 pub struct AutoTqResult {

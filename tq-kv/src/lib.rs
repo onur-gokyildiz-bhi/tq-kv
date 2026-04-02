@@ -149,6 +149,11 @@ pub struct TurboQuantConfig {
     /// Number of initial layers to skip (uncompressed fp16 KV cache).
     /// If None, falls back to TQ_SKIP env var (default: 4).
     pub skip_layers: Option<usize>,
+    /// Number of final layers to protect (uncompressed fp16 KV cache).
+    /// turboquant_plus found last layers are disproportionately sensitive:
+    /// last 8 layers account for ALL quality loss in their experiments.
+    /// If None, falls back to TQ_PROTECT_LAST env var (default: 0 = off).
+    pub protect_last_layers: Option<usize>,
     /// Number of sink tokens to preserve at full precision.
     /// If None, falls back to TQ_SINK env var (default: 4).
     pub sink_tokens: Option<usize>,
@@ -190,6 +195,7 @@ impl Default for TurboQuantConfig {
             rotation_matrix: None,
             key_channel_bias: None,
             skip_layers: None,
+            protect_last_layers: None,
             sink_tokens: None,
             per_head_bits: None,
             pre_rope: false,
