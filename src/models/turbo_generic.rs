@@ -45,6 +45,7 @@ impl Embedding {
     }
 
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        let shape = ids.shape().to_vec();
         let ids_flat = ids.to_vec1()?;
         let w = self.weight.as_slice();
         let n_tokens = ids_flat.len();
@@ -59,7 +60,10 @@ impl Embedding {
                 output.extend(std::iter::repeat(0.0f32).take(self.hidden_size));
             }
         }
-        Tensor::from_vec(output, vec![n_tokens, self.hidden_size], ids.device())
+        // Preserve input shape: [batch, seq_len] → [batch, seq_len, hidden_size]
+        let mut out_shape = shape;
+        out_shape.push(self.hidden_size);
+        Tensor::from_vec(output, out_shape, ids.device())
     }
 }
 
@@ -338,8 +342,11 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
 }
 
 fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Tensor> {
-    let shape = mask.shape();
-    mask.where_cond(&on_true.broadcast_as(shape)?, on_false)
+    // Expand on_true to match mask shape (handles scalar → N-D)
+    let n = mask.elem_count();
+    let val = on_true.to_vec1()?[0];
+    let expanded = Tensor::from_vec(vec![val; n], mask.shape().to_vec(), mask.device())?;
+    mask.where_cond(&expanded, on_false)
 }
 
 // ============================================================
@@ -1735,8 +1742,10 @@ impl LayerWeights {
                     let att = match mask {
                         None => att,
                         Some(mask) => {
-                            let mask = mask.broadcast_as(att.shape())?;
-                            masked_fill(&att, &mask, &self.neg_inf)?
+                            // mask is [seq, seq], att is [batch, heads, seq, seq]
+                            let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
+                            let mask4d = mask4d.broadcast_as(att.shape())?;
+                            masked_fill(&att, &mask4d, &self.neg_inf)?
                         }
                     };
                     let att = softmax_last_dim(&att)?;
@@ -1768,8 +1777,9 @@ impl LayerWeights {
             let att = match mask {
                 None => att,
                 Some(mask) => {
-                    let mask = mask.broadcast_as(att.shape())?;
-                    masked_fill(&att, &mask, &self.neg_inf)?
+                    let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
+                    let mask4d = mask4d.broadcast_as(att.shape())?;
+                    masked_fill(&att, &mask4d, &self.neg_inf)?
                 }
             };
             let att = softmax_last_dim(&att)?;
