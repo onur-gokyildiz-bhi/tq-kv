@@ -6,12 +6,10 @@
 //!
 //! Future: LoRA adapter support via `output = W*x + alpha * B*A*x`.
 
+use std::sync::OnceLock;
 use crate::cuda::{TqTensor, TqDevice, Result, TqError};
 use crate::gguf::GgmlDType;
 use crate::quant;
-
-#[cfg(feature = "cuda")]
-use std::sync::OnceLock;
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
 
@@ -26,6 +24,8 @@ pub struct QWeight {
     pub dtype: GgmlDType,
     /// Weight shape: (out_features, in_features) — row-major.
     pub shape: (usize, usize),
+    /// Lazily dequantized f32 weight (avoids re-dequant per forward).
+    cpu_cache: OnceLock<Vec<f32>>,
     /// Lazily uploaded GPU copy of raw_data (avoids re-upload per forward).
     #[cfg(feature = "cuda")]
     gpu_cache: OnceLock<CudaSlice<u8>>,
@@ -37,8 +37,9 @@ impl Clone for QWeight {
             raw_data: self.raw_data.clone(),
             dtype: self.dtype,
             shape: self.shape,
+            cpu_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
-            gpu_cache: OnceLock::new(), // fresh cache — will re-upload on first use
+            gpu_cache: OnceLock::new(),
         }
     }
 }
@@ -58,6 +59,7 @@ impl QWeight {
     pub fn new(raw_data: Vec<u8>, dtype: GgmlDType, shape: (usize, usize)) -> Self {
         Self {
             raw_data, dtype, shape,
+            cpu_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
             gpu_cache: OnceLock::new(),
         }
@@ -150,8 +152,14 @@ impl QMatMul {
         }
     }
 
-    /// CPU forward: dequantize weight, then naive matmul.
+    /// CPU forward: dequantize weight, then parallel matmul via rayon.
+    ///
+    /// For decode (batch=1): parallelizes over output rows (out_features).
+    /// 7B model: 4 matmuls/layer × 28 layers = 112 matmuls per token.
+    /// Each matmul: 3584 output rows × 3584 dot products — rayon splits across cores.
     fn forward_cpu(qw: &QWeight, x: &TqTensor) -> Result<TqTensor> {
+        use rayon::prelude::*;
+
         let x_shape = x.shape().to_vec();
         let in_features = qw.in_features();
         let out_features = qw.out_features();
@@ -167,19 +175,24 @@ impl QMatMul {
 
         let batch_elements: usize = x_shape[..x_shape.len() - 1].iter().product();
         let x_data = x.as_slice();
-        let w_data = qw.dequantize();
+        // Lazy dequant cache: dequantize once, reuse for all subsequent tokens.
+        // 7B model: 112 weight matrices, each dequanted once at first token.
+        let w_data = qw.cpu_cache.get_or_init(|| qw.dequantize());
 
-        let mut output = Vec::with_capacity(batch_elements * out_features);
+        // Parallel over output rows — each row is an independent dot product.
+        // For decode: batch=1, out_features=3584 → 3584 parallel tasks.
+        let w_slice = w_data.as_slice();
+        let mut output = vec![0.0f32; batch_elements * out_features];
 
         for b in 0..batch_elements {
             let x_row = &x_data[b * in_features..(b + 1) * in_features];
-            for o in 0..out_features {
-                let w_row = &w_data[o * in_features..(o + 1) * in_features];
-                let dot: f32 = x_row.iter().zip(w_row.iter())
+            let out_chunk = &mut output[b * out_features..(b + 1) * out_features];
+            out_chunk.par_iter_mut().enumerate().for_each(|(o, out)| {
+                let w_row = &w_slice[o * in_features..(o + 1) * in_features];
+                *out = x_row.iter().zip(w_row.iter())
                     .map(|(&xi, &wi)| xi * wi)
-                    .sum();
-                output.push(dot);
-            }
+                    .sum::<f32>();
+            });
         }
 
         let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
