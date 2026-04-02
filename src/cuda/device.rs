@@ -1,7 +1,7 @@
 //! Device abstraction — CPU or CUDA GPU.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::CudaDevice as CudarcDevice;
+use cudarc::driver::CudaContext;
 
 /// Compute device for tensor operations.
 #[derive(Clone, Debug)]
@@ -9,7 +9,7 @@ pub enum TqDevice {
     Cpu,
     #[cfg(feature = "cuda")]
     Cuda {
-        device: std::sync::Arc<CudarcDevice>,
+        context: std::sync::Arc<CudaContext>,
         ordinal: usize,
     },
 }
@@ -23,16 +23,10 @@ impl TqDevice {
     /// Select CUDA device if available, otherwise fall back to CPU.
     #[cfg(feature = "cuda")]
     pub fn cuda_if_available(ordinal: usize) -> super::Result<Self> {
-        match CudarcDevice::new(ordinal) {
-            Ok(dev) => {
-                let name = dev.name().unwrap_or_else(|_| "unknown".into());
-                let (free, total) = dev.mem_info().unwrap_or((0, 0));
-                eprintln!(
-                    "CUDA device {}: {} ({:.1} GB free / {:.1} GB total)",
-                    ordinal, name,
-                    free as f64 / 1e9, total as f64 / 1e9,
-                );
-                Ok(TqDevice::Cuda { device: dev, ordinal })
+        match CudaContext::new(ordinal) {
+            Ok(ctx) => {
+                eprintln!("CUDA device {} initialized", ordinal);
+                Ok(TqDevice::Cuda { context: ctx, ordinal })
             }
             Err(e) => {
                 eprintln!("CUDA not available ({}), falling back to CPU", e);
@@ -62,12 +56,12 @@ impl TqDevice {
         !self.is_cuda()
     }
 
-    /// Get the cudarc device handle (panics on CPU).
+    /// Get the cudarc context handle (panics on CPU).
     #[cfg(feature = "cuda")]
-    pub fn cuda_device(&self) -> &std::sync::Arc<CudarcDevice> {
+    pub fn cuda_context(&self) -> &std::sync::Arc<CudaContext> {
         match self {
-            TqDevice::Cuda { device, .. } => device,
-            _ => panic!("cuda_device() called on CPU device"),
+            TqDevice::Cuda { context, .. } => context,
+            _ => panic!("cuda_context() called on CPU device"),
         }
     }
 }

@@ -1,0 +1,441 @@
+//! CUDA kernel launcher — loads PTX at init, provides type-safe Rust wrappers.
+//!
+//! PTX files are compiled by build.rs (nvcc) and embedded via include_str!.
+//! Each kernel is loaded once into a CudaModule, then launched via cudarc's
+//! launch_builder API.
+//!
+//! Only compiled when `--features cuda`.
+
+use std::sync::Arc;
+use cudarc::driver::{
+    CudaContext, CudaStream, CudaModule, CudaFunction, CudaSlice, LaunchConfig,
+    result::DriverError,
+};
+use cudarc::driver::PushKernelArg;
+use cudarc::nvrtc::Ptx;
+
+// ─── PTX sources (embedded by build.rs) ────────────────────────
+
+// Include the auto-generated PTX module from build.rs
+include!(concat!(env!("OUT_DIR"), "/ptx_generated.rs"));
+
+// ─── Kernel registry ───────────────────────────────────────────
+
+/// Global kernel registry — lazily loads PTX modules and caches compiled kernels.
+pub struct KernelRegistry {
+    pub ctx: Arc<CudaContext>,
+    pub stream: Arc<CudaStream>,
+    modules: std::collections::HashMap<&'static str, Arc<CudaModule>>,
+}
+
+impl KernelRegistry {
+    /// Initialize the kernel registry — loads all PTX modules.
+    pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self, DriverError> {
+        let reg = Self {
+            ctx: ctx.clone(),
+            stream: stream.clone(),
+            modules: std::collections::HashMap::new(),
+        };
+        // PTX loading deferred until kernels are actually compiled by nvcc.
+        // Call load_ptx_module() for each compiled module.
+        Ok(reg)
+    }
+
+    /// Load a PTX string into the registry under the given name.
+    pub fn load_ptx_module(&mut self, name: &'static str, ptx_src: &str) -> Result<(), DriverError> {
+        let ptx = Ptx::from_src(ptx_src);
+        let module = self.ctx.load_module(ptx)?;
+        self.modules.insert(name, module);
+        Ok(())
+    }
+
+    /// Get a kernel function from a loaded module.
+    pub fn get_fn(&self, module: &str, kernel: &str) -> Result<CudaFunction, DriverError> {
+        let m = self.modules.get(module)
+            .ok_or(DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_FOUND))?;
+        m.load_function(kernel)
+    }
+}
+
+// ─── Launch configuration helpers ──────────────────────────────
+
+/// Standard 1D launch: n elements, 256 threads per block.
+pub fn launch_1d(n: usize) -> LaunchConfig {
+    let threads = 256u32;
+    let blocks = ((n as u32) + threads - 1) / threads;
+    LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// 1D launch: 1 block per row, block_size threads.
+pub fn launch_per_row(n_rows: usize, block_size: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (block_size as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Launch with shared memory.
+pub fn launch_with_shmem(grid: u32, block: u32, shmem: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: shmem,
+    }
+}
+
+// ─── Type-safe kernel wrappers ─────────────────────────────────
+//
+// cudarc 0.19 API: stream.launch_builder(&func).arg(&a).arg(&b).launch(cfg)
+//
+// Priority order for wiring:
+//  1. softmax      — attention + logits
+//  2. rms_norm     — normalization (2× per layer)
+//  3. silu_mul     — MLP activation
+//  4. rope         — position encoding
+//  5. q4km_matvec  — fused decode matmul
+//  6. elementwise  — add, mul, scalar
+//  7. flash_attn   — prefill
+//  8. tq_fused_attn — compressed KV
+//  9. hadamard     — key decompress
+// 10. sparse_v     — compressed V
+
+/// Launch softmax_last_dim_f32: 1 block per row.
+pub fn softmax_last_dim(
+    reg: &KernelRegistry,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("softmax", "softmax_last_dim_f32")?;
+    let block = 256.min(n_cols) as u32;
+    let cfg = launch_with_shmem(n_rows as u32, block, block * 4);
+    let nr = n_rows as i32;
+    let nc = n_cols as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input)
+            .arg(output)
+            .arg(&nr)
+            .arg(&nc)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch rms_norm_f32: 1 block per token.
+pub fn rms_norm(
+    reg: &KernelRegistry,
+    input: &CudaSlice<f32>,
+    weight: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    n_tokens: usize,
+    hidden_dim: usize,
+    eps: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_norm", "rms_norm_f32")?;
+    let block = 256.min(hidden_dim) as u32;
+    let cfg = launch_with_shmem(n_tokens as u32, block, block * 4);
+    let hd = hidden_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input)
+            .arg(weight)
+            .arg(output)
+            .arg(&hd)
+            .arg(&eps)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch fused_add_rms_norm_f32: residual += input; output = norm(residual).
+pub fn fused_add_rms_norm(
+    reg: &KernelRegistry,
+    input: &CudaSlice<f32>,
+    residual: &mut CudaSlice<f32>,
+    weight: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    n_tokens: usize,
+    hidden_dim: usize,
+    eps: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_norm", "fused_add_rms_norm_f32")?;
+    let block = 256.min(hidden_dim) as u32;
+    let cfg = launch_with_shmem(n_tokens as u32, block, block * 4);
+    let hd = hidden_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input)
+            .arg(residual)
+            .arg(weight)
+            .arg(output)
+            .arg(&hd)
+            .arg(&eps)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch fused_silu_mul_f32: output = silu(gate) * up.
+pub fn fused_silu_mul(
+    reg: &KernelRegistry,
+    gate: &CudaSlice<f32>,
+    up: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    n_elements: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_mlp", "fused_silu_mul_f32")?;
+    let cfg = launch_1d(n_elements);
+    let n = n_elements as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(gate)
+            .arg(up)
+            .arg(output)
+            .arg(&n)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch q4km_matvec_f32: fused Q4_K_M dequant + matvec.
+pub fn q4km_matvec(
+    reg: &KernelRegistry,
+    w_packed: &CudaSlice<u8>,
+    x: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("qmatmul", "q4km_matvec_f32")?;
+    let cfg = launch_per_row(out_features, 256);
+    let of = out_features as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_packed)
+            .arg(x)
+            .arg(output)
+            .arg(&of)
+            .arg(&inf)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch q8_0_matvec_f32: fused Q8_0 dequant + matvec.
+pub fn q8_0_matvec(
+    reg: &KernelRegistry,
+    w_packed: &CudaSlice<u8>,
+    x: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("qmatmul", "q8_0_matvec_f32")?;
+    let cfg = launch_per_row(out_features, 256);
+    let of = out_features as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_packed)
+            .arg(x)
+            .arg(output)
+            .arg(&of)
+            .arg(&inf)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch elementwise add_f32.
+pub fn add(
+    reg: &KernelRegistry,
+    a: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("elementwise", "add_f32")?;
+    let cfg = launch_1d(n);
+    let ni = n as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(a)
+            .arg(b)
+            .arg(output)
+            .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch elementwise mul_f32.
+pub fn mul(
+    reg: &KernelRegistry,
+    a: &CudaSlice<f32>,
+    b: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("elementwise", "mul_f32")?;
+    let cfg = launch_1d(n);
+    let ni = n as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(a)
+            .arg(b)
+            .arg(output)
+            .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch scalar_mul_f32.
+pub fn scalar_mul(
+    reg: &KernelRegistry,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    scalar: f32,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("elementwise", "scalar_mul_f32")?;
+    let cfg = launch_1d(n);
+    let ni = n as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input)
+            .arg(output)
+            .arg(&scalar)
+            .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch silu_f32: output = x * sigmoid(x).
+pub fn silu(
+    reg: &KernelRegistry,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("elementwise", "silu_f32")?;
+    let cfg = launch_1d(n);
+    let ni = n as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input)
+            .arg(output)
+            .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch flash_attention_prefill_f32.
+pub fn flash_attention_prefill(
+    reg: &KernelRegistry,
+    q: &CudaSlice<f32>,
+    k: &CudaSlice<f32>,
+    v: &CudaSlice<f32>,
+    o: &mut CudaSlice<f32>,
+    batch_size: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    seq_q: usize,
+    seq_kv: usize,
+    head_dim: usize,
+    scale: f32,
+    causal: bool,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("flash_attention", "flash_attention_prefill_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (batch_size as u32 * n_heads as u32, seq_q as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: (2 * 64 * head_dim * 4) as u32,
+    };
+    let bs = batch_size as i32;
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let sq = seq_q as i32;
+    let skv = seq_kv as i32;
+    let hd = head_dim as i32;
+    let c = causal as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q).arg(k).arg(v).arg(o)
+            .arg(&bs).arg(&nh).arg(&nkv)
+            .arg(&sq).arg(&skv).arg(&hd)
+            .arg(&scale).arg(&c)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch tq_fused_attention_f32 for compressed KV attention.
+pub fn tq_fused_attention(
+    reg: &KernelRegistry,
+    query: &CudaSlice<f32>,
+    packed_indices: &CudaSlice<u8>,
+    norms: &CudaSlice<f32>,
+    centroids: &CudaSlice<f32>,
+    scores_out: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_keys: usize,
+    head_dim: usize,
+    bits: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_attention", "tq_fused_attention_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: ((1 << bits) * 4) as u32,
+    };
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let nk = n_keys as i32;
+    let hd = head_dim as i32;
+    let b = bits as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(query).arg(packed_indices).arg(norms).arg(centroids).arg(scores_out)
+            .arg(&nh).arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&scale)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch hadamard_inverse_batch_f32 for key decompression.
+pub fn hadamard_inverse_batch(
+    reg: &KernelRegistry,
+    data: &mut CudaSlice<f32>,
+    signs: &CudaSlice<f32>,
+    n_vectors: usize,
+    dim: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("hadamard", "hadamard_inverse_batch_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_vectors as u32, 1, 1),
+        block_dim: (dim as u32, 1, 1),
+        shared_mem_bytes: (dim * 4) as u32,
+    };
+    let nv = n_vectors as i32;
+    let d = dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(data).arg(signs)
+            .arg(&nv).arg(&d)
+            .launch(cfg)?;
+    }
+    Ok(())
+}

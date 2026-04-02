@@ -8,8 +8,14 @@ edition = "2021"
 description = "TurboQuant-powered LLM inference engine — Pure Rust, custom CUDA backend"
 keywords = ["llm", "inference", "turboquant", "kv-cache", "quantization"]
 
+[features]
+default = []
+cuda = ["cudarc", "half"]
+
 [dependencies]
 tq-kv = { path = "tq-kv" }
+cudarc = { version = "0.19", features = ["driver", "cublas", "nvrtc", "cuda-version-from-build-system"], optional = true }
+half = { version = "2", optional = true }
 tokenizers = "0.20"
 clap = { version = "4", features = ["derive"] }
 hf-hub = "0.4"

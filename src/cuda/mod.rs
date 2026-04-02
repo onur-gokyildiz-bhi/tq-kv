@@ -10,6 +10,8 @@ mod ops;
 pub mod memory;
 pub mod graph;
 pub mod paged_kv;
+#[cfg(feature = "cuda")]
+pub mod kernels;
 
 pub use device::TqDevice;
 pub use dtype::TqDType;

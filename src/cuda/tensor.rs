@@ -10,11 +10,11 @@ use super::{TqDevice, TqDType, Result, TqError, tq_bail};
 pub enum TqStorage {
     /// CPU: contiguous f32 data in row-major order.
     Cpu(Vec<f32>),
-    /// CUDA: device memory (Phase 3 — placeholder for now).
+    /// CUDA: device memory on GPU.
     #[cfg(feature = "cuda")]
     Cuda {
         data: cudarc::driver::CudaSlice<f32>,
-        device: std::sync::Arc<cudarc::driver::CudaDevice>,
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
     },
 }
 
@@ -106,11 +106,9 @@ impl TqTensor {
         match &self.storage {
             TqStorage::Cpu(data) => Ok(data.clone()),
             #[cfg(feature = "cuda")]
-            TqStorage::Cuda { data, device } => {
-                let mut host = vec![0.0f32; self.elem_count()];
-                device.dtoh_sync_copy_into(data, &mut host)
-                    .map_err(|e| TqError::Msg(format!("dtoh: {}", e)))?;
-                Ok(host)
+            TqStorage::Cuda { data, stream } => {
+                stream.clone_dtoh(data)
+                    .map_err(|e| TqError::Msg(format!("dtoh: {}", e)))
             }
         }
     }
