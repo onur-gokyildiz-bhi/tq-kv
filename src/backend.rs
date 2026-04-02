@@ -292,8 +292,6 @@ pub struct CudaBackend {
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     registry: crate::cuda::kernels::KernelRegistry,
     /// GPU cache for small persistent weights (norm weights, biases).
-    /// Keyed by raw pointer address of the source &[f32] slice.
-    /// Safe because weight slices live in Tensor (stable Vec<f32> allocation).
     weight_cache: std::sync::Mutex<std::collections::HashMap<usize, cudarc::driver::CudaSlice<f32>>>,
     cpu: CpuBackend,
 }
@@ -352,7 +350,6 @@ impl ComputeBackend for CudaBackend {
         // GPU fused kernel: only for decode (m=1) with supported quant types.
         // Prefill (m>1) falls back to CPU (future: cuBLAS SGEMM).
         if m == 1 && matches!(weight.dtype, GgmlDType::Q4K | GgmlDType::Q8_0) {
-            // Upload input x to GPU
             let x_gpu = match self.stream.clone_htod(x) {
                 Ok(v) => v,
                 Err(_) => return self.cpu.qmatmul(x, weight, m, k, n),
@@ -382,7 +379,6 @@ impl ComputeBackend for CudaBackend {
                 return self.cpu.qmatmul(x, weight, m, k, n);
             }
 
-            // Download result
             match self.stream.clone_dtoh(&out_gpu) {
                 Ok(v) => v,
                 Err(_) => self.cpu.qmatmul(x, weight, m, k, n),
