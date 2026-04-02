@@ -221,6 +221,15 @@ impl QMatMul {
         Self { inner, span }
     }
 
+    /// Pre-warm weight cache: dequant on CPU (or upload to GPU).
+    /// Call during model load to eliminate first-forward latency.
+    fn warmup(&self) {
+        match &self.inner {
+            qmm::QMatMul::Quantized(qw) => qw.warmup_cpu(),
+            qmm::QMatMul::Full(_) => {},
+        }
+    }
+
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         self.inner.forward(xs)
@@ -2088,7 +2097,7 @@ impl GenericTurboModel {
             });
         }
 
-        Ok(Self {
+        let model = Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
             layers,
             norm,
@@ -2096,7 +2105,37 @@ impl GenericTurboModel {
             masks: HashMap::new(),
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
-        })
+        };
+
+        // Pre-warm all weight caches: dequant once at load time.
+        // Eliminates first-forward dequant latency (~15s for 7B model).
+        eprintln!("  Pre-warming weight caches ({} layers)...", block_count);
+        model.output.warmup();
+        for layer in &model.layers {
+            layer.attention_wo.warmup();
+            match &layer.qkv {
+                QkvWeights::Separate { wq, wk, wv } => { wq.warmup(); wk.warmup(); wv.warmup(); }
+                QkvWeights::Merged { wqkv } => { wqkv.warmup(); }
+            }
+            match &layer.mlp_or_moe {
+                MlpOrMoe::Mlp(mlp) => {
+                    mlp.feed_forward_w1.warmup();
+                    mlp.feed_forward_w2.warmup();
+                    mlp.feed_forward_w3.warmup();
+                }
+                MlpOrMoe::UpDown(ud) => {
+                    ud.ffn_up.warmup();
+                    ud.ffn_down.warmup();
+                }
+                MlpOrMoe::MoE { experts, feed_forward_gate_inp, .. } => {
+                    feed_forward_gate_inp.warmup();
+                    for exp in experts { exp.feed_forward_w1.warmup(); exp.feed_forward_w2.warmup(); exp.feed_forward_w3.warmup(); }
+                }
+            }
+        }
+        eprintln!("  Weight caches warmed.");
+
+        Ok(model)
     }
 
     fn mask(&mut self, t: usize, device: &Device) -> Result<Tensor> {

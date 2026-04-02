@@ -82,6 +82,26 @@ impl QWeight {
         self.to_tensor(device)
     }
 
+    /// Eagerly upload raw quantized bytes to GPU.
+    /// Call during model load to avoid first-forward latency.
+    #[cfg(feature = "cuda")]
+    pub fn upload_to_gpu(&self, device: &TqDevice) -> Result<()> {
+        if let TqDevice::Cuda { .. } = device {
+            let stream = device.cuda_stream()?;
+            self.gpu_cache.get_or_init(|| {
+                stream.clone_htod(&self.raw_data)
+                    .expect("QWeight GPU upload failed")
+            });
+        }
+        Ok(())
+    }
+
+    /// Eagerly dequantize and cache on CPU.
+    /// Call during model load to avoid first-forward dequant latency.
+    pub fn warmup_cpu(&self) {
+        self.cpu_cache.get_or_init(|| self.dequantize());
+    }
+
     /// Number of output features (rows).
     pub fn out_features(&self) -> usize { self.shape.0 }
 
