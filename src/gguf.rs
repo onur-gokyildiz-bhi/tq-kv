@@ -4,7 +4,7 @@
 //! Compatible with llama.cpp GGUF v3 format (magic 0x46554747).
 
 use std::collections::HashMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Write, Seek, SeekFrom};
 
 use crate::cuda::{TqDevice, TqError, Result};
 use crate::qmatmul::QWeight;
@@ -323,6 +323,146 @@ impl GgufContent {
         self.metadata.get(key)
             .ok_or_else(|| TqError::Msg(format!("missing metadata: {}", key)))
     }
+}
+
+// ─── GGUF Writer ─────────────────────────────────────────────
+
+/// Write a complete GGUF v3 file.
+///
+/// `tensors`: Vec of (name, dims_innermost_first, dtype, data_bytes).
+/// Metadata and tensor data are written sequentially.
+pub fn write_gguf<W: Write + Seek>(
+    writer: &mut W,
+    metadata: &[(&str, &GgufValue)],
+    tensors: &[(&str, &[usize], GgmlDType, &[u8])],
+) -> Result<()> {
+    let alignment = DEFAULT_ALIGNMENT;
+
+    // ─── Header ───
+    writer.write_all(&GGUF_MAGIC.to_le_bytes()).map_err(io_err)?;
+    writer.write_all(&3u32.to_le_bytes()).map_err(io_err)?;  // version 3
+    writer.write_all(&(tensors.len() as u64).to_le_bytes()).map_err(io_err)?;
+    writer.write_all(&(metadata.len() as u64).to_le_bytes()).map_err(io_err)?;
+
+    // ─── Metadata ───
+    for &(key, value) in metadata {
+        write_string(writer, key)?;
+        write_value(writer, value)?;
+    }
+
+    // ─── Tensor descriptors ───
+    // Pre-compute offsets: tensors are packed sequentially with alignment
+    let mut data_offset = 0u64;
+    let mut tensor_offsets = Vec::with_capacity(tensors.len());
+    for &(_, _, _, data) in tensors {
+        let aligned = (data_offset as usize + alignment - 1) / alignment * alignment;
+        tensor_offsets.push(aligned as u64);
+        data_offset = aligned as u64 + data.len() as u64;
+    }
+
+    for (i, &(name, dims, dtype, _)) in tensors.iter().enumerate() {
+        write_string(writer, name)?;
+        writer.write_all(&(dims.len() as u32).to_le_bytes()).map_err(io_err)?;
+        // GGUF stores dims innermost-first (reverse of our shape convention)
+        for &d in dims.iter().rev() {
+            writer.write_all(&(d as u64).to_le_bytes()).map_err(io_err)?;
+        }
+        writer.write_all(&(dtype as u32).to_le_bytes()).map_err(io_err)?;
+        writer.write_all(&tensor_offsets[i].to_le_bytes()).map_err(io_err)?;
+    }
+
+    // ─── Alignment padding before tensor data ───
+    let pos = writer.stream_position().map_err(io_err)? as usize;
+    let aligned_pos = (pos + alignment - 1) / alignment * alignment;
+    let padding = aligned_pos - pos;
+    if padding > 0 {
+        writer.write_all(&vec![0u8; padding]).map_err(io_err)?;
+    }
+
+    // ─── Tensor data ───
+    let data_start = writer.stream_position().map_err(io_err)?;
+    for (i, &(_, _, _, data)) in tensors.iter().enumerate() {
+        // Pad to alignment
+        let target = data_start + tensor_offsets[i];
+        let current = writer.stream_position().map_err(io_err)?;
+        if current < target {
+            writer.write_all(&vec![0u8; (target - current) as usize]).map_err(io_err)?;
+        }
+        writer.write_all(data).map_err(io_err)?;
+    }
+
+    Ok(())
+}
+
+fn io_err(e: std::io::Error) -> TqError {
+    TqError::Msg(format!("GGUF write: {}", e))
+}
+
+fn write_string<W: Write>(w: &mut W, s: &str) -> Result<()> {
+    w.write_all(&(s.len() as u64).to_le_bytes()).map_err(io_err)?;
+    w.write_all(s.as_bytes()).map_err(io_err)?;
+    Ok(())
+}
+
+fn write_value<W: Write>(w: &mut W, val: &GgufValue) -> Result<()> {
+    match val {
+        GgufValue::U8(v) => { w.write_all(&0u32.to_le_bytes()).map_err(io_err)?; w.write_all(&[*v]).map_err(io_err)?; }
+        GgufValue::I8(v) => { w.write_all(&1u32.to_le_bytes()).map_err(io_err)?; w.write_all(&[*v as u8]).map_err(io_err)?; }
+        GgufValue::U16(v) => { w.write_all(&2u32.to_le_bytes()).map_err(io_err)?; w.write_all(&v.to_le_bytes()).map_err(io_err)?; }
+        GgufValue::I16(v) => { w.write_all(&3u32.to_le_bytes()).map_err(io_err)?; w.write_all(&v.to_le_bytes()).map_err(io_err)?; }
+        GgufValue::U32(v) => { w.write_all(&4u32.to_le_bytes()).map_err(io_err)?; w.write_all(&v.to_le_bytes()).map_err(io_err)?; }
+        GgufValue::I32(v) => { w.write_all(&5u32.to_le_bytes()).map_err(io_err)?; w.write_all(&v.to_le_bytes()).map_err(io_err)?; }
+        GgufValue::F32(v) => { w.write_all(&6u32.to_le_bytes()).map_err(io_err)?; w.write_all(&v.to_le_bytes()).map_err(io_err)?; }
+        GgufValue::String(v) => { w.write_all(&8u32.to_le_bytes()).map_err(io_err)?; write_string(w, v)?; }
+        GgufValue::U64(v) => { w.write_all(&10u32.to_le_bytes()).map_err(io_err)?; w.write_all(&v.to_le_bytes()).map_err(io_err)?; }
+        GgufValue::I64(v) => { w.write_all(&11u32.to_le_bytes()).map_err(io_err)?; w.write_all(&v.to_le_bytes()).map_err(io_err)?; }
+        GgufValue::F64(v) => { w.write_all(&12u32.to_le_bytes()).map_err(io_err)?; w.write_all(&v.to_le_bytes()).map_err(io_err)?; }
+        GgufValue::Bool(v) => { w.write_all(&7u32.to_le_bytes()).map_err(io_err)?; w.write_all(&[if *v {1} else {0}]).map_err(io_err)?; }
+        GgufValue::Array(arr) => {
+            w.write_all(&9u32.to_le_bytes()).map_err(io_err)?; // GGUF_TYPE_ARRAY
+            // Detect element type from first element
+            let elem_type = match arr.first() {
+                Some(GgufValue::U8(_)) => 0u32,
+                Some(GgufValue::I8(_)) => 1u32,
+                Some(GgufValue::U16(_)) => 2u32,
+                Some(GgufValue::I16(_)) => 3u32,
+                Some(GgufValue::U32(_)) => 4u32,
+                Some(GgufValue::I32(_)) => 5u32,
+                Some(GgufValue::F32(_)) => 6u32,
+                Some(GgufValue::F64(_)) => 12u32,
+                Some(GgufValue::String(_)) => 8u32,
+                Some(GgufValue::U64(_)) => 10u32,
+                Some(GgufValue::I64(_)) => 11u32,
+                Some(GgufValue::Bool(_)) => 13u32,
+                _ => 4u32,
+            };
+            w.write_all(&elem_type.to_le_bytes()).map_err(io_err)?;
+            w.write_all(&(arr.len() as u64).to_le_bytes()).map_err(io_err)?;
+            for elem in arr {
+                write_value_payload(w, elem)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_value_payload<W: Write>(w: &mut W, val: &GgufValue) -> Result<()> {
+    match val {
+        GgufValue::U8(v) => w.write_all(&[*v]).map_err(io_err)?,
+        GgufValue::I8(v) => w.write_all(&[*v as u8]).map_err(io_err)?,
+        GgufValue::U16(v) => w.write_all(&v.to_le_bytes()).map_err(io_err)?,
+        GgufValue::I16(v) => w.write_all(&v.to_le_bytes()).map_err(io_err)?,
+        GgufValue::U32(v) => w.write_all(&v.to_le_bytes()).map_err(io_err)?,
+        GgufValue::I32(v) => w.write_all(&v.to_le_bytes()).map_err(io_err)?,
+        GgufValue::F32(v) => w.write_all(&v.to_le_bytes()).map_err(io_err)?,
+        GgufValue::F64(v) => w.write_all(&v.to_le_bytes()).map_err(io_err)?,
+        GgufValue::U64(v) => w.write_all(&v.to_le_bytes()).map_err(io_err)?,
+        GgufValue::I64(v) => w.write_all(&v.to_le_bytes()).map_err(io_err)?,
+        GgufValue::Bool(v) => w.write_all(&[if *v {1} else {0}]).map_err(io_err)?,
+        GgufValue::String(v) => write_string(w, v)?,
+        GgufValue::Array(_) => return Err(TqError::Msg("nested arrays not supported".into())),
+    }
+    Ok(())
 }
 
 // ─── Binary reading helpers ───────────────────────────────────

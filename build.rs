@@ -147,7 +147,7 @@ fn generate_ptx_module(out_dir: &Path, entries: &[(String, PathBuf)]) {
 }
 
 #[allow(dead_code)]
-fn generate_empty_ptx_module(out_dir: &Path) {
+fn generate_empty_ptx_module(out_dir: &std::path::Path) {
     let code = "// No CUDA kernels compiled (nvcc not found or cuda feature disabled).\n";
     let ptx_rs = out_dir.join("ptx_generated.rs");
     std::fs::write(&ptx_rs, code).expect("Failed to write empty ptx_generated.rs");
