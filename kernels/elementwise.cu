@@ -4,6 +4,7 @@
 // Vectorized float4 loads where possible for 4x fewer memory transactions.
 
 #include "common.cuh"
+#include <cuda_fp16.h>
 
 // ─── SiLU (x * sigmoid(x)) ──────────────────────────────────
 extern "C" __global__ void silu_f32(

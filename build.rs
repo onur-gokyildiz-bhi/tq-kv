@@ -76,8 +76,9 @@ fn compile_cuda_kernels() {
 
         eprintln!("Compiling {:?} → {:?}", cu_file, ptx_path);
 
-        let status = std::process::Command::new(&nvcc)
-            .args(&[
+        // Find MSVC cl.exe for nvcc host compilation (Windows)
+        let mut cmd = std::process::Command::new(&nvcc);
+        cmd.args(&[
                 "--ptx",
                 "-arch=sm_86",              // RTX 3080 (Ampere)
                 "-O3",
@@ -85,8 +86,24 @@ fn compile_cuda_kernels() {
                 "-I", kernels_dir.to_str().unwrap(),
                 "-o", ptx_path.to_str().unwrap(),
                 cu_file.to_str().unwrap(),
-            ])
-            .status();
+            ]);
+
+        // On Windows, point nvcc to cl.exe if not in PATH
+        if cfg!(windows) {
+            let msvc_paths = [
+                r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64",
+                r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.38.33130\bin\Hostx64\x64",
+            ];
+            for p in &msvc_paths {
+                let cl = Path::new(p).join("cl.exe");
+                if cl.exists() {
+                    cmd.arg("-ccbin").arg(p);
+                    break;
+                }
+            }
+        }
+
+        let status = cmd.status();
 
         match status {
             Ok(s) if s.success() => {

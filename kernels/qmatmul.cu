@@ -10,6 +10,7 @@
 // For prefill (batch > 1), use q4km_dequant + cuBLAS SGEMM instead.
 
 #include "common.cuh"
+#include <cuda_fp16.h>
 
 // ─── Q4_K_M Constants ─────────────────────────────────────────
 #define QK_K 256              // super-block element count

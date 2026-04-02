@@ -29,16 +29,37 @@ pub struct KernelRegistry {
 }
 
 impl KernelRegistry {
-    /// Initialize the kernel registry — loads all PTX modules.
+    /// Initialize the kernel registry — loads all 11 compiled PTX modules.
     pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self, DriverError> {
-        let reg = Self {
+        let mut reg = Self {
             ctx: ctx.clone(),
             stream: stream.clone(),
             modules: std::collections::HashMap::new(),
         };
-        // PTX loading deferred until kernels are actually compiled by nvcc.
-        // Call load_ptx_module() for each compiled module.
+        reg.load_all_ptx()?;
         Ok(reg)
+    }
+
+    /// Load all compiled PTX modules from embedded strings.
+    fn load_all_ptx(&mut self) -> Result<(), DriverError> {
+        let ptx_sources: &[(&str, &str)] = &[
+            ("elementwise", PTX_ELEMENTWISE),
+            ("flash_attention", PTX_FLASH_ATTENTION),
+            ("fused_attention", PTX_FUSED_ATTENTION),
+            ("fused_mlp", PTX_FUSED_MLP),
+            ("fused_norm", PTX_FUSED_NORM),
+            ("hadamard", PTX_HADAMARD),
+            ("qmatmul", PTX_QMATMUL),
+            ("rope", PTX_ROPE),
+            ("sampling", PTX_SAMPLING),
+            ("softmax", PTX_SOFTMAX),
+            ("sparse_v", PTX_SPARSE_V),
+        ];
+        for &(name, ptx_src) in ptx_sources {
+            self.load_ptx_module(name, ptx_src)?;
+        }
+        eprintln!("[cuda] Loaded {} PTX modules ({} kernels)", self.modules.len(), 34);
+        Ok(())
     }
 
     /// Load a PTX string into the registry under the given name.
