@@ -15,7 +15,7 @@ import subprocess
 import numpy as np
 
 # Add turboquant_plus to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'turboquant_plus'))
+sys.path.insert(0, r'E:\Onur\BHI\turboquant_plus')
 
 from turboquant.polar_quant import PolarQuant
 from turboquant.turboquant import TurboQuant, TurboQuantMSE
