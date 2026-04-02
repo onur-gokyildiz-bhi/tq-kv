@@ -308,7 +308,12 @@ impl TqTensor {
 
     /// Matrix multiply: self @ other.
     /// Supports batched matmul for rank >= 2.
+    /// GPU: uses cuBLAS SGEMM when both tensors are on CUDA.
     pub fn matmul(&self, other: &TqTensor) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if self.is_cuda() && other.is_cuda() {
+            return self.matmul_cublas(other);
+        }
         super::ops::TqOps::matmul(self, other)
     }
 
@@ -728,6 +733,82 @@ impl TqTensor {
             shape,
             dtype: TqDType::F32,
         }
+    }
+
+    /// GPU matmul via cuBLAS SGEMM: C = A @ B.
+    ///
+    /// For 2D: standard SGEMM.
+    /// For higher rank: strided batched SGEMM (batch dims broadcast).
+    fn matmul_cublas(&self, other: &TqTensor) -> Result<Self> {
+        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+        use cudarc::cublas::sys::cublasOperation_t;
+
+        let a_shape = self.shape().to_vec();
+        let b_shape = other.shape().to_vec();
+        let a_rank = a_shape.len();
+        let b_rank = b_shape.len();
+
+        if a_rank < 2 || b_rank < 2 {
+            tq_bail!("matmul_cublas: need rank >= 2, got {} and {}", a_rank, b_rank);
+        }
+
+        let m = a_shape[a_rank - 2]; // rows of A
+        let k = a_shape[a_rank - 1]; // cols of A = rows of B
+        let n = b_shape[b_rank - 1]; // cols of B
+
+        if b_shape[b_rank - 2] != k {
+            tq_bail!("matmul_cublas: inner dims mismatch {} vs {}", k, b_shape[b_rank - 2]);
+        }
+
+        let stream = self.cuda_stream().clone();
+        let blas = CudaBlas::new(stream.clone())
+            .map_err(|e| TqError::Msg(format!("cuBLAS init: {}", e)))?;
+
+        let batch: usize = a_shape[..a_rank - 2].iter().product();
+
+        let mut out_gpu = stream.alloc_zeros::<f32>(batch * m * n)
+            .map_err(|e| TqError::Msg(format!("matmul alloc: {}", e)))?;
+
+        // cuBLAS is column-major. To compute row-major C = A @ B,
+        // we compute C^T = B^T @ A^T in column-major, which gives us
+        // C in row-major layout. So we swap A and B and transpose flags.
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N, // B (no transpose in col-major = transpose in row-major)
+            transb: cublasOperation_t::CUBLAS_OP_N, // A
+            m: n as i32,     // cols of C (= cols of B in row-major)
+            n: m as i32,     // rows of C (= rows of A in row-major)
+            k: k as i32,
+            alpha: 1.0f32,
+            lda: n as i32,   // leading dim of B in col-major
+            ldb: k as i32,   // leading dim of A in col-major
+            beta: 0.0f32,
+            ldc: n as i32,   // leading dim of C in col-major
+        };
+
+        if batch == 1 {
+            unsafe {
+                blas.gemm(cfg, other.cuda_data(), self.cuda_data(), &mut out_gpu)
+                    .map_err(|e| TqError::Msg(format!("cuBLAS sgemm: {}", e)))?;
+            }
+        } else {
+            use cudarc::cublas::StridedBatchedConfig;
+            let strided_cfg = StridedBatchedConfig {
+                gemm: cfg,
+                batch_size: batch as i32,
+                stride_a: (k * n) as i64,
+                stride_b: (m * k) as i64,
+                stride_c: (m * n) as i64,
+            };
+            unsafe {
+                blas.gemm_strided_batched(strided_cfg, other.cuda_data(), self.cuda_data(), &mut out_gpu)
+                    .map_err(|e| TqError::Msg(format!("cuBLAS batched sgemm: {}", e)))?;
+            }
+        }
+
+        let mut out_shape = a_shape[..a_rank - 2].to_vec();
+        out_shape.push(m);
+        out_shape.push(n);
+        Ok(Self::from_cuda(out_gpu, out_shape, stream))
     }
 }
 

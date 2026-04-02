@@ -91,20 +91,59 @@ impl RmsNorm {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
+
+        #[cfg(feature = "cuda")]
+        if x.is_cuda() {
+            return self.forward_gpu(x);
+        }
+
+        // CPU path
         let x = x.to_dtype(DType::F32)?;
         let variance = x.sqr()?.mean_keepdim(x.rank() - 1)?;
-        // rms = sqrt(variance + eps)
         let eps_tensor = Tensor::new(self.eps as f32, x.device())?;
         let rms = variance.broadcast_add(&eps_tensor)?.sqrt()?;
         let normalized = x.broadcast_div(&rms)?;
         normalized.broadcast_mul(&self.weight)
     }
+
+    #[cfg(feature = "cuda")]
+    fn forward_gpu(&self, x: &Tensor) -> Result<Tensor> {
+        let shape = x.shape().to_vec();
+        let hidden_dim = *shape.last().unwrap();
+        let n_tokens = x.elem_count() / hidden_dim;
+        let stream = x.cuda_stream();
+
+        // Ensure norm weight is on GPU
+        let weight_gpu = self.weight.ensure_gpu(
+            &crate::cuda::TqDevice::Cuda {
+                context: stream.context().clone(),
+                ordinal: 0,
+            }
+        )?;
+
+        let mut out_gpu = stream.alloc_zeros::<f32>(x.elem_count())
+            .map_err(|e| TqError::Msg(format!("rms_norm alloc: {}", e)))?;
+        let reg = crate::cuda::kernels::KernelRegistry::new(&stream.context(), &stream)
+            .map_err(|e| TqError::Msg(format!("kernel init: {}", e)))?;
+
+        crate::cuda::kernels::rms_norm(
+            &reg, x.cuda_data(), weight_gpu.cuda_data(), &mut out_gpu,
+            n_tokens, hidden_dim, self.eps as f32,
+        ).map_err(|e| TqError::Msg(format!("rms_norm kernel: {}", e)))?;
+
+        Ok(Tensor::from_cuda(out_gpu, shape, stream.clone()))
+    }
 }
 
 pub const MAX_SEQ_LEN: usize = 4096;
 
-/// CUDA-compatible softmax (candle_nn::ops::softmax_last_dim has no CUDA kernel).
+/// Softmax along last dimension — GPU-accelerated when tensor is on CUDA.
 fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.is_cuda() {
+        return softmax_last_dim_gpu(x);
+    }
+    // CPU path
     let last = x.rank() - 1;
     let max_val = x.max_keepdim(last)?;
     let exp = x.broadcast_sub(&max_val)?.exp()?;
@@ -112,8 +151,46 @@ fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
     exp.broadcast_div(&sum)
 }
 
+#[cfg(feature = "cuda")]
+fn softmax_last_dim_gpu(x: &Tensor) -> Result<Tensor> {
+    let shape = x.shape().to_vec();
+    let n_cols = *shape.last().unwrap();
+    let n_rows = x.elem_count() / n_cols;
+    let stream = x.cuda_stream();
+
+    let mut out_gpu = stream.alloc_zeros::<f32>(x.elem_count())
+        .map_err(|e| TqError::Msg(format!("softmax alloc: {}", e)))?;
+    let reg = crate::cuda::kernels::KernelRegistry::new(&stream.context(), &stream)
+        .map_err(|e| TqError::Msg(format!("kernel init: {}", e)))?;
+    crate::cuda::kernels::softmax_last_dim(&reg, x.cuda_data(), &mut out_gpu, n_rows, n_cols)
+        .map_err(|e| TqError::Msg(format!("softmax kernel: {}", e)))?;
+
+    Ok(Tensor::from_cuda(out_gpu, shape, stream.clone()))
+}
+
+/// SiLU activation — GPU-accelerated when tensor is on CUDA.
 fn silu(x: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.is_cuda() {
+        return silu_gpu(x);
+    }
     x.silu()
+}
+
+#[cfg(feature = "cuda")]
+fn silu_gpu(x: &Tensor) -> Result<Tensor> {
+    let shape = x.shape().to_vec();
+    let n = x.elem_count();
+    let stream = x.cuda_stream();
+
+    let mut out_gpu = stream.alloc_zeros::<f32>(n)
+        .map_err(|e| TqError::Msg(format!("silu alloc: {}", e)))?;
+    let reg = crate::cuda::kernels::KernelRegistry::new(&stream.context(), &stream)
+        .map_err(|e| TqError::Msg(format!("kernel init: {}", e)))?;
+    crate::cuda::kernels::silu(&reg, x.cuda_data(), &mut out_gpu, n)
+        .map_err(|e| TqError::Msg(format!("silu kernel: {}", e)))?;
+
+    Ok(Tensor::from_cuda(out_gpu, shape, stream.clone()))
 }
 
 #[derive(Debug, Clone)]

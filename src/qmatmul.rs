@@ -16,7 +16,9 @@ use std::sync::OnceLock;
 use cudarc::driver::CudaSlice;
 
 /// Quantized weight matrix stored in GGML block format.
-#[derive(Debug, Clone)]
+///
+/// When CUDA is enabled, raw weight bytes are lazily uploaded to GPU
+/// on first use and cached for subsequent forward passes.
 pub struct QWeight {
     /// Raw quantized bytes (GGML block layout).
     pub raw_data: Vec<u8>,
@@ -24,12 +26,41 @@ pub struct QWeight {
     pub dtype: GgmlDType,
     /// Weight shape: (out_features, in_features) — row-major.
     pub shape: (usize, usize),
+    /// Lazily uploaded GPU copy of raw_data (avoids re-upload per forward).
+    #[cfg(feature = "cuda")]
+    gpu_cache: OnceLock<CudaSlice<u8>>,
+}
+
+impl Clone for QWeight {
+    fn clone(&self) -> Self {
+        Self {
+            raw_data: self.raw_data.clone(),
+            dtype: self.dtype,
+            shape: self.shape,
+            #[cfg(feature = "cuda")]
+            gpu_cache: OnceLock::new(), // fresh cache — will re-upload on first use
+        }
+    }
+}
+
+impl std::fmt::Debug for QWeight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QWeight")
+            .field("dtype", &self.dtype)
+            .field("shape", &self.shape)
+            .field("raw_bytes", &self.raw_data.len())
+            .finish()
+    }
 }
 
 impl QWeight {
     /// Create from raw GGUF tensor data.
     pub fn new(raw_data: Vec<u8>, dtype: GgmlDType, shape: (usize, usize)) -> Self {
-        Self { raw_data, dtype, shape }
+        Self {
+            raw_data, dtype, shape,
+            #[cfg(feature = "cuda")]
+            gpu_cache: OnceLock::new(),
+        }
     }
 
     /// Dequantize entire weight matrix to f32.
@@ -158,8 +189,9 @@ impl QMatMul {
 
     /// GPU forward: fused dequant+matvec for Q4_K_M / Q8_0.
     ///
-    /// Uploads raw quantized weight bytes to GPU (cached), then launches
-    /// the fused kernel that reads packed data directly — no intermediate
+    /// Raw quantized weight bytes are lazily uploaded to GPU on first call
+    /// and cached in `QWeight::gpu_cache` for all subsequent calls.
+    /// The fused kernel reads packed data directly — no intermediate
     /// f32 weight buffer needed. This is 3-4x faster than dequant+SGEMM.
     #[cfg(feature = "cuda")]
     fn forward_gpu(qw: &QWeight, x: &TqTensor) -> Result<TqTensor> {
@@ -170,18 +202,17 @@ impl QMatMul {
 
         let stream = x.cuda_stream();
 
-        // Upload quantized weight bytes to GPU
-        let w_gpu: CudaSlice<u8> = stream.clone_htod(&qw.raw_data)
-            .map_err(|e| TqError::Msg(format!("weight upload: {}", e)))?;
+        // Lazy GPU cache: upload weight bytes once, reuse for all subsequent calls
+        let w_gpu = qw.gpu_cache.get_or_init(|| {
+            stream.clone_htod(&qw.raw_data)
+                .expect("QWeight GPU upload failed")
+        });
 
         // For decode (batch=1), use fused matvec kernel
-        // For prefill (batch>1), fall back to dequant + matmul (future: cuBLAS)
         if batch_elements == 1 {
-            // Allocate output on GPU
             let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(out_features)
                 .map_err(|e| TqError::Msg(format!("output alloc: {}", e)))?;
 
-            // Get kernel registry and launch
             let reg = crate::cuda::kernels::KernelRegistry::new(
                 &stream.context(), &stream,
             ).map_err(|e| TqError::Msg(format!("kernel init: {}", e)))?;
@@ -191,26 +222,24 @@ impl QMatMul {
             match qw.dtype {
                 GgmlDType::Q4K => {
                     crate::cuda::kernels::q4km_matvec(
-                        &reg, &w_gpu, x_gpu, &mut out_gpu, out_features, in_features,
+                        &reg, w_gpu, x_gpu, &mut out_gpu, out_features, in_features,
                     ).map_err(|e| TqError::Msg(format!("q4km_matvec: {}", e)))?;
                 }
                 GgmlDType::Q8_0 => {
                     crate::cuda::kernels::q8_0_matvec(
-                        &reg, &w_gpu, x_gpu, &mut out_gpu, out_features, in_features,
+                        &reg, w_gpu, x_gpu, &mut out_gpu, out_features, in_features,
                     ).map_err(|e| TqError::Msg(format!("q8_0_matvec: {}", e)))?;
                 }
                 _ => {
-                    // Fallback: dequant on CPU, upload, matmul
                     return Self::forward_gpu_fallback(qw, x);
                 }
             }
 
-            // Build output tensor from GPU data
             let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
             out_shape.push(out_features);
             Ok(TqTensor::from_cuda(out_gpu, out_shape, stream.clone()))
         } else {
-            // Prefill: fall back to dequant + standard matmul
+            // Prefill: fall back to dequant + standard matmul (future: cuBLAS)
             Self::forward_gpu_fallback(qw, x)
         }
     }
