@@ -55,10 +55,17 @@ impl KernelRegistry {
             ("softmax", PTX_SOFTMAX),
             ("sparse_v", PTX_SPARSE_V),
         ];
+        let mut loaded = 0;
         for &(name, ptx_src) in ptx_sources {
-            self.load_ptx_module(name, ptx_src)?;
+            match self.load_ptx_module(name, ptx_src) {
+                Ok(()) => loaded += 1,
+                Err(e) => eprintln!("[cuda] WARNING: failed to load {} PTX: {:?}", name, e),
+            }
         }
-        eprintln!("[cuda] Loaded {} PTX modules ({} kernels)", self.modules.len(), 34);
+        eprintln!("[cuda] Loaded {}/{} PTX modules", loaded, ptx_sources.len());
+        if loaded == 0 {
+            return Err(DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_PTX));
+        }
         Ok(())
     }
 
@@ -73,7 +80,10 @@ impl KernelRegistry {
     /// Get a kernel function from a loaded module.
     pub fn get_fn(&self, module: &str, kernel: &str) -> Result<CudaFunction, DriverError> {
         let m = self.modules.get(module)
-            .ok_or(DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_FOUND))?;
+            .ok_or_else(|| {
+                eprintln!("[cuda] Module '{}' not loaded (needed for kernel '{}')", module, kernel);
+                DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_FOUND)
+            })?;
         m.load_function(kernel)
     }
 }
@@ -134,7 +144,9 @@ pub fn softmax_last_dim(
     n_cols: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("softmax", "softmax_last_dim_f32")?;
-    let block = 256.min(n_cols) as u32;
+    // Block size must be multiple of 32 (warp size) — warp shuffle reads all 32 lanes.
+    // Round up to next multiple of 32, cap at 256.
+    let block = (((n_cols.max(32) + 31) / 32) * 32).min(256) as u32;
     let cfg = launch_with_shmem(n_rows as u32, block, block * 4);
     let nr = n_rows as i32;
     let nc = n_cols as i32;
@@ -456,6 +468,73 @@ pub fn hadamard_inverse_batch(
         reg.stream.launch_builder(&f)
             .arg(data).arg(signs)
             .arg(&nv).arg(&d)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch rope_halved_f32: in-place halved RoPE (Qwen2, Mistral).
+/// x: [n_tokens * n_heads * head_dim] flat — modified in-place.
+pub fn rope_halved(
+    reg: &KernelRegistry,
+    x: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos_offset: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("rope", "rope_halved_f32")?;
+    let total_half_pairs = n_tokens * n_heads * (rope_dim / 2);
+    let cfg = launch_1d(total_half_pairs);
+    let nt = n_tokens as i32;
+    let nh = n_heads as i32;
+    let hd = head_dim as i32;
+    let rd = rope_dim as i32;
+    let po = pos_offset as i32;
+    let null_positions: u64 = 0;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(x)
+            .arg(cos)
+            .arg(sin)
+            .arg(&null_positions)
+            .arg(&nt).arg(&nh).arg(&hd).arg(&rd).arg(&po)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch rope_interleaved_f32: in-place interleaved RoPE (Llama).
+pub fn rope_interleaved(
+    reg: &KernelRegistry,
+    x: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos_offset: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("rope", "rope_interleaved_f32")?;
+    let total_half_pairs = n_tokens * n_heads * (rope_dim / 2);
+    let cfg = launch_1d(total_half_pairs);
+    let nt = n_tokens as i32;
+    let nh = n_heads as i32;
+    let hd = head_dim as i32;
+    let rd = rope_dim as i32;
+    let po = pos_offset as i32;
+    let null_positions: u64 = 0;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(x)
+            .arg(cos)
+            .arg(sin)
+            .arg(&null_positions)
+            .arg(&nt).arg(&nh).arg(&hd).arg(&rd).arg(&po)
             .launch(cfg)?;
     }
     Ok(())

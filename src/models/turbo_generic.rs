@@ -11,7 +11,9 @@
 //! - f32 attention in decompress path (GPU)
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::backend::ComputeBackend;
 use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
 use crate::cuda::Result;
 use crate::gguf::{GgufContent, GgmlDType};
@@ -29,7 +31,7 @@ macro_rules! bail {
 
 /// Module trait — replaces candle_nn::Module.
 trait Module {
-    fn forward(&self, x: &Tensor) -> Result<Tensor>;
+    fn forward(&self, x: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor>;
 }
 
 /// Embedding lookup — replaces candle_nn::Embedding.
@@ -93,108 +95,32 @@ impl RmsNorm {
         Self::from_qweight(&qw.raw_data, qw.dtype, n_elements, eps, device)
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
         let _enter = self.span.enter();
-
-        #[cfg(feature = "cuda")]
-        if x.is_cuda() {
-            return self.forward_gpu(x);
-        }
-
-        // CPU path
-        let x = x.to_dtype(DType::F32)?;
-        let variance = x.sqr()?.mean_keepdim(x.rank() - 1)?;
-        let eps_tensor = Tensor::new(self.eps as f32, x.device())?;
-        let rms = variance.broadcast_add(&eps_tensor)?.sqrt()?;
-        let normalized = x.broadcast_div(&rms)?;
-        normalized.broadcast_mul(&self.weight)
-    }
-
-    #[cfg(feature = "cuda")]
-    fn forward_gpu(&self, x: &Tensor) -> Result<Tensor> {
-        let shape = x.shape().to_vec();
-        let hidden_dim = *shape.last().unwrap();
-        let n_tokens = x.elem_count() / hidden_dim;
-        let stream = x.cuda_stream();
-
-        // Ensure norm weight is on GPU
-        let weight_gpu = self.weight.ensure_gpu(
-            &crate::cuda::TqDevice::Cuda {
-                context: stream.context().clone(),
-                ordinal: 0,
-            }
-        )?;
-
-        let mut out_gpu = stream.alloc_zeros::<f32>(x.elem_count())
-            .map_err(|e| TqError::Msg(format!("rms_norm alloc: {}", e)))?;
-        let reg = crate::cuda::kernels::KernelRegistry::new(&stream.context(), &stream)
-            .map_err(|e| TqError::Msg(format!("kernel init: {}", e)))?;
-
-        crate::cuda::kernels::rms_norm(
-            &reg, x.cuda_data(), weight_gpu.cuda_data(), &mut out_gpu,
-            n_tokens, hidden_dim, self.eps as f32,
-        ).map_err(|e| TqError::Msg(format!("rms_norm kernel: {}", e)))?;
-
-        Ok(Tensor::from_cuda(out_gpu, shape, stream.clone()))
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let shape = x_f32.shape().to_vec();
+        let hidden = *shape.last().unwrap();
+        let n_tokens = x_f32.elem_count() / hidden;
+        let result = backend.rms_norm(x_f32.as_slice(), self.weight.as_slice(), self.eps as f32, n_tokens, hidden);
+        Tensor::from_vec(result, shape, x.device())
     }
 }
 
 pub const MAX_SEQ_LEN: usize = 4096;
 
-/// Softmax along last dimension — GPU-accelerated when tensor is on CUDA.
-fn softmax_last_dim(x: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
-    if x.is_cuda() {
-        return softmax_last_dim_gpu(x);
-    }
-    // CPU path
-    let last = x.rank() - 1;
-    let max_val = x.max_keepdim(last)?;
-    let exp = x.broadcast_sub(&max_val)?.exp()?;
-    let sum = exp.sum_keepdim(last)?;
-    exp.broadcast_div(&sum)
-}
-
-#[cfg(feature = "cuda")]
-fn softmax_last_dim_gpu(x: &Tensor) -> Result<Tensor> {
+/// Softmax along last dimension — dispatched via compute backend.
+fn softmax_last_dim(x: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
     let shape = x.shape().to_vec();
-    let n_cols = *shape.last().unwrap();
-    let n_rows = x.elem_count() / n_cols;
-    let stream = x.cuda_stream();
-
-    let mut out_gpu = stream.alloc_zeros::<f32>(x.elem_count())
-        .map_err(|e| TqError::Msg(format!("softmax alloc: {}", e)))?;
-    let reg = crate::cuda::kernels::KernelRegistry::new(&stream.context(), &stream)
-        .map_err(|e| TqError::Msg(format!("kernel init: {}", e)))?;
-    crate::cuda::kernels::softmax_last_dim(&reg, x.cuda_data(), &mut out_gpu, n_rows, n_cols)
-        .map_err(|e| TqError::Msg(format!("softmax kernel: {}", e)))?;
-
-    Ok(Tensor::from_cuda(out_gpu, shape, stream.clone()))
+    let cols = *shape.last().unwrap();
+    let rows = x.elem_count() / cols;
+    let result = backend.softmax(x.as_slice(), rows, cols);
+    Tensor::from_vec(result, shape, x.device())
 }
 
-/// SiLU activation — GPU-accelerated when tensor is on CUDA.
-fn silu(x: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
-    if x.is_cuda() {
-        return silu_gpu(x);
-    }
-    x.silu()
-}
-
-#[cfg(feature = "cuda")]
-fn silu_gpu(x: &Tensor) -> Result<Tensor> {
-    let shape = x.shape().to_vec();
-    let n = x.elem_count();
-    let stream = x.cuda_stream();
-
-    let mut out_gpu = stream.alloc_zeros::<f32>(n)
-        .map_err(|e| TqError::Msg(format!("silu alloc: {}", e)))?;
-    let reg = crate::cuda::kernels::KernelRegistry::new(&stream.context(), &stream)
-        .map_err(|e| TqError::Msg(format!("kernel init: {}", e)))?;
-    crate::cuda::kernels::silu(&reg, x.cuda_data(), &mut out_gpu, n)
-        .map_err(|e| TqError::Msg(format!("silu kernel: {}", e)))?;
-
-    Ok(Tensor::from_cuda(out_gpu, shape, stream.clone()))
+/// Fused SiLU gate × up: silu(gate) * up — single pass, no intermediate tensor.
+fn fused_silu_mul(gate: &Tensor, up: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
+    let result = backend.fused_silu_mul(gate.as_slice(), up.as_slice());
+    Tensor::from_vec(result, gate.shape().to_vec(), gate.device())
 }
 
 #[derive(Debug, Clone)]
@@ -221,18 +147,52 @@ impl QMatMul {
         Self { inner, span }
     }
 
-    /// Pre-warm weight cache: dequant on CPU (or upload to GPU).
+    /// Pre-warm weight cache: dequant on CPU + upload to GPU via backend.
     /// Call during model load to eliminate first-forward latency.
-    fn warmup(&self) {
+    fn warmup(&self, backend: &dyn ComputeBackend) {
         match &self.inner {
-            qmm::QMatMul::Quantized(qw) => qw.warmup_cpu(),
+            qmm::QMatMul::Quantized(qw) => {
+                qw.warmup_cpu();
+                backend.warmup_qweight(qw);
+            }
             qmm::QMatMul::Full(_) => {},
         }
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
         let _enter = self.span.enter();
-        self.inner.forward(xs)
+        match &self.inner {
+            qmm::QMatMul::Quantized(qw) => {
+                let x_shape = xs.shape().to_vec();
+                let in_features = qw.in_features();
+                let out_features = qw.out_features();
+                let last_dim = *x_shape.last()
+                    .ok_or_else(|| TqError::Msg("empty input".into()))?;
+                if last_dim != in_features {
+                    return Err(TqError::Msg(format!(
+                        "QMatMul: input last dim {} != weight in_features {}",
+                        last_dim, in_features
+                    )));
+                }
+                let batch_elements: usize = x_shape[..x_shape.len() - 1].iter().product();
+                let result = backend.qmatmul(xs.as_slice(), qw, batch_elements, in_features, out_features);
+                let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+                out_shape.push(out_features);
+                Tensor::from_vec(result, out_shape, xs.device())
+            }
+            qmm::QMatMul::Full(w) => {
+                // Full-precision: x @ W^T via backend
+                let x_shape = xs.shape().to_vec();
+                let w_shape = w.shape().to_vec();
+                let k = *x_shape.last().unwrap();
+                let n = w_shape[0]; // out_features
+                let m: usize = x_shape[..x_shape.len() - 1].iter().product();
+                let result = backend.matmul(xs.as_slice(), w.as_slice(), m, k, n);
+                let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+                out_shape.push(n);
+                Tensor::from_vec(result, out_shape, xs.device())
+            }
+        }
     }
 }
 
@@ -249,10 +209,11 @@ struct Mlp {
 }
 
 impl Module for Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let w1 = self.feed_forward_w1.forward(xs)?;
-        let w3 = self.feed_forward_w3.forward(xs)?;
-        self.feed_forward_w2.forward(&(silu(&w1)? * w3)?)
+    fn forward(&self, xs: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
+        let w1 = self.feed_forward_w1.forward(xs, backend)?;
+        let w3 = self.feed_forward_w3.forward(xs, backend)?;
+        let activated = fused_silu_mul(&w1, &w3, backend)?;
+        self.feed_forward_w2.forward(&activated, backend)
     }
 }
 
@@ -265,10 +226,11 @@ struct MlpUpDown {
 }
 
 impl Module for MlpUpDown {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let up = self.ffn_up.forward(xs)?;
+    fn forward(&self, xs: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
+        let up = self.ffn_up.forward(xs, backend)?;
         let chunks = up.chunk(2, xs.rank() - 1)?;
-        self.ffn_down.forward(&(silu(&chunks[0])? * &chunks[1])?)
+        let activated = fused_silu_mul(&chunks[0], &chunks[1], backend)?;
+        self.ffn_down.forward(&activated, backend)
     }
 }
 
@@ -284,7 +246,7 @@ enum MlpOrMoe {
 }
 
 impl Module for MlpOrMoe {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
         match self {
             Self::MoE {
                 feed_forward_gate_inp,
@@ -293,8 +255,8 @@ impl Module for MlpOrMoe {
             } => {
                 let (b_size, seq_len, hidden_dim) = xs.dims3()?;
                 let xs = xs.reshape(vec![b_size * seq_len, hidden_dim])?;
-                let router_logits = feed_forward_gate_inp.forward(&xs)?;
-                let routing_weights = softmax_last_dim(&router_logits)?;
+                let router_logits = feed_forward_gate_inp.forward(&xs, backend)?;
+                let routing_weights = softmax_last_dim(&router_logits, backend)?;
                 let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2()?;
 
                 let mut top_x = vec![vec![]; experts.len()];
@@ -323,14 +285,14 @@ impl Module for MlpOrMoe {
                     let selected_rws = Tensor::from_slice(&selected_rws[expert_idx], vec![n_tokens_for_expert], xs.device())?
                         .reshape(vec![n_tokens_for_expert, 1])?;
                     let current_state = xs.index_select(&top_x, 0)?.reshape(vec![n_tokens_for_expert, hidden_dim])?;
-                    let current_hidden_states = expert_layer.forward(&current_state)?;
+                    let current_hidden_states = expert_layer.forward(&current_state, backend)?;
                     let current_hidden_states = current_hidden_states.broadcast_mul(&selected_rws)?;
                     ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
                 }
                 ys.reshape(vec![b_size, seq_len, hidden_dim])
             }
-            Self::Mlp(mlp) => mlp.forward(xs),
-            Self::UpDown(mlp) => mlp.forward(xs),
+            Self::Mlp(mlp) => mlp.forward(xs, backend),
+            Self::UpDown(mlp) => mlp.forward(xs, backend),
         }
     }
 }
@@ -945,15 +907,16 @@ impl LayerWeights {
         x: &Tensor,
         mask: Option<&Tensor>,
         index_pos: usize,
+        backend: &dyn ComputeBackend,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         let (mut q, mut k, mut v) = match &self.qkv {
             QkvWeights::Separate { wq, wk, wv } => {
-                (wq.forward(x)?, wk.forward(x)?, wv.forward(x)?)
+                (wq.forward(x, backend)?, wk.forward(x, backend)?, wv.forward(x, backend)?)
             }
             QkvWeights::Merged { wqkv } => {
-                let qkv = wqkv.forward(x)?;
+                let qkv = wqkv.forward(x, backend)?;
                 let q_size = self.n_head * self.head_dim;
                 let kv_size = self.n_kv_head * self.head_dim;
                 let q = qkv.narrow(2, 0, q_size)?;
@@ -1507,7 +1470,7 @@ impl LayerWeights {
                     let att = Tensor::from_vec(
                         all_scores, vec![1, self.n_head, 1, total_len], q.device(),
                     )?;
-                    softmax_last_dim(&att)?
+                    softmax_last_dim(&att, backend)?
                 } else {
                     // DECOMPRESS PATH: decompress all keys, standard matmul
                     let mut k_parts: Vec<Tensor> = Vec::new();
@@ -1635,7 +1598,7 @@ impl LayerWeights {
                         att = att.broadcast_add(&bias_tensor)?;
                     }
 
-                    softmax_last_dim(&att)?
+                    softmax_last_dim(&att, backend)?
                 };
 
                 // --- Compute attention output: att @ V ---
@@ -1757,13 +1720,13 @@ impl LayerWeights {
                             masked_fill(&att, &mask4d, &self.neg_inf)?
                         }
                     };
-                    let att = softmax_last_dim(&att)?;
+                    let att = softmax_last_dim(&att, backend)?;
                     att.matmul(&v_for_attn.contiguous()?)?
                 }
             };
 
             let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
-            self.attention_wo.forward(&y)
+            self.attention_wo.forward(&y, backend)
         } else {
             // UNCOMPRESSED PATH: standard fp16 KV cache (first N layers)
             let (k, v) = match &self.kv_cache {
@@ -1791,11 +1754,11 @@ impl LayerWeights {
                     masked_fill(&att, &mask4d, &self.neg_inf)?
                 }
             };
-            let att = softmax_last_dim(&att)?;
+            let att = softmax_last_dim(&att, backend)?;
             let y = att.matmul(&v.contiguous()?)?;
 
             let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
-            self.attention_wo.forward(&y)
+            self.attention_wo.forward(&y, backend)
         }
     }
 }
@@ -1804,13 +1767,13 @@ impl LayerWeights {
 // Generic TurboQuant Model
 // ============================================================
 
-#[derive(Debug, Clone)]
 pub struct GenericTurboModel {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
     norm: RmsNorm,
     output: QMatMul,
     masks: HashMap<usize, Tensor>,
+    backend: Arc<dyn ComputeBackend>,
     span: tracing::Span,
     span_output: tracing::Span,
 }
@@ -2097,41 +2060,56 @@ impl GenericTurboModel {
             });
         }
 
+        let backend = crate::backend::create_backend();
+
         let model = Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
             layers,
             norm,
             output: QMatMul::from_qtensor(output)?,
             masks: HashMap::new(),
+            backend,
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
         };
 
-        // Pre-warm weight caches: dequant at load time to eliminate first-forward latency.
-        // Uses ~5.7 GB RAM for 7B model. Disable with TQ_NO_WARMUP=1 on low-memory systems.
+        // Pre-warm weight caches: dequant on CPU + upload to GPU.
+        // Disable with TQ_NO_WARMUP=1 on low-memory systems.
         let do_warmup = std::env::var("TQ_NO_WARMUP").map(|v| v != "1").unwrap_or(true);
         if do_warmup {
-        eprintln!("  Pre-warming weight caches ({} layers)...", block_count);
-        model.output.warmup();
+        let b = model.backend.as_ref();
+        eprintln!("  Pre-warming weight caches ({} layers, backend={})...", block_count, b.name());
+        model.output.warmup(b);
+        // Final norm weight
+        b.warmup_f32(model.norm.weight.as_slice());
         for layer in &model.layers {
-            layer.attention_wo.warmup();
+            layer.attention_wo.warmup(b);
             match &layer.qkv {
-                QkvWeights::Separate { wq, wk, wv } => { wq.warmup(); wk.warmup(); wv.warmup(); }
-                QkvWeights::Merged { wqkv } => { wqkv.warmup(); }
+                QkvWeights::Separate { wq, wk, wv } => { wq.warmup(b); wk.warmup(b); wv.warmup(b); }
+                QkvWeights::Merged { wqkv } => { wqkv.warmup(b); }
+            }
+            // Norm weights → GPU cache
+            b.warmup_f32(layer.attention_norm.weight.as_slice());
+            b.warmup_f32(layer.ffn_norm.weight.as_slice());
+            if let Some(ref n) = layer.post_attention_norm {
+                b.warmup_f32(n.weight.as_slice());
+            }
+            if let Some(ref n) = layer.post_ffn_norm {
+                b.warmup_f32(n.weight.as_slice());
             }
             match &layer.mlp_or_moe {
                 MlpOrMoe::Mlp(mlp) => {
-                    mlp.feed_forward_w1.warmup();
-                    mlp.feed_forward_w2.warmup();
-                    mlp.feed_forward_w3.warmup();
+                    mlp.feed_forward_w1.warmup(b);
+                    mlp.feed_forward_w2.warmup(b);
+                    mlp.feed_forward_w3.warmup(b);
                 }
                 MlpOrMoe::UpDown(ud) => {
-                    ud.ffn_up.warmup();
-                    ud.ffn_down.warmup();
+                    ud.ffn_up.warmup(b);
+                    ud.ffn_down.warmup(b);
                 }
                 MlpOrMoe::MoE { experts, feed_forward_gate_inp, .. } => {
-                    feed_forward_gate_inp.warmup();
-                    for exp in experts { exp.feed_forward_w1.warmup(); exp.feed_forward_w2.warmup(); exp.feed_forward_w3.warmup(); }
+                    feed_forward_gate_inp.warmup(b);
+                    for exp in experts { exp.feed_forward_w1.warmup(b); exp.feed_forward_w2.warmup(b); exp.feed_forward_w3.warmup(b); }
                 }
             }
         }
@@ -2162,35 +2140,47 @@ impl GenericTurboModel {
             Some(self.mask(seq_len, x.device())?)
         };
         let _enter = self.span.enter();
+        let backend = self.backend.clone();
+        let backend = backend.as_ref();
         let mut layer_in = self.tok_embeddings.forward(x)?;
         for layer in self.layers.iter_mut() {
             let x = layer_in;
             let residual = &x;
-            let x = layer.attention_norm.forward(&x)?;
-            let attn = layer.forward_attn(&x, mask.as_ref(), index_pos)?;
+            let x = layer.attention_norm.forward(&x, backend)?;
+            let attn = layer.forward_attn(&x, mask.as_ref(), index_pos, backend)?;
             // Optional post-attention norm (Gemma2)
             let attn = match &layer.post_attention_norm {
-                Some(norm) => norm.forward(&attn)?,
+                Some(norm) => norm.forward(&attn, backend)?,
                 None => attn,
             };
-            let x = (attn + residual)?;
-
+            // Fused residual add + FFN norm: residual += attn; x = rms_norm(residual)
             let _enter = layer.span_mlp.enter();
-            let residual = &x;
-            let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.mlp_or_moe.forward(&x)?;
+            let attn_f32 = attn.to_dtype(DType::F32)?;
+            let residual_f32 = residual.to_dtype(DType::F32)?;
+            let shape = attn_f32.shape().to_vec();
+            let hidden = *shape.last().unwrap();
+            let n_tokens = attn_f32.elem_count() / hidden;
+            let (normed, new_residual) = backend.fused_add_rms_norm(
+                attn_f32.as_slice(), residual_f32.as_slice(),
+                layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                n_tokens, hidden,
+            );
+            let x = Tensor::from_vec(normed, shape.clone(), attn_f32.device())?;
+            let residual = Tensor::from_vec(new_residual, shape, attn_f32.device())?;
+            let residual = &residual;
+            let x = layer.mlp_or_moe.forward(&x, backend)?;
             // Optional post-FFN norm (Gemma2)
             let x = match &layer.post_ffn_norm {
-                Some(norm) => norm.forward(&x)?,
+                Some(norm) => norm.forward(&x, backend)?,
                 None => x,
             };
             let x = (x + residual)?;
             layer_in = x;
         }
-        let x = self.norm.forward(&layer_in)?;
+        let x = self.norm.forward(&layer_in, backend)?;
         let x = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
         let _enter = self.span_output.enter();
-        self.output.forward(&x)
+        self.output.forward(&x, backend)
     }
 
     /// Load from safetensors file(s) + config.json (FP16/BF16 models).

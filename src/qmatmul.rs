@@ -102,6 +102,21 @@ impl QWeight {
         self.cpu_cache.get_or_init(|| self.dequantize());
     }
 
+    /// Get cached dequantized weights, or dequantize and cache on first call.
+    pub fn cpu_cache_or_dequant(&self) -> &Vec<f32> {
+        self.cpu_cache.get_or_init(|| self.dequantize())
+    }
+
+    /// Get or initialize GPU cache of raw quantized bytes.
+    /// Returns a reference to the CudaSlice<u8> for kernel launch.
+    #[cfg(feature = "cuda")]
+    pub fn gpu_cache_or_upload(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> &CudaSlice<u8> {
+        self.gpu_cache.get_or_init(|| {
+            stream.clone_htod(&self.raw_data)
+                .expect("QWeight GPU upload failed")
+        })
+    }
+
     /// Number of output features (rows).
     pub fn out_features(&self) -> usize { self.shape.0 }
 

@@ -1,4 +1,5 @@
 mod auto_tq;
+pub mod backend;
 mod calibrate;
 mod catalog;
 mod chat;

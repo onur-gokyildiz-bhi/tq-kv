@@ -52,7 +52,7 @@ impl Sampler {
             SamplingMode::ArgMax => {
                 let (max_idx, _) = logits_row.iter()
                     .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                     .unwrap();
                 Ok(max_idx as u32)
             }
