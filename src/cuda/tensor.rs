@@ -572,6 +572,163 @@ impl TqTensor {
         }
         Ok(dim)
     }
+
+    /// True if this tensor lives on a CUDA device.
+    pub fn is_cuda(&self) -> bool {
+        match &self.storage {
+            TqStorage::Cpu(_) => false,
+            #[cfg(feature = "cuda")]
+            TqStorage::Cuda { .. } => true,
+        }
+    }
+}
+
+// ─── GPU dispatch (cuda feature only) ─────────────────────────
+#[cfg(feature = "cuda")]
+impl TqTensor {
+    /// Create from a Vec<f32> and shape, uploading to GPU when device is CUDA.
+    ///
+    /// Use this instead of `from_vec` when you want the tensor on the target device.
+    pub fn from_vec_on_device(data: Vec<f32>, shape: impl Into<Vec<usize>>, device: &TqDevice) -> Result<Self> {
+        let shape = shape.into();
+        let expected: usize = shape.iter().product();
+        if data.len() != expected {
+            tq_bail!("from_vec_on_device: data len {} != shape product {}", data.len(), expected);
+        }
+        match device {
+            TqDevice::Cpu => Ok(Self {
+                storage: TqStorage::Cpu(data),
+                shape,
+                dtype: TqDType::F32,
+            }),
+            TqDevice::Cuda { .. } => {
+                let stream = device.cuda_stream()?;
+                let cuda_data = stream.clone_htod(&data)
+                    .map_err(|e| TqError::Cuda(e))?;
+                Ok(Self {
+                    storage: TqStorage::Cuda { data: cuda_data, stream },
+                    shape,
+                    dtype: TqDType::F32,
+                })
+            }
+        }
+    }
+
+    /// Create a zeros tensor on the target device (GPU-allocated when CUDA).
+    pub fn zeros_on_device(shape: impl Into<Vec<usize>>, device: &TqDevice) -> Result<Self> {
+        let shape = shape.into();
+        let n: usize = shape.iter().product();
+        match device {
+            TqDevice::Cpu => Self::from_vec(vec![0.0; n], shape, device),
+            TqDevice::Cuda { .. } => {
+                let stream = device.cuda_stream()?;
+                let cuda_data = stream.alloc_zeros::<f32>(n)
+                    .map_err(|e| TqError::Cuda(e))?;
+                Ok(Self {
+                    storage: TqStorage::Cuda { data: cuda_data, stream },
+                    shape,
+                    dtype: TqDType::F32,
+                })
+            }
+        }
+    }
+
+    /// Transfer tensor to a different device (CPU<->GPU).
+    ///
+    /// - CPU->GPU: uploads via `stream.clone_htod`
+    /// - GPU->CPU: downloads via `stream.clone_dtoh`
+    /// - Same device: returns a clone
+    pub fn to_device(&self, device: &TqDevice) -> Result<Self> {
+        match (&self.storage, device) {
+            // CPU -> CPU: clone
+            (TqStorage::Cpu(_), TqDevice::Cpu) => Ok(self.clone()),
+
+            // CPU -> GPU: upload
+            (TqStorage::Cpu(data), TqDevice::Cuda { .. }) => {
+                let stream = device.cuda_stream()?;
+                let cuda_data = stream.clone_htod(data)
+                    .map_err(|e| TqError::Cuda(e))?;
+                Ok(Self {
+                    storage: TqStorage::Cuda { data: cuda_data, stream },
+                    shape: self.shape.clone(),
+                    dtype: self.dtype,
+                })
+            }
+
+            // GPU -> CPU: download
+            (TqStorage::Cuda { data, stream }, TqDevice::Cpu) => {
+                let host_data = stream.clone_dtoh(data)
+                    .map_err(|e| TqError::Cuda(e))?;
+                Ok(Self {
+                    storage: TqStorage::Cpu(host_data),
+                    shape: self.shape.clone(),
+                    dtype: self.dtype,
+                })
+            }
+
+            // GPU -> GPU (same ordinal): clone
+            (TqStorage::Cuda { .. }, TqDevice::Cuda { .. }) => {
+                // TODO: cross-device transfer when multi-GPU is wired up
+                Ok(self.clone())
+            }
+        }
+    }
+
+    /// Get a reference to the underlying CudaSlice for kernel launches.
+    ///
+    /// Panics if the tensor is on CPU.
+    pub fn cuda_data(&self) -> &cudarc::driver::CudaSlice<f32> {
+        match &self.storage {
+            TqStorage::Cuda { data, .. } => data,
+            _ => panic!("cuda_data() called on CPU tensor — use to_device() first"),
+        }
+    }
+
+    /// Get a mutable reference to the underlying CudaSlice for kernel launches.
+    ///
+    /// Panics if the tensor is on CPU.
+    pub fn cuda_data_mut(&mut self) -> &mut cudarc::driver::CudaSlice<f32> {
+        match &mut self.storage {
+            TqStorage::Cuda { data, .. } => data,
+            _ => panic!("cuda_data_mut() called on CPU tensor — use to_device() first"),
+        }
+    }
+
+    /// Get the CUDA stream associated with this tensor.
+    ///
+    /// Panics if the tensor is on CPU.
+    pub fn cuda_stream(&self) -> &std::sync::Arc<cudarc::driver::CudaStream> {
+        match &self.storage {
+            TqStorage::Cuda { stream, .. } => stream,
+            _ => panic!("cuda_stream() called on CPU tensor"),
+        }
+    }
+
+    /// Ensure the tensor lives on GPU, uploading if needed.
+    ///
+    /// If already on GPU, returns a clone. If on CPU, uploads to the given device.
+    pub fn ensure_gpu(&self, device: &TqDevice) -> Result<Self> {
+        if self.is_cuda() {
+            Ok(self.clone())
+        } else {
+            self.to_device(device)
+        }
+    }
+
+    /// Create a TqTensor directly from a CudaSlice (already on GPU).
+    ///
+    /// Used by kernel launchers to wrap output buffers as tensors.
+    pub fn from_cuda(
+        data: cudarc::driver::CudaSlice<f32>,
+        shape: Vec<usize>,
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Self {
+        Self {
+            storage: TqStorage::Cuda { data, stream },
+            shape,
+            dtype: TqDType::F32,
+        }
+    }
 }
 
 // ─── Operator overloads ────────────────────────────────────────

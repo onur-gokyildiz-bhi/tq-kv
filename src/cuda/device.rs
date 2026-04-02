@@ -64,6 +64,15 @@ impl TqDevice {
             _ => panic!("cuda_context() called on CPU device"),
         }
     }
+
+    /// Get the default stream from the CUDA context (panics on CPU).
+    #[cfg(feature = "cuda")]
+    pub fn cuda_stream(&self) -> super::Result<std::sync::Arc<cudarc::driver::CudaStream>> {
+        match self {
+            TqDevice::Cuda { context, .. } => Ok(context.default_stream()),
+            _ => panic!("cuda_stream() called on CPU device"),
+        }
+    }
 }
 
 impl PartialEq for TqDevice {
