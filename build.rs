@@ -3,8 +3,7 @@
 //! Detects CUDA_PATH, compiles kernels/*.cu → PTX, generates src/cuda/ptx.rs
 //! with embedded PTX strings. Feature-gated: only runs with `--features cuda`.
 
-use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn main() {
     // Only compile CUDA kernels when the cuda feature is enabled
@@ -144,6 +143,7 @@ fn generate_ptx_module(out_dir: &Path, entries: &[(String, PathBuf)]) {
     eprintln!("Generated {:?} with {} kernel(s)", ptx_rs, entries.len());
 }
 
+#[allow(dead_code)]
 fn generate_empty_ptx_module(out_dir: &Path) {
     let code = "// No CUDA kernels compiled (nvcc not found or cuda feature disabled).\n";
     let ptx_rs = out_dir.join("ptx_generated.rs");

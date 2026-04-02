@@ -81,6 +81,7 @@ impl PartialEq for TqDevice {
             (TqDevice::Cpu, TqDevice::Cpu) => true,
             #[cfg(feature = "cuda")]
             (TqDevice::Cuda { ordinal: a, .. }, TqDevice::Cuda { ordinal: b, .. }) => a == b,
+            #[cfg(feature = "cuda")]
             _ => false,
         }
     }

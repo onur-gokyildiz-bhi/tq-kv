@@ -355,7 +355,7 @@ pub fn resolve_hf_safetensors(repo_name: &str) -> Result<PathBuf> {
 
     // Find and download safetensors files
     // HF hub API: list repo files, filter *.safetensors
-    let info = api.model(repo_name.to_string());
+    let _info = api.model(repo_name.to_string());
 
     // Try common single-file pattern first
     let single = repo.get("model.safetensors");
@@ -367,7 +367,7 @@ pub fn resolve_hf_safetensors(repo_name: &str) -> Result<PathBuf> {
     // Try sharded pattern: model-00001-of-NNNNN.safetensors
     let mut found = false;
     for i in 1..=100 {
-        let name = format!("model-{:05}-of-", i);
+        let _name = format!("model-{:05}-of-", i);
         // We don't know the total, so just try to get the index file first
         let idx_file = format!("model.safetensors.index.json");
         if !found {

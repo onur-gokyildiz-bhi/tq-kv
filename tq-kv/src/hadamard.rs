@@ -178,7 +178,7 @@ pub fn random_orthogonal(dim: usize, seed: u64) -> Vec<f32> {
     }
 
     // Apply dim random Householder reflections: Q = H_1 * H_2 * ... * H_dim
-    for k in 0..dim {
+    for _k in 0..dim {
         // Random unit vector
         let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();

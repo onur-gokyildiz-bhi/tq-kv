@@ -8,12 +8,15 @@ pub mod gguf;
 pub mod quant;
 pub mod qmatmul;
 pub mod sampling;
+#[allow(dead_code)]
 mod diagnostics;
 mod download;
+#[allow(dead_code)]
 mod engine;
 mod hub;
 mod inference;
 mod model;
+#[allow(dead_code)]
 mod models;
 mod serve;
 

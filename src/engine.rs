@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
 use tq_kv::TurboQuantConfig;
 
-use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
+use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqError};
 use crate::gguf::GgufContent;
 use crate::sampling::{Sampler, SamplingMode};
 use crate::config::ModelArch;

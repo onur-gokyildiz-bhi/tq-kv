@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::cuda::{TqTensor, TqDevice, TqError, Result};
+use crate::cuda::{TqDevice, TqError, Result};
 use crate::qmatmul::QWeight;
 
 // ─── Constants ─────────────────────────────────────────────────

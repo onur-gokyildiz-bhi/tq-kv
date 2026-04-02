@@ -135,10 +135,12 @@ fn bench_v1(data: &[f32], dim: usize, bits: u8) -> BenchResult {
     let original_bytes = data.len() * 4;
 
     let t0 = Instant::now();
+    #[allow(deprecated)]
     let compressed = compress_vectors(data, dim, &config);
     let compress_time = t0.elapsed();
 
     let t0 = Instant::now();
+    #[allow(deprecated)]
     let decompressed = decompress_vectors(&compressed);
     let decompress_time = t0.elapsed();
 

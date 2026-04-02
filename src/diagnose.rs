@@ -146,17 +146,7 @@ fn main() {
             eprintln!("  to capture k_flat before compression and pass to diagnose_layer().");
             eprintln!();
 
-            // Implementation sketch (commented out — requires candle + model loading):
-            //
-            // use candle_core::{Device, DType};
-            // use candle_core::quantized::gguf_file;
-            //
-            // let device = Device::Cpu;
-            // let mut file = std::fs::File::open(&path).unwrap();
-            // let content = gguf_file::Content::read(&mut file).unwrap();
-            // let tq_config = tq_kv::TurboQuantConfig::balanced();
-            // let model = turbo_qwen2::ModelWeights::from_gguf(content, &mut file, &device, tq_config).unwrap();
-            //
+            // TODO: Implement real model loading for layer-by-layer diagnosis
             // // Forward pass with diagnostic hooks would go here.
             // // Each layer's k_flat (captured in forward_attn at line 214 of turbo_qwen2.rs)
             // // needs to be extracted and passed to diagnose_layer().

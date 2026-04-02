@@ -241,7 +241,7 @@ impl TqTensor {
 
         for o in 0..outer {
             for s in start..start + len {
-                let base = o * strides[dim] * self.shape[dim] + s * inner;
+                let _base = o * strides[dim] * self.shape[dim] + s * inner;
                 // Wait, simpler approach for contiguous:
                 let src_offset = o * (self.shape[dim] * inner) + s * inner;
                 result.extend_from_slice(&data[src_offset..src_offset + inner]);

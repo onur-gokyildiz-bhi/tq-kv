@@ -3,7 +3,7 @@
 //! CUDA dispatch will be added in Phase 3.
 //! Each op checks storage type and dispatches accordingly.
 
-use super::{TqTensor, TqDType, Result, tq_bail};
+use super::{TqTensor, Result, tq_bail};
 
 /// Tensor operation implementations.
 pub struct TqOps;

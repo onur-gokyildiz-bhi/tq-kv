@@ -1130,7 +1130,7 @@ impl LayerWeights {
 
             // --- Handle sink tokens (FP16, uncompressed) ---
             let sink_end = sink_n.min(global_start + seq_len);
-            let new_sink_count = if global_start < sink_n {
+            let _new_sink_count = if global_start < sink_n {
                 // Some tokens in this batch are sink tokens
                 let n_sink_in_batch = sink_end - global_start;
                 // Extract sink portion of k: k is [1, n_kv_head, seq_len, head_dim]
@@ -1595,7 +1595,7 @@ impl LayerWeights {
 
                     // Apply compaction beta biases to compacted segment logits
                     if let Some(ref comp) = cache.compacted {
-                        let ct = comp[0].t;
+                        let _ct = comp[0].t;
                         let beta_start = cache.sink_len + cache.cold_len;
                         // Build bias vector: [sink=0, cold=0, compacted=beta, hot=0, current=0]
                         let mut full_bias = vec![0.0f32; attn_len];
