@@ -35,6 +35,9 @@ pub enum GgmlDType {
     Q6K = 14,
     Q8K = 15,
     BF16 = 30,
+    /// TQ4_1S: TurboQuant 4-bit weight compression (WHT + 16 Lloyd-Max centroids).
+    /// 32 elements → 20 bytes (5.0 BPW). Custom type, not in upstream GGML.
+    TQ4_1S = 1024,
 }
 
 impl GgmlDType {
@@ -55,6 +58,7 @@ impl GgmlDType {
             14 => Ok(GgmlDType::Q6K),
             15 => Ok(GgmlDType::Q8K),
             30 => Ok(GgmlDType::BF16),
+            1024 => Ok(GgmlDType::TQ4_1S),
             _ => Err(TqError::Msg(format!("unknown GGML dtype: {}", v))),
         }
     }
@@ -65,7 +69,7 @@ impl GgmlDType {
             GgmlDType::F32 => 1,
             GgmlDType::F16 | GgmlDType::BF16 => 1,
             GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 |
-            GgmlDType::Q5_1 | GgmlDType::Q8_0 | GgmlDType::Q8_1 => 32,
+            GgmlDType::Q5_1 | GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::TQ4_1S => 32,
             GgmlDType::Q2K | GgmlDType::Q3K | GgmlDType::Q4K |
             GgmlDType::Q5K | GgmlDType::Q6K | GgmlDType::Q8K => 256,
         }
@@ -88,6 +92,7 @@ impl GgmlDType {
             GgmlDType::Q5K => 176,     // 2+2+12+32+128 = 176
             GgmlDType::Q6K => 210,     // 128+64+16+2 = 210
             GgmlDType::Q8K => 292,     // 4+256+32 = 292
+            GgmlDType::TQ4_1S => 20,  // 2+2+16 = 20 (scale:f16 + offset:f16 + nibbles:16B)
         }
     }
 

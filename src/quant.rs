@@ -231,6 +231,10 @@ pub fn dequantize(data: &[u8], dtype: GgmlDType, n_elements: usize) -> Vec<f32> 
         GgmlDType::Q4K => dequantize_q4k(data, n_elements),
         GgmlDType::Q5K => dequantize_q5k(data, n_elements),
         GgmlDType::Q6K => dequantize_q6k(data, n_elements),
+        GgmlDType::TQ4_1S => {
+            let blocks = tq_kv::weight_compress::bytes_to_blocks(data);
+            tq_kv::weight_compress::decompress_weights(&blocks, n_elements, 42) // seed=42 default
+        }
         _ => {
             eprintln!("WARNING: unsupported dequant for {:?}, returning zeros", dtype);
             vec![0.0; n_elements]
