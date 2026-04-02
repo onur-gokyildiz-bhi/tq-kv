@@ -58,17 +58,24 @@ pub fn dequantize_q4k(data: &[u8], n_elements: usize) -> Vec<f32> {
         let scales = &block[4..16];   // 12 bytes
         let qs = &block[16..144];     // 128 bytes
 
-        for sub in 0..8 {
-            let (sc, m) = get_scale_min_k4(sub, scales);
-            let d1 = d * sc as f32;
-            let m1 = dmin * m as f32;
+        // Canonical GGML Q4_K layout: 128 qs bytes in 4 groups of 32 bytes.
+        // Each group covers 2 sub-blocks: lo nibbles → sub 2*j, hi nibbles → sub 2*j+1.
+        // Each sub-block has its own (scale, min) pair from get_scale_min_k4.
+        for j in 0..4 {
+            let (sc_lo, m_lo) = get_scale_min_k4(2 * j, scales);
+            let (sc_hi, m_hi) = get_scale_min_k4(2 * j + 1, scales);
+            let d_lo = d * sc_lo as f32;
+            let d_hi = d * sc_hi as f32;
+            let dm_lo = dmin * m_lo as f32;
+            let dm_hi = dmin * m_hi as f32;
 
-            for j in 0..16 {
-                let byte = qs[sub * 16 + j];
-                let lo = (byte & 0xF) as f32;
-                let hi = (byte >> 4) as f32;
-                output.push(d1 * lo - m1);
-                output.push(d1 * hi - m1);
+            // 32 bytes → 64 values: lo nibbles first (32 values), then hi nibbles (32 values)
+            let q_off = j * 32;
+            for l in 0..32 {
+                output.push(d_lo * (qs[q_off + l] & 0xF) as f32 - dm_lo);
+            }
+            for l in 0..32 {
+                output.push(d_hi * (qs[q_off + l] >> 4) as f32 - dm_hi);
             }
         }
     }
@@ -92,24 +99,29 @@ pub fn dequantize_q5k(data: &[u8], n_elements: usize) -> Vec<f32> {
         let qh = &block[16..48];      // 32 bytes — high bits
         let qs = &block[48..176];     // 128 bytes — low 4 bits
 
-        for sub in 0..8 {
-            let (sc, m) = get_scale_min_k4(sub, scales);
-            let d1 = d * sc as f32;
-            let m1 = dmin * m as f32;
+        // Canonical GGML Q5_K layout: 128 qs bytes in 4 groups of 32 bytes.
+        // Each group covers 2 sub-blocks: lo nibbles → sub 2*j, hi nibbles → sub 2*j+1.
+        // The 5th bit comes from qh[l]: bit (2*j) for lo, bit (2*j+1) for hi.
+        for j in 0..4usize {
+            let (sc_lo, m_lo) = get_scale_min_k4(2 * j, scales);
+            let (sc_hi, m_hi) = get_scale_min_k4(2 * j + 1, scales);
+            let d_lo = d * sc_lo as f32;
+            let d_hi = d * sc_hi as f32;
+            let dm_lo = dmin * m_lo as f32;
+            let dm_hi = dmin * m_hi as f32;
 
-            for j in 0..16 {
-                let byte = qs[sub * 16 + j];
-                let lo = (byte & 0xF) as u32;
-                let hi = (byte >> 4) as u32;
-
-                // 5th bit from qh
-                let qh_byte_idx = sub * 4 + j / 2;
-                let qh_byte = if qh_byte_idx < 32 { qh[qh_byte_idx] } else { 0 };
-                let bit_lo = ((qh_byte >> (2 * (j % 2))) & 1) as u32;
-                let bit_hi = ((qh_byte >> (2 * (j % 2) + 1)) & 1) as u32;
-
-                output.push(d1 * (lo | (bit_lo << 4)) as f32 - m1);
-                output.push(d1 * (hi | (bit_hi << 4)) as f32 - m1);
+            let q_off = j * 32;
+            // lo nibbles first (32 values for sub-block 2*j)
+            for l in 0..32 {
+                let lo = (qs[q_off + l] & 0xF) as u32;
+                let bit5 = ((qh[l] >> (2 * j)) & 1) as u32;
+                output.push(d_lo * (lo | (bit5 << 4)) as f32 - dm_lo);
+            }
+            // hi nibbles next (32 values for sub-block 2*j+1)
+            for l in 0..32 {
+                let hi = (qs[q_off + l] >> 4) as u32;
+                let bit5 = ((qh[l] >> (2 * j + 1)) & 1) as u32;
+                output.push(d_hi * (hi | (bit5 << 4)) as f32 - dm_hi);
             }
         }
     }
@@ -132,22 +144,42 @@ pub fn dequantize_q6k(data: &[u8], n_elements: usize) -> Vec<f32> {
         let scales = &block[192..208]; // i8 scales x16
         let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
 
-        for sub in 0..16 {
-            let sc = scales[sub] as i8 as f32;
-            let base = sub * 16;
+        // Canonical GGML Q6_K layout: 128 ql bytes + 64 qh bytes → 256 values.
+        // Processed in 2 groups of 128 values. Each group uses 64 ql bytes + 32 qh bytes + 8 scales.
+        // Within each group of 128:
+        //   positions  0..31: lo nibble of ql[0..32],  qh bits 0-1
+        //   positions 32..63: lo nibble of ql[32..64], qh bits 2-3
+        //   positions 64..95: hi nibble of ql[0..32],  qh bits 4-5
+        //   positions 96..127: hi nibble of ql[32..64], qh bits 6-7
+        for n in 0..2usize {
+            let ql_off = n * 64;
+            let qh_off = n * 32;
+            let sc_off = n * 8;
+            let mut buf = [0.0f32; 128];
 
-            for j in 0..16 {
-                let idx = base + j;
-                let ql_byte = ql[idx / 2];
-                let lo = if idx % 2 == 0 { ql_byte & 0xF } else { ql_byte >> 4 };
+            for l in 0..32usize {
+                let is = l / 16; // 0 or 1
 
-                let qh_idx = idx / 4;
-                let qh_shift = (idx % 4) * 2;
-                let hi = if qh_idx < 64 { (qh[qh_idx] >> qh_shift) & 3 } else { 0 };
+                let q1 = (ql[ql_off + l] & 0xF) as i32
+                    | (((qh[qh_off + l] >> 0) & 3) as i32) << 4;
+                let q2 = (ql[ql_off + l + 32] & 0xF) as i32
+                    | (((qh[qh_off + l] >> 2) & 3) as i32) << 4;
+                let q3 = (ql[ql_off + l] >> 4) as i32
+                    | (((qh[qh_off + l] >> 4) & 3) as i32) << 4;
+                let q4 = (ql[ql_off + l + 32] >> 4) as i32
+                    | (((qh[qh_off + l] >> 6) & 3) as i32) << 4;
 
-                let val = ((lo as u32) | ((hi as u32) << 4)) as i32 - 32;
-                output.push(d * sc * val as f32);
+                let sc0 = scales[sc_off + is] as i8 as f32;
+                let sc2 = scales[sc_off + is + 2] as i8 as f32;
+                let sc4 = scales[sc_off + is + 4] as i8 as f32;
+                let sc6 = scales[sc_off + is + 6] as i8 as f32;
+
+                buf[l]      = d * sc0 * (q1 - 32) as f32;
+                buf[l + 32] = d * sc2 * (q2 - 32) as f32;
+                buf[l + 64] = d * sc4 * (q3 - 32) as f32;
+                buf[l + 96] = d * sc6 * (q4 - 32) as f32;
             }
+            output.extend_from_slice(&buf);
         }
     }
     output

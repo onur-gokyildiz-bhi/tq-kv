@@ -70,20 +70,30 @@ extern "C" __global__ void q4km_matvec_f32(
         const uint8_t* scales = block + 4;
         const uint8_t* qs = block + 16;
 
-        // Process 8 sub-blocks of 32 elements each
-        for (int sub = 0; sub < 8; ++sub) {
-            uint8_t sc, m;
-            get_scale_min_k4(sub, scales, &sc, &m);
-            float d1 = d * (float)sc;
-            float m1 = dmin * (float)m;
+        // Canonical GGML Q4_K layout: 128 qs bytes in 4 groups of 32 bytes.
+        // Each group covers 2 sub-blocks: lo nibbles → sub 2*j, hi nibbles → sub 2*j+1.
+        // Output order: [32 lo values, 32 hi values] per group = 64 per group.
+        for (int grp = 0; grp < 4; ++grp) {
+            uint8_t sc_lo, m_lo, sc_hi, m_hi;
+            get_scale_min_k4(2 * grp,     scales, &sc_lo, &m_lo);
+            get_scale_min_k4(2 * grp + 1, scales, &sc_hi, &m_hi);
+            float d_lo  = d * (float)sc_lo;
+            float d_hi  = d * (float)sc_hi;
+            float dm_lo = dmin * (float)m_lo;
+            float dm_hi = dmin * (float)m_hi;
 
-            // 16 bytes → 32 values (4-bit pairs)
-            for (int j = 0; j < 16; ++j) {
-                uint8_t byte = qs[sub * 16 + j];
-                int idx = sub * 32 + j * 2;
-                float v0 = d1 * (float)(byte & 0xF) - m1;
-                float v1 = d1 * (float)(byte >> 4)   - m1;
-                partial_sum += v0 * x_sb[idx] + v1 * x_sb[idx + 1];
+            int q_off = grp * 32;
+            int x_off = grp * 64;
+
+            // Lo nibbles: 32 values for sub-block 2*grp
+            for (int l = 0; l < 32; ++l) {
+                float v = d_lo * (float)(qs[q_off + l] & 0xF) - dm_lo;
+                partial_sum += v * x_sb[x_off + l];
+            }
+            // Hi nibbles: 32 values for sub-block 2*grp+1
+            for (int l = 0; l < 32; ++l) {
+                float v = d_hi * (float)(qs[q_off + l] >> 4) - dm_hi;
+                partial_sum += v * x_sb[x_off + 32 + l];
             }
         }
     }
@@ -165,17 +175,23 @@ extern "C" __global__ void q4km_dequant_f32(
     const uint8_t* scales = block + 4;
     const uint8_t* qs = block + 16;
 
-    // Each thread handles elements within the super-block
-    for (int sub = tid / 16; sub < 8; sub += blockDim.x / 16) {
-        int j = tid % 16;
-        uint8_t sc, m;
-        get_scale_min_k4(sub, scales, &sc, &m);
-        float d1 = d * (float)sc;
-        float m1 = dmin * (float)m;
+    // Canonical GGML Q4_K layout: 4 groups of 32 qs bytes.
+    // Each group covers 2 sub-blocks: lo nibbles → sub 2*grp, hi nibbles → sub 2*grp+1.
+    // Output: [32 lo values, 32 hi values] per group = 64 per group.
+    // Each thread handles one byte (produces 2 values at stride 32).
+    for (int grp = tid / 32; grp < 4; grp += blockDim.x / 32) {
+        int l = tid % 32;
+        uint8_t sc_lo, m_lo, sc_hi, m_hi;
+        get_scale_min_k4(2 * grp,     scales, &sc_lo, &m_lo);
+        get_scale_min_k4(2 * grp + 1, scales, &sc_hi, &m_hi);
+        float d_lo  = d * (float)sc_lo;
+        float d_hi  = d * (float)sc_hi;
+        float dm_lo = dmin * (float)m_lo;
+        float dm_hi = dmin * (float)m_hi;
 
-        uint8_t byte = qs[sub * 16 + j];
-        int idx = sub * 32 + j * 2;
-        out[idx]     = d1 * (float)(byte & 0xF) - m1;
-        out[idx + 1] = d1 * (float)(byte >> 4)   - m1;
+        uint8_t byte = qs[grp * 32 + l];
+        int base = grp * 64;
+        out[base + l]      = d_lo * (float)(byte & 0xF) - dm_lo;
+        out[base + 32 + l] = d_hi * (float)(byte >> 4)  - dm_hi;
     }
 }
