@@ -570,3 +570,65 @@ fn extract_last_logits(logits: &Tensor) -> crate::cuda::Result<Tensor> {
         _ => Err(TqError::Msg(format!("unexpected logits shape: {:?}", shape))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cuda::{TqTensor as Tensor, TqDevice as Device};
+
+    #[test]
+    fn test_extract_last_logits_3d() {
+        // [1, 5, 100] — batch=1, seq_len=5, vocab=100
+        let data: Vec<f32> = (0..500).map(|i| i as f32).collect();
+        let t = Tensor::from_vec(data, vec![1, 5, 100], &Device::Cpu).unwrap();
+        let result = extract_last_logits(&t).unwrap();
+        assert_eq!(result.shape(), &[100]);
+        let vals = result.to_vec1().unwrap();
+        // Last seq position is row 4 (indices 400..500)
+        assert!((vals[0] - 400.0).abs() < 1e-6);
+        assert!((vals[99] - 499.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_extract_last_logits_2d() {
+        // [1, 100] — batch=1, vocab=100
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let t = Tensor::from_vec(data, vec![1, 100], &Device::Cpu).unwrap();
+        let result = extract_last_logits(&t).unwrap();
+        assert_eq!(result.shape(), &[100]);
+        let vals = result.to_vec1().unwrap();
+        assert!((vals[0] - 0.0).abs() < 1e-6);
+        assert!((vals[99] - 99.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_extract_last_logits_1d() {
+        // [100] — already flat
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let t = Tensor::from_vec(data.clone(), vec![100], &Device::Cpu).unwrap();
+        let result = extract_last_logits(&t).unwrap();
+        assert_eq!(result.shape(), &[100]);
+        assert_eq!(result.to_vec1().unwrap(), data);
+    }
+
+    #[test]
+    fn test_compute_nll() {
+        // Known logits: [2.0, 1.0, 0.1] with target=0
+        // softmax(2.0, 1.0, 0.1):
+        //   exp(2)=7.389, exp(1)=2.718, exp(0.1)=1.105
+        //   sum = 11.212
+        //   p(0) = 7.389/11.212 = 0.659
+        //   NLL = -ln(0.659) ≈ 0.417
+        let logits = vec![2.0f32, 1.0, 0.1];
+        let nll = compute_nll(&logits, 0);
+        assert!((nll - 0.417).abs() < 0.01, "NLL was {}", nll);
+
+        // Target with low probability should have high NLL
+        let nll_low = compute_nll(&logits, 2);
+        assert!(nll_low > nll, "low-prob target should have higher NLL");
+
+        // NLL should always be non-negative for valid targets
+        assert!(nll >= 0.0);
+        assert!(nll_low >= 0.0);
+    }
+}

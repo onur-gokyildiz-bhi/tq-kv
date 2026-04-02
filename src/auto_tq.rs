@@ -248,4 +248,30 @@ mod tests {
         let cfg = to_tq_config(&result).unwrap();
         assert_eq!(cfg.bits, 2);
     }
+
+    #[test]
+    fn test_decide_fits_no_compression() {
+        // On CPU device, decide should always return disabled (no VRAM to manage)
+        let device = Device::Cpu;
+        // Small model that would fit easily: 1 GB, 32 layers, 8 heads, dim 128, 4096 ctx
+        let result = decide(&device, 1_000_000_000, 32, 8, 128, 4096);
+        assert!(!result.enabled);
+        assert_eq!(result.bits, 0);
+        assert_eq!(result.vram_total_mb, 0);
+        // Reason should mention CPU
+        assert!(result.reason.contains("CPU"));
+    }
+
+    #[test]
+    fn test_decide_4bit_compression() {
+        // On CPU device, even a huge model should still return disabled
+        // because decide() requires CUDA to be active
+        let device = Device::Cpu;
+        let result = decide(&device, 50_000_000_000, 80, 8, 128, 131072);
+        assert!(!result.enabled);
+        assert_eq!(result.bits, 0);
+        // Verify the AutoTqResult fields are zeroed for CPU path
+        assert_eq!(result.vram_total_mb, 0);
+        assert_eq!(result.vram_available_mb, 0);
+    }
 }

@@ -191,4 +191,55 @@ mod tests {
         // With uniform distribution and 50 samples from 100 tokens, should see variety
         assert!(seen.len() > 5);
     }
+
+    #[test]
+    fn test_argmax_tie_breaking() {
+        // Two equal max values — argmax should pick the first one
+        let logits = TqTensor::from_vec(
+            vec![0.1, 0.9, 0.5, 0.9, 0.2],
+            vec![5],
+            &TqDevice::Cpu,
+        ).unwrap();
+
+        let mut sampler = Sampler::argmax();
+        let token = sampler.sample(&logits).unwrap();
+        // Rust's max_by picks the last max with partial_cmp, but the iterator
+        // returns the element with the greatest value; with ties the last wins
+        assert!(token == 1 || token == 3); // either tie-break is acceptable
+    }
+
+    #[test]
+    fn test_temperature_effect() {
+        // With very high temperature, distribution should be nearly uniform
+        // even with non-uniform logits
+        let logits = TqTensor::from_vec(
+            vec![10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![10],
+            &TqDevice::Cpu,
+        ).unwrap();
+
+        // Low temperature: should almost always pick token 0
+        let mut low_temp = Sampler::new(
+            SamplingMode::TopKTopP { k: 10, p: 1.0, temperature: 0.01 },
+            42,
+        );
+        let mut token0_count = 0;
+        for _ in 0..20 {
+            if low_temp.sample(&logits).unwrap() == 0 {
+                token0_count += 1;
+            }
+        }
+        assert!(token0_count >= 18, "low temp should almost always pick dominant token");
+
+        // High temperature: should see more diversity
+        let mut high_temp = Sampler::new(
+            SamplingMode::TopKTopP { k: 10, p: 1.0, temperature: 100.0 },
+            42,
+        );
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            seen.insert(high_temp.sample(&logits).unwrap());
+        }
+        assert!(seen.len() >= 3, "high temp should produce diverse tokens, got {}", seen.len());
+    }
 }

@@ -307,4 +307,48 @@ mod tests {
         assert!((data[1] - 7.0).abs() < 1e-6);
         assert!((data[2] - 11.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_qmatmul_batched() {
+        // W = [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1],[1,1,1,1]] (5x4)
+        // x = [2, 3, 4] batch of ones → each row is [1,1,1,1]
+        // x @ W^T: each row → [1, 1, 1, 1, 4]
+        let w = TqTensor::from_vec(
+            vec![
+                1.0, 0.0, 0.0, 0.0,
+                0.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+                0.0, 0.0, 0.0, 1.0,
+                1.0, 1.0, 1.0, 1.0,
+            ],
+            vec![5, 4],
+            &TqDevice::Cpu,
+        ).unwrap();
+        let x = TqTensor::from_vec(vec![1.0; 2 * 3 * 4], vec![2, 3, 4], &TqDevice::Cpu).unwrap();
+
+        let qmm = QMatMul::from_tensor(w);
+        let y = qmm.forward(&x).unwrap();
+        assert_eq!(y.shape(), &[2, 3, 5]);
+        let data = y.to_vec1().unwrap();
+        // Every group of 5 should be [1, 1, 1, 1, 4]
+        for i in 0..6 {
+            assert!((data[i * 5] - 1.0).abs() < 1e-6);
+            assert!((data[i * 5 + 4] - 4.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_qweight_clone() {
+        let w_data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let qw = QWeight::new(w_data.clone(), GgmlDType::F32, (2, 2));
+        let cloned = qw.clone();
+        assert_eq!(cloned.dtype, GgmlDType::F32);
+        assert_eq!(cloned.shape, (2, 2));
+        assert_eq!(cloned.raw_data, w_data);
+        // Dequantized values should match
+        assert_eq!(qw.dequantize(), cloned.dequantize());
+    }
 }

@@ -936,4 +936,100 @@ mod tests {
         let c = a.broadcast_add(&b).unwrap();
         assert_eq!(c.to_vec1().unwrap(), vec![11.0, 22.0, 13.0, 24.0]);
     }
+
+    #[test]
+    fn test_chunk() {
+        let t = TqTensor::from_vec(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![6], &TqDevice::Cpu
+        ).unwrap();
+        let chunks = t.chunk(3, 0).unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].shape(), &[2]);
+        assert_eq!(chunks[0].to_vec1().unwrap(), vec![1.0, 2.0]);
+        assert_eq!(chunks[1].to_vec1().unwrap(), vec![3.0, 4.0]);
+        assert_eq!(chunks[2].to_vec1().unwrap(), vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_zeros_like() {
+        let t = TqTensor::from_vec(vec![1.0, 2.0, 3.0], vec![1, 3], &TqDevice::Cpu).unwrap();
+        let z = t.zeros_like().unwrap();
+        assert_eq!(z.shape(), &[1, 3]);
+        assert_eq!(z.to_vec1().unwrap(), vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_expand() {
+        // Expand size-1 dim: [1, 3] -> [4, 3]
+        let t = TqTensor::from_vec(vec![1.0, 2.0, 3.0], vec![1, 3], &TqDevice::Cpu).unwrap();
+        let e = t.expand(vec![4, 3]).unwrap();
+        assert_eq!(e.shape(), &[4, 3]);
+        let data = e.to_vec1().unwrap();
+        // Each row should be [1, 2, 3] repeated 4 times
+        assert_eq!(data, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_index_select() {
+        // 3x2 matrix, select rows 0 and 2
+        let t = TqTensor::from_vec(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![3, 2], &TqDevice::Cpu
+        ).unwrap();
+        let indices = TqTensor::from_vec(vec![0.0, 2.0], vec![2], &TqDevice::Cpu).unwrap();
+        let s = t.index_select(&indices, 0).unwrap();
+        assert_eq!(s.shape(), &[2, 2]);
+        assert_eq!(s.to_vec1().unwrap(), vec![1.0, 2.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_where_cond() {
+        let mask = TqTensor::from_vec(vec![1.0, 0.0, 1.0, 0.0], vec![4], &TqDevice::Cpu).unwrap();
+        let on_true = TqTensor::from_vec(vec![10.0, 20.0, 30.0, 40.0], vec![4], &TqDevice::Cpu).unwrap();
+        let on_false = TqTensor::from_vec(vec![100.0, 200.0, 300.0, 400.0], vec![4], &TqDevice::Cpu).unwrap();
+        let result = mask.where_cond(&on_true, &on_false).unwrap();
+        assert_eq!(result.to_vec1().unwrap(), vec![10.0, 200.0, 30.0, 400.0]);
+    }
+
+    #[test]
+    fn test_unsqueeze_squeeze() {
+        let t = TqTensor::from_vec(vec![1.0, 2.0, 3.0], vec![3], &TqDevice::Cpu).unwrap();
+        // unsqueeze at dim 0: [3] -> [1, 3]
+        let u = t.unsqueeze(0).unwrap();
+        assert_eq!(u.shape(), &[1, 3]);
+        // squeeze dim 0: [1, 3] -> [3]
+        let s = u.squeeze(0).unwrap();
+        assert_eq!(s.shape(), &[3]);
+        assert_eq!(s.to_vec1().unwrap(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_operator_add() {
+        let a = TqTensor::from_vec(vec![1.0, 2.0, 3.0], vec![3], &TqDevice::Cpu).unwrap();
+        let b = TqTensor::from_vec(vec![4.0, 5.0, 6.0], vec![3], &TqDevice::Cpu).unwrap();
+        let c = (a + b).unwrap();
+        assert_eq!(c.to_vec1().unwrap(), vec![5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn test_operator_sub() {
+        let a = TqTensor::from_vec(vec![10.0, 20.0, 30.0], vec![3], &TqDevice::Cpu).unwrap();
+        let b = TqTensor::from_vec(vec![1.0, 2.0, 3.0], vec![3], &TqDevice::Cpu).unwrap();
+        let c = (a - b).unwrap();
+        assert_eq!(c.to_vec1().unwrap(), vec![9.0, 18.0, 27.0]);
+    }
+
+    #[test]
+    fn test_operator_mul() {
+        let a = TqTensor::from_vec(vec![2.0, 3.0, 4.0], vec![3], &TqDevice::Cpu).unwrap();
+        let b = TqTensor::from_vec(vec![5.0, 6.0, 7.0], vec![3], &TqDevice::Cpu).unwrap();
+        let c = (a * b).unwrap();
+        assert_eq!(c.to_vec1().unwrap(), vec![10.0, 18.0, 28.0]);
+    }
+
+    #[test]
+    fn test_div_scalar() {
+        let t = TqTensor::from_vec(vec![10.0, 20.0, 30.0], vec![3], &TqDevice::Cpu).unwrap();
+        let d = (t / 2.0).unwrap();
+        assert_eq!(d.to_vec1().unwrap(), vec![5.0, 10.0, 15.0]);
+    }
 }

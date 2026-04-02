@@ -533,4 +533,62 @@ mod tests {
         assert!(content.metadata.is_empty());
         assert!(content.tensor_infos.is_empty());
     }
+
+    #[test]
+    fn test_gguf_value_conversions() {
+        // to_u32: from U32
+        assert_eq!(GgufValue::U32(42).to_u32().unwrap(), 42);
+        // to_u32: from U8
+        assert_eq!(GgufValue::U8(7).to_u32().unwrap(), 7);
+        // to_u32: from U16
+        assert_eq!(GgufValue::U16(1000).to_u32().unwrap(), 1000);
+        // to_u32: from I32
+        assert_eq!(GgufValue::I32(99).to_u32().unwrap(), 99);
+        // to_u32: from U64
+        assert_eq!(GgufValue::U64(123).to_u32().unwrap(), 123);
+        // to_u32: from F32 should fail
+        assert!(GgufValue::F32(1.0).to_u32().is_err());
+
+        // to_f32: from F32
+        assert!((GgufValue::F32(3.14).to_f32().unwrap() - 3.14).abs() < 1e-6);
+        // to_f32: from F64
+        assert!((GgufValue::F64(2.718).to_f32().unwrap() - 2.718).abs() < 1e-3);
+        // to_f32: from U32 should fail
+        assert!(GgufValue::U32(1).to_f32().is_err());
+
+        // to_string_val: from String
+        assert_eq!(GgufValue::String("hello".into()).to_string_val().unwrap(), "hello");
+        // to_string_val: from U32 should fail
+        assert!(GgufValue::U32(1).to_string_val().is_err());
+    }
+
+    #[test]
+    fn test_ggml_dtype_all_variants() {
+        // All valid variant round-trips
+        let cases: &[(u32, GgmlDType)] = &[
+            (0, GgmlDType::F32),
+            (1, GgmlDType::F16),
+            (2, GgmlDType::Q4_0),
+            (3, GgmlDType::Q4_1),
+            (6, GgmlDType::Q5_0),
+            (7, GgmlDType::Q5_1),
+            (8, GgmlDType::Q8_0),
+            (9, GgmlDType::Q8_1),
+            (10, GgmlDType::Q2K),
+            (11, GgmlDType::Q3K),
+            (12, GgmlDType::Q4K),
+            (13, GgmlDType::Q5K),
+            (14, GgmlDType::Q6K),
+            (15, GgmlDType::Q8K),
+            (30, GgmlDType::BF16),
+        ];
+        for &(id, expected) in cases {
+            assert_eq!(GgmlDType::from_u32(id).unwrap(), expected);
+        }
+        // Invalid values should error
+        assert!(GgmlDType::from_u32(4).is_err());
+        assert!(GgmlDType::from_u32(5).is_err());
+        assert!(GgmlDType::from_u32(16).is_err());
+        assert!(GgmlDType::from_u32(255).is_err());
+    }
 }
