@@ -1,16 +1,16 @@
-//! Candle-based unified inference engine.
+//! Unified inference engine — TqTensor-based (no candle dependency).
 //!
 //! Two modes:
-//! - Standard: candle's stock quantized models (f32 KV cache)
-//! - TurboQuant: forked models with compressed KV cache (2-4 bit)
+//! - Standard: GGUF quantized models (f32 KV cache)
+//! - TurboQuant: compressed KV cache (2-4 bit)
 
 use anyhow::{Context, Result};
-use candle_core::quantized::gguf_file;
-use candle_core::{Device, Tensor};
-use candle_transformers::generation::{LogitsProcessor, Sampling};
 use tokenizers::Tokenizer;
 use tq_kv::TurboQuantConfig;
 
+use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
+use crate::gguf::GgufContent;
+use crate::sampling::{Sampler, SamplingMode};
 use crate::config::ModelArch;
 use crate::models::turbo_generic;
 
@@ -20,7 +20,7 @@ use crate::models::turbo_generic;
 struct ModelWeights(turbo_generic::GenericTurboModel);
 
 impl ModelWeights {
-    fn forward(&mut self, x: &Tensor, pos: usize) -> candle_core::Result<Tensor> {
+    fn forward(&mut self, x: &Tensor, pos: usize) -> crate::cuda::Result<Tensor> {
         self.0.forward(x, pos)
     }
 }
@@ -238,7 +238,7 @@ impl Engine {
         let device = if force_cpu {
             Device::Cpu
         } else {
-            Device::cuda_if_available(0).context("Device init failed")?
+            Device::cuda_if_available(0).unwrap_or(Device::Cpu)
         };
         eprintln!("Device: {}", if device.is_cuda() { "CUDA GPU" } else { "CPU" });
 
@@ -273,12 +273,9 @@ impl Engine {
             let mut file = std::fs::File::open(model_path)
                 .with_context(|| format!("Cannot open model: {}", model_path.display()))?;
 
-            let content = gguf_file::Content::read(&mut file)
+            let content = GgufContent::read(&mut file)
                 .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
 
-            // GenericTurboModel is the unified GGUF loader — CUDA-compatible ops
-            // (custom RmsNorm, RoPE, softmax) work on both CPU and GPU.
-            // When tq_config is None, all layers use uncompressed fp16 KV cache.
             let tq = tq_config.unwrap_or_else(|| {
                 let mut cfg = TurboQuantConfig::balanced();
                 cfg.skip_layers = Some(999);
@@ -324,9 +321,15 @@ impl Engine {
     }
 
     /// Enable quality gate — monitors running PPL during generation.
-    /// If PPL exceeds `threshold`, logs a warning suggesting higher bit width.
     pub fn enable_quality_gate(&mut self, ppl_threshold: f64) {
         self.quality_gate = Some(QualityGate::new(ppl_threshold));
+    }
+
+    /// Create a token input tensor from token IDs.
+    fn make_input(&self, tokens: &[u32]) -> crate::cuda::Result<Tensor> {
+        let data: Vec<f32> = tokens.iter().map(|&t| t as f32).collect();
+        let len = data.len();
+        Tensor::from_vec(data, vec![1, len], &self.device)
     }
 
     /// Generate text with streaming callback.
@@ -350,26 +353,29 @@ impl Engine {
 
         eprintln!("Prompt tokens: {}", prompt_tokens.len());
 
-        let sampling = if params.temperature <= 0.0 {
-            Sampling::ArgMax
+        let mut sampler = if params.temperature <= 0.0 {
+            Sampler::new(SamplingMode::ArgMax, params.seed)
         } else {
-            Sampling::TopKThenTopP {
-                k: params.top_k,
-                p: params.top_p as f64,
-                temperature: params.temperature as f64,
-            }
+            Sampler::new(
+                SamplingMode::TopKTopP {
+                    k: params.top_k,
+                    p: params.top_p as f64,
+                    temperature: params.temperature as f64,
+                },
+                params.seed,
+            )
         };
-        let mut logits_processor = LogitsProcessor::from_sampling(params.seed, sampling);
 
         self.position = 0;
-        let input = Tensor::new(prompt_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input, self.position)?;
+        let input = self.make_input(&prompt_tokens)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let logits = self.model.forward(&input, self.position)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         self.position += prompt_tokens.len();
 
-        let logits = logits.squeeze(0)?;
-        let logits = extract_last_logits(&logits)?.to_device(&Device::Cpu)?;
-        let mut next_token = logits_processor
-            .sample(&logits)
+        let logits = extract_last_logits(&logits)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut next_token = sampler.sample(&logits)
             .map_err(|e| anyhow::anyhow!("Sampling error: {}", e))?;
 
         let mut output = String::new();
@@ -380,9 +386,6 @@ impl Engine {
         while n_generated < params.max_tokens {
             if self.eos_token_ids.contains(&next_token) { break; }
 
-            // Incremental decode: decode ALL generated tokens, then diff with previous.
-            // This preserves spaces that sentencepiece tokenizers encode as part of
-            // the token (e.g., "▁Hello" → " Hello"). Single-token decode loses the space.
             all_tokens.push(next_token);
             let full_text = self.tokenizer.decode(&all_tokens, true).unwrap_or_default();
             if full_text.len() > prev_decoded_len {
@@ -392,16 +395,19 @@ impl Engine {
             }
             prev_decoded_len = full_text.len();
 
-            let input = Tensor::new(&[next_token], &self.device)?.unsqueeze(0)?;
-            let logits = self.model.forward(&input, self.position)?;
+            let input = self.make_input(&[next_token])
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let logits = self.model.forward(&input, self.position)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             self.position += 1;
 
-            let logits = logits.squeeze(0)?;
-            let logits = extract_last_logits(&logits)?.to_device(&Device::Cpu)?;
+            let logits = extract_last_logits(&logits)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            // Apply repetition penalty: reduce logits for tokens already generated
+            // Apply repetition penalty
             let logits = if params.repeat_penalty != 1.0 && !all_tokens.is_empty() {
-                let mut logits_vec = logits.to_vec1::<f32>()?;
+                let mut logits_vec = logits.to_vec1()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
                 for &token_id in &all_tokens {
                     let idx = token_id as usize;
                     if idx < logits_vec.len() {
@@ -413,21 +419,22 @@ impl Engine {
                         };
                     }
                 }
-                Tensor::from_vec(logits_vec, logits.shape(), logits.device())?
+                Tensor::from_vec(logits_vec, logits.shape().to_vec(), &self.device)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?
             } else {
                 logits
             };
 
-            next_token = logits_processor
-                .sample(&logits)
+            next_token = sampler.sample(&logits)
                 .map_err(|e| anyhow::anyhow!("Sampling error: {}", e))?;
 
             // Quality gate: monitor running PPL
             if let Some(ref mut gate) = self.quality_gate {
-                let logits_vec = logits.to_vec1::<f32>()?;
+                let logits_vec = logits.to_vec1()
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
                 if let Some(ppl) = gate.update(&logits_vec, next_token) {
                     eprintln!(
-                        "⚠ Quality gate: PPL {:.1} exceeds threshold {:.1} at token {}. \
+                        "Warning: Quality gate: PPL {:.1} exceeds threshold {:.1} at token {}. \
                          Consider using higher bit width (--tq-bits 4) or fewer compressed layers (TQ_SKIP).",
                         ppl, gate.ppl_threshold, n_generated,
                     );
@@ -463,7 +470,6 @@ impl Engine {
     ///
     /// Token-by-token evaluation: at each position, the model predicts the next token.
     /// PPL = exp(average negative log-likelihood).
-    /// `stride`: number of tokens to process in the prefill before switching to per-token eval.
     pub fn compute_perplexity(&mut self, text: &str, _stride: usize) -> Result<f64> {
         let encoding = self.tokenizer
             .encode(text, false)
@@ -482,33 +488,33 @@ impl Engine {
         self.position = 0;
 
         // Process first token (no prediction possible)
-        let first = Tensor::new(&tokens[0..1], &self.device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&first, 0)?;
+        let first = self.make_input(&tokens[0..1])
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let logits = self.model.forward(&first, 0)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         self.position = 1;
 
         // Get prediction for token[1] from the first forward pass
-        let logits = logits.squeeze(0)?.to_device(&Device::Cpu)?.to_dtype(candle_core::DType::F32)?;
-        let logit_vec = if logits.dims().len() == 2 {
-            logits.get(logits.dims()[0] - 1)?.to_vec1::<f32>()?
-        } else {
-            logits.to_vec1::<f32>()?
-        };
+        let logits = extract_last_logits(&logits)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let logit_vec = logits.to_vec1()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         let nll = compute_nll(&logit_vec, tokens[1] as usize);
         total_nll += nll;
         n_evaluated += 1;
 
         // Token-by-token evaluation
         for t in 1..n_tokens - 1 {
-            let input = Tensor::new(&tokens[t..t + 1], &self.device)?.unsqueeze(0)?;
-            let logits = self.model.forward(&input, self.position)?;
+            let input = self.make_input(&tokens[t..t + 1])
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let logits = self.model.forward(&input, self.position)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
             self.position += 1;
 
-            let logits = logits.squeeze(0)?.to_device(&Device::Cpu)?.to_dtype(candle_core::DType::F32)?;
-            let logit_vec = if logits.dims().len() == 2 {
-                logits.get(logits.dims()[0] - 1)?.to_vec1::<f32>()?
-            } else {
-                logits.to_vec1::<f32>()?
-            };
+            let logits = extract_last_logits(&logits)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let logit_vec = logits.to_vec1()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             let nll = compute_nll(&logit_vec, tokens[t + 1] as usize);
             total_nll += nll;
@@ -543,11 +549,24 @@ fn compute_nll(logits: &[f32], target_id: usize) -> f64 {
     log_sum_exp - target_logit
 }
 
-fn extract_last_logits(logits: &Tensor) -> candle_core::Result<Tensor> {
-    let dims = logits.dims();
-    if dims.len() == 2 && dims[0] > 0 {
-        logits.get(dims[0] - 1)
-    } else {
-        Ok(logits.clone())
+/// Extract the last token's logits from model output.
+/// Model output may be [batch, seq_len, vocab] or [batch, vocab].
+fn extract_last_logits(logits: &Tensor) -> crate::cuda::Result<Tensor> {
+    let shape = logits.shape();
+    match shape.len() {
+        3 => {
+            // [batch, seq_len, vocab] → take last seq position, squeeze batch
+            let seq_len = shape[1];
+            logits.narrow(1, seq_len - 1, 1)?.squeeze(1)?.squeeze(0)
+        }
+        2 => {
+            // [batch, vocab] → squeeze batch
+            logits.squeeze(0)
+        }
+        1 => {
+            // Already [vocab]
+            Ok(logits.clone())
+        }
+        _ => Err(TqError::Msg(format!("unexpected logits shape: {:?}", shape))),
     }
 }

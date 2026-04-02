@@ -12,17 +12,62 @@
 
 use std::collections::HashMap;
 
-use candle_core::quantized::gguf_file;
-use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{Embedding, Module};
+use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
+use crate::cuda::Result;
+use crate::gguf::{GgufContent, GgmlDType};
+use crate::qmatmul as qmm;
 use tq_kv::TurboQuantConfig;
+
+/// Bail macro compatible with our error type.
+macro_rules! bail {
+    ($($arg:tt)*) => { return Err(TqError::Msg(format!($($arg)*))) };
+}
+
+// ============================================================
+// Traits and primitives (replaces candle_nn)
+// ============================================================
+
+/// Module trait — replaces candle_nn::Module.
+trait Module {
+    fn forward(&self, x: &Tensor) -> Result<Tensor>;
+}
+
+/// Embedding lookup — replaces candle_nn::Embedding.
+#[derive(Debug, Clone)]
+struct Embedding {
+    weight: Tensor,
+    hidden_size: usize,
+}
+
+impl Embedding {
+    fn new(weight: Tensor, hidden_size: usize) -> Self {
+        Self { weight, hidden_size }
+    }
+
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        let ids_flat = ids.to_vec1()?;
+        let w = self.weight.as_slice();
+        let n_tokens = ids_flat.len();
+        let mut output = Vec::with_capacity(n_tokens * self.hidden_size);
+        for &id in &ids_flat {
+            let idx = id as usize;
+            let start = idx * self.hidden_size;
+            let end = start + self.hidden_size;
+            if end <= w.len() {
+                output.extend_from_slice(&w[start..end]);
+            } else {
+                output.extend(std::iter::repeat(0.0f32).take(self.hidden_size));
+            }
+        }
+        Tensor::from_vec(output, vec![n_tokens, self.hidden_size], ids.device())
+    }
+}
 
 // ============================================================
 // Shared primitives (CUDA-compatible)
 // ============================================================
 
-/// Device-aware RmsNorm — candle's version always dequantizes to CPU.
-/// This version uses only primitive ops that have CUDA kernels.
+/// Device-aware RmsNorm — uses primitive ops that work on both CPU and GPU.
 #[derive(Debug, Clone)]
 struct RmsNorm {
     weight: Tensor,
@@ -31,22 +76,28 @@ struct RmsNorm {
 }
 
 impl RmsNorm {
-    fn from_qtensor(qtensor: candle_core::quantized::QTensor, eps: f64, device: &Device) -> Result<Self> {
-        let weight = qtensor.dequantize(device)?;
+    fn from_qweight(raw: &[u8], dtype: GgmlDType, n_elements: usize, eps: f64, device: &Device) -> Result<Self> {
+        let data = crate::quant::dequantize(raw, dtype, n_elements);
+        let weight = Tensor::from_vec(data, vec![n_elements], device)?;
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
         Ok(Self { weight, eps, span })
     }
-}
 
-impl Module for RmsNorm {
+    /// Create from QWeight (candle API compat: `RmsNorm::from_qtensor(qt, eps, device)?`).
+    fn from_qtensor(qw: qmm::QWeight, eps: f64, device: &Device) -> Result<Self> {
+        let n_elements = qw.shape.0 * qw.shape.1;
+        Self::from_qweight(&qw.raw_data, qw.dtype, n_elements, eps, device)
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let x_dtype = x.dtype();
         let x = x.to_dtype(DType::F32)?;
         let variance = x.sqr()?.mean_keepdim(x.rank() - 1)?;
-        let rms = (variance + self.eps)?.sqrt()?;
+        // rms = sqrt(variance + eps)
+        let eps_tensor = Tensor::new(self.eps as f32, x.device())?;
+        let rms = variance.broadcast_add(&eps_tensor)?.sqrt()?;
         let normalized = x.broadcast_div(&rms)?;
-        normalized.broadcast_mul(&self.weight.to_dtype(DType::F32)?)?.to_dtype(x_dtype)
+        normalized.broadcast_mul(&self.weight)
     }
 }
 
@@ -67,19 +118,24 @@ fn silu(x: &Tensor) -> Result<Tensor> {
 
 #[derive(Debug, Clone)]
 struct QMatMul {
-    inner: candle_core::quantized::QMatMul,
+    inner: qmm::QMatMul,
     span: tracing::Span,
 }
 
 impl QMatMul {
-    fn from_qtensor(qtensor: candle_core::quantized::QTensor) -> Result<Self> {
-        let inner = candle_core::quantized::QMatMul::from_qtensor(qtensor)?;
+    fn from_qweight(w: qmm::QWeight) -> Result<Self> {
+        let inner = qmm::QMatMul::from_qweight(w);
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         Ok(Self { inner, span })
     }
 
+    /// Alias for from_qweight (candle API compat).
+    fn from_qtensor(w: qmm::QWeight) -> Result<Self> {
+        Self::from_qweight(w)
+    }
+
     fn from_tensor(tensor: Tensor) -> Self {
-        let inner = candle_core::quantized::QMatMul::Tensor(tensor);
+        let inner = qmm::QMatMul::from_tensor(tensor);
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         Self { inner, span }
     }
@@ -146,10 +202,10 @@ impl Module for MlpOrMoe {
                 n_expert_used,
             } => {
                 let (b_size, seq_len, hidden_dim) = xs.dims3()?;
-                let xs = xs.reshape(((), hidden_dim))?;
+                let xs = xs.reshape(vec![b_size * seq_len, hidden_dim])?;
                 let router_logits = feed_forward_gate_inp.forward(&xs)?;
                 let routing_weights = softmax_last_dim(&router_logits)?;
-                let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+                let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2()?;
 
                 let mut top_x = vec![vec![]; experts.len()];
                 let mut selected_rws = vec![vec![]; experts.len()];
@@ -172,15 +228,16 @@ impl Module for MlpOrMoe {
                 for (expert_idx, expert_layer) in experts.iter().enumerate() {
                     let top_x = &top_x[expert_idx];
                     if top_x.is_empty() { continue; }
-                    let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
-                    let selected_rws = Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?
-                        .reshape(((), 1))?;
-                    let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
+                    let n_tokens_for_expert = top_x.len();
+                    let top_x = Tensor::from_vec(top_x.iter().map(|&x| x as f32).collect(), vec![n_tokens_for_expert], xs.device())?;
+                    let selected_rws = Tensor::from_slice(&selected_rws[expert_idx], vec![n_tokens_for_expert], xs.device())?
+                        .reshape(vec![n_tokens_for_expert, 1])?;
+                    let current_state = xs.index_select(&top_x, 0)?.reshape(vec![n_tokens_for_expert, hidden_dim])?;
                     let current_hidden_states = expert_layer.forward(&current_state)?;
                     let current_hidden_states = current_hidden_states.broadcast_mul(&selected_rws)?;
                     ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
                 }
-                ys.reshape((b_size, seq_len, hidden_dim))
+                ys.reshape(vec![b_size, seq_len, hidden_dim])
             }
             Self::Mlp(mlp) => mlp.forward(xs),
             Self::UpDown(mlp) => mlp.forward(xs),
@@ -198,14 +255,14 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
     } else {
         let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
         x.unsqueeze(2)?
-            .expand((b_sz, n_kv_head, n_rep, seq_len, head_dim))?
-            .reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
+            .expand(vec![b_sz, n_kv_head, n_rep, seq_len, head_dim])?
+            .reshape(vec![b_sz, n_kv_head * n_rep, seq_len, head_dim])
     }
 }
 
 fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: &Tensor) -> Result<Tensor> {
     let shape = mask.shape();
-    mask.where_cond(&on_true.broadcast_as(shape.dims())?, on_false)
+    mask.where_cond(&on_true.broadcast_as(shape)?, on_false)
 }
 
 // ============================================================
@@ -295,7 +352,7 @@ fn decompress_compressed_keys(
     config: &TurboQuantConfig,
 ) -> Result<Tensor> {
     let compressed_len = if k_per_head.is_empty() || k_per_head[0].count == 0 {
-        return Tensor::zeros((1, n_kv_head, 0, head_dim), dtype, device);
+        return Tensor::zeros(vec![1, n_kv_head, 0, head_dim], device);
     } else {
         k_per_head[0].count
     };
@@ -308,7 +365,7 @@ fn decompress_compressed_keys(
         };
         all_data.extend(decompressed);
     }
-    Tensor::from_vec(all_data, (1, n_kv_head, compressed_len, head_dim), device)?.to_dtype(dtype)
+    Tensor::from_vec(all_data, vec![1, n_kv_head, compressed_len, head_dim], device)?.to_dtype(dtype)
 }
 
 /// Decompress pre-RoPE compressed keys and apply RoPE dynamically.
@@ -330,7 +387,7 @@ fn decompress_and_apply_rope(
     // First decompress to get pre-RoPE keys
     let pre_rope = decompress_compressed_keys(k_per_head, n_kv_head, head_dim, DType::F32, device, config)?;
     let compressed_len = if k_per_head.is_empty() || k_per_head[0].count == 0 {
-        return Tensor::zeros((1, n_kv_head, 0, head_dim), dtype, device);
+        return Tensor::zeros(vec![1, n_kv_head, 0, head_dim], device);
     } else {
         k_per_head[0].count
     };
@@ -377,7 +434,7 @@ fn decompress_values_store(
             }
         }
     }
-    Tensor::from_vec(all_data, (1, n_kv_head, seq_len, head_dim), device)
+    Tensor::from_vec(all_data, vec![1, n_kv_head, seq_len, head_dim], device)
 }
 
 /// Sparse attention-value multiply on CPU tensors.
@@ -394,8 +451,8 @@ fn sparse_attn_v(
     head_dim: usize,
     threshold: f32,
 ) -> Result<Tensor> {
-    let att_flat = att.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-    let v_flat = v.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+    let att_flat = att.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let v_flat = v.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1()?;
     let seq_len = att.dim(3)?;
 
     let mut output = Vec::with_capacity(n_heads * head_dim);
@@ -406,7 +463,7 @@ fn sparse_attn_v(
         output.extend_from_slice(&head_out);
     }
 
-    Tensor::from_vec(output, (1, n_heads, 1, head_dim), att.device())
+    Tensor::from_vec(output, vec![1, n_heads, 1, head_dim], att.device())
 }
 
 // ============================================================
@@ -430,7 +487,7 @@ fn rope_halved(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 fn rope_interleaved(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let (b, h, s, d) = x.dims4()?;
     let half = d / 2;
-    let x = x.reshape((b, h, s, half, 2))?;
+    let x = x.reshape(vec![b, h, s, half, 2])?;
     let x0 = x.narrow(4, 0, 1)?.squeeze(4)?;
     let x1 = x.narrow(4, 1, 1)?.squeeze(4)?;
     let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
@@ -439,7 +496,7 @@ fn rope_interleaved(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let r1 = (x0.broadcast_mul(&sin)? + x1.broadcast_mul(&cos)?)?;
     let r0 = r0.unsqueeze(4)?;
     let r1 = r1.unsqueeze(4)?;
-    Tensor::cat(&[&r0, &r1], 4)?.reshape((b, h, s, d))
+    Tensor::cat(&[&r0, &r1], 4)?.reshape(vec![b, h, s, d])
 }
 
 /// Which RoPE layout to use.
@@ -712,7 +769,7 @@ fn compute_smooth_scales(
         scales.iter().map(|&s| 1.0 / s.max(0.01).sqrt()).collect()
     };
 
-    Tensor::from_vec(vals, head_dim, device).ok()
+    Tensor::from_vec(vals, vec![head_dim], device).ok()
 }
 
 /// QKV weight layout — separate tensors (most models) or merged single tensor (Phi-3.5).
@@ -817,9 +874,9 @@ impl LayerWeights {
         // These have consistent per-channel statistics — no positional or bias contamination.
         // Ideal for computing per-channel bias and scale calibration.
         if crate::calibrate::CALIBRATION_COLLECTOR.get().is_some() {
-            let k_for_cal = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            let k_for_cal = k.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?
                 .transpose(1, 2)?.contiguous()?;
-            if let Ok(k_f32) = k_for_cal.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>() {
+            if let Ok(k_f32) = k_for_cal.to_dtype(DType::F32)?.flatten_all()?.to_vec1() {
                 crate::calibrate::maybe_collect(&k_f32, self.n_kv_head, seq_len, self.head_dim);
             }
         }
@@ -835,9 +892,9 @@ impl LayerWeights {
             v = v.broadcast_add(bv)?;
         }
 
-        let q = q.reshape((b_sz, seq_len, self.n_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
-        let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
-        let v = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        let q = q.reshape(vec![b_sz, seq_len, self.n_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
+        let k = k.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
+        let v = v.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
 
         // SmoothAttention: migrate K outliers to Q BEFORE RoPE.
         // K *= 1/sqrt(s), Q *= sqrt(s). Invariance: (Q*sqrt(s)) * (K/sqrt(s))^T = Q * K^T
@@ -965,7 +1022,7 @@ impl LayerWeights {
                 }
             } else {
                 // Compressed path: quantize per head × position
-                let v_f32 = v.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                let v_f32 = v.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1()?;
                 let v_store = cache.v_compressed.as_mut().unwrap();
                 match v_store {
                     CompressedValueStore::Bits8(v_comp) => {
@@ -1025,7 +1082,7 @@ impl LayerWeights {
                     &k
                 };
                 let k_to_compress = k_source.narrow(2, compress_start, tokens_to_compress)?;
-                let k_flat = k_to_compress.contiguous()?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                let k_flat = k_to_compress.contiguous()?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
                 let hdim = self.head_dim;
                 let use_grouped = layer_tq_config.group_size > 0 && hdim % layer_tq_config.group_size == 0;
                 for h in 0..self.n_kv_head {
@@ -1162,12 +1219,12 @@ impl LayerWeights {
                             self.padded_head_dim, DType::F32, q.device(), &layer_tq_config,
                         )?
                     };
-                    let k_flat = k_decomp_full.flatten_all()?.to_vec1::<f32>()?;
+                    let k_flat = k_decomp_full.flatten_all()?.to_vec1()?;
 
                     // Use ALL query heads mapped to each KV head as reference queries.
                     // More reference queries = better compaction quality.
                     // For GQA: n_rep queries share each KV head.
-                    let q_flat = q.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let q_flat = q.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
                     // Collect recent queries: use current query (all heads)
                     // Each KV head gets n_rep reference queries from its mapped Q heads
                     let n_ref_queries = n_rep;
@@ -1176,13 +1233,13 @@ impl LayerWeights {
                     let v_for_compact = if cache.value_bits == 0 {
                         let v_tensor = cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?;
                         // v_tensor is [1, n_kv_head, total_len, head_dim]
-                        v_tensor.flatten_all()?.to_vec1::<f32>()?
+                        v_tensor.flatten_all()?.to_vec1()?
                     } else {
                         let v_tensor = decompress_values_store(
                             cache.v_compressed.as_ref().unwrap(),
                             self.n_kv_head, self.head_dim, total_len, q.device(),
                         )?;
-                        v_tensor.flatten_all()?.to_vec1::<f32>()?
+                        v_tensor.flatten_all()?.to_vec1()?
                     };
 
                     let hdim = self.head_dim;
@@ -1262,7 +1319,7 @@ impl LayerWeights {
                     // No key decompression — saves memory bandwidth.
                     // Scores are computed per query-head using pre-rotated query
                     // and centroid table lookup (AVX2 SIMD when available).
-                    let q_flat = q_f32.flatten_all()?.to_vec1::<f32>()?;
+                    let q_flat = q_f32.flatten_all()?.to_vec1()?;
                     let scale = 1.0 / (self.head_dim as f32).sqrt();
                     // Use calibrated centroids if available, else standard Gaussian
                     let cal_centroids_owned: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
@@ -1285,7 +1342,7 @@ impl LayerWeights {
                             // Segment 1: Sink keys (standard dot product, not compressed)
                             if let Some(ref sink) = cache.sink_k {
                                 let sink_f32 = sink.to_dtype(DType::F32).expect("sink to_dtype");
-                                let sink_flat = sink_f32.flatten_all().expect("sink flatten").to_vec1::<f32>().expect("sink to_vec1");
+                                let sink_flat = sink_f32.flatten_all().expect("sink flatten").to_vec1().expect("sink to_vec1");
                                 let sink_count = cache.sink_len;
                                 for s in 0..sink_count {
                                     let offset = (kv_h * sink_count + s) * self.head_dim;
@@ -1339,7 +1396,7 @@ impl LayerWeights {
                             // Only if current token was compressed (not still in sink range)
                             if n_compressed > 0 {
                                 let k_f32 = k.to_dtype(DType::F32).expect("k to_dtype");
-                                let k_flat = k_f32.flatten_all().expect("k flatten").to_vec1::<f32>().expect("k to_vec1");
+                                let k_flat = k_f32.flatten_all().expect("k flatten").to_vec1().expect("k to_vec1");
                                 let k_vec = &k_flat[kv_h * self.head_dim..(kv_h + 1) * self.head_dim];
                                 let dot: f32 = q_vec.iter().zip(k_vec.iter())
                                     .map(|(&qi, &ki)| qi * ki).sum();
@@ -1355,7 +1412,7 @@ impl LayerWeights {
                         all_scores.extend_from_slice(s);
                     }
                     let att = Tensor::from_vec(
-                        all_scores, (1, self.n_head, 1, total_len), q.device(),
+                        all_scores, vec![1, self.n_head, 1, total_len], q.device(),
                     )?;
                     softmax_last_dim(&att)?
                 } else {
@@ -1402,7 +1459,7 @@ impl LayerWeights {
                             comp_data.extend_from_slice(&comp[h].keys);
                         }
                         let k_comp = Tensor::from_vec(
-                            comp_data, (1, self.n_kv_head, ct, self.head_dim), q.device(),
+                            comp_data, vec![1, self.n_kv_head, ct, self.head_dim], q.device(),
                         )?;
                         k_parts.push(k_comp);
                     }
@@ -1441,7 +1498,8 @@ impl LayerWeights {
                     let k_full = if k_parts.len() == 1 {
                         k_parts.remove(0)
                     } else {
-                        Tensor::cat(&k_parts, 2)?
+                        let k_refs: Vec<&Tensor> = k_parts.iter().collect();
+                        Tensor::cat(&k_refs, 2)?
                     };
 
                     // Effective attention length: sink + cold + compacted_t + hot + current
@@ -1462,7 +1520,7 @@ impl LayerWeights {
                             full_bias[beta_start + i] = b;
                         }
                         let bias_tensor = Tensor::from_vec(
-                            full_bias, (1, 1, 1, attn_len), q.device(),
+                            full_bias, vec![1, 1, 1, attn_len], q.device(),
                         )?;
                         att = att.broadcast_add(&bias_tensor)?;
                     }
@@ -1479,7 +1537,7 @@ impl LayerWeights {
                             full_bias[hot_start + i] = b;
                         }
                         let bias_tensor = Tensor::from_vec(
-                            full_bias, (1, 1, 1, attn_len), q.device(),
+                            full_bias, vec![1, 1, 1, attn_len], q.device(),
                         )?;
                         att = att.broadcast_add(&bias_tensor)?;
                     }
@@ -1525,7 +1583,7 @@ impl LayerWeights {
                         comp_v_data.extend_from_slice(&comp[h].values);
                     }
                     let v_comp = Tensor::from_vec(
-                        comp_v_data, (1, self.n_kv_head, ct, head_dim), device,
+                        comp_v_data, vec![1, self.n_kv_head, ct, head_dim], device,
                     )?;
                     v_parts.push(v_comp);
 
@@ -1539,14 +1597,15 @@ impl LayerWeights {
                     let v_full = if v_parts.len() == 1 {
                         v_parts.remove(0)
                     } else {
-                        Tensor::cat(&v_parts, 2)?
+                        let v_refs: Vec<&Tensor> = v_parts.iter().collect();
+                        Tensor::cat(&v_refs, 2)?
                     };
                     let v_full = repeat_kv(v_full, n_rep)?;
                     att.matmul(&v_full.contiguous()?)?.to_dtype(cache.dtype)?
 
                 } else if sparse_thresh > 0.0 && att.device().is_cpu() && cache.value_bits > 0 {
                     // Fused sparse-decompress path: decompress only active V rows
-                    let att_flat = att.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+                    let att_flat = att.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
                     let v_store = cache.v_compressed.as_ref().unwrap();
                     let head_dim = self.head_dim;
                     let mut output = Vec::with_capacity(self.n_head * head_dim);
@@ -1564,7 +1623,7 @@ impl LayerWeights {
                         output.extend_from_slice(&head_out);
                     }
 
-                    Tensor::from_vec(output, (1, self.n_head, 1, head_dim), att.device())?
+                    Tensor::from_vec(output, vec![1, self.n_head, 1, head_dim], att.device())?
                         .to_dtype(cache.dtype)?
                 } else {
                     // Standard path: decompress all values, matmul or sparse multiply
@@ -1590,24 +1649,10 @@ impl LayerWeights {
                 let k = repeat_kv(k, n_rep)?;
                 let v_for_attn = repeat_kv(v, n_rep)?;
 
-                // Try Flash Attention for prefill (memory efficient, faster for long prompts)
-                if q.device().is_cpu() && mask.is_none() {
-                    let scale = 1.0 / (self.head_dim as f32).sqrt();
-                    let q_fa = q.to_dtype(DType::F32)?;
-                    let k_fa = k.to_dtype(DType::F32)?;
-                    let v_fa = v_for_attn.to_dtype(DType::F32)?.contiguous()?;
-                    match candle_nn::cpu_flash_attention::run_flash_attn_cpu::<f32>(
-                        &q_fa, &k_fa, &v_fa, None, scale, None, None,
-                    ) {
-                        Ok(y) => y.to_dtype(q.dtype())?,
-                        Err(_) => {
-                            // Fallback to manual
-                            let att = softmax_last_dim(
-                                &(q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?
-                            )?;
-                            att.matmul(&v_for_attn.contiguous()?)?
-                        }
-                    }
+                // Standard attention for prefill (no candle flash attention dependency)
+                if false {
+                    // placeholder branch — flash attention will be re-added when custom CUDA kernels land
+                    unreachable!()
                 } else {
                     let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
                     let att = match mask {
@@ -1684,11 +1729,12 @@ fn precompute_freqs_cis(
         .step_by(2)
         .map(|i| 1f32 / freq_base.powf(i as f32 / head_dim as f32))
         .collect();
-    let theta = Tensor::new(theta.as_slice(), device)?;
-    let idx_theta = Tensor::arange(0, context_length as u32, device)?
+    let n_theta = theta.len();
+    let theta = Tensor::from_slice(&theta, vec![n_theta], device)?;
+    let idx_theta = Tensor::arange(0, context_length, device)?
         .to_dtype(DType::F32)?
-        .reshape((context_length, 1))?
-        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
+        .reshape(vec![context_length, 1])?
+        .matmul(&theta.reshape(vec![1, n_theta])?)?;
     Ok((idx_theta.cos()?, idx_theta.sin()?))
 }
 
@@ -1704,19 +1750,19 @@ fn detect_rope_style(arch: &str) -> RopeStyle {
 
 impl GenericTurboModel {
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
-        ct: gguf_file::Content,
+        ct: GgufContent,
         reader: &mut R,
         device: &Device,
         tq_config: TurboQuantConfig,
     ) -> Result<Self> {
         let md_get = |s: &str| match ct.metadata.get(s) {
-            None => candle_core::bail!("cannot find {s} in metadata"),
+            None => bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
 
         // Read architecture from GGUF metadata
         let arch = md_get("general.architecture")
-            .and_then(|v| v.to_string().map_err(|e| candle_core::Error::Msg(format!("{e:?}"))))
+            .and_then(|v| v.to_string_val().map_err(|e| TqError::Msg(format!("{e:?}"))))
             .map(|s| s.clone())
             .unwrap_or_else(|_| "llama".to_string());
 
@@ -1753,7 +1799,7 @@ impl GenericTurboModel {
         // padding 96→128 adds 33% zeros that dilute signal after Hadamard rotation.
         let padded_head_dim = head_dim;
         if !head_dim.is_power_of_two() {
-            candle_core::bail!(
+            bail!(
                 "TurboQuant requires power-of-2 head_dim, but this model has head_dim={}. \
                  Models with non-standard head dimensions (Phi-3.5, etc.) are not supported \
                  for KV compression. Run without --turbo-quant for these models.",
@@ -1815,7 +1861,7 @@ impl GenericTurboModel {
 
         // Embeddings + output
         let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
-        let tok_embeddings = tok_embeddings_q.dequantize(device)?;
+        let tok_embeddings = tok_embeddings_q.dequantize_to_device(device)?;
         let norm = RmsNorm::from_qtensor(
             ct.tensor(reader, "output_norm.weight", device)?, rms_norm_eps, device,
         )?;
@@ -1851,17 +1897,17 @@ impl GenericTurboModel {
 
             // Optional biases (Qwen2 has them, Llama/Phi/Gemma don't)
             let attention_bq = if has_bias {
-                Some(ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?.dequantize(device)?)
+                Some(ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?.dequantize_to_device(device)?)
             } else {
                 None
             };
             let attention_bk = if has_bias {
-                Some(ct.tensor(reader, &format!("{prefix}.attn_k.bias"), device)?.dequantize(device)?)
+                Some(ct.tensor(reader, &format!("{prefix}.attn_k.bias"), device)?.dequantize_to_device(device)?)
             } else {
                 None
             };
             let attention_bv = if has_bias {
-                Some(ct.tensor(reader, &format!("{prefix}.attn_v.bias"), device)?.dequantize(device)?)
+                Some(ct.tensor(reader, &format!("{prefix}.attn_v.bias"), device)?.dequantize_to_device(device)?)
             } else {
                 None
             };
@@ -1970,10 +2016,10 @@ impl GenericTurboModel {
         if let Some(mask) = self.masks.get(&t) {
             Ok(mask.clone())
         } else {
-            let mask: Vec<_> = (0..t)
-                .flat_map(|i| (0..t).map(move |j| u8::from(j > i)))
+            let mask: Vec<f32> = (0..t)
+                .flat_map(|i| (0..t).map(move |j| if j > i { 1.0f32 } else { 0.0f32 }))
                 .collect();
-            let mask = Tensor::from_slice(&mask, (t, t), device)?;
+            let mask = Tensor::from_slice(&mask, vec![t, t], device)?;
             self.masks.insert(t, mask.clone());
             Ok(mask)
         }
@@ -2013,7 +2059,7 @@ impl GenericTurboModel {
             layer_in = x;
         }
         let x = self.norm.forward(&layer_in)?;
-        let x = x.i((.., seq_len - 1, ..))?;
+        let x = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
         let _enter = self.span_output.enter();
         self.output.forward(&x)
     }
@@ -2029,187 +2075,10 @@ impl GenericTurboModel {
     /// * `device` - Target device
     /// * `tq_config` - TurboQuant configuration
     pub fn from_safetensors(
-        model_dir: &std::path::Path,
-        device: &Device,
-        tq_config: TurboQuantConfig,
+        _model_dir: &std::path::Path,
+        _device: &Device,
+        _tq_config: TurboQuantConfig,
     ) -> Result<Self> {
-        use candle_core::DType;
-
-        // 1. Read config.json
-        let config_path = model_dir.join("config.json");
-        let config_str = std::fs::read_to_string(&config_path)
-            .map_err(|e| candle_core::Error::Msg(format!("Cannot read config.json: {e}")))?;
-        let config: serde_json::Value = serde_json::from_str(&config_str)
-            .map_err(|e| candle_core::Error::Msg(format!("Invalid config.json: {e}")))?;
-
-        let head_count = config["num_attention_heads"].as_u64().unwrap_or(32) as usize;
-        let head_count_kv = config["num_key_value_heads"].as_u64().unwrap_or(head_count as u64) as usize;
-        let block_count = config["num_hidden_layers"].as_u64().unwrap_or(32) as usize;
-        let embedding_length = config["hidden_size"].as_u64().unwrap_or(4096) as usize;
-        let rms_norm_eps = config["rms_norm_eps"].as_f64().unwrap_or(1e-6);
-        let rope_freq_base = config["rope_theta"].as_f64().unwrap_or(10000.0) as f32;
-        let context_length = config["max_position_embeddings"].as_u64().unwrap_or(4096) as usize;
-        let head_dim = config["head_dim"].as_u64()
-            .map(|v| v as usize)
-            .unwrap_or(embedding_length / head_count);
-
-        if !head_dim.is_power_of_two() {
-            candle_core::bail!("TurboQuant requires power-of-2 head_dim, got {}", head_dim);
-        }
-
-        let arch = config["model_type"].as_str().unwrap_or("llama").to_string();
-        let rope_style = detect_rope_style(&arch);
-        let rope_dim = head_dim; // safetensors models typically use full head_dim for RoPE
-
-        eprintln!(
-            "TurboQuant FP16 [{}]: {} layers, {} heads (kv={}), head_dim={}, emb={}, {}-bit KV cache",
-            arch, block_count, head_count, head_count_kv, head_dim, embedding_length, tq_config.bits,
-        );
-
-        // 2. Load all safetensors files
-        let mut tensors = std::collections::HashMap::new();
-        let entries: Vec<_> = std::fs::read_dir(model_dir)
-            .map_err(|e| candle_core::Error::Msg(format!("Cannot read model dir: {e}")))?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "safetensors"))
-            .collect();
-
-        if entries.is_empty() {
-            candle_core::bail!("No .safetensors files found in {}", model_dir.display());
-        }
-
-        for entry in &entries {
-            let loaded = candle_core::safetensors::load(entry.path(), device)?;
-            tensors.extend(loaded);
-        }
-        eprintln!("  Loaded {} tensors from {} safetensors file(s)", tensors.len(), entries.len());
-
-        // Helper to get a tensor by name, casting BF16→F32 for CPU compat
-        let get = |name: &str| -> Result<Tensor> {
-            let t = tensors.get(name)
-                .cloned()
-                .ok_or_else(|| candle_core::Error::Msg(format!("Missing tensor: {name}")))?;
-            // BF16 lacks many kernels — cast to F32 for reliable compute on both CPU and GPU
-            if t.dtype() == DType::BF16 {
-                t.to_dtype(DType::F32)
-            } else {
-                Ok(t)
-            }
-        };
-
-        // 3. Pre-compute shared state
-        let padded_head_dim = head_dim;
-        let signs = tq_kv::hadamard::generate_signs(padded_head_dim, tq_config.rotation_seed);
-        let (cos, sin) = precompute_freqs_cis(rope_dim, rope_freq_base, context_length, device)?;
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
-
-        // 4. Embeddings + output
-        let tok_embeddings = get("model.embed_tokens.weight")?;
-        let norm_w = get("model.norm.weight")?;
-        let norm = RmsNorm { weight: norm_w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") };
-
-        let output = if let Ok(t) = get("lm_head.weight") {
-            QMatMul::from_tensor(t)
-        } else {
-            eprintln!("  (tie_word_embeddings: reusing embed_tokens.weight for lm_head)");
-            QMatMul::from_tensor(tok_embeddings.clone())
-        };
-
-        // 5. Load layers
-        let mut layers = Vec::with_capacity(block_count);
-        for i in 0..block_count {
-            let p = format!("model.layers.{i}");
-
-            let wq = get(&format!("{p}.self_attn.q_proj.weight"))?;
-            let wk = get(&format!("{p}.self_attn.k_proj.weight"))?;
-            let wv = get(&format!("{p}.self_attn.v_proj.weight"))?;
-            let wo = get(&format!("{p}.self_attn.o_proj.weight"))?;
-
-            let qkv = QkvWeights::Separate {
-                wq: QMatMul::from_tensor(wq),
-                wk: QMatMul::from_tensor(wk),
-                wv: QMatMul::from_tensor(wv),
-            };
-
-            // Biases (optional — Qwen2 has them)
-            let bq = get(&format!("{p}.self_attn.q_proj.bias")).ok();
-            let bk = get(&format!("{p}.self_attn.k_proj.bias")).ok();
-            let bv = get(&format!("{p}.self_attn.v_proj.bias")).ok();
-
-            // MLP
-            let mlp_or_moe = if let Ok(gate) = get(&format!("{p}.mlp.gate_proj.weight")) {
-                let down = get(&format!("{p}.mlp.down_proj.weight"))?;
-                let up = get(&format!("{p}.mlp.up_proj.weight"))?;
-                MlpOrMoe::Mlp(Mlp {
-                    feed_forward_w1: QMatMul::from_tensor(gate),
-                    feed_forward_w2: QMatMul::from_tensor(down),
-                    feed_forward_w3: QMatMul::from_tensor(up),
-                })
-            } else {
-                let up = get(&format!("{p}.mlp.up_proj.weight"))?;
-                let down = get(&format!("{p}.mlp.down_proj.weight"))?;
-                MlpOrMoe::UpDown(MlpUpDown {
-                    ffn_up: QMatMul::from_tensor(up),
-                    ffn_down: QMatMul::from_tensor(down),
-                })
-            };
-
-            let attn_norm_w = get(&format!("{p}.input_layernorm.weight"))?;
-            let ffn_norm_w = get(&format!("{p}.post_attention_layernorm.weight"))?;
-
-            let attn_norm = RmsNorm { weight: attn_norm_w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") };
-            let ffn_norm = RmsNorm { weight: ffn_norm_w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") };
-
-            // Post norms (Gemma2)
-            let post_attn_norm = get(&format!("{p}.post_attention_layernorm_2.weight")).ok()
-                .map(|w| RmsNorm { weight: w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") });
-            let post_ffn_norm = get(&format!("{p}.post_feedforward_layernorm.weight")).ok()
-                .map(|w| RmsNorm { weight: w, eps: rms_norm_eps, span: tracing::span!(tracing::Level::TRACE, "rms-norm") });
-
-            layers.push(LayerWeights {
-                qkv,
-                attention_wo: QMatMul::from_tensor(wo),
-                attention_bq: bq,
-                attention_bk: bk,
-                attention_bv: bv,
-                attention_norm: attn_norm,
-                ffn_norm,
-                mlp_or_moe,
-                n_head: head_count,
-                n_kv_head: head_count_kv,
-                head_dim,
-                cos: cos.clone(),
-                sin: sin.clone(),
-                neg_inf: neg_inf.clone(),
-                rope_style,
-                rope_dim,
-                padded_head_dim,
-                post_attention_norm: post_attn_norm,
-                post_ffn_norm,
-                layer_idx: i,
-                n_layers: block_count,
-                kv_cache: None,
-                kv_compressed: None,
-                tq_config: tq_config.clone(),
-                signs: signs.clone(),
-                smooth_k_scales: compute_smooth_scales(&tq_config, head_dim, device, false),
-                smooth_q_scales: compute_smooth_scales(&tq_config, head_dim, device, true),
-                span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
-                span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
-                span_mlp: tracing::span!(tracing::Level::TRACE, "mlp"),
-            });
-        }
-
-        eprintln!("FP16 model loaded! {} layers", block_count);
-
-        Ok(Self {
-            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
-            layers,
-            norm,
-            output,
-            masks: HashMap::new(),
-            span: tracing::span!(tracing::Level::TRACE, "model"),
-            span_output: tracing::span!(tracing::Level::TRACE, "output"),
-        })
+        bail!("safetensors loading not yet implemented for tq-cuda backend")
     }
 }

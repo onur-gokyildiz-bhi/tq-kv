@@ -39,6 +39,11 @@ impl QWeight {
         TqTensor::from_vec(data, vec![self.shape.0, self.shape.1], device)
     }
 
+    /// Dequantize to TqTensor on target device (candle-compat: `.dequantize(device)?`).
+    pub fn dequantize_to_device(&self, device: &TqDevice) -> Result<TqTensor> {
+        self.to_tensor(device)
+    }
+
     /// Number of output features (rows).
     pub fn out_features(&self) -> usize { self.shape.0 }
 
@@ -66,6 +71,11 @@ impl QMatMul {
     /// Create from a quantized weight.
     pub fn from_qweight(w: QWeight) -> Self {
         QMatMul::Quantized(w)
+    }
+
+    /// Alias for from_qweight (candle API compat).
+    pub fn from_qtensor(w: QWeight) -> Self {
+        Self::from_qweight(w)
     }
 
     /// Create from a full-precision tensor (non-quantized weights like biases).

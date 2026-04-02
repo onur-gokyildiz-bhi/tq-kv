@@ -59,6 +59,14 @@ impl From<&str> for TqError {
     fn from(s: &str) -> Self { TqError::Msg(s.to_string()) }
 }
 
+impl From<std::io::Error> for TqError {
+    fn from(e: std::io::Error) -> Self { TqError::Msg(e.to_string()) }
+}
+
+impl From<serde_json::Error> for TqError {
+    fn from(e: serde_json::Error) -> Self { TqError::Msg(e.to_string()) }
+}
+
 #[cfg(feature = "cuda")]
 impl From<cudarc::driver::DriverError> for TqError {
     fn from(e: cudarc::driver::DriverError) -> Self { TqError::Cuda(e) }

@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::cuda::{TqDevice, TqError, Result};
+use crate::cuda::{TqTensor, TqDevice, TqError, Result};
+use crate::qmatmul::QWeight;
 
 // ─── Constants ─────────────────────────────────────────────────
 
@@ -281,6 +282,29 @@ impl GgufContent {
             .map_err(|e| TqError::Msg(format!("read error for {} ({} bytes): {}", name, size, e)))?;
 
         Ok((info, buf))
+    }
+
+    /// Load a tensor as QWeight (candle-compatible API).
+    ///
+    /// This is the primary tensor loading method — matches candle's
+    /// `content.tensor(reader, name, device)?` but returns QWeight.
+    /// The `_device` parameter is accepted for API compat but ignored
+    /// (QWeight is device-agnostic; transfer happens at compute time).
+    pub fn tensor<R: Read + Seek>(
+        &self,
+        reader: &mut R,
+        name: &str,
+        _device: &TqDevice,
+    ) -> Result<QWeight> {
+        let (info, data) = self.tensor_data(reader, name)?;
+        let shape = if info.shape.len() >= 2 {
+            (info.shape[0], info.shape[1])
+        } else if info.shape.len() == 1 {
+            (1, info.shape[0])
+        } else {
+            (1, 1)
+        };
+        Ok(QWeight::new(data, info.dtype, shape))
     }
 
     /// Get a metadata value by key.

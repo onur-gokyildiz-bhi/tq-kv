@@ -426,6 +426,146 @@ impl TqTensor {
         Self::from_vec(data, vec![len], device)
     }
 
+    // ─── Additional methods (candle compatibility) ───────────
+
+    /// Split tensor into `n` chunks along `dim`.
+    pub fn chunk(&self, n: usize, dim: usize) -> Result<Vec<Self>> {
+        let dim = self.resolve_dim(dim)?;
+        let size = self.shape[dim];
+        let chunk_size = (size + n - 1) / n;
+        let mut chunks = Vec::with_capacity(n);
+        let mut start = 0;
+        while start < size {
+            let len = chunk_size.min(size - start);
+            chunks.push(self.narrow(dim, start, len)?);
+            start += len;
+        }
+        Ok(chunks)
+    }
+
+    /// Create a zero tensor with the same shape.
+    pub fn zeros_like(&self) -> Result<Self> {
+        Self::zeros(self.shape.clone(), self.device())
+    }
+
+    /// Get data as Vec<Vec<f32>> (rank-2 only).
+    pub fn to_vec2(&self) -> Result<Vec<Vec<f32>>> {
+        let (rows, cols) = self.dims2()?;
+        let data = self.as_slice();
+        let mut result = Vec::with_capacity(rows);
+        for r in 0..rows {
+            result.push(data[r * cols..(r + 1) * cols].to_vec());
+        }
+        Ok(result)
+    }
+
+    /// Select rows/slices by index along a dimension.
+    pub fn index_select(&self, indices: &TqTensor, dim: usize) -> Result<Self> {
+        let dim = self.resolve_dim(dim)?;
+        let idx = indices.as_slice();
+        let data = self.as_slice();
+        let outer: usize = self.shape[..dim].iter().product();
+        let dim_size = self.shape[dim];
+        let inner: usize = self.shape[dim + 1..].iter().product();
+        let n_idx = idx.len();
+
+        let mut result = Vec::with_capacity(outer * n_idx * inner);
+        for o in 0..outer {
+            for &i in idx {
+                let i = i as usize;
+                let src = o * dim_size * inner + i * inner;
+                result.extend_from_slice(&data[src..src + inner]);
+            }
+        }
+
+        let mut new_shape = self.shape.clone();
+        new_shape[dim] = n_idx;
+        Self::from_vec(result, new_shape, self.device())
+    }
+
+    /// Scatter-add: self[indices[i]] += src[i] along dimension.
+    pub fn index_add(&self, indices: &TqTensor, src: &TqTensor, dim: usize) -> Result<Self> {
+        let dim = self.resolve_dim(dim)?;
+        let idx = indices.as_slice();
+        let mut result = self.to_vec1()?;
+        let src_data = src.as_slice();
+        let inner: usize = self.shape[dim + 1..].iter().product();
+
+        for (src_i, &target_i) in idx.iter().enumerate() {
+            let target_i = target_i as usize;
+            for j in 0..inner {
+                result[target_i * inner + j] += src_data[src_i * inner + j];
+            }
+        }
+
+        Self::from_vec(result, self.shape.clone(), self.device())
+    }
+
+    /// Expand (broadcast) size-1 dimensions to target shape.
+    pub fn expand(&self, shape: impl Into<Vec<usize>>) -> Result<Self> {
+        let target = shape.into();
+        if target.len() != self.rank() {
+            tq_bail!("expand: target rank {} != source rank {}", target.len(), self.rank());
+        }
+
+        let rank = self.rank();
+        let data = self.as_slice();
+
+        // Source strides (row-major), zeroed for size-1 dims (broadcast)
+        let mut src_strides = vec![1usize; rank];
+        for i in (0..rank.saturating_sub(1)).rev() {
+            src_strides[i] = src_strides[i + 1] * self.shape[i + 1];
+        }
+        for i in 0..rank {
+            if self.shape[i] == 1 {
+                src_strides[i] = 0;
+            } else if self.shape[i] != target[i] {
+                tq_bail!("expand: dim {} size {} != target {}", i, self.shape[i], target[i]);
+            }
+        }
+
+        // Target strides
+        let mut tgt_strides = vec![1usize; rank];
+        for i in (0..rank.saturating_sub(1)).rev() {
+            tgt_strides[i] = tgt_strides[i + 1] * target[i + 1];
+        }
+
+        let n = target.iter().product::<usize>();
+        let mut result = Vec::with_capacity(n);
+        for flat in 0..n {
+            let mut src_idx = 0;
+            let mut remaining = flat;
+            for d in 0..rank {
+                let coord = remaining / tgt_strides[d];
+                remaining %= tgt_strides[d];
+                src_idx += coord * src_strides[d];
+            }
+            result.push(data[src_idx]);
+        }
+
+        Self::from_vec(result, target, self.device())
+    }
+
+    /// Broadcast self to target shape (alias for expand).
+    pub fn broadcast_as(&self, shape: &[usize]) -> Result<Self> {
+        self.expand(shape.to_vec())
+    }
+
+    /// Conditional select: where self != 0 pick on_true, else on_false.
+    pub fn where_cond(&self, on_true: &TqTensor, on_false: &TqTensor) -> Result<TqTensor> {
+        let mask = self.as_slice();
+        let t = on_true.as_slice();
+        let f = on_false.as_slice();
+        let n = self.elem_count();
+        if t.len() != n || f.len() != n {
+            tq_bail!("where_cond: shape mismatch");
+        }
+        let result: Vec<f32> = (0..n)
+            .map(|i| if mask[i] != 0.0 { t[i] } else { f[i] })
+            .collect();
+        Self::from_vec(result, self.shape.clone(), self.device())
+    }
+
     // ─── Internal helpers ──────────────────────────────────────
 
     fn resolve_dim(&self, dim: usize) -> Result<usize> {
@@ -434,6 +574,53 @@ impl TqTensor {
         }
         Ok(dim)
     }
+}
+
+// ─── Operator overloads ────────────────────────────────────────
+
+impl std::ops::Add<TqTensor> for TqTensor {
+    type Output = Result<TqTensor>;
+    fn add(self, rhs: TqTensor) -> Result<TqTensor> { self.broadcast_add(&rhs) }
+}
+
+impl std::ops::Add<&TqTensor> for TqTensor {
+    type Output = Result<TqTensor>;
+    fn add(self, rhs: &TqTensor) -> Result<TqTensor> { self.broadcast_add(rhs) }
+}
+
+impl std::ops::Add<TqTensor> for &TqTensor {
+    type Output = Result<TqTensor>;
+    fn add(self, rhs: TqTensor) -> Result<TqTensor> { self.broadcast_add(&rhs) }
+}
+
+impl std::ops::Sub<TqTensor> for TqTensor {
+    type Output = Result<TqTensor>;
+    fn sub(self, rhs: TqTensor) -> Result<TqTensor> { self.broadcast_sub(&rhs) }
+}
+
+impl std::ops::Sub<&TqTensor> for TqTensor {
+    type Output = Result<TqTensor>;
+    fn sub(self, rhs: &TqTensor) -> Result<TqTensor> { self.broadcast_sub(rhs) }
+}
+
+impl std::ops::Mul<TqTensor> for TqTensor {
+    type Output = Result<TqTensor>;
+    fn mul(self, rhs: TqTensor) -> Result<TqTensor> { self.broadcast_mul(&rhs) }
+}
+
+impl std::ops::Mul<&TqTensor> for TqTensor {
+    type Output = Result<TqTensor>;
+    fn mul(self, rhs: &TqTensor) -> Result<TqTensor> { self.broadcast_mul(rhs) }
+}
+
+impl std::ops::Div<f64> for TqTensor {
+    type Output = Result<TqTensor>;
+    fn div(self, rhs: f64) -> Result<TqTensor> { self.div_scalar(rhs) }
+}
+
+impl std::ops::Div<f64> for &TqTensor {
+    type Output = Result<TqTensor>;
+    fn div(self, rhs: f64) -> Result<TqTensor> { self.div_scalar(rhs) }
 }
 
 #[cfg(test)]
