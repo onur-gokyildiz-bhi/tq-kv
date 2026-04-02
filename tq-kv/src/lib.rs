@@ -52,6 +52,7 @@ pub mod hadamard;
 pub mod polar;
 #[doc(hidden)]
 pub mod qjl;
+pub mod weight_compress;
 
 /// C FFI layer for llama.cpp and other C/C++ engines.
 /// Compile with `cargo build --release --features ffi` to produce `libtq_kv.a`.
