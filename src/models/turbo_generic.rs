@@ -2250,10 +2250,26 @@ impl GenericTurboModel {
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
 
-        // CUDA Graph capture: requires non-default stream + Arc<CudaSlice> refactoring.
-        // cudarc's CudaSlice deep-clone (cuMemcpyDtoDAsync) and event tracking
-        // are incompatible with graph capture. Needs Arc-based copy-on-write tensors.
-        // See: TqStorage should use Arc<CudaSlice<f32>> for zero-copy clone.
+        // Reset graph on new sequence (prefill)
+        #[cfg(feature = "cuda")]
+        if seq_len > 1 {
+            self.graph_manager.reset();
+            self.graph_output = None;
+        }
+
+        // ── CUDA Graph replay ──
+        #[cfg(feature = "cuda")]
+        if seq_len == 1 && self.graph_manager.is_ready(1) {
+            self.graph_manager.replay(1)
+                .map_err(|e| TqError::Msg(format!("graph replay: {}", e)))?;
+            if let Some(ref out) = self.graph_output {
+                return Ok(out.clone());
+            }
+        }
+
+        // ── CUDA Graph capture ──
+        #[cfg(feature = "cuda")]
+        let capturing = seq_len == 1 && self.graph_manager.should_capture(1);
 
         let mask = if seq_len == 1 {
             None
@@ -2273,7 +2289,23 @@ impl GenericTurboModel {
                 layer_in = gpu_tensor;
             }
         }
-        for layer in self.layers.iter_mut() {
+
+        // Begin graph capture AFTER embedding upload (H2D copy must be outside capture).
+        // Graph capture only works when ALL ops stay on GPU (no to_vec1/dtoh sync).
+        // TQ compressed path has CPU-side key compression → incompatible.
+        #[cfg(feature = "cuda")]
+        if capturing {
+            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                unsafe { reg.stream.context().disable_event_tracking(); }
+                reg.stream.synchronize().ok();
+                if let Err(e) = self.graph_manager.begin_capture(&reg.stream) {
+                    eprintln!("[cuda-graph] begin_capture failed: {}", e);
+                    unsafe { reg.stream.context().enable_event_tracking(); }
+                }
+            }
+        }
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let x = layer_in;
 
             // ── Fused kernel path: 5 launches replace ~13 per layer ──
@@ -2443,7 +2475,25 @@ impl GenericTurboModel {
         let x = self.norm.forward(&layer_in, backend)?;
         let x = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
         let _enter = self.span_output.enter();
-        self.output.forward(&x, backend)
+        let output = self.output.forward(&x, backend)?;
+
+        // End graph capture
+        #[cfg(feature = "cuda")]
+        if capturing && matches!(self.graph_manager.status, crate::cuda::graph::GraphStatus::Capturing) {
+            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                match self.graph_manager.end_capture(&reg.stream, 1) {
+                    Ok(()) => {
+                        self.graph_output = Some(output.clone());
+                    }
+                    Err(e) => {
+                        eprintln!("[cuda-graph] end_capture failed: {}", e);
+                        self.graph_manager.reset();
+                    }
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     /// Load from safetensors file(s) + config.json (FP16/BF16 models).
