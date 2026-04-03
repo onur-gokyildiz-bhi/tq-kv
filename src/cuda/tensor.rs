@@ -1049,6 +1049,162 @@ impl std::ops::Div<f64> for &TqTensor {
     fn div(self, rhs: f64) -> Result<TqTensor> { self.div_scalar(rhs) }
 }
 
+// ─── GPU-native compute methods (Phase 2) ─────────────────────
+//
+// These bypass ComputeBackend and keep data on GPU.
+// Used directly from turbo_generic.rs when tensors are CUDA-resident.
+
+#[cfg(feature = "cuda")]
+impl TqTensor {
+    /// GPU RMS normalization: output = x * weight / rms(x).
+    /// weight must be a CPU tensor (norm weights are small, cached on GPU via registry).
+    pub fn rms_norm_gpu(&self, weight: &TqTensor, eps: f32) -> Result<Self> {
+        let TqStorage::Cuda { data: x, stream } = &self.storage else {
+            tq_bail!("rms_norm_gpu: tensor not on GPU");
+        };
+        let reg = super::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+
+        let shape = self.shape.clone();
+        let hidden = *shape.last().unwrap();
+        let n_tokens = self.elem_count() / hidden;
+        let n = n_tokens * hidden;
+
+        // Weight: upload or get cached
+        let w_data = weight.to_vec1()?;
+        let w_gpu = stream.clone_htod(&w_data)
+            .map_err(|e| TqError::Msg(format!("rms_norm weight upload: {}", e)))?;
+
+        let mut out = stream.alloc_zeros::<f32>(n)
+            .map_err(|e| TqError::Msg(format!("rms_norm alloc: {}", e)))?;
+
+        super::kernels::rms_norm(reg, x, &w_gpu, &mut out, n_tokens, hidden, eps)
+            .map_err(|e| TqError::Msg(format!("rms_norm kernel: {}", e)))?;
+
+        Ok(Self::from_cuda(out, shape, stream.clone()))
+    }
+
+    /// GPU softmax along last dimension.
+    pub fn softmax_gpu(&self) -> Result<Self> {
+        let TqStorage::Cuda { data: x, stream } = &self.storage else {
+            tq_bail!("softmax_gpu: tensor not on GPU");
+        };
+        let reg = super::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+
+        let shape = self.shape.clone();
+        let cols = *shape.last().unwrap();
+        let rows = self.elem_count() / cols;
+
+        let mut out = stream.alloc_zeros::<f32>(rows * cols)
+            .map_err(|e| TqError::Msg(format!("softmax alloc: {}", e)))?;
+
+        super::kernels::softmax_last_dim(reg, x, &mut out, rows, cols)
+            .map_err(|e| TqError::Msg(format!("softmax kernel: {}", e)))?;
+
+        Ok(Self::from_cuda(out, shape, stream.clone()))
+    }
+
+    /// GPU fused SiLU × multiply: output = silu(self) * up.
+    pub fn fused_silu_mul_gpu(&self, up: &TqTensor) -> Result<Self> {
+        let TqStorage::Cuda { data: gate, stream } = &self.storage else {
+            tq_bail!("fused_silu_mul_gpu: gate not on GPU");
+        };
+        let TqStorage::Cuda { data: up_data, .. } = &up.storage else {
+            tq_bail!("fused_silu_mul_gpu: up not on GPU");
+        };
+        let reg = super::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+
+        let n = self.elem_count();
+        let mut out = stream.alloc_zeros::<f32>(n)
+            .map_err(|e| TqError::Msg(format!("fused_silu_mul alloc: {}", e)))?;
+
+        super::kernels::fused_silu_mul(reg, gate, up_data, &mut out, n)
+            .map_err(|e| TqError::Msg(format!("fused_silu_mul kernel: {}", e)))?;
+
+        Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()))
+    }
+
+    /// GPU fused residual add + RMS norm.
+    /// Returns (normalized_output, updated_residual).
+    pub fn fused_add_rms_norm_gpu(&self, residual: &TqTensor, weight: &TqTensor, eps: f32) -> Result<(Self, Self)> {
+        let TqStorage::Cuda { data: input, stream } = &self.storage else {
+            tq_bail!("fused_add_rms_norm_gpu: input not on GPU");
+        };
+        let TqStorage::Cuda { data: res, .. } = &residual.storage else {
+            tq_bail!("fused_add_rms_norm_gpu: residual not on GPU");
+        };
+        let reg = super::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+
+        let shape = self.shape.clone();
+        let hidden = *shape.last().unwrap();
+        let n_tokens = self.elem_count() / hidden;
+        let n = n_tokens * hidden;
+
+        let w_data = weight.to_vec1()?;
+        let w_gpu = stream.clone_htod(&w_data)
+            .map_err(|e| TqError::Msg(format!("fused norm weight: {}", e)))?;
+
+        let mut res_gpu = stream.clone_htod(&residual.to_vec1()?)
+            .map_err(|e| TqError::Msg(format!("fused norm res copy: {}", e)))?;
+        let mut out = stream.alloc_zeros::<f32>(n)
+            .map_err(|e| TqError::Msg(format!("fused norm alloc: {}", e)))?;
+
+        super::kernels::fused_add_rms_norm(reg, input, &mut res_gpu, &w_gpu, &mut out, n_tokens, hidden, eps)
+            .map_err(|e| TqError::Msg(format!("fused_add_rms_norm kernel: {}", e)))?;
+
+        Ok((
+            Self::from_cuda(out, shape.clone(), stream.clone()),
+            Self::from_cuda(res_gpu, shape, stream.clone()),
+        ))
+    }
+
+    /// GPU quantized matvec: output = x @ W^T where W is Q4_K_M or Q8_0.
+    /// Weight bytes must already be on GPU (via QWeight::gpu_cache_or_upload).
+    pub fn qmatmul_gpu(
+        &self,
+        w_gpu: &cudarc::driver::CudaSlice<u8>,
+        dtype: crate::gguf::GgmlDType,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<Self> {
+        let TqStorage::Cuda { data: x, stream } = &self.storage else {
+            tq_bail!("qmatmul_gpu: input not on GPU");
+        };
+        let reg = super::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+
+        let x_shape = self.shape.clone();
+        let batch: usize = x_shape[..x_shape.len() - 1].iter().product();
+
+        // Only decode (batch=1) uses fused kernel; prefill uses cuBLAS via dequant
+        if batch == 1 {
+            let mut out = stream.alloc_zeros::<f32>(out_features)
+                .map_err(|e| TqError::Msg(format!("qmatmul alloc: {}", e)))?;
+
+            match dtype {
+                crate::gguf::GgmlDType::Q4K => {
+                    super::kernels::q4km_matvec(reg, w_gpu, x, &mut out, out_features, in_features)
+                        .map_err(|e| TqError::Msg(format!("q4km_matvec: {}", e)))?;
+                }
+                crate::gguf::GgmlDType::Q8_0 => {
+                    super::kernels::q8_0_matvec(reg, w_gpu, x, &mut out, out_features, in_features)
+                        .map_err(|e| TqError::Msg(format!("q8_0_matvec: {}", e)))?;
+                }
+                _ => tq_bail!("qmatmul_gpu: unsupported dtype {:?}", dtype),
+            }
+
+            let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+            out_shape.push(out_features);
+            Ok(Self::from_cuda(out, out_shape, stream.clone()))
+        } else {
+            tq_bail!("qmatmul_gpu: batch>1 not yet supported (use cuBLAS path)");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
