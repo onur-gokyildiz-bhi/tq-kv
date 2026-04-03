@@ -672,3 +672,22 @@ pub fn gpu_reduce_max_last(
     unsafe { reg.stream.launch_builder(&f).arg(input).arg(output).arg(&(rows as i32)).arg(&(cols as i32)).launch(launch_1d(rows))?; }
     Ok(())
 }
+
+/// GPU concat copy: dst[dst_offset + i] = src[i] for i in 0..n.
+pub fn concat_copy(
+    reg: &KernelRegistry,
+    src: &CudaSlice<f32>,
+    dst: &CudaSlice<f32>,  // written to via kernel (logically mutable)
+    n: usize,
+    dst_offset: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "concat_copy_f32")?;
+    let ni = n as i32;
+    let di = dst_offset as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(src).arg(dst).arg(&ni).arg(&di)
+            .launch(launch_1d(n))?;
+    }
+    Ok(())
+}

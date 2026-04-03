@@ -120,8 +120,7 @@ impl TqTensor {
             TqStorage::Cpu(data) => data,
             #[cfg(feature = "cuda")]
             TqStorage::Cuda { data, stream } => {
-                // Auto-download from GPU. This is a transitional path —
-                // each call here is a target for GPU-native dispatch.
+                // Transitional auto-download for ops without GPU dispatch yet.
                 let cpu_data = stream.clone_dtoh(data).expect("as_slice GPU download failed");
                 let leaked: &'static [f32] = Box::leak(cpu_data.into_boxed_slice());
                 leaked
@@ -364,7 +363,83 @@ impl TqTensor {
         let total_dim: usize = tensors.iter().map(|t| t.shape[dim]).sum();
         let new_n = outer * total_dim * inner;
 
-        // CPU path (handles both CPU and GPU tensors via to_vec1 download)
+        // GPU path: all tensors on GPU → GPU-to-GPU concat (zero CPU transfer!)
+        #[cfg(feature = "cuda")]
+        {
+            let all_cuda = tensors.iter().all(|t| t.is_cuda());
+            if all_cuda {
+                if let TqStorage::Cuda { stream, .. } = &first.storage {
+                    let mut out_gpu = stream.alloc_zeros::<f32>(new_n)
+                        .map_err(|e| TqError::Msg(format!("cat alloc: {}", e)))?;
+
+                    if let Some(reg) = super::kernels::global_registry() {
+                        // Pre-upload 1D identity strides (reused for all copies)
+                        let shape_1 = stream.clone_htod(&[0i32]) // placeholder
+                            .map_err(|e| TqError::Msg(format!("cat: {}", e)))?;
+                        let stride_1 = stream.clone_htod(&[1i32])
+                            .map_err(|e| TqError::Msg(format!("cat: {}", e)))?;
+
+                        let mut dst_offset: usize = 0;
+                        for o in 0..outer {
+                            for t in tensors {
+                                let t_dim = t.shape[dim];
+                                let chunk = t_dim * inner;
+                                let src_off = o * chunk;
+
+                                // Copy: out_gpu[dst_offset..dst_offset+chunk] = src[src_off..src_off+chunk]
+                                // strided_copy with rank=1, shape=[chunk], strides=[1], src_offset=src_off
+                                // writes to output starting at index 0..chunk
+                                // We need output offset too... strided_copy writes to output[0..n].
+                                // Solution: create a sub-view of out_gpu at dst_offset.
+                                // cudarc CudaSlice doesn't support subslice, so use a temporary buffer
+                                // then copy into the right position.
+
+                                // Actually simpler: use strided_copy on the FULL output buffer
+                                // with src_strides=[1] and a virtual mapping that puts output
+                                // at the correct offset. But strided_copy writes to output[idx].
+
+                                // Simplest correct approach: temporary chunk buffer, then
+                                // use the CUDA kernel to scatter-write.
+                                // For now: direct GPU memcpy via a simple kernel.
+
+                                // Use elementwise add kernel trick: out[dst+i] = src[src+i] + 0
+                                // No — that would need offset support.
+
+                                // PRAGMATIC: For cat of 2 tensors (the common KV cache case),
+                                // just build output from strided_copy of each piece.
+                                let chunk_shape = stream.clone_htod(&[chunk as i32])
+                                    .map_err(|e| TqError::Msg(format!("cat: {}", e)))?;
+                                let mut chunk_buf = stream.alloc_zeros::<f32>(chunk)
+                                    .map_err(|e| TqError::Msg(format!("cat: {}", e)))?;
+                                super::kernels::strided_copy(
+                                    reg, t.cuda_data(), &mut chunk_buf, chunk, 1,
+                                    &chunk_shape, &stride_1, &stride_1, src_off as i32,
+                                ).map_err(|e| TqError::Msg(format!("cat strided: {}", e)))?;
+
+                                // Now copy chunk_buf into out_gpu at dst_offset
+                                // strided_copy: out[i] = src[0 + i], but we need out[dst+i] = src[i]
+                                // Use strided_copy on out_gpu with src=chunk_buf, offset=0,
+                                // and output index remapped... this doesn't work directly.
+
+                                // Final pragmatic: download chunk_buf, upload into correct position
+                                // NO — that defeats GPU cat purpose.
+
+                                // Copy chunk_buf into out_gpu at offset
+                                super::kernels::concat_copy(
+                                    reg, &chunk_buf, &out_gpu, chunk, dst_offset,
+                                ).map_err(|e| TqError::Msg(format!("cat concat: {}", e)))?;
+
+                                dst_offset += chunk;
+                            }
+                        }
+                    }
+
+                    return Ok(Self::from_cuda(out_gpu, new_shape, stream.clone()));
+                }
+            }
+        }
+
+        // CPU path
         let mut result = Vec::with_capacity(new_n);
         let data_vecs: Vec<Vec<f32>> = tensors.iter()
             .map(|t| t.to_vec1())
@@ -709,36 +784,58 @@ impl TqTensor {
         }
 
         let rank = self.rank();
-        let data = self.as_slice();
 
         // Source strides (row-major), zeroed for size-1 dims (broadcast)
-        let mut src_strides = vec![1usize; rank];
+        let mut src_strides = vec![1i32; rank];
         for i in (0..rank.saturating_sub(1)).rev() {
-            src_strides[i] = src_strides[i + 1] * self.shape[i + 1];
+            src_strides[i] = src_strides[i + 1] * self.shape[i + 1] as i32;
         }
         for i in 0..rank {
             if self.shape[i] == 1 {
-                src_strides[i] = 0;
+                src_strides[i] = 0; // broadcast dimension
             } else if self.shape[i] != target[i] {
                 tq_bail!("expand: dim {} size {} != target {}", i, self.shape[i], target[i]);
             }
         }
 
         // Target strides
-        let mut tgt_strides = vec![1usize; rank];
+        let mut tgt_strides = vec![1i32; rank];
         for i in (0..rank.saturating_sub(1)).rev() {
-            tgt_strides[i] = tgt_strides[i + 1] * target[i + 1];
+            tgt_strides[i] = tgt_strides[i + 1] * target[i + 1] as i32;
         }
 
         let n = target.iter().product::<usize>();
+
+        // GPU path: use strided_copy with broadcast strides (0 = repeat)
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            if let Some(reg) = super::kernels::global_registry() {
+                let mut out = stream.alloc_zeros::<f32>(n)
+                    .map_err(|e| TqError::Msg(format!("expand alloc: {}", e)))?;
+                let shape_gpu = stream.clone_htod(&target.iter().map(|&x| x as i32).collect::<Vec<_>>())
+                    .map_err(|e| TqError::Msg(format!("expand: {}", e)))?;
+                let tgt_gpu = stream.clone_htod(&tgt_strides)
+                    .map_err(|e| TqError::Msg(format!("expand: {}", e)))?;
+                let src_gpu = stream.clone_htod(&src_strides)
+                    .map_err(|e| TqError::Msg(format!("expand: {}", e)))?;
+
+                super::kernels::strided_copy(reg, src, &mut out, n, rank, &shape_gpu, &tgt_gpu, &src_gpu, 0)
+                    .map_err(|e| TqError::Msg(format!("expand kernel: {}", e)))?;
+
+                return Ok(Self::from_cuda(out, target, stream.clone()));
+            }
+        }
+
+        // CPU path
+        let data = self.as_slice();
         let mut result = Vec::with_capacity(n);
         for flat in 0..n {
             let mut src_idx = 0;
             let mut remaining = flat;
             for d in 0..rank {
-                let coord = remaining / tgt_strides[d];
-                remaining %= tgt_strides[d];
-                src_idx += coord * src_strides[d];
+                let coord = remaining / tgt_strides[d] as usize;
+                remaining %= tgt_strides[d] as usize;
+                src_idx += coord * src_strides[d] as usize;
             }
             result.push(data[src_idx]);
         }
