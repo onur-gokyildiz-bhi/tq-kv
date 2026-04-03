@@ -32,10 +32,10 @@ impl TqDevice {
         match CudaContext::new(ordinal) {
             Ok(ctx) => {
                 eprintln!("CUDA device {} initialized", ordinal);
-                // Non-default stream: enables CUDA Graph capture.
-                // cudarc automatically enables event tracking for multi-stream sync.
-                let stream = ctx.new_stream()
-                    .map_err(|e| super::TqError::Msg(format!("stream create: {}", e)))?;
+                // Default stream for now. Graph capture requires non-default stream +
+                // disabled event tracking, but cudarc's error_state mechanism makes
+                // debugging graph issues difficult. TODO: revisit after cudarc 0.20+.
+                let stream = ctx.default_stream();
                 let registry = super::kernels::KernelRegistry::new(&ctx, &stream)
                     .map_err(|e| super::TqError::Msg(format!("kernel init: {}", e)))?;
                 let registry = std::sync::Arc::new(registry);

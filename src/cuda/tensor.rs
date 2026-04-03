@@ -368,78 +368,31 @@ impl TqTensor {
         let total_dim: usize = tensors.iter().map(|t| t.shape[dim]).sum();
         let new_n = outer * total_dim * inner;
 
-        // GPU path: all tensors on GPU → GPU-to-GPU concat (zero CPU transfer!)
+        // GPU path: all tensors on GPU → GPU-to-GPU concat via copy_with_offsets.
+        // Graph-capture safe: no clone_htod, no temp alloc — just kernel launches.
         #[cfg(feature = "cuda")]
         {
             let all_cuda = tensors.iter().all(|t| t.is_cuda());
             if all_cuda {
                 if let TqStorage::Cuda { stream, .. } = &first.storage {
-                    let mut out_gpu = stream.alloc_zeros::<f32>(new_n)
-                        .map_err(|e| TqError::Msg(format!("cat alloc: {}", e)))?;
-
                     if let Some(reg) = super::kernels::global_registry() {
-                        // Pre-upload 1D identity strides (reused for all copies)
-                        let shape_1 = stream.clone_htod(&[0i32]) // placeholder
-                            .map_err(|e| TqError::Msg(format!("cat: {}", e)))?;
-                        let stride_1 = stream.clone_htod(&[1i32])
-                            .map_err(|e| TqError::Msg(format!("cat: {}", e)))?;
+                        let out_gpu = stream.alloc_zeros::<f32>(new_n)
+                            .map_err(|e| TqError::Msg(format!("cat alloc: {}", e)))?;
 
                         let mut dst_offset: usize = 0;
                         for o in 0..outer {
                             for t in tensors {
-                                let t_dim = t.shape[dim];
-                                let chunk = t_dim * inner;
+                                let chunk = t.shape[dim] * inner;
                                 let src_off = o * chunk;
-
-                                // Copy: out_gpu[dst_offset..dst_offset+chunk] = src[src_off..src_off+chunk]
-                                // strided_copy with rank=1, shape=[chunk], strides=[1], src_offset=src_off
-                                // writes to output starting at index 0..chunk
-                                // We need output offset too... strided_copy writes to output[0..n].
-                                // Solution: create a sub-view of out_gpu at dst_offset.
-                                // cudarc CudaSlice doesn't support subslice, so use a temporary buffer
-                                // then copy into the right position.
-
-                                // Actually simpler: use strided_copy on the FULL output buffer
-                                // with src_strides=[1] and a virtual mapping that puts output
-                                // at the correct offset. But strided_copy writes to output[idx].
-
-                                // Simplest correct approach: temporary chunk buffer, then
-                                // use the CUDA kernel to scatter-write.
-                                // For now: direct GPU memcpy via a simple kernel.
-
-                                // Use elementwise add kernel trick: out[dst+i] = src[src+i] + 0
-                                // No — that would need offset support.
-
-                                // PRAGMATIC: For cat of 2 tensors (the common KV cache case),
-                                // just build output from strided_copy of each piece.
-                                let chunk_shape = stream.clone_htod(&[chunk as i32])
-                                    .map_err(|e| TqError::Msg(format!("cat: {}", e)))?;
-                                let mut chunk_buf = stream.alloc_zeros::<f32>(chunk)
-                                    .map_err(|e| TqError::Msg(format!("cat: {}", e)))?;
-                                super::kernels::strided_copy(
-                                    reg, t.cuda_data(), &mut chunk_buf, chunk, 1,
-                                    &chunk_shape, &stride_1, &stride_1, src_off as i32,
-                                ).map_err(|e| TqError::Msg(format!("cat strided: {}", e)))?;
-
-                                // Now copy chunk_buf into out_gpu at dst_offset
-                                // strided_copy: out[i] = src[0 + i], but we need out[dst+i] = src[i]
-                                // Use strided_copy on out_gpu with src=chunk_buf, offset=0,
-                                // and output index remapped... this doesn't work directly.
-
-                                // Final pragmatic: download chunk_buf, upload into correct position
-                                // NO — that defeats GPU cat purpose.
-
-                                // Copy chunk_buf into out_gpu at offset
-                                super::kernels::concat_copy(
-                                    reg, &chunk_buf, &out_gpu, chunk, dst_offset,
-                                ).map_err(|e| TqError::Msg(format!("cat concat: {}", e)))?;
-
+                                super::kernels::copy_with_offsets(
+                                    reg, t.cuda_data(), &out_gpu, chunk, src_off, dst_offset,
+                                ).map_err(|e| TqError::Msg(format!("cat copy: {}", e)))?;
                                 dst_offset += chunk;
                             }
                         }
-                    }
 
-                    return Ok(Self::from_cuda(out_gpu, new_shape, stream.clone()));
+                        return Ok(Self::from_cuda(out_gpu, new_shape, stream.clone()));
+                    }
                 }
             }
         }

@@ -240,6 +240,23 @@ extern "C" __global__ void reduce_max_last_f32(
     output[row] = mx;
 }
 
+// ─── Copy with offsets (graph-capture safe cat) ─────────────
+// dst[dst_offset + i] = src[src_offset + i] for i in 0..n.
+// Replaces strided_copy + concat_copy pair in Tensor::cat() —
+// no GPU metadata uploads (clone_htod) needed.
+
+extern "C" __global__ void copy_with_offsets_f32(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    const int n,
+    const int src_offset,
+    const int dst_offset
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    dst[dst_offset + idx] = src[src_offset + idx];
+}
+
 // ─── F32 Matvec ─────────────────────────────────────────────
 // Single-vector matrix-vector multiply: output = W @ x
 // W: [out_features, in_features] row-major f32 (pre-dequantized, cached on GPU)

@@ -704,6 +704,28 @@ pub fn concat_copy(
     Ok(())
 }
 
+/// Copy with source and destination offsets: dst[dst_off+i] = src[src_off+i].
+/// Graph-capture safe: no clone_htod, no temp alloc. Replaces strided_copy+concat_copy in cat().
+pub fn copy_with_offsets(
+    reg: &KernelRegistry,
+    src: &CudaSlice<f32>,
+    dst: &CudaSlice<f32>,  // written via kernel
+    n: usize,
+    src_offset: usize,
+    dst_offset: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "copy_with_offsets_f32")?;
+    let ni = n as i32;
+    let so = src_offset as i32;
+    let do_ = dst_offset as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(src).arg(dst).arg(&ni).arg(&so).arg(&do_)
+            .launch(launch_1d(n))?;
+    }
+    Ok(())
+}
+
 /// F32 matvec: output = W @ x. No dequant — for pre-dequantized cached weights.
 /// 1 block per output row, 256 threads. Replaces cuBLAS SGEMM for decode (m=1).
 pub fn f32_matvec(

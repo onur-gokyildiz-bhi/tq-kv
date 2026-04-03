@@ -100,7 +100,7 @@ impl CudaGraphManager {
         // Event tracking creates cross-stream dependencies that break capture.
         stream.synchronize()
             .map_err(|e| super::TqError::Msg(format!("graph pre-sync: {}", e)))?;
-        unsafe { stream.context().disable_event_tracking(); }
+        // Event tracking disabled globally at device init (no per-capture toggle needed)
         stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| super::TqError::Msg(format!("graph begin_capture: {}", e)))?;
         self.status = GraphStatus::Capturing;
@@ -116,8 +116,6 @@ impl CudaGraphManager {
     ) -> Result<(), super::TqError> {
         use cudarc::driver::sys::CUgraphInstantiate_flags_enum;
         let result = stream.end_capture(CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
-        // Re-enable event tracking after capture
-        unsafe { stream.context().enable_event_tracking(); }
         let graph = result.map_err(|e| super::TqError::Msg(format!("graph end_capture: {}", e)))?;
         if let Some(graph) = graph {
             // Pre-upload to avoid first-launch overhead

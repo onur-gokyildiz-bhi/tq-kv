@@ -2296,17 +2296,31 @@ impl GenericTurboModel {
         #[cfg(feature = "cuda")]
         if capturing {
             if let Some(reg) = crate::cuda::kernels::global_registry() {
-                unsafe { reg.stream.context().disable_event_tracking(); }
-                reg.stream.synchronize().ok();
                 if let Err(e) = self.graph_manager.begin_capture(&reg.stream) {
                     eprintln!("[cuda-graph] begin_capture failed: {}", e);
-                    unsafe { reg.stream.context().enable_event_tracking(); }
+                } else {
+                    // Verify capture is active
+                    match reg.stream.capture_status() {
+                        Ok(s) => eprintln!("[cuda-graph] capture started, status={:?}", s),
+                        Err(e) => eprintln!("[cuda-graph] capture_status error: {}", e),
+                    }
                 }
             }
         }
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let x = layer_in;
+
+            // Debug: unconditional capture status check
+            #[cfg(feature = "cuda")]
+            if capturing && layer_idx < 2 {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    match reg.stream.capture_status() {
+                        Ok(s) => eprintln!("[cuda-graph] L{} entry: {:?}", layer_idx, s),
+                        Err(e) => eprintln!("[cuda-graph] L{} entry ERROR: {}", layer_idx, e),
+                    }
+                }
+            }
 
             // ── Fused kernel path: 5 launches replace ~13 per layer ──
             // Conditions: CUDA decode (seq_len=1), Q4K separate QKV, standard Mlp, no post-norms.
@@ -2418,9 +2432,52 @@ impl GenericTurboModel {
             }
 
             // ── Fallback: original separate-kernel path ──
+            // Debug: check graph capture status at key points
+            #[cfg(feature = "cuda")]
+            if capturing {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    if let Ok(status) = reg.stream.capture_status() {
+                        use cudarc::driver::sys::CUstreamCaptureStatus_enum::*;
+                        match status {
+                            CU_STREAM_CAPTURE_STATUS_ACTIVE => {},
+                            s => eprintln!("[cuda-graph] L{} pre-norm: capture status={:?}", layer_idx, s),
+                        }
+                    }
+                }
+            }
             let residual = &x;
-            let x = layer.attention_norm.forward(&x, backend)?;
+            let x = match layer.attention_norm.forward(&x, backend) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[cuda-graph] L{} norm FAILED: {}", layer_idx, e);
+                    return Err(e);
+                }
+            };
+            #[cfg(feature = "cuda")]
+            if capturing {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    if let Ok(status) = reg.stream.capture_status() {
+                        use cudarc::driver::sys::CUstreamCaptureStatus_enum::*;
+                        match status {
+                            CU_STREAM_CAPTURE_STATUS_ACTIVE => {},
+                            s => eprintln!("[cuda-graph] L{} post-norm: capture status={:?}", layer_idx, s),
+                        }
+                    }
+                }
+            }
             let attn = layer.forward_attn(&x, None, mask.as_ref(), index_pos, backend)?;
+            #[cfg(feature = "cuda")]
+            if capturing {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    if let Ok(status) = reg.stream.capture_status() {
+                        use cudarc::driver::sys::CUstreamCaptureStatus_enum::*;
+                        match status {
+                            CU_STREAM_CAPTURE_STATUS_ACTIVE => {},
+                            s => eprintln!("[cuda-graph] L{} post-attn: capture status={:?}", layer_idx, s),
+                        }
+                    }
+                }
+            }
             // Optional post-attention norm (Gemma2)
             let attn = match &layer.post_attention_norm {
                 Some(norm) => norm.forward(&attn, backend)?,
