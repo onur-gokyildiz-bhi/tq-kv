@@ -920,13 +920,12 @@ struct LayerWeights {
 impl LayerWeights {
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let _enter = self.span_rot.enter();
-        let (_b_sz, _n_head, seq_len, _n_embd) = x.dims4()?;
+        let (_b_sz, _n_head, seq_len, _head_dim) = x.dims4()?;
+        // RoPE via tensor ops (stays on CPU — broadcast shape mismatch prevents GPU)
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
         let x = x.contiguous()?;
         if self.rope_dim < self.head_dim {
-            // Partial RoPE: apply rotation only to first rope_dim dimensions,
-            // leave the remaining dimensions unchanged.
             let x_rope = x.narrow(3, 0, self.rope_dim)?;
             let x_pass = x.narrow(3, self.rope_dim, self.head_dim - self.rope_dim)?;
             let x_rotated = match self.rope_style {
@@ -2102,7 +2101,7 @@ impl GenericTurboModel {
 
         let backend = crate::backend::create_backend();
 
-        let model = Self {
+        let mut model = Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
             layers,
             norm,
@@ -2153,6 +2152,11 @@ impl GenericTurboModel {
                 }
             }
         }
+        // Note: cos/sin, norm weights, biases kept on CPU.
+        // GPU upload happens lazily via as_slice auto-download.
+        // Moving them to GPU causes broadcast shape mismatch (different-shape
+        // broadcast_mul/add not GPU-native yet) → CPU fallback → worse perf.
+
         eprintln!("  Weight caches warmed.");
         } // end if do_warmup
 
