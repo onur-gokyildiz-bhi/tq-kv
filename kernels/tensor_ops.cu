@@ -257,6 +257,23 @@ extern "C" __global__ void copy_with_offsets_f32(
     dst[dst_offset + idx] = src[src_offset + idx];
 }
 
+// ─── KV Cache Attention Mask ────────────────────────────────
+// Generates padding mask for pre-allocated KV cache.
+// Positions 0..valid_len → 0.0, positions valid_len..max_seq → -1e10.
+// Used with padded Q@K^T to ignore unfilled positions in softmax.
+// Graph-safe: no allocations, reads valid_len from a GPU scalar buffer.
+
+extern "C" __global__ void generate_kv_mask_f32(
+    float* __restrict__ mask,
+    const int* __restrict__ valid_len_ptr,   // GPU scalar: number of valid positions
+    const int max_seq
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= max_seq) return;
+    const int valid_len = *valid_len_ptr;
+    mask[idx] = (idx < valid_len) ? 0.0f : -1e10f;
+}
+
 // ─── F32 Matvec ─────────────────────────────────────────────
 // Single-vector matrix-vector multiply: output = W @ x
 // W: [out_features, in_features] row-major f32 (pre-dequantized, cached on GPU)

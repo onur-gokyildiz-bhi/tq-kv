@@ -749,6 +749,24 @@ pub fn f32_matvec(
     Ok(())
 }
 
+/// Generate KV cache attention mask: 0.0 for valid positions, -1e10 for padding.
+/// Reads valid_len from a GPU scalar buffer (graph-replay-safe: update the scalar before replay).
+pub fn generate_kv_mask(
+    reg: &KernelRegistry,
+    mask: &CudaSlice<f32>,
+    valid_len_ptr: &CudaSlice<i32>,
+    max_seq: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "generate_kv_mask_f32")?;
+    let ms = max_seq as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(mask).arg(valid_len_ptr).arg(&ms)
+            .launch(launch_1d(max_seq))?;
+    }
+    Ok(())
+}
+
 // ─── Fused layer kernels (fused_layer.cu) ──────────────────────
 //
 // These replace 13 separate kernel launches per layer with 3:

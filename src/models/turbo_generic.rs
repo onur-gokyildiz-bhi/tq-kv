@@ -888,6 +888,167 @@ fn compute_smooth_scales(
     Tensor::from_vec(vals, vec![head_dim], device).ok()
 }
 
+// ============================================================
+// Pre-allocated GPU KV Cache (for CUDA Graph replay)
+// ============================================================
+
+/// Maximum sequence length for pre-allocated KV cache.
+/// Determines GPU memory usage: 2 * n_layers * n_kv_head * MAX_KV_SEQ * head_dim * 4 bytes.
+/// For Qwen2-7B (n_kv_head=4, head_dim=128, 28 layers): 2*28*4*4096*128*4 = 3.5GB.
+/// Use a smaller default to be practical on 10GB GPUs.
+const MAX_KV_SEQ: usize = 2048;
+
+/// Pre-allocated GPU KV cache for CUDA Graph compatible inference.
+///
+/// Layout: K and V are flat `[n_kv_head * max_seq * head_dim]` buffers.
+/// Per-head data is contiguous: head h starts at `h * max_seq * head_dim`.
+/// New tokens are appended at `h * max_seq * head_dim + seq_len * head_dim`.
+///
+/// For attention, the full buffer is used as `[1, n_kv_head, max_seq, head_dim]`
+/// with positions >= seq_len masked to -inf in the attention score.
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for GpuKvCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuKvCache")
+            .field("seq_len", &self.seq_len)
+            .field("max_seq", &self.max_seq)
+            .field("n_kv_head", &self.n_kv_head)
+            .field("head_dim", &self.head_dim)
+            .finish()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Clone for GpuKvCache {
+    fn clone(&self) -> Self {
+        // Shallow clone: Arc bump (zero-copy GPU buffers)
+        Self {
+            k_buf: self.k_buf.clone(),
+            v_buf: self.v_buf.clone(),
+            mask_buf: self.mask_buf.clone(),
+            valid_len_gpu: self.stream.clone_htod(&[self.seq_len as i32]).unwrap(),
+            seq_len: self.seq_len,
+            max_seq: self.max_seq,
+            n_kv_head: self.n_kv_head,
+            head_dim: self.head_dim,
+            stream: self.stream.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct GpuKvCache {
+    k_buf: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    v_buf: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    /// Attention padding mask: [max_seq]. 0.0 for valid, -1e10 for padding.
+    mask_buf: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    /// GPU scalar for current valid length (read by mask generation kernel).
+    /// Updated via clone_htod before graph replay — graph-safe pointer.
+    valid_len_gpu: cudarc::driver::CudaSlice<i32>,
+    seq_len: usize,
+    max_seq: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuKvCache {
+    fn new(
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
+        n_kv_head: usize,
+        head_dim: usize,
+        max_seq: usize,
+    ) -> std::result::Result<Self, crate::cuda::TqError> {
+        let total = n_kv_head * max_seq * head_dim;
+        let k_buf = crate::cuda::gpu_alloc_zeros_pub(&stream, total)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuKvCache k alloc: {}", e)))?;
+        let v_buf = crate::cuda::gpu_alloc_zeros_pub(&stream, total)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuKvCache v alloc: {}", e)))?;
+        let mask_buf = crate::cuda::gpu_alloc_zeros_pub(&stream, max_seq)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuKvCache mask alloc: {}", e)))?;
+        let valid_len_gpu = stream.clone_htod(&[0i32])
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuKvCache len alloc: {}", e)))?;
+        Ok(Self {
+            k_buf: std::sync::Arc::new(k_buf),
+            v_buf: std::sync::Arc::new(v_buf),
+            mask_buf: std::sync::Arc::new(mask_buf),
+            valid_len_gpu,
+            seq_len: 0,
+            max_seq,
+            n_kv_head,
+            head_dim,
+            stream,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.seq_len = 0;
+    }
+
+    /// Append new K/V tokens. Input shape: [1, n_kv_head, n_new, head_dim].
+    fn append(&mut self, new_k: &Tensor, new_v: &Tensor, n_new: usize) -> Result<()> {
+        if self.seq_len + n_new > self.max_seq {
+            bail!("GpuKvCache: overflow {} + {} > {}", self.seq_len, n_new, self.max_seq);
+        }
+        let reg = crate::cuda::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+        let k_src = new_k.cuda_data();
+        let v_src = new_v.cuda_data();
+        let k_dst = std::sync::Arc::make_mut(&mut self.k_buf);
+        let v_dst = std::sync::Arc::make_mut(&mut self.v_buf);
+
+        // Copy each head's new tokens to the correct offset in the pre-allocated buffer.
+        // Per-head layout: head h data at [h * max_seq * head_dim .. (h+1) * max_seq * head_dim]
+        for h in 0..self.n_kv_head {
+            let src_off = (h * n_new * self.head_dim) as usize;
+            let dst_off = h * self.max_seq * self.head_dim + self.seq_len * self.head_dim;
+            let count = n_new * self.head_dim;
+            crate::cuda::kernels::copy_with_offsets(reg, k_src, k_dst, count, src_off, dst_off)
+                .map_err(|e| TqError::Msg(format!("kv append k: {}", e)))?;
+            crate::cuda::kernels::copy_with_offsets(reg, v_src, v_dst, count, src_off, dst_off)
+                .map_err(|e| TqError::Msg(format!("kv append v: {}", e)))?;
+        }
+        self.seq_len += n_new;
+
+        // Update GPU scalar + regenerate mask (graph-safe: kernel reads from GPU buffer)
+        let new_len = self.seq_len as i32;
+        let _ = self.stream.memcpy_htod(&[new_len], &mut self.valid_len_gpu);
+        let mask_mut = std::sync::Arc::make_mut(&mut self.mask_buf);
+        crate::cuda::kernels::generate_kv_mask(reg, mask_mut, &self.valid_len_gpu, self.max_seq)
+            .map_err(|e| TqError::Msg(format!("kv mask gen: {}", e)))?;
+        Ok(())
+    }
+
+    /// Get K as a Tensor wrapping the pre-allocated buffer.
+    /// Shape: [1, n_kv_head, max_seq, head_dim] (full buffer, mask unused positions).
+    fn k_tensor(&self) -> Tensor {
+        Tensor::from_cuda_arc(
+            self.k_buf.clone(),
+            vec![1, self.n_kv_head, self.max_seq, self.head_dim],
+            self.stream.clone(),
+        )
+    }
+
+    /// Get V as a Tensor wrapping the pre-allocated buffer.
+    fn v_tensor(&self) -> Tensor {
+        Tensor::from_cuda_arc(
+            self.v_buf.clone(),
+            vec![1, self.n_kv_head, self.max_seq, self.head_dim],
+            self.stream.clone(),
+        )
+    }
+
+    /// Get attention mask as tensor [1, 1, 1, max_seq] for broadcasting.
+    fn mask_tensor(&self) -> Tensor {
+        Tensor::from_cuda_arc(
+            self.mask_buf.clone(),
+            vec![1, 1, 1, self.max_seq],
+            self.stream.clone(),
+        )
+    }
+}
+
 /// QKV weight layout — separate tensors (most models) or merged single tensor (Phi-3.5).
 #[derive(Debug, Clone)]
 enum QkvWeights {
@@ -925,6 +1086,9 @@ struct LayerWeights {
     n_layers: usize,
     /// Standard KV cache for uncompressed layers
     kv_cache: Option<(Tensor, Tensor)>,
+    /// Pre-allocated GPU KV cache (used when CUDA Graph is enabled).
+    #[cfg(feature = "cuda")]
+    gpu_kv_cache: Option<GpuKvCache>,
     kv_compressed: Option<CompressedKvCache>,
     tq_config: TurboQuantConfig,
     signs: Vec<f32>,
@@ -991,9 +1155,6 @@ impl LayerWeights {
         backend: &dyn ComputeBackend,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
-        // Debug: track stale errors through attention ops
-        #[cfg(feature = "cuda")]
-        let _dbg_layer = self.layer_idx;
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         let (mut q, mut k, mut v) = if let Some(qkv) = pre_qkv {
             qkv
@@ -1013,17 +1174,6 @@ impl LayerWeights {
             }
         }
         }; // end if let Some(qkv) / else
-
-        #[cfg(feature = "cuda")]
-        if _dbg_layer == 0 {
-            if let Some(reg) = crate::cuda::kernels::global_registry() {
-                if let Err(e) = reg.stream.context().check_err() {
-                    eprintln!("[attn-dbg] L0 after QKV: stale={:?}", e);
-                } else {
-                    eprintln!("[attn-dbg] L0 after QKV: clean");
-                }
-            }
-        }
 
         // Calibration hook: collect RAW key vectors (before attention bias, before RoPE).
         // These have consistent per-channel statistics — no positional or bias contamination.
@@ -1046,27 +1196,9 @@ impl LayerWeights {
         if let Some(bv) = &self.attention_bv {
             v = v.broadcast_add(bv)?;
         }
-        #[cfg(feature = "cuda")]
-        if _dbg_layer == 0 {
-            if let Some(reg) = crate::cuda::kernels::global_registry() {
-                if let Err(e) = reg.stream.context().check_err() {
-                    eprintln!("[attn-dbg] L0 after BIAS: stale={:?}", e);
-                }
-            }
-        }
-
         let q = q.reshape(vec![b_sz, seq_len, self.n_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
         let k = k.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
         let v = v.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
-
-        #[cfg(feature = "cuda")]
-        if _dbg_layer == 0 {
-            if let Some(reg) = crate::cuda::kernels::global_registry() {
-                if let Err(e) = reg.stream.context().check_err() {
-                    eprintln!("[attn-dbg] L0 after BIAS+RESHAPE+TRANSPOSE: stale={:?}", e);
-                }
-            }
-        }
 
         // SmoothAttention: migrate K outliers to Q BEFORE RoPE.
         // K *= 1/sqrt(s), Q *= sqrt(s). Invariance: (Q*sqrt(s)) * (K/sqrt(s))^T = Q * K^T
@@ -1083,15 +1215,6 @@ impl LayerWeights {
 
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
-
-        #[cfg(feature = "cuda")]
-        if _dbg_layer == 0 {
-            if let Some(reg) = crate::cuda::kernels::global_registry() {
-                if let Err(e) = reg.stream.context().check_err() {
-                    eprintln!("[attn-dbg] L0 after ROPE: stale={:?}", e);
-                }
-            }
-        }
 
         // Selective compression: first TQ_SKIP_FIRST_LAYERS use standard fp16 KV cache,
         // remaining layers use TurboQuant compression.
@@ -1854,6 +1977,73 @@ impl LayerWeights {
             self.attention_wo.forward(&y, backend)
         } else {
             // UNCOMPRESSED PATH: standard fp16 KV cache (first N layers)
+            //
+            // GPU path: pre-allocated GpuKvCache with pad+mask (graph-compatible).
+            // CPU path: Tensor::cat (original, allocation per step).
+            #[cfg(feature = "cuda")]
+            let graph_mode = std::env::var("TQ_GRAPH").map(|v| v == "1").unwrap_or(false);
+            #[cfg(feature = "cuda")]
+            if k.is_cuda() && seq_len == 1 && graph_mode {
+                // Initialize GPU KV cache on first decode step (graph mode only)
+                if self.gpu_kv_cache.is_none() {
+                    if let Some(reg) = crate::cuda::kernels::global_registry() {
+                        match GpuKvCache::new(reg.stream.clone(), self.n_kv_head, self.head_dim, MAX_KV_SEQ) {
+                            Ok(mut cache) => {
+                                // Seed with prefill KV data from the CPU-path kv_cache
+                                if let Some((prev_k, prev_v)) = &self.kv_cache {
+                                    let prefill_len = prev_k.shape()[2]; // [1, n_kv_head, seq, head_dim]
+                                    // Ensure KV data is on GPU (prefill may have produced CPU tensors)
+                                    let gk = if prev_k.is_cuda() { prev_k.clone() } else {
+                                        prev_k.to_device_auto().unwrap_or_else(|_| prev_k.clone())
+                                    };
+                                    let gv = if prev_v.is_cuda() { prev_v.clone() } else {
+                                        prev_v.to_device_auto().unwrap_or_else(|_| prev_v.clone())
+                                    };
+                                    if gk.is_cuda() && gv.is_cuda() {
+                                        if let Err(e) = cache.append(&gk, &gv, prefill_len) {
+                                            eprintln!("[gpu-kv] L{}: seed failed: {}", self.layer_idx, e);
+                                        }
+                                    }
+                                }
+                                eprintln!("[gpu-kv] L{}: pre-allocated {}×{}×{} = {:.1}MB per K/V (seeded {})",
+                                    self.layer_idx, self.n_kv_head, MAX_KV_SEQ, self.head_dim,
+                                    (self.n_kv_head * MAX_KV_SEQ * self.head_dim * 4) as f64 / 1e6,
+                                    cache.seq_len);
+                                self.gpu_kv_cache = Some(cache);
+                            }
+                            Err(e) => eprintln!("[gpu-kv] L{}: alloc failed: {}", self.layer_idx, e),
+                        }
+                    }
+                }
+                if let Some(ref mut gpu_kv) = self.gpu_kv_cache {
+                    if index_pos == 0 {
+                        gpu_kv.reset();
+                    }
+                    // Append new K/V to pre-allocated buffers
+                    gpu_kv.append(&k, &v, seq_len)?;
+
+                    // Get padded K/V tensors [1, n_kv_head, max_seq, head_dim]
+                    let k_full = gpu_kv.k_tensor();
+                    let v_full = gpu_kv.v_tensor();
+                    let kv_mask = gpu_kv.mask_tensor(); // [1, 1, 1, max_seq]
+
+                    let k_full = repeat_kv(k_full, n_rep)?;
+                    let v_full = repeat_kv(v_full, n_rep)?;
+
+                    // Q@K^T: [1, n_head, 1, max_seq] (fixed shape)
+                    let att = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+                    // Apply padding mask: -1e10 for unfilled positions
+                    let kv_mask = kv_mask.broadcast_as(att.shape())?;
+                    let att = (att + kv_mask)?;
+                    let att = softmax_last_dim(&att, backend)?;
+                    let y = att.matmul(&v_full.contiguous()?)?;
+
+                    let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+                    return self.attention_wo.forward(&y, backend);
+                }
+            }
+
+            // CPU fallback / prefill: original cat()-based KV cache
             let (k, v) = match &self.kv_cache {
                 None => (k, v),
                 Some((prev_k, prev_v)) => {
@@ -1907,6 +2097,9 @@ pub struct GenericTurboModel {
     /// Cached output tensor from graph capture (for replay).
     #[cfg(feature = "cuda")]
     graph_output: Option<Tensor>,
+    /// GPU buffers kept alive for graph replay (prevents ILLEGAL_ADDRESS from freed pointers).
+    #[cfg(feature = "cuda")]
+    graph_retained_buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
 }
 
 fn precompute_freqs_cis(
@@ -2180,6 +2373,8 @@ impl GenericTurboModel {
                 layer_idx,
                 n_layers: block_count,
                 kv_cache: None,
+                #[cfg(feature = "cuda")]
+                gpu_kv_cache: None,
                 kv_compressed: None,
                 tq_config: tq_config.clone(),
                 signs: signs.clone(),
@@ -2208,6 +2403,8 @@ impl GenericTurboModel {
             ),
             #[cfg(feature = "cuda")]
             graph_output: None,
+            #[cfg(feature = "cuda")]
+            graph_retained_buffers: Vec::new(),
         };
 
         // Pre-warm weight caches: dequant on CPU + upload to GPU.
@@ -2295,14 +2492,21 @@ impl GenericTurboModel {
         if seq_len > 1 {
             self.graph_manager.reset();
             self.graph_output = None;
+            self.graph_retained_buffers.clear(); // release GPU buffers from previous graph
         }
 
         // ── CUDA Graph replay ──
         #[cfg(feature = "cuda")]
         if seq_len == 1 && self.graph_manager.is_ready(1) {
             let reg = crate::cuda::kernels::global_registry().unwrap();
+            // Clear stale error_state before replay (capture may leave benign errors)
+            let _ = reg.stream.context().check_err();
             self.graph_manager.replay(&reg.stream, 1)
                 .map_err(|e| TqError::Msg(format!("graph replay: {}", e)))?;
+            // Sync after replay to ensure output is ready for dtoh
+            reg.stream.synchronize()
+                .map_err(|e| TqError::Msg(format!("graph sync: {}", e)))?;
+            let _ = reg.stream.context().check_err(); // clear post-replay errors
             if let Some(ref out) = self.graph_output {
                 return Ok(out.clone());
             }
@@ -2336,6 +2540,9 @@ impl GenericTurboModel {
         // TQ compressed path has CPU-side key compression → incompatible.
         #[cfg(feature = "cuda")]
         if capturing {
+            // Start collecting GPU buffer references — prevents intermediate CudaSlice
+            // from being freed while graph holds baked pointers to them.
+            crate::cuda::graph_retention_start();
             if let Some(reg) = crate::cuda::kernels::global_registry() {
                 if let Err(e) = self.graph_manager.begin_capture(&reg.stream) {
                     eprintln!("[cuda-graph] begin_capture failed: {}", e);
@@ -2366,9 +2573,12 @@ impl GenericTurboModel {
 
             // ── Fused kernel path: 5 launches replace ~13 per layer ──
             // Conditions: CUDA decode (seq_len=1), Q4K separate QKV, standard Mlp, no post-norms.
+            // Skip for compressed layers (TQ KV path has CPU-side operations).
             // Phases are scoped to avoid borrow conflicts with &mut self in forward_attn.
             #[cfg(feature = "cuda")]
-            if seq_len == 1 && x.is_cuda()
+            let layer_uses_compression = get_layer_bits(layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers).is_some();
+            #[cfg(feature = "cuda")]
+            if seq_len == 1 && x.is_cuda() && !layer_uses_compression
                 && layer.post_attention_norm.is_none()
                 && layer.post_ffn_norm.is_none()
                 && matches!(&layer.qkv, QkvWeights::Separate { .. })
@@ -2468,65 +2678,61 @@ impl GenericTurboModel {
                         Ok(combined)
                     })(); // MLP borrows released
 
-                    layer_in = fused_mlp_result?;
-                    continue; // skip fallback path
+                    match fused_mlp_result {
+                        Ok(result) => {
+                            layer_in = result;
+                            continue; // skip fallback path
+                        }
+                        Err(_) => {
+                            // Fused MLP failed (e.g., Q6K weights) — fall through to separate-kernel MLP.
+                            // Attention already computed; compute residual + norm + MLP below.
+                            let _enter = layer.span_mlp.enter();
+                            let attn_f32 = attn.to_dtype(DType::F32)?;
+                            let residual_f32 = x.to_dtype(DType::F32)?;
+                            #[cfg(feature = "cuda")]
+                            let (mlp_in, residual_owned) = if attn_f32.is_cuda() {
+                                attn_f32.fused_add_rms_norm_gpu(
+                                    &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
+                                )?
+                            } else {
+                                let shape = attn_f32.shape().to_vec();
+                                let hidden = *shape.last().unwrap();
+                                let n_tokens = attn_f32.elem_count() / hidden;
+                                let (normed, new_res) = backend.fused_add_rms_norm(
+                                    attn_f32.as_slice(), residual_f32.as_slice(),
+                                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                                    n_tokens, hidden,
+                                );
+                                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
+                            };
+                            #[cfg(not(feature = "cuda"))]
+                            let (mlp_in, residual_owned) = {
+                                let shape = attn_f32.shape().to_vec();
+                                let hidden = *shape.last().unwrap();
+                                let n_tokens = attn_f32.elem_count() / hidden;
+                                let (normed, new_res) = backend.fused_add_rms_norm(
+                                    attn_f32.as_slice(), residual_f32.as_slice(),
+                                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                                    n_tokens, hidden,
+                                );
+                                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
+                            };
+                            let mlp_out = layer.mlp_or_moe.forward(&mlp_in, backend)?;
+                            layer_in = (mlp_out + &residual_owned)?;
+                            continue;
+                        }
+                    }
                 }
             }
 
             // ── Fallback: original separate-kernel path ──
-            // Debug: check graph capture status at key points
-            #[cfg(feature = "cuda")]
-            if capturing {
-                if let Some(reg) = crate::cuda::kernels::global_registry() {
-                    if let Ok(status) = reg.stream.capture_status() {
-                        use cudarc::driver::sys::CUstreamCaptureStatus_enum::*;
-                        match status {
-                            CU_STREAM_CAPTURE_STATUS_ACTIVE => {},
-                            s => eprintln!("[cuda-graph] L{} pre-norm: capture status={:?}", layer_idx, s),
-                        }
-                    }
-                }
-            }
             let residual = &x;
-            // Debug: track where stale error originates during graph capture
-            #[cfg(feature = "cuda")]
-            if capturing && layer_idx == 0 {
-                if let Some(reg) = crate::cuda::kernels::global_registry() {
-                    let _ = reg.stream.context().check_err(); // clear before norm
-                }
-            }
             let x = layer.attention_norm.forward(&x, backend)?;
-            #[cfg(feature = "cuda")]
-            if capturing && layer_idx == 0 {
-                if let Some(reg) = crate::cuda::kernels::global_registry() {
-                    if let Err(e) = reg.stream.context().check_err() {
-                        eprintln!("[cuda-graph] L0 AFTER NORM: stale={:?}", e);
-                    }
-                }
-            }
-            #[cfg(feature = "cuda")]
-            if capturing {
-                if let Some(reg) = crate::cuda::kernels::global_registry() {
-                    if let Ok(status) = reg.stream.capture_status() {
-                        use cudarc::driver::sys::CUstreamCaptureStatus_enum::*;
-                        match status {
-                            CU_STREAM_CAPTURE_STATUS_ACTIVE => {},
-                            s => eprintln!("[cuda-graph] L{} post-norm: capture status={:?}", layer_idx, s),
-                        }
-                    }
-                }
-            }
             let attn = layer.forward_attn(&x, None, mask.as_ref(), index_pos, backend)?;
             #[cfg(feature = "cuda")]
-            if capturing && layer_idx == 0 {
-                if let Some(reg) = crate::cuda::kernels::global_registry() {
-                    if let Err(e) = reg.stream.context().check_err() {
-                        eprintln!("[cuda-graph] L0 AFTER ATTN: stale={:?}", e);
-                    }
-                }
-            }
-            #[cfg(feature = "cuda")]
-            if capturing {
+            if false { // placeholder for future graph capture status checks
                 if let Some(reg) = crate::cuda::kernels::global_registry() {
                     if let Ok(status) = reg.stream.capture_status() {
                         use cudarc::driver::sys::CUstreamCaptureStatus_enum::*;
@@ -2600,10 +2806,31 @@ impl GenericTurboModel {
                 match self.graph_manager.end_capture(&reg.stream, 1) {
                     Ok(()) => {
                         self.graph_output = Some(output.clone());
+                        // Drain retained buffers — keeps GPU memory alive for graph replay.
+                        self.graph_retained_buffers = crate::cuda::graph_retention_drain();
+                        eprintln!("[cuda-graph] retained {} GPU buffers for replay", self.graph_retained_buffers.len());
+                        // IMPORTANT: During capture, operations are RECORDED but NOT EXECUTED.
+                        // The output buffer has invalid data (virtual memory, not computed).
+                        // Do an immediate graph replay to produce valid output.
+                        let _ = reg.stream.context().check_err();
+                        match self.graph_manager.replay(&reg.stream, 1) {
+                            Ok(()) => {
+                                let _ = reg.stream.synchronize();
+                                let _ = reg.stream.context().check_err();
+                                eprintln!("[cuda-graph] initial replay OK — output buffer now valid");
+                            }
+                            Err(e) => {
+                                eprintln!("[cuda-graph] initial replay FAILED: {}", e);
+                                self.graph_manager.reset();
+                                self.graph_retained_buffers.clear();
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("[cuda-graph] end_capture failed: {}", e);
                         self.graph_manager.reset();
+                        // Drain and discard on failure
+                        let _ = crate::cuda::graph_retention_drain();
                     }
                 }
             }

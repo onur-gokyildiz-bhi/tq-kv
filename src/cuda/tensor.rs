@@ -5,10 +5,143 @@
 
 use super::{TqDevice, TqDType, Result, TqError, tq_bail};
 
+// ── CUDA Graph Decode Buffer Pool ────────────────────────────────
+// For CUDA Graph replay, ALL GPU memory must be allocated BEFORE capture.
+// During capture, cuMemAllocAsync creates graph-scoped virtual memory that's
+// only valid during graph execution — not persistent between launches.
+//
+// Solution: DecodeBufferPool with two phases:
+//   1. RECORDING (warm-up pass): alloc normally + save each buffer
+//   2. POOLED (capture + replay passes): return saved buffers, no new alloc
+//
+// Same pointers every pass → graph bakes persistent addresses.
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PoolMode {
+    /// Normal mode: gpu_alloc_zeros allocates fresh buffers
+    Off,
+    /// Recording: alloc normally + push to pool (warm-up pass before capture)
+    Recording,
+    /// Pooled: return pool[cursor++] instead of allocating (capture + replay passes)
+    Pooled,
+}
+
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static DECODE_POOL_MODE: std::cell::Cell<PoolMode> = const { std::cell::Cell::new(PoolMode::Off) };
+    static DECODE_POOL_BUFFERS: std::cell::RefCell<Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>>
+        = const { std::cell::RefCell::new(Vec::new()) };
+    static DECODE_POOL_CURSOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Set pool mode.
+#[cfg(feature = "cuda")]
+pub fn decode_pool_set_mode(mode: PoolMode) {
+    DECODE_POOL_MODE.with(|m| m.set(mode));
+    if mode == PoolMode::Recording {
+        DECODE_POOL_BUFFERS.with(|b| b.borrow_mut().clear());
+    }
+    DECODE_POOL_CURSOR.with(|c| c.set(0));
+}
+
+/// Reset pool cursor to 0 (call at start of each forward pass in Pooled mode).
+#[cfg(feature = "cuda")]
+pub fn decode_pool_reset_cursor() {
+    DECODE_POOL_CURSOR.with(|c| c.set(0));
+}
+
+/// Get recorded pool buffers (for storing in model struct).
+#[cfg(feature = "cuda")]
+pub fn decode_pool_drain() -> Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>> {
+    DECODE_POOL_BUFFERS.with(|b| {
+        let mut v = b.borrow_mut();
+        std::mem::take(&mut *v)
+    })
+}
+
+/// Restore pool buffers (from model struct into thread-local).
+#[cfg(feature = "cuda")]
+pub fn decode_pool_restore(buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>) {
+    DECODE_POOL_BUFFERS.with(|b| *b.borrow_mut() = buffers);
+}
+
+/// Allocate or reuse a GPU buffer depending on pool mode.
+/// In Recording mode: alloc + save to pool.
+/// In Pooled mode: return pool[cursor++] (same pointer every time).
+/// In Off mode: normal alloc.
+#[cfg(feature = "cuda")]
+fn pool_alloc_f32(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    len: usize,
+) -> std::result::Result<std::sync::Arc<cudarc::driver::CudaSlice<f32>>, cudarc::driver::result::DriverError> {
+    let mode = DECODE_POOL_MODE.with(|m| m.get());
+    match mode {
+        PoolMode::Off => {
+            let buf = gpu_alloc_zeros::<f32>(stream, len)?;
+            Ok(std::sync::Arc::new(buf))
+        }
+        PoolMode::Recording => {
+            let buf = gpu_alloc_zeros::<f32>(stream, len)?;
+            let arc = std::sync::Arc::new(buf);
+            DECODE_POOL_BUFFERS.with(|b| b.borrow_mut().push(arc.clone()));
+            Ok(arc)
+        }
+        PoolMode::Pooled => {
+            let idx = DECODE_POOL_CURSOR.with(|c| {
+                let i = c.get();
+                c.set(i + 1);
+                i
+            });
+            let arc = DECODE_POOL_BUFFERS.with(|b| {
+                let bufs = b.borrow();
+                if idx < bufs.len() {
+                    Some(bufs[idx].clone())
+                } else {
+                    None
+                }
+            });
+            match arc {
+                Some(a) => {
+                    // Verify size matches (sanity check)
+                    if a.len() != len {
+                        eprintln!("[pool] WARNING: size mismatch at idx {}: pool={} requested={}", idx, a.len(), len);
+                    }
+                    Ok(a)
+                }
+                None => {
+                    eprintln!("[pool] WARNING: pool exhausted at idx {} (pool has {} buffers), allocating fresh",
+                        idx, DECODE_POOL_BUFFERS.with(|b| b.borrow().len()));
+                    let buf = gpu_alloc_zeros::<f32>(stream, len)?;
+                    Ok(std::sync::Arc::new(buf))
+                }
+            }
+        }
+    }
+}
+
+// Keep graph_retention_start/drain as no-ops for backward compat
+#[cfg(feature = "cuda")]
+pub fn graph_retention_start() {}
+#[cfg(feature = "cuda")]
+pub fn graph_retention_drain() -> Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>> { Vec::new() }
+#[cfg(feature = "cuda")]
+fn graph_retention_keep(_data: &std::sync::Arc<cudarc::driver::CudaSlice<f32>>) {}
+
+/// Public wrapper for gpu_alloc_zeros (used by GpuKvCache).
+#[cfg(feature = "cuda")]
+pub fn gpu_alloc_zeros_pub(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    len: usize,
+) -> std::result::Result<cudarc::driver::CudaSlice<f32>, cudarc::driver::result::DriverError> {
+    gpu_alloc_zeros::<f32>(stream, len)
+}
+
 /// GPU alloc that clears cudarc's stale error_state first.
 /// During CUDA Graph capture, CudaSlice::drop → cuMemFreeAsync on pre-capture memory
 /// sets error_state to INVALID_VALUE. This stale error blocks subsequent alloc_zeros
 /// via bind_to_thread → check_err. Clearing before alloc prevents the cascade.
+///
 #[cfg(feature = "cuda")]
 fn gpu_alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
@@ -125,8 +258,38 @@ impl TqTensor {
             TqStorage::Cpu(data) => Ok(data.clone()),
             #[cfg(feature = "cuda")]
             TqStorage::Cuda { data, stream } => {
-                stream.clone_dtoh(data.as_ref())
-                    .map_err(|e| TqError::Msg(format!("dtoh: {}", e)))
+                // Sync + clear stale error_state before dtoh (graph capture/replay may leave benign errors)
+                if let Err(e) = stream.synchronize() {
+                    eprintln!("[dtoh] sync failed: {:?}", e);
+                }
+                if let Err(e) = stream.context().check_err() {
+                    eprintln!("[dtoh] stale error cleared: {:?}", e);
+                }
+                // First try normal clone_dtoh. If it fails (e.g., stale error from graph capture),
+                // fall back to raw CUDA memcpy which bypasses cudarc's error_state mechanism.
+                match stream.clone_dtoh(data.as_ref()) {
+                    Ok(v) => Ok(v),
+                    Err(_) => {
+                        let _ = stream.context().check_err(); // clear error_state
+                        let _ = stream.synchronize();
+                        // Raw memcpy: bypass cudarc's bind_to_thread/check_err
+                        use cudarc::driver::{DevicePtr, DeviceSlice};
+                        let n = data.len();
+                        let mut dst = vec![0.0f32; n];
+                        let (src_ptr, _guard) = data.as_ref().device_ptr(stream.as_ref());
+                        let res = unsafe {
+                            cudarc::driver::sys::cuMemcpyDtoH_v2(
+                                dst.as_mut_ptr() as *mut _,
+                                src_ptr,
+                                n * std::mem::size_of::<f32>(),
+                            )
+                        };
+                        if res != cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS {
+                            return Err(TqError::Msg(format!("dtoh raw fallback (n={}): {:?}", n, res)));
+                        }
+                        Ok(dst)
+                    }
+                }
             }
         }
     }
@@ -945,8 +1108,10 @@ impl TqTensor {
                 let stream = device.cuda_stream()?;
                 let cuda_data = stream.clone_htod(&data)
                     .map_err(|e| TqError::Cuda(e))?;
+                let arc = std::sync::Arc::new(cuda_data);
+                graph_retention_keep(&arc);
                 Ok(Self {
-                    storage: TqStorage::Cuda { data: std::sync::Arc::new(cuda_data), stream },
+                    storage: TqStorage::Cuda { data: arc, stream },
                     shape,
                     dtype: TqDType::F32,
                 })
@@ -964,8 +1129,10 @@ impl TqTensor {
                 let stream = device.cuda_stream()?;
                 let cuda_data = gpu_alloc_zeros::<f32>(&stream, n)
                     .map_err(|e| TqError::Cuda(e))?;
+                let arc = std::sync::Arc::new(cuda_data);
+                graph_retention_keep(&arc);
                 Ok(Self {
-                    storage: TqStorage::Cuda { data: std::sync::Arc::new(cuda_data), stream },
+                    storage: TqStorage::Cuda { data: arc, stream },
                     shape,
                     dtype: TqDType::F32,
                 })
@@ -988,8 +1155,10 @@ impl TqTensor {
                 let stream = device.cuda_stream()?;
                 let cuda_data = stream.clone_htod(data)
                     .map_err(|e| TqError::Cuda(e))?;
+                let arc = std::sync::Arc::new(cuda_data);
+                graph_retention_keep(&arc);
                 Ok(Self {
-                    storage: TqStorage::Cuda { data: std::sync::Arc::new(cuda_data), stream },
+                    storage: TqStorage::Cuda { data: arc, stream },
                     shape: self.shape.clone(),
                     dtype: self.dtype,
                 })
@@ -1065,7 +1234,9 @@ impl TqTensor {
         match &self.storage {
             TqStorage::Cpu(data) => {
                 let gpu = stream.clone_htod(data).map_err(|e| TqError::Msg(format!("auto-upload: {}", e)))?;
-                Ok(Self { storage: TqStorage::Cuda { data: std::sync::Arc::new(gpu), stream }, shape: self.shape.clone(), dtype: self.dtype })
+                let arc = std::sync::Arc::new(gpu);
+                graph_retention_keep(&arc);
+                Ok(Self { storage: TqStorage::Cuda { data: arc, stream }, shape: self.shape.clone(), dtype: self.dtype })
             }
             _ => Ok(self.clone()),
         }
@@ -1081,8 +1252,24 @@ impl TqTensor {
         shape: Vec<usize>,
         stream: std::sync::Arc<cudarc::driver::CudaStream>,
     ) -> Self {
+        let arc = std::sync::Arc::new(data);
+        Self { storage: TqStorage::Cuda { data: arc, stream }, shape, dtype: TqDType::F32 }
+    }
+
+    /// Create a TqTensor from an existing Arc<CudaSlice> (zero-copy view).
+    /// Used by GpuKvCache to wrap pre-allocated buffers as tensors.
+
+    /// Create a TqTensor from an existing Arc<CudaSlice> (zero-copy view).
+    /// Used by GpuKvCache to wrap pre-allocated buffers as tensors.
+    #[cfg(feature = "cuda")]
+    pub fn from_cuda_arc(
+        data: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+        shape: Vec<usize>,
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Self {
+        graph_retention_keep(&data);
         Self {
-            storage: TqStorage::Cuda { data: std::sync::Arc::new(data), stream },
+            storage: TqStorage::Cuda { data, stream },
             shape,
             dtype: TqDType::F32,
         }
@@ -1381,7 +1568,7 @@ impl TqTensor {
 
         Ok((
             Self::from_cuda(out, shape.clone(), stream.clone()),
-            Self { storage: TqStorage::Cuda { data: res_arc, stream: stream.clone() }, shape, dtype: TqDType::F32 },
+            { graph_retention_keep(&res_arc); Self { storage: TqStorage::Cuda { data: res_arc, stream: stream.clone() }, shape, dtype: TqDType::F32 } },
         ))
     }
 
