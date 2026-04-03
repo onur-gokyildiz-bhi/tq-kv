@@ -101,7 +101,7 @@ impl TqTensor {
         }
     }
 
-    /// Get underlying f32 data (CPU only).
+    /// Get underlying f32 data.
     pub fn to_vec1(&self) -> Result<Vec<f32>> {
         match &self.storage {
             TqStorage::Cpu(data) => Ok(data.clone()),
@@ -115,20 +115,14 @@ impl TqTensor {
 
     /// Borrow underlying f32 slice.
     /// For CUDA tensors: downloads to CPU transparently (allocates).
-    /// This enables gradual GPU migration — ops that don't have GPU dispatch yet
-    /// will auto-download, run on CPU, and the result goes back to CPU.
     pub fn as_slice(&self) -> &[f32] {
         match &self.storage {
             TqStorage::Cpu(data) => data,
             #[cfg(feature = "cuda")]
             TqStorage::Cuda { data, stream } => {
-                // Auto-download: convert CUDA tensor to CPU slice.
-                // This is slow but prevents panics during GPU migration.
-                // Each op should eventually get a GPU-native path.
+                // Auto-download from GPU. This is a transitional path —
+                // each call here is a target for GPU-native dispatch.
                 let cpu_data = stream.clone_dtoh(data).expect("as_slice GPU download failed");
-                // SAFETY: we leak the vec to get a stable reference.
-                // This is intentionally leaky — it's a transitional hack during GPU migration.
-                // Each leaked slice is small (activation tensor) and freed at process exit.
                 let leaked: &'static [f32] = Box::leak(cpu_data.into_boxed_slice());
                 leaked
             }
@@ -1098,10 +1092,13 @@ impl TqTensor {
         let n_tokens = self.elem_count() / hidden;
         let n = n_tokens * hidden;
 
-        // Weight: upload or get cached
-        let w_data = weight.to_vec1()?;
-        let w_gpu = stream.clone_htod(&w_data)
-            .map_err(|e| TqError::Msg(format!("rms_norm weight upload: {}", e)))?;
+        // Weight: use GPU data if available, else upload
+        let w_gpu = if weight.is_cuda() {
+            weight.cuda_data().clone()
+        } else {
+            let w_data = weight.to_vec1()?;
+            stream.clone_htod(&w_data).map_err(|e| TqError::Msg(format!("rms_norm weight: {}", e)))?
+        };
 
         let mut out = stream.alloc_zeros::<f32>(n)
             .map_err(|e| TqError::Msg(format!("rms_norm alloc: {}", e)))?;
@@ -1171,12 +1168,17 @@ impl TqTensor {
         let n_tokens = self.elem_count() / hidden;
         let n = n_tokens * hidden;
 
-        let w_data = weight.to_vec1()?;
-        let w_gpu = stream.clone_htod(&w_data)
-            .map_err(|e| TqError::Msg(format!("fused norm weight: {}", e)))?;
+        // Weight: CPU tensor, upload once (should be cached in practice)
+        let w_gpu = if weight.is_cuda() {
+            weight.cuda_data().clone()
+        } else {
+            let w_data = weight.to_vec1()?;
+            stream.clone_htod(&w_data).map_err(|e| TqError::Msg(format!("fused norm weight: {}", e)))?
+        };
 
-        let mut res_gpu = stream.clone_htod(&residual.to_vec1()?)
-            .map_err(|e| TqError::Msg(format!("fused norm res copy: {}", e)))?;
+        // Residual: need a mutable copy (kernel modifies in-place).
+        // If already on GPU, clone the GPU buffer (no CPU round-trip!)
+        let mut res_gpu = res.clone();
         let mut out = stream.alloc_zeros::<f32>(n)
             .map_err(|e| TqError::Msg(format!("fused norm alloc: {}", e)))?;
 
