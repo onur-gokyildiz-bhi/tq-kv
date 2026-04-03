@@ -44,6 +44,12 @@ pub struct CudaGraphManager {
     eager_count: usize,
 }
 
+// SAFETY: CudaGraph is bound to a single GPU context. We only access
+// CudaGraphManager from the inference thread (single-threaded model forward).
+// The raw CUDA pointers don't cross threads in practice.
+unsafe impl Send for CudaGraphManager {}
+unsafe impl Sync for CudaGraphManager {}
+
 impl CudaGraphManager {
     /// Create a new graph manager.
     pub fn new(enabled: bool) -> Self {

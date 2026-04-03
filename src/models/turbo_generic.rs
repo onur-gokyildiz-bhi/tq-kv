@@ -209,7 +209,10 @@ impl QMatMul {
                         );
                         return xs.qmatmul_gpu(w_gpu, qw.dtype, qw.out_features(), qw.in_features());
                     }
-                    // Prefill (batch>1) or unsupported dtype (Q6K etc): download to CPU
+                    // Q6K/other dtypes on GPU: use f32_matvec (decode) or cuBLAS (prefill).
+                    // Critical: avoids to_vec1() sync that breaks GPU pipeline pipelining
+                    // and prevents CUDA Graph capture.
+                    return qmm::QMatMul::forward_gpu_fallback(qw, xs);
                 }
 
                 let x_shape = xs.shape().to_vec();
@@ -1858,6 +1861,12 @@ pub struct GenericTurboModel {
     backend: Arc<dyn ComputeBackend>,
     span: tracing::Span,
     span_output: tracing::Span,
+    /// CUDA Graph manager for decode acceleration.
+    #[cfg(feature = "cuda")]
+    graph_manager: crate::cuda::graph::CudaGraphManager,
+    /// Cached output tensor from graph capture (for replay).
+    #[cfg(feature = "cuda")]
+    graph_output: Option<Tensor>,
 }
 
 fn precompute_freqs_cis(
@@ -2153,6 +2162,12 @@ impl GenericTurboModel {
             backend,
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
+            #[cfg(feature = "cuda")]
+            graph_manager: crate::cuda::graph::CudaGraphManager::new(
+                std::env::var("TQ_GRAPH").map(|v| v == "1").unwrap_or(false)
+            ),
+            #[cfg(feature = "cuda")]
+            graph_output: None,
         };
 
         // Pre-warm weight caches: dequant on CPU + upload to GPU.
@@ -2234,6 +2249,11 @@ impl GenericTurboModel {
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
+
+        // CUDA Graph capture: deferred until pre-allocated buffer pool is implemented.
+        // cudarc's alloc_zeros/clone_htod are not graph-capture compatible (need cuMemAllocAsync).
+        // Prerequisite: pre-allocate all temp buffers before capture, reuse during replay.
+
         let mask = if seq_len == 1 {
             None
         } else {
