@@ -991,6 +991,9 @@ impl LayerWeights {
         backend: &dyn ComputeBackend,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
+        // Debug: track stale errors through attention ops
+        #[cfg(feature = "cuda")]
+        let _dbg_layer = self.layer_idx;
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         let (mut q, mut k, mut v) = if let Some(qkv) = pre_qkv {
             qkv
@@ -1010,6 +1013,17 @@ impl LayerWeights {
             }
         }
         }; // end if let Some(qkv) / else
+
+        #[cfg(feature = "cuda")]
+        if _dbg_layer == 0 {
+            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                if let Err(e) = reg.stream.context().check_err() {
+                    eprintln!("[attn-dbg] L0 after QKV: stale={:?}", e);
+                } else {
+                    eprintln!("[attn-dbg] L0 after QKV: clean");
+                }
+            }
+        }
 
         // Calibration hook: collect RAW key vectors (before attention bias, before RoPE).
         // These have consistent per-channel statistics — no positional or bias contamination.
@@ -1032,10 +1046,27 @@ impl LayerWeights {
         if let Some(bv) = &self.attention_bv {
             v = v.broadcast_add(bv)?;
         }
+        #[cfg(feature = "cuda")]
+        if _dbg_layer == 0 {
+            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                if let Err(e) = reg.stream.context().check_err() {
+                    eprintln!("[attn-dbg] L0 after BIAS: stale={:?}", e);
+                }
+            }
+        }
 
         let q = q.reshape(vec![b_sz, seq_len, self.n_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
         let k = k.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
         let v = v.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
+
+        #[cfg(feature = "cuda")]
+        if _dbg_layer == 0 {
+            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                if let Err(e) = reg.stream.context().check_err() {
+                    eprintln!("[attn-dbg] L0 after BIAS+RESHAPE+TRANSPOSE: stale={:?}", e);
+                }
+            }
+        }
 
         // SmoothAttention: migrate K outliers to Q BEFORE RoPE.
         // K *= 1/sqrt(s), Q *= sqrt(s). Invariance: (Q*sqrt(s)) * (K/sqrt(s))^T = Q * K^T
@@ -1052,6 +1083,15 @@ impl LayerWeights {
 
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
+
+        #[cfg(feature = "cuda")]
+        if _dbg_layer == 0 {
+            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                if let Err(e) = reg.stream.context().check_err() {
+                    eprintln!("[attn-dbg] L0 after ROPE: stale={:?}", e);
+                }
+            }
+        }
 
         // Selective compression: first TQ_SKIP_FIRST_LAYERS use standard fp16 KV cache,
         // remaining layers use TurboQuant compression.
@@ -2260,7 +2300,8 @@ impl GenericTurboModel {
         // ── CUDA Graph replay ──
         #[cfg(feature = "cuda")]
         if seq_len == 1 && self.graph_manager.is_ready(1) {
-            self.graph_manager.replay(1)
+            let reg = crate::cuda::kernels::global_registry().unwrap();
+            self.graph_manager.replay(&reg.stream, 1)
                 .map_err(|e| TqError::Msg(format!("graph replay: {}", e)))?;
             if let Some(ref out) = self.graph_output {
                 return Ok(out.clone());
@@ -2315,6 +2356,7 @@ impl GenericTurboModel {
             #[cfg(feature = "cuda")]
             if capturing && layer_idx < 2 {
                 if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    let _ = reg.stream.context().check_err(); // clear stale from prev layer drops
                     match reg.stream.capture_status() {
                         Ok(s) => eprintln!("[cuda-graph] L{} entry: {:?}", layer_idx, s),
                         Err(e) => eprintln!("[cuda-graph] L{} entry ERROR: {}", layer_idx, e),
@@ -2446,13 +2488,22 @@ impl GenericTurboModel {
                 }
             }
             let residual = &x;
-            let x = match layer.attention_norm.forward(&x, backend) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("[cuda-graph] L{} norm FAILED: {}", layer_idx, e);
-                    return Err(e);
+            // Debug: track where stale error originates during graph capture
+            #[cfg(feature = "cuda")]
+            if capturing && layer_idx == 0 {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    let _ = reg.stream.context().check_err(); // clear before norm
                 }
-            };
+            }
+            let x = layer.attention_norm.forward(&x, backend)?;
+            #[cfg(feature = "cuda")]
+            if capturing && layer_idx == 0 {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    if let Err(e) = reg.stream.context().check_err() {
+                        eprintln!("[cuda-graph] L0 AFTER NORM: stale={:?}", e);
+                    }
+                }
+            }
             #[cfg(feature = "cuda")]
             if capturing {
                 if let Some(reg) = crate::cuda::kernels::global_registry() {
@@ -2466,6 +2517,14 @@ impl GenericTurboModel {
                 }
             }
             let attn = layer.forward_attn(&x, None, mask.as_ref(), index_pos, backend)?;
+            #[cfg(feature = "cuda")]
+            if capturing && layer_idx == 0 {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    if let Err(e) = reg.stream.context().check_err() {
+                        eprintln!("[cuda-graph] L0 AFTER ATTN: stale={:?}", e);
+                    }
+                }
+            }
             #[cfg(feature = "cuda")]
             if capturing {
                 if let Some(reg) = crate::cuda::kernels::global_registry() {

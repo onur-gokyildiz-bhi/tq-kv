@@ -289,6 +289,7 @@ impl QMatMul {
 
         // For decode (batch=1), use fused matvec kernel
         if batch_elements == 1 {
+            let _ = stream.context().check_err(); // clear stale errors for graph capture
             let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(out_features)
                 .map_err(|e| TqError::Msg(format!("output alloc: {}", e)))?;
 
@@ -346,6 +347,7 @@ impl QMatMul {
 
         if batch == 1 {
             // Decode: custom f32_matvec kernel (zero cuBLAS overhead)
+            let _ = stream.context().check_err();
             let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(out_f)
                 .map_err(|e| TqError::Msg(format!("f32_matvec alloc: {}", e)))?;
             crate::cuda::kernels::f32_matvec(

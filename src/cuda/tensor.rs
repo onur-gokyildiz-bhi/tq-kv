@@ -5,6 +5,19 @@
 
 use super::{TqDevice, TqDType, Result, TqError, tq_bail};
 
+/// GPU alloc that clears cudarc's stale error_state first.
+/// During CUDA Graph capture, CudaSlice::drop → cuMemFreeAsync on pre-capture memory
+/// sets error_state to INVALID_VALUE. This stale error blocks subsequent alloc_zeros
+/// via bind_to_thread → check_err. Clearing before alloc prevents the cascade.
+#[cfg(feature = "cuda")]
+fn gpu_alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    len: usize,
+) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::result::DriverError> {
+    let _ = stream.context().check_err();
+    stream.alloc_zeros(len)
+}
+
 /// Storage backend for tensor data.
 ///
 /// CUDA variant uses `Arc<CudaSlice<f32>>` for zero-copy clone semantics:
@@ -212,7 +225,8 @@ impl TqTensor {
         #[cfg(feature = "cuda")]
         if let TqStorage::Cuda { data: src, stream } = &self.storage {
             if let Some(reg) = super::kernels::global_registry() {
-                let mut out_gpu = stream.alloc_zeros::<f32>(n)
+                let _ = stream.context().check_err();
+                let mut out_gpu = gpu_alloc_zeros::<f32>(stream,n)
                     .map_err(|e| TqError::Msg(format!("transpose alloc: {}", e)))?;
                 let out_shape_gpu = stream.clone_htod(&new_shape.iter().map(|&x| x as i32).collect::<Vec<_>>())
                     .map_err(|e| TqError::Msg(format!("transpose: {}", e)))?;
@@ -222,9 +236,14 @@ impl TqTensor {
                     .map_err(|e| TqError::Msg(format!("transpose: {}", e)))?;
 
                 super::kernels::strided_copy(
-                    reg, src, &mut out_gpu, n, rank,
+                    reg, src.as_ref(), &mut out_gpu, n, rank,
                     &out_shape_gpu, &out_strides_gpu, &src_strides_gpu, 0,
                 ).map_err(|e| TqError::Msg(format!("transpose kernel: {}", e)))?;
+
+                // Leak metadata to prevent cuMemFreeAsync during graph capture
+                std::mem::forget(out_shape_gpu);
+                std::mem::forget(out_strides_gpu);
+                std::mem::forget(src_strides_gpu);
 
                 return Ok(Self::from_cuda(out_gpu, new_shape, stream.clone()));
             }
@@ -283,7 +302,8 @@ impl TqTensor {
             let src_offset = (start * inner) as i32;
 
             // Simple contiguous copy approach: for contiguous narrow, use sliced memcpy
-            let mut out_gpu = stream.alloc_zeros::<f32>(new_n)
+            let _ = stream.context().check_err();
+            let mut out_gpu = gpu_alloc_zeros::<f32>(stream,new_n)
                 .map_err(|e| TqError::Msg(format!("narrow alloc: {}", e)))?;
 
             if let Some(reg) = super::kernels::global_registry() {
@@ -312,9 +332,13 @@ impl TqTensor {
                 };
 
                 super::kernels::strided_copy(
-                    reg, src, &mut out_gpu, new_n, rank,
+                    reg, src.as_ref(), &mut out_gpu, new_n, rank,
                     &out_shape_gpu, &out_strides_gpu, &src_strides_gpu, base_offset,
                 ).map_err(|e| TqError::Msg(format!("narrow kernel: {}", e)))?;
+
+                std::mem::forget(out_shape_gpu);
+                std::mem::forget(out_strides_gpu);
+                std::mem::forget(src_strides_gpu);
 
                 return Ok(Self::from_cuda(out_gpu, new_shape, stream.clone()));
             }
@@ -376,7 +400,7 @@ impl TqTensor {
             if all_cuda {
                 if let TqStorage::Cuda { stream, .. } = &first.storage {
                     if let Some(reg) = super::kernels::global_registry() {
-                        let out_gpu = stream.alloc_zeros::<f32>(new_n)
+                        let out_gpu = gpu_alloc_zeros::<f32>(stream,new_n)
                             .map_err(|e| TqError::Msg(format!("cat alloc: {}", e)))?;
 
                         let mut dst_offset: usize = 0;
@@ -504,9 +528,19 @@ impl TqTensor {
         let ast_gpu = stream.clone_htod(&a_str).map_err(|e| TqError::Msg(format!("{}", e)))?;
         let bst_gpu = stream.clone_htod(&b_str).map_err(|e| TqError::Msg(format!("{}", e)))?;
 
-        let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
-        kernel_fn(reg, a, b, &mut out, n, rank, &os_gpu, &ost_gpu, &ast_gpu, &bst_gpu)
+        let _ = stream.context().check_err(); // clear stale errors from CudaSlice drops
+        let mut out = gpu_alloc_zeros::<f32>(stream,n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+        kernel_fn(reg, a.as_ref(), b.as_ref(), &mut out, n, rank, &os_gpu, &ost_gpu, &ast_gpu, &bst_gpu)
             .map_err(|e| TqError::Msg(format!("broadcast kernel: {}", e)))?;
+
+        // Leak metadata GPU buffers to prevent cuMemFreeAsync during graph capture.
+        // cuMemFreeAsync of graph-internal allocations can set error_state, which causes
+        // subsequent bind_to_thread → check_err to surface stale INVALID_VALUE errors.
+        // Memory is small (16-32 bytes per call) and reclaimed on context destroy.
+        std::mem::forget(os_gpu);
+        std::mem::forget(ost_gpu);
+        std::mem::forget(ast_gpu);
+        std::mem::forget(bst_gpu);
 
         Ok(Self::from_cuda(out, out_shape, stream.clone()))
     }
@@ -552,7 +586,7 @@ impl TqTensor {
                 let s_gpu = stream.clone_htod(&[s]).map_err(|e| TqError::Msg(format!("{}", e)))?;
                 // Use broadcast_mul with scalar (broadcast s to all elements)
                 // Simpler: use scalar_mul kernel from elementwise.cu
-                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                let mut out = gpu_alloc_zeros::<f32>(stream,n).map_err(|e| TqError::Msg(format!("{}", e)))?;
                 super::kernels::scalar_mul(reg, src, &mut out, s, n)
                     .map_err(|e| TqError::Msg(format!("scalar_mul: {}", e)))?;
                 return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
@@ -573,7 +607,7 @@ impl TqTensor {
         if let TqStorage::Cuda { data: src, stream } = &self.storage {
             if let Some(reg) = super::kernels::global_registry() {
                 let n = self.elem_count();
-                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                let mut out = gpu_alloc_zeros::<f32>(stream,n).map_err(|e| TqError::Msg(format!("{}", e)))?;
                 super::kernels::gpu_exp(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("exp: {}", e)))?;
                 return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
             }
@@ -588,7 +622,7 @@ impl TqTensor {
         if let TqStorage::Cuda { data: src, stream } = &self.storage {
             if let Some(reg) = super::kernels::global_registry() {
                 let n = self.elem_count();
-                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                let mut out = gpu_alloc_zeros::<f32>(stream,n).map_err(|e| TqError::Msg(format!("{}", e)))?;
                 super::kernels::gpu_sqrt(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("sqrt: {}", e)))?;
                 return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
             }
@@ -603,7 +637,7 @@ impl TqTensor {
         if let TqStorage::Cuda { data: src, stream } = &self.storage {
             if let Some(reg) = super::kernels::global_registry() {
                 let n = self.elem_count();
-                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                let mut out = gpu_alloc_zeros::<f32>(stream,n).map_err(|e| TqError::Msg(format!("{}", e)))?;
                 super::kernels::gpu_sqr(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("sqr: {}", e)))?;
                 return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
             }
@@ -618,7 +652,7 @@ impl TqTensor {
         if let TqStorage::Cuda { data: src, stream } = &self.storage {
             if let Some(reg) = super::kernels::global_registry() {
                 let n = self.elem_count();
-                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                let mut out = gpu_alloc_zeros::<f32>(stream,n).map_err(|e| TqError::Msg(format!("{}", e)))?;
                 super::kernels::silu(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("silu: {}", e)))?;
                 return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
             }
@@ -635,7 +669,7 @@ impl TqTensor {
         if let TqStorage::Cuda { data: src, stream } = &self.storage {
             if let Some(reg) = super::kernels::global_registry() {
                 let n = self.elem_count();
-                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                let mut out = gpu_alloc_zeros::<f32>(stream,n).map_err(|e| TqError::Msg(format!("{}", e)))?;
                 super::kernels::gpu_cos(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("cos: {}", e)))?;
                 return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
             }
@@ -650,7 +684,7 @@ impl TqTensor {
         if let TqStorage::Cuda { data: src, stream } = &self.storage {
             if let Some(reg) = super::kernels::global_registry() {
                 let n = self.elem_count();
-                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                let mut out = gpu_alloc_zeros::<f32>(stream,n).map_err(|e| TqError::Msg(format!("{}", e)))?;
                 super::kernels::gpu_sin(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("sin: {}", e)))?;
                 return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
             }
@@ -811,8 +845,10 @@ impl TqTensor {
         #[cfg(feature = "cuda")]
         if let TqStorage::Cuda { data: src, stream } = &self.storage {
             if let Some(reg) = super::kernels::global_registry() {
-                let mut out = stream.alloc_zeros::<f32>(n)
-                    .map_err(|e| TqError::Msg(format!("expand alloc: {}", e)))?;
+                // Clear stale errors from CudaSlice::drop → cuMemFreeAsync during graph capture
+                let _ = stream.context().check_err();
+                let mut out = gpu_alloc_zeros::<f32>(stream,n)
+                    .map_err(|e| TqError::Msg(format!("expand alloc (n={}): {}", n, e)))?;
                 let shape_gpu = stream.clone_htod(&target.iter().map(|&x| x as i32).collect::<Vec<_>>())
                     .map_err(|e| TqError::Msg(format!("expand: {}", e)))?;
                 let tgt_gpu = stream.clone_htod(&tgt_strides)
@@ -820,8 +856,12 @@ impl TqTensor {
                 let src_gpu = stream.clone_htod(&src_strides)
                     .map_err(|e| TqError::Msg(format!("expand: {}", e)))?;
 
-                super::kernels::strided_copy(reg, src, &mut out, n, rank, &shape_gpu, &tgt_gpu, &src_gpu, 0)
+                super::kernels::strided_copy(reg, src.as_ref(), &mut out, n, rank, &shape_gpu, &tgt_gpu, &src_gpu, 0)
                     .map_err(|e| TqError::Msg(format!("expand kernel: {}", e)))?;
+
+                std::mem::forget(shape_gpu);
+                std::mem::forget(tgt_gpu);
+                std::mem::forget(src_gpu);
 
                 return Ok(Self::from_cuda(out, target, stream.clone()));
             }
@@ -922,7 +962,7 @@ impl TqTensor {
             TqDevice::Cpu => Self::from_vec(vec![0.0; n], shape, device),
             TqDevice::Cuda { .. } => {
                 let stream = device.cuda_stream()?;
-                let cuda_data = stream.alloc_zeros::<f32>(n)
+                let cuda_data = gpu_alloc_zeros::<f32>(&stream, n)
                     .map_err(|e| TqError::Cuda(e))?;
                 Ok(Self {
                     storage: TqStorage::Cuda { data: std::sync::Arc::new(cuda_data), stream },
@@ -1080,7 +1120,7 @@ impl TqTensor {
 
         let batch: usize = a_shape[..a_rank - 2].iter().product();
 
-        let mut out_gpu = stream.alloc_zeros::<f32>(batch * m * n)
+        let mut out_gpu = gpu_alloc_zeros::<f32>(&stream, batch * m * n)
             .map_err(|e| TqError::Msg(format!("matmul alloc: {}", e)))?;
 
         // cuBLAS is column-major. To compute row-major C = A @ B,
@@ -1148,7 +1188,7 @@ impl TqTensor {
         let k = in_features;    // cols of x = rows of W^T
         let n = out_features;   // cols of W^T
 
-        let mut out_gpu = stream.alloc_zeros::<f32>(m * n)
+        let mut out_gpu = gpu_alloc_zeros::<f32>(&stream, m * n)
             .map_err(|e| TqError::Msg(format!("matvec alloc: {}", e)))?;
 
         // cuBLAS col-major: C^T = B^T @ A^T gives row-major C = A @ B
@@ -1245,7 +1285,7 @@ impl TqTensor {
         let n_tokens = self.elem_count() / hidden;
         let n = n_tokens * hidden;
 
-        let mut out = stream.alloc_zeros::<f32>(n)
+        let mut out = gpu_alloc_zeros::<f32>(stream,n)
             .map_err(|e| TqError::Msg(format!("rms_norm alloc: {}", e)))?;
 
         // Weight: use GPU data directly (no clone) or upload once
@@ -1274,7 +1314,7 @@ impl TqTensor {
         let cols = *shape.last().unwrap();
         let rows = self.elem_count() / cols;
 
-        let mut out = stream.alloc_zeros::<f32>(rows * cols)
+        let mut out = gpu_alloc_zeros::<f32>(stream,rows * cols)
             .map_err(|e| TqError::Msg(format!("softmax alloc: {}", e)))?;
 
         super::kernels::softmax_last_dim(reg, x, &mut out, rows, cols)
@@ -1295,7 +1335,7 @@ impl TqTensor {
             .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
 
         let n = self.elem_count();
-        let mut out = stream.alloc_zeros::<f32>(n)
+        let mut out = gpu_alloc_zeros::<f32>(stream,n)
             .map_err(|e| TqError::Msg(format!("fused_silu_mul alloc: {}", e)))?;
 
         super::kernels::fused_silu_mul(reg, gate, up_data, &mut out, n)
@@ -1325,7 +1365,7 @@ impl TqTensor {
         // Arc::make_mut ensures copy-on-write: clones only if ref count > 1.
         let mut res_arc = res.clone();
         let res_mut = std::sync::Arc::make_mut(&mut res_arc);
-        let mut out = stream.alloc_zeros::<f32>(n)
+        let mut out = gpu_alloc_zeros::<f32>(stream,n)
             .map_err(|e| TqError::Msg(format!("fused norm alloc: {}", e)))?;
 
         // Weight: use GPU data directly (no clone) or upload
@@ -1365,7 +1405,7 @@ impl TqTensor {
 
         // Only decode (batch=1) uses fused kernel; prefill uses cuBLAS via dequant
         if batch == 1 {
-            let mut out = stream.alloc_zeros::<f32>(out_features)
+            let mut out = gpu_alloc_zeros::<f32>(stream,out_features)
                 .map_err(|e| TqError::Msg(format!("qmatmul alloc: {}", e)))?;
 
             match dtype {
