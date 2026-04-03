@@ -44,10 +44,10 @@ impl KernelRegistry {
     fn load_all_ptx(&mut self) -> Result<(), DriverError> {
         let ptx_sources: &[(&str, &str)] = &[
             ("elementwise", PTX_ELEMENTWISE),
-            // flash_attention: compiled but not yet integrated into inference pipeline.
-            // Skipped to avoid PTX JIT warnings. Enable when flash attention dispatch is wired.
+            // flash_attention: deferred (PTX JIT issue on sm_86)
             // ("flash_attention", PTX_FLASH_ATTENTION),
             ("fused_attention", PTX_FUSED_ATTENTION),
+            ("tensor_ops", PTX_TENSOR_OPS),
             ("fused_mlp", PTX_FUSED_MLP),
             ("fused_norm", PTX_FUSED_NORM),
             ("hadamard", PTX_HADAMARD),
@@ -541,5 +541,121 @@ pub fn rope_interleaved(
             .arg(&nt).arg(&nh).arg(&hd).arg(&rd).arg(&po)
             .launch(cfg)?;
     }
+    Ok(())
+}
+
+// ─── Tensor shape/elementwise ops (GPU-native) ──────────────
+
+/// GPU strided copy: narrow + transpose via stride remapping.
+pub fn strided_copy(
+    reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>,
+    n: usize, rank: usize,
+    out_shape: &CudaSlice<i32>, out_strides: &CudaSlice<i32>,
+    src_strides: &CudaSlice<i32>, src_offset: i32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "strided_copy_f32")?;
+    let ni = n as i32; let ri = rank as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input).arg(output).arg(&ni).arg(&ri)
+            .arg(out_shape).arg(out_strides).arg(src_strides).arg(&src_offset)
+            .launch(launch_1d(n))?;
+    }
+    Ok(())
+}
+
+pub fn gpu_exp(reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>, n: usize) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "exp_f32")?;
+    unsafe { reg.stream.launch_builder(&f).arg(input).arg(output).arg(&(n as i32)).launch(launch_1d(n))?; }
+    Ok(())
+}
+
+pub fn gpu_sqrt(reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>, n: usize) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "sqrt_f32")?;
+    unsafe { reg.stream.launch_builder(&f).arg(input).arg(output).arg(&(n as i32)).launch(launch_1d(n))?; }
+    Ok(())
+}
+
+pub fn gpu_cos(reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>, n: usize) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "cos_f32")?;
+    unsafe { reg.stream.launch_builder(&f).arg(input).arg(output).arg(&(n as i32)).launch(launch_1d(n))?; }
+    Ok(())
+}
+
+pub fn gpu_sin(reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>, n: usize) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "sin_f32")?;
+    unsafe { reg.stream.launch_builder(&f).arg(input).arg(output).arg(&(n as i32)).launch(launch_1d(n))?; }
+    Ok(())
+}
+
+pub fn gpu_sqr(reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>, n: usize) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "sqr_f32")?;
+    unsafe { reg.stream.launch_builder(&f).arg(input).arg(output).arg(&(n as i32)).launch(launch_1d(n))?; }
+    Ok(())
+}
+
+pub fn gpu_broadcast_add(
+    reg: &KernelRegistry, a: &CudaSlice<f32>, b: &CudaSlice<f32>, output: &mut CudaSlice<f32>,
+    n: usize, rank: usize,
+    out_shape: &CudaSlice<i32>, out_strides: &CudaSlice<i32>,
+    a_strides: &CudaSlice<i32>, b_strides: &CudaSlice<i32>,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "broadcast_add_f32")?;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(a).arg(b).arg(output).arg(&(n as i32)).arg(&(rank as i32))
+            .arg(out_shape).arg(out_strides).arg(a_strides).arg(b_strides)
+            .launch(launch_1d(n))?;
+    }
+    Ok(())
+}
+
+pub fn gpu_broadcast_mul(
+    reg: &KernelRegistry, a: &CudaSlice<f32>, b: &CudaSlice<f32>, output: &mut CudaSlice<f32>,
+    n: usize, rank: usize,
+    out_shape: &CudaSlice<i32>, out_strides: &CudaSlice<i32>,
+    a_strides: &CudaSlice<i32>, b_strides: &CudaSlice<i32>,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "broadcast_mul_f32")?;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(a).arg(b).arg(output).arg(&(n as i32)).arg(&(rank as i32))
+            .arg(out_shape).arg(out_strides).arg(a_strides).arg(b_strides)
+            .launch(launch_1d(n))?;
+    }
+    Ok(())
+}
+
+pub fn gpu_broadcast_sub(
+    reg: &KernelRegistry, a: &CudaSlice<f32>, b: &CudaSlice<f32>, output: &mut CudaSlice<f32>,
+    n: usize, rank: usize,
+    out_shape: &CudaSlice<i32>, out_strides: &CudaSlice<i32>,
+    a_strides: &CudaSlice<i32>, b_strides: &CudaSlice<i32>,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "broadcast_sub_f32")?;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(a).arg(b).arg(output).arg(&(n as i32)).arg(&(rank as i32))
+            .arg(out_shape).arg(out_strides).arg(a_strides).arg(b_strides)
+            .launch(launch_1d(n))?;
+    }
+    Ok(())
+}
+
+pub fn gpu_reduce_sum_last(
+    reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>,
+    rows: usize, cols: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "reduce_sum_last_f32")?;
+    unsafe { reg.stream.launch_builder(&f).arg(input).arg(output).arg(&(rows as i32)).arg(&(cols as i32)).launch(launch_1d(rows))?; }
+    Ok(())
+}
+
+pub fn gpu_reduce_max_last(
+    reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>,
+    rows: usize, cols: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "reduce_max_last_f32")?;
+    unsafe { reg.stream.launch_builder(&f).arg(input).arg(output).arg(&(rows as i32)).arg(&(cols as i32)).launch(launch_1d(rows))?; }
     Ok(())
 }
