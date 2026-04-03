@@ -2152,10 +2152,23 @@ impl GenericTurboModel {
                 }
             }
         }
-        // Note: cos/sin, norm weights, biases kept on CPU.
-        // GPU upload happens lazily via as_slice auto-download.
-        // Moving them to GPU causes broadcast shape mismatch (different-shape
-        // broadcast_mul/add not GPU-native yet) → CPU fallback → worse perf.
+        // Upload persistent tensors to GPU (norm weights, cos/sin, biases).
+        // Full broadcast GPU support enables this (stride-based kernels).
+        #[cfg(feature = "cuda")]
+        if crate::cuda::kernels::global_registry().is_some() {
+            if let Ok(gpu) = model.norm.weight.to_device_auto() { model.norm.weight = gpu; }
+            for layer in &mut model.layers {
+                if let Ok(gpu) = layer.cos.to_device_auto() { layer.cos = gpu; }
+                if let Ok(gpu) = layer.sin.to_device_auto() { layer.sin = gpu; }
+                if let Ok(gpu) = layer.attention_norm.weight.to_device_auto() { layer.attention_norm.weight = gpu; }
+                if let Ok(gpu) = layer.ffn_norm.weight.to_device_auto() { layer.ffn_norm.weight = gpu; }
+                if let Some(ref b) = layer.attention_bq { if let Ok(gpu) = b.to_device_auto() { layer.attention_bq = Some(gpu); } }
+                if let Some(ref b) = layer.attention_bk { if let Ok(gpu) = b.to_device_auto() { layer.attention_bk = Some(gpu); } }
+                if let Some(ref b) = layer.attention_bv { if let Ok(gpu) = b.to_device_auto() { layer.attention_bv = Some(gpu); } }
+                if let Ok(gpu) = layer.neg_inf.to_device_auto() { layer.neg_inf = gpu; }
+            }
+            eprintln!("  Persistent tensors uploaded to GPU.");
+        }
 
         eprintln!("  Weight caches warmed.");
         } // end if do_warmup

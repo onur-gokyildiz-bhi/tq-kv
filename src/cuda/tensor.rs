@@ -480,19 +480,84 @@ impl TqTensor {
         super::ops::TqOps::matmul(self, other)
     }
 
+    /// Compute broadcast output shape + strides for two tensors.
+    /// Returns (out_shape, a_strides, b_strides) with 0-stride for broadcast dims.
+    #[cfg(feature = "cuda")]
+    fn broadcast_strides(a_shape: &[usize], b_shape: &[usize]) -> Result<(Vec<usize>, Vec<i32>, Vec<i32>)> {
+        let rank = a_shape.len().max(b_shape.len());
+        let mut out = vec![0usize; rank];
+        let mut a_str = vec![0i32; rank];
+        let mut b_str = vec![0i32; rank];
+
+        // Pad shapes with 1s on the left
+        let a_pad: Vec<usize> = (0..rank).map(|i| {
+            if i < rank - a_shape.len() { 1 } else { a_shape[i - (rank - a_shape.len())] }
+        }).collect();
+        let b_pad: Vec<usize> = (0..rank).map(|i| {
+            if i < rank - b_shape.len() { 1 } else { b_shape[i - (rank - b_shape.len())] }
+        }).collect();
+
+        for i in 0..rank {
+            out[i] = a_pad[i].max(b_pad[i]);
+            if a_pad[i] != 1 && b_pad[i] != 1 && a_pad[i] != b_pad[i] {
+                tq_bail!("broadcast: shapes incompatible at dim {}", i);
+            }
+        }
+
+        // Compute strides (row-major, 0 for broadcast dims)
+        let mut a_real_stride = vec![1i32; rank];
+        let mut b_real_stride = vec![1i32; rank];
+        for i in (0..rank.saturating_sub(1)).rev() {
+            a_real_stride[i] = a_real_stride[i + 1] * a_pad[i + 1] as i32;
+            b_real_stride[i] = b_real_stride[i + 1] * b_pad[i + 1] as i32;
+        }
+        for i in 0..rank {
+            a_str[i] = if a_pad[i] == 1 { 0 } else { a_real_stride[i] };
+            b_str[i] = if b_pad[i] == 1 { 0 } else { b_real_stride[i] };
+        }
+
+        Ok((out, a_str, b_str))
+    }
+
+    /// GPU broadcast binary op helper.
+    #[cfg(feature = "cuda")]
+    fn gpu_broadcast_binop(
+        &self, other: &TqTensor,
+        kernel_fn: fn(&super::kernels::KernelRegistry, &cudarc::driver::CudaSlice<f32>, &cudarc::driver::CudaSlice<f32>,
+            &mut cudarc::driver::CudaSlice<f32>, usize, usize,
+            &cudarc::driver::CudaSlice<i32>, &cudarc::driver::CudaSlice<i32>,
+            &cudarc::driver::CudaSlice<i32>, &cudarc::driver::CudaSlice<i32>) -> std::result::Result<(), cudarc::driver::result::DriverError>,
+    ) -> Result<Self> {
+        let (TqStorage::Cuda { data: a, stream }, TqStorage::Cuda { data: b, .. }) = (&self.storage, &other.storage) else {
+            tq_bail!("gpu_broadcast_binop: both must be CUDA");
+        };
+        let reg = super::kernels::global_registry().ok_or_else(|| TqError::Msg("no registry".into()))?;
+        let (out_shape, a_str, b_str) = Self::broadcast_strides(&self.shape, &other.shape)?;
+        let rank = out_shape.len();
+        let n: usize = out_shape.iter().product();
+
+        let mut out_strides = vec![1i32; rank];
+        for i in (0..rank.saturating_sub(1)).rev() {
+            out_strides[i] = out_strides[i + 1] * out_shape[i + 1] as i32;
+        }
+
+        let os_gpu = stream.clone_htod(&out_shape.iter().map(|&x| x as i32).collect::<Vec<_>>()).map_err(|e| TqError::Msg(format!("{}", e)))?;
+        let ost_gpu = stream.clone_htod(&out_strides).map_err(|e| TqError::Msg(format!("{}", e)))?;
+        let ast_gpu = stream.clone_htod(&a_str).map_err(|e| TqError::Msg(format!("{}", e)))?;
+        let bst_gpu = stream.clone_htod(&b_str).map_err(|e| TqError::Msg(format!("{}", e)))?;
+
+        let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+        kernel_fn(reg, a, b, &mut out, n, rank, &os_gpu, &ost_gpu, &ast_gpu, &bst_gpu)
+            .map_err(|e| TqError::Msg(format!("broadcast kernel: {}", e)))?;
+
+        Ok(Self::from_cuda(out, out_shape, stream.clone()))
+    }
+
     /// Element-wise multiply with broadcasting.
     pub fn broadcast_mul(&self, other: &TqTensor) -> Result<Self> {
-        // If both are same-shape CUDA tensors, use simple elementwise kernel
         #[cfg(feature = "cuda")]
-        if self.is_cuda() && other.is_cuda() && self.shape == other.shape {
-            if let (TqStorage::Cuda { data: a, stream }, TqStorage::Cuda { data: b, .. }) = (&self.storage, &other.storage) {
-                if let Some(reg) = super::kernels::global_registry() {
-                    let n = self.elem_count();
-                    let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
-                    super::kernels::mul(reg, a, b, &mut out, n).map_err(|e| TqError::Msg(format!("mul: {}", e)))?;
-                    return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
-                }
-            }
+        if self.is_cuda() && other.is_cuda() {
+            return self.gpu_broadcast_binop(other, super::kernels::gpu_broadcast_mul);
         }
         super::ops::TqOps::broadcast_binop(self, other, |a, b| a * b)
     }
@@ -500,39 +565,17 @@ impl TqTensor {
     /// Element-wise add with broadcasting.
     pub fn broadcast_add(&self, other: &TqTensor) -> Result<Self> {
         #[cfg(feature = "cuda")]
-        if self.is_cuda() && other.is_cuda() && self.shape == other.shape {
-            if let (TqStorage::Cuda { data: a, stream }, TqStorage::Cuda { data: b, .. }) = (&self.storage, &other.storage) {
-                if let Some(reg) = super::kernels::global_registry() {
-                    let n = self.elem_count();
-                    let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
-                    super::kernels::add(reg, a, b, &mut out, n).map_err(|e| TqError::Msg(format!("add: {}", e)))?;
-                    return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
-                }
-            }
+        if self.is_cuda() && other.is_cuda() {
+            return self.gpu_broadcast_binop(other, super::kernels::gpu_broadcast_add);
         }
         super::ops::TqOps::broadcast_binop(self, other, |a, b| a + b)
     }
 
     /// Element-wise sub with broadcasting.
     pub fn broadcast_sub(&self, other: &TqTensor) -> Result<Self> {
-        // GPU same-shape fast path
         #[cfg(feature = "cuda")]
-        if self.is_cuda() && other.is_cuda() && self.shape == other.shape {
-            if let (TqStorage::Cuda { data: a, stream }, TqStorage::Cuda { data: b, .. }) = (&self.storage, &other.storage) {
-                if let Some(reg) = super::kernels::global_registry() {
-                    let n = self.elem_count();
-                    let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
-                    // sub = a + (-1 * b) — use broadcast_sub kernel
-                    super::kernels::gpu_broadcast_sub(
-                        reg, a, b, &mut out, n, 1,
-                        &stream.clone_htod(&[n as i32]).map_err(|e| TqError::Msg(format!("{}", e)))?,
-                        &stream.clone_htod(&[1i32]).map_err(|e| TqError::Msg(format!("{}", e)))?,
-                        &stream.clone_htod(&[1i32]).map_err(|e| TqError::Msg(format!("{}", e)))?,
-                        &stream.clone_htod(&[1i32]).map_err(|e| TqError::Msg(format!("{}", e)))?,
-                    ).map_err(|e| TqError::Msg(format!("sub: {}", e)))?;
-                    return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
-                }
-            }
+        if self.is_cuda() && other.is_cuda() {
+            return self.gpu_broadcast_binop(other, super::kernels::gpu_broadcast_sub);
         }
         super::ops::TqOps::broadcast_binop(self, other, |a, b| a - b)
     }
