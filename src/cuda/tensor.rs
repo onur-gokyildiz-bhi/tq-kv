@@ -6,14 +6,19 @@
 use super::{TqDevice, TqDType, Result, TqError, tq_bail};
 
 /// Storage backend for tensor data.
+///
+/// CUDA variant uses `Arc<CudaSlice<f32>>` for zero-copy clone semantics:
+/// - `TqTensor::clone()` = Arc ref-count increment (NOT GPU memory copy)
+/// - `unsqueeze`, `reshape`, `contiguous` = zero-copy (only shape metadata changes)
+/// - `cuda_data_mut()` = copy-on-write via `Arc::make_mut()` (only copies if shared)
 #[derive(Debug, Clone)]
 pub enum TqStorage {
     /// CPU: contiguous f32 data in row-major order.
     Cpu(Vec<f32>),
-    /// CUDA: device memory on GPU.
+    /// CUDA: device memory on GPU (reference-counted, zero-copy clone).
     #[cfg(feature = "cuda")]
     Cuda {
-        data: cudarc::driver::CudaSlice<f32>,
+        data: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
         stream: std::sync::Arc<cudarc::driver::CudaStream>,
     },
 }
@@ -107,7 +112,7 @@ impl TqTensor {
             TqStorage::Cpu(data) => Ok(data.clone()),
             #[cfg(feature = "cuda")]
             TqStorage::Cuda { data, stream } => {
-                stream.clone_dtoh(data)
+                stream.clone_dtoh(data.as_ref())
                     .map_err(|e| TqError::Msg(format!("dtoh: {}", e)))
             }
         }
@@ -121,7 +126,7 @@ impl TqTensor {
             #[cfg(feature = "cuda")]
             TqStorage::Cuda { data, stream } => {
                 // Transitional auto-download for ops without GPU dispatch yet.
-                let cpu_data = stream.clone_dtoh(data).expect("as_slice GPU download failed");
+                let cpu_data = stream.clone_dtoh(data.as_ref()).expect("as_slice GPU download failed");
                 let leaked: &'static [f32] = Box::leak(cpu_data.into_boxed_slice());
                 leaked
             }
@@ -948,7 +953,7 @@ impl TqTensor {
                 let cuda_data = stream.clone_htod(&data)
                     .map_err(|e| TqError::Cuda(e))?;
                 Ok(Self {
-                    storage: TqStorage::Cuda { data: cuda_data, stream },
+                    storage: TqStorage::Cuda { data: std::sync::Arc::new(cuda_data), stream },
                     shape,
                     dtype: TqDType::F32,
                 })
@@ -967,7 +972,7 @@ impl TqTensor {
                 let cuda_data = stream.alloc_zeros::<f32>(n)
                     .map_err(|e| TqError::Cuda(e))?;
                 Ok(Self {
-                    storage: TqStorage::Cuda { data: cuda_data, stream },
+                    storage: TqStorage::Cuda { data: std::sync::Arc::new(cuda_data), stream },
                     shape,
                     dtype: TqDType::F32,
                 })
@@ -991,7 +996,7 @@ impl TqTensor {
                 let cuda_data = stream.clone_htod(data)
                     .map_err(|e| TqError::Cuda(e))?;
                 Ok(Self {
-                    storage: TqStorage::Cuda { data: cuda_data, stream },
+                    storage: TqStorage::Cuda { data: std::sync::Arc::new(cuda_data), stream },
                     shape: self.shape.clone(),
                     dtype: self.dtype,
                 })
@@ -999,7 +1004,7 @@ impl TqTensor {
 
             // GPU -> CPU: download
             (TqStorage::Cuda { data, stream }, TqDevice::Cpu) => {
-                let host_data = stream.clone_dtoh(data)
+                let host_data = stream.clone_dtoh(data.as_ref())
                     .map_err(|e| TqError::Cuda(e))?;
                 Ok(Self {
                     storage: TqStorage::Cpu(host_data),
@@ -1021,17 +1026,18 @@ impl TqTensor {
     /// Panics if the tensor is on CPU.
     pub fn cuda_data(&self) -> &cudarc::driver::CudaSlice<f32> {
         match &self.storage {
-            TqStorage::Cuda { data, .. } => data,
+            TqStorage::Cuda { data, .. } => data.as_ref(),
             _ => panic!("cuda_data() called on CPU tensor — use to_device() first"),
         }
     }
 
-    /// Get a mutable reference to the underlying CudaSlice for kernel launches.
+    /// Get a mutable reference to the underlying CudaSlice (copy-on-write).
     ///
+    /// If the Arc has other references, this clones the GPU buffer first.
     /// Panics if the tensor is on CPU.
     pub fn cuda_data_mut(&mut self) -> &mut cudarc::driver::CudaSlice<f32> {
         match &mut self.storage {
-            TqStorage::Cuda { data, .. } => data,
+            TqStorage::Cuda { data, .. } => std::sync::Arc::make_mut(data),
             _ => panic!("cuda_data_mut() called on CPU tensor — use to_device() first"),
         }
     }
@@ -1066,7 +1072,7 @@ impl TqTensor {
         match &self.storage {
             TqStorage::Cpu(data) => {
                 let gpu = stream.clone_htod(data).map_err(|e| TqError::Msg(format!("auto-upload: {}", e)))?;
-                Ok(Self { storage: TqStorage::Cuda { data: gpu, stream }, shape: self.shape.clone(), dtype: self.dtype })
+                Ok(Self { storage: TqStorage::Cuda { data: std::sync::Arc::new(gpu), stream }, shape: self.shape.clone(), dtype: self.dtype })
             }
             _ => Ok(self.clone()),
         }
@@ -1075,13 +1081,15 @@ impl TqTensor {
     /// Create a TqTensor directly from a CudaSlice (already on GPU).
     ///
     /// Used by kernel launchers to wrap output buffers as tensors.
+    /// Create a TqTensor directly from a CudaSlice (already on GPU).
+    /// Wraps in Arc for zero-copy clone semantics.
     pub fn from_cuda(
         data: cudarc::driver::CudaSlice<f32>,
         shape: Vec<usize>,
         stream: std::sync::Arc<cudarc::driver::CudaStream>,
     ) -> Self {
         Self {
-            storage: TqStorage::Cuda { data, stream },
+            storage: TqStorage::Cuda { data: std::sync::Arc::new(data), stream },
             shape,
             dtype: TqDType::F32,
         }
@@ -1360,25 +1368,27 @@ impl TqTensor {
         let n_tokens = self.elem_count() / hidden;
         let n = n_tokens * hidden;
 
-        // Residual: need a mutable copy (kernel modifies in-place)
-        let mut res_gpu = res.clone();
+        // Residual: need a mutable copy (kernel modifies in-place).
+        // Arc::make_mut ensures copy-on-write: clones only if ref count > 1.
+        let mut res_arc = res.clone();
+        let res_mut = std::sync::Arc::make_mut(&mut res_arc);
         let mut out = stream.alloc_zeros::<f32>(n)
             .map_err(|e| TqError::Msg(format!("fused norm alloc: {}", e)))?;
 
         // Weight: use GPU data directly (no clone) or upload
         if weight.is_cuda() {
-            super::kernels::fused_add_rms_norm(reg, input, &mut res_gpu, weight.cuda_data(), &mut out, n_tokens, hidden, eps)
+            super::kernels::fused_add_rms_norm(reg, input.as_ref(), res_mut, weight.cuda_data(), &mut out, n_tokens, hidden, eps)
                 .map_err(|e| TqError::Msg(format!("fused_add_rms_norm kernel: {}", e)))?;
         } else {
             let w_gpu = stream.clone_htod(&weight.to_vec1()?)
                 .map_err(|e| TqError::Msg(format!("fused norm weight: {}", e)))?;
-            super::kernels::fused_add_rms_norm(reg, input, &mut res_gpu, &w_gpu, &mut out, n_tokens, hidden, eps)
+            super::kernels::fused_add_rms_norm(reg, input.as_ref(), res_mut, &w_gpu, &mut out, n_tokens, hidden, eps)
                 .map_err(|e| TqError::Msg(format!("fused_add_rms_norm kernel: {}", e)))?;
         }
 
         Ok((
             Self::from_cuda(out, shape.clone(), stream.clone()),
-            Self::from_cuda(res_gpu, shape, stream.clone()),
+            Self { storage: TqStorage::Cuda { data: res_arc, stream: stream.clone() }, shape, dtype: TqDType::F32 },
         ))
     }
 
