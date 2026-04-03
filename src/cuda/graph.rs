@@ -42,6 +42,10 @@ pub struct CudaGraphManager {
     pub warmup_runs: usize,
     /// Current eager run count.
     eager_count: usize,
+    /// Non-default stream for graph capture (created on demand).
+    /// Default/null stream doesn't support capture.
+    #[cfg(feature = "cuda")]
+    capture_stream: Option<std::sync::Arc<cudarc::driver::CudaStream>>,
 }
 
 // SAFETY: CudaGraph is bound to a single GPU context. We only access
@@ -61,6 +65,8 @@ impl CudaGraphManager {
             enabled,
             warmup_runs: 1,
             eager_count: 0,
+            #[cfg(feature = "cuda")]
+            capture_stream: None,
         }
     }
 
@@ -90,7 +96,10 @@ impl CudaGraphManager {
     #[cfg(feature = "cuda")]
     pub fn begin_capture(&mut self, stream: &cudarc::driver::CudaStream) -> Result<(), super::TqError> {
         use cudarc::driver::sys::CUstreamCaptureMode;
-        stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
+        // Sync stream before capture to drain all pending work.
+        stream.synchronize()
+            .map_err(|e| super::TqError::Msg(format!("graph pre-sync: {}", e)))?;
+        stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| super::TqError::Msg(format!("graph begin_capture: {}", e)))?;
         self.status = GraphStatus::Capturing;
         Ok(())

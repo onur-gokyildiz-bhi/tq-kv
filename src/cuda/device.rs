@@ -32,10 +32,7 @@ impl TqDevice {
         match CudaContext::new(ordinal) {
             Ok(ctx) => {
                 eprintln!("CUDA device {} initialized", ordinal);
-                // Use non-default stream: required for CUDA Graph capture.
-                // default_stream() returns the null stream which doesn't support capture.
-                let stream = ctx.new_stream()
-                    .map_err(|e| super::TqError::Msg(format!("stream create: {}", e)))?;
+                let stream = ctx.default_stream();
                 let registry = super::kernels::KernelRegistry::new(&ctx, &stream)
                     .map_err(|e| super::TqError::Msg(format!("kernel init: {}", e)))?;
                 let registry = std::sync::Arc::new(registry);

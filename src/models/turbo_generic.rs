@@ -2250,9 +2250,10 @@ impl GenericTurboModel {
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
 
-        // CUDA Graph capture: deferred until pre-allocated buffer pool is implemented.
-        // cudarc's alloc_zeros/clone_htod are not graph-capture compatible (need cuMemAllocAsync).
-        // Prerequisite: pre-allocate all temp buffers before capture, reuse during replay.
+        // CUDA Graph capture: requires non-default stream + Arc<CudaSlice> refactoring.
+        // cudarc's CudaSlice deep-clone (cuMemcpyDtoDAsync) and event tracking
+        // are incompatible with graph capture. Needs Arc-based copy-on-write tensors.
+        // See: TqStorage should use Arc<CudaSlice<f32>> for zero-copy clone.
 
         let mask = if seq_len == 1 {
             None

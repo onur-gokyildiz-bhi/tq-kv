@@ -1284,19 +1284,19 @@ impl TqTensor {
         let n_tokens = self.elem_count() / hidden;
         let n = n_tokens * hidden;
 
-        // Weight: use GPU data if available, else upload
-        let w_gpu = if weight.is_cuda() {
-            weight.cuda_data().clone()
-        } else {
-            let w_data = weight.to_vec1()?;
-            stream.clone_htod(&w_data).map_err(|e| TqError::Msg(format!("rms_norm weight: {}", e)))?
-        };
-
         let mut out = stream.alloc_zeros::<f32>(n)
             .map_err(|e| TqError::Msg(format!("rms_norm alloc: {}", e)))?;
 
-        super::kernels::rms_norm(reg, x, &w_gpu, &mut out, n_tokens, hidden, eps)
-            .map_err(|e| TqError::Msg(format!("rms_norm kernel: {}", e)))?;
+        // Weight: use GPU data directly (no clone) or upload once
+        if weight.is_cuda() {
+            super::kernels::rms_norm(reg, x, weight.cuda_data(), &mut out, n_tokens, hidden, eps)
+                .map_err(|e| TqError::Msg(format!("rms_norm kernel: {}", e)))?;
+        } else {
+            let w_gpu = stream.clone_htod(&weight.to_vec1()?)
+                .map_err(|e| TqError::Msg(format!("rms_norm weight: {}", e)))?;
+            super::kernels::rms_norm(reg, x, &w_gpu, &mut out, n_tokens, hidden, eps)
+                .map_err(|e| TqError::Msg(format!("rms_norm kernel: {}", e)))?;
+        }
 
         Ok(Self::from_cuda(out, shape, stream.clone()))
     }
@@ -1360,22 +1360,21 @@ impl TqTensor {
         let n_tokens = self.elem_count() / hidden;
         let n = n_tokens * hidden;
 
-        // Weight: CPU tensor, upload once (should be cached in practice)
-        let w_gpu = if weight.is_cuda() {
-            weight.cuda_data().clone()
-        } else {
-            let w_data = weight.to_vec1()?;
-            stream.clone_htod(&w_data).map_err(|e| TqError::Msg(format!("fused norm weight: {}", e)))?
-        };
-
-        // Residual: need a mutable copy (kernel modifies in-place).
-        // If already on GPU, clone the GPU buffer (no CPU round-trip!)
+        // Residual: need a mutable copy (kernel modifies in-place)
         let mut res_gpu = res.clone();
         let mut out = stream.alloc_zeros::<f32>(n)
             .map_err(|e| TqError::Msg(format!("fused norm alloc: {}", e)))?;
 
-        super::kernels::fused_add_rms_norm(reg, input, &mut res_gpu, &w_gpu, &mut out, n_tokens, hidden, eps)
-            .map_err(|e| TqError::Msg(format!("fused_add_rms_norm kernel: {}", e)))?;
+        // Weight: use GPU data directly (no clone) or upload
+        if weight.is_cuda() {
+            super::kernels::fused_add_rms_norm(reg, input, &mut res_gpu, weight.cuda_data(), &mut out, n_tokens, hidden, eps)
+                .map_err(|e| TqError::Msg(format!("fused_add_rms_norm kernel: {}", e)))?;
+        } else {
+            let w_gpu = stream.clone_htod(&weight.to_vec1()?)
+                .map_err(|e| TqError::Msg(format!("fused norm weight: {}", e)))?;
+            super::kernels::fused_add_rms_norm(reg, input, &mut res_gpu, &w_gpu, &mut out, n_tokens, hidden, eps)
+                .map_err(|e| TqError::Msg(format!("fused_add_rms_norm kernel: {}", e)))?;
+        }
 
         Ok((
             Self::from_cuda(out, shape.clone(), stream.clone()),
