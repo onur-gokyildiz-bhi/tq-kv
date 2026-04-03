@@ -98,6 +98,14 @@ impl RmsNorm {
     fn forward(&self, x: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
         let _enter = self.span.enter();
         let x_f32 = x.to_dtype(DType::F32)?;
+
+        // GPU-resident path: use TqTensor::rms_norm_gpu directly
+        #[cfg(feature = "cuda")]
+        if x_f32.is_cuda() {
+            return x_f32.rms_norm_gpu(&self.weight, self.eps as f32);
+        }
+
+        // CPU path via backend
         let shape = x_f32.shape().to_vec();
         let hidden = *shape.last().unwrap();
         let n_tokens = x_f32.elem_count() / hidden;
@@ -110,6 +118,10 @@ pub const MAX_SEQ_LEN: usize = 4096;
 
 /// Softmax along last dimension — dispatched via compute backend.
 fn softmax_last_dim(x: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.is_cuda() {
+        return x.softmax_gpu();
+    }
     let shape = x.shape().to_vec();
     let cols = *shape.last().unwrap();
     let rows = x.elem_count() / cols;
@@ -119,6 +131,10 @@ fn softmax_last_dim(x: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> 
 
 /// Fused SiLU gate × up: silu(gate) * up — single pass, no intermediate tensor.
 fn fused_silu_mul(gate: &Tensor, up: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if gate.is_cuda() && up.is_cuda() {
+        return gate.fused_silu_mul_gpu(up);
+    }
     let result = backend.fused_silu_mul(gate.as_slice(), up.as_slice());
     Tensor::from_vec(result, gate.shape().to_vec(), gate.device())
 }
@@ -163,6 +179,21 @@ impl QMatMul {
         let _enter = self.span.enter();
         match &self.inner {
             qmm::QMatMul::Quantized(qw) => {
+                // GPU-resident path: keep data on GPU (decode only, batch=1)
+                #[cfg(feature = "cuda")]
+                if xs.is_cuda() {
+                    let x_shape = xs.shape().to_vec();
+                    let batch: usize = x_shape[..x_shape.len() - 1].iter().product();
+                    if batch == 1 && matches!(qw.dtype, crate::gguf::GgmlDType::Q4K | crate::gguf::GgmlDType::Q8_0) {
+                        let w_gpu = qw.gpu_cache_or_upload(
+                            &crate::cuda::kernels::global_registry()
+                                .expect("no GPU registry").stream
+                        );
+                        return xs.qmatmul_gpu(w_gpu, qw.dtype, qw.out_features(), qw.in_features());
+                    }
+                    // Prefill (batch>1) or unsupported dtype: download to CPU
+                }
+
                 let x_shape = xs.shape().to_vec();
                 let in_features = qw.in_features();
                 let out_features = qw.out_features();
@@ -175,17 +206,26 @@ impl QMatMul {
                     )));
                 }
                 let batch_elements: usize = x_shape[..x_shape.len() - 1].iter().product();
-                let result = backend.qmatmul(xs.as_slice(), qw, batch_elements, in_features, out_features);
+                // If tensor is on GPU but we're in CPU path (prefill batch>1), download first
+                let x_data = if xs.is_cuda() { xs.to_vec1()? } else { xs.as_slice().to_vec() };
+                let result = backend.qmatmul(&x_data, qw, batch_elements, in_features, out_features);
                 let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
                 out_shape.push(out_features);
                 Tensor::from_vec(result, out_shape, xs.device())
             }
             qmm::QMatMul::Full(w) => {
-                // Full-precision: x @ W^T via backend
+                // GPU: both on GPU → cuBLAS matmul (stays on GPU)
+                #[cfg(feature = "cuda")]
+                if xs.is_cuda() {
+                    let w_gpu = w.to_device_auto()?;
+                    let wt = w_gpu.t()?;
+                    return xs.matmul(&wt);
+                }
+                // CPU: x @ W^T via backend
                 let x_shape = xs.shape().to_vec();
                 let w_shape = w.shape().to_vec();
                 let k = *x_shape.last().unwrap();
-                let n = w_shape[0]; // out_features
+                let n = w_shape[0];
                 let m: usize = x_shape[..x_shape.len() - 1].iter().product();
                 let result = backend.matmul(xs.as_slice(), w.as_slice(), m, k, n);
                 let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
@@ -2143,6 +2183,15 @@ impl GenericTurboModel {
         let backend = self.backend.clone();
         let backend = backend.as_ref();
         let mut layer_in = self.tok_embeddings.forward(x)?;
+
+        // Phase 3: Upload embedding to GPU for GPU-resident forward pass.
+        // All subsequent ops auto-dispatch to GPU when tensor is CUDA.
+        #[cfg(feature = "cuda")]
+        if crate::cuda::kernels::global_registry().is_some() {
+            if let Ok(gpu_tensor) = layer_in.to_device_auto() {
+                layer_in = gpu_tensor;
+            }
+        }
         for layer in self.layers.iter_mut() {
             let x = layer_in;
             let residual = &x;
@@ -2157,17 +2206,39 @@ impl GenericTurboModel {
             let _enter = layer.span_mlp.enter();
             let attn_f32 = attn.to_dtype(DType::F32)?;
             let residual_f32 = residual.to_dtype(DType::F32)?;
-            let shape = attn_f32.shape().to_vec();
-            let hidden = *shape.last().unwrap();
-            let n_tokens = attn_f32.elem_count() / hidden;
-            let (normed, new_residual) = backend.fused_add_rms_norm(
-                attn_f32.as_slice(), residual_f32.as_slice(),
-                layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
-                n_tokens, hidden,
-            );
-            let x = Tensor::from_vec(normed, shape.clone(), attn_f32.device())?;
-            let residual = Tensor::from_vec(new_residual, shape, attn_f32.device())?;
-            let residual = &residual;
+
+            #[cfg(feature = "cuda")]
+            let (x, residual_owned) = if attn_f32.is_cuda() {
+                let (normed, new_res) = attn_f32.fused_add_rms_norm_gpu(
+                    &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
+                )?;
+                (normed, new_res)
+            } else {
+                let shape = attn_f32.shape().to_vec();
+                let hidden = *shape.last().unwrap();
+                let n_tokens = attn_f32.elem_count() / hidden;
+                let (normed, new_residual) = backend.fused_add_rms_norm(
+                    attn_f32.as_slice(), residual_f32.as_slice(),
+                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                    n_tokens, hidden,
+                );
+                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                 Tensor::from_vec(new_residual, shape, attn_f32.device())?)
+            };
+            #[cfg(not(feature = "cuda"))]
+            let (x, residual_owned) = {
+                let shape = attn_f32.shape().to_vec();
+                let hidden = *shape.last().unwrap();
+                let n_tokens = attn_f32.elem_count() / hidden;
+                let (normed, new_residual) = backend.fused_add_rms_norm(
+                    attn_f32.as_slice(), residual_f32.as_slice(),
+                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                    n_tokens, hidden,
+                );
+                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                 Tensor::from_vec(new_residual, shape, attn_f32.device())?)
+            };
+            let residual = &residual_owned;
             let x = layer.mlp_or_moe.forward(&x, backend)?;
             // Optional post-FFN norm (Gemma2)
             let x = match &layer.post_ffn_norm {

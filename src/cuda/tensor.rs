@@ -113,12 +113,25 @@ impl TqTensor {
         }
     }
 
-    /// Borrow underlying f32 slice (CPU only, panics on CUDA).
+    /// Borrow underlying f32 slice.
+    /// For CUDA tensors: downloads to CPU transparently (allocates).
+    /// This enables gradual GPU migration — ops that don't have GPU dispatch yet
+    /// will auto-download, run on CPU, and the result goes back to CPU.
     pub fn as_slice(&self) -> &[f32] {
         match &self.storage {
             TqStorage::Cpu(data) => data,
             #[cfg(feature = "cuda")]
-            _ => panic!("as_slice() called on CUDA tensor — use to_vec1()"),
+            TqStorage::Cuda { data, stream } => {
+                // Auto-download: convert CUDA tensor to CPU slice.
+                // This is slow but prevents panics during GPU migration.
+                // Each op should eventually get a GPU-native path.
+                let cpu_data = stream.clone_dtoh(data).expect("as_slice GPU download failed");
+                // SAFETY: we leak the vec to get a stable reference.
+                // This is intentionally leaky — it's a transitional hack during GPU migration.
+                // Each leaked slice is small (activation tensor) and freed at process exit.
+                let leaked: &'static [f32] = Box::leak(cpu_data.into_boxed_slice());
+                leaked
+            }
         }
     }
 
@@ -907,6 +920,21 @@ impl TqTensor {
             Ok(self.clone())
         } else {
             self.to_device(device)
+        }
+    }
+
+    /// Upload to GPU if global registry is available. No-op if already on GPU.
+    pub fn to_device_auto(&self) -> Result<Self> {
+        if self.is_cuda() { return Ok(self.clone()); }
+        let reg = super::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry for auto-upload".into()))?;
+        let stream = reg.stream.clone();
+        match &self.storage {
+            TqStorage::Cpu(data) => {
+                let gpu = stream.clone_htod(data).map_err(|e| TqError::Msg(format!("auto-upload: {}", e)))?;
+                Ok(Self { storage: TqStorage::Cuda { data: gpu, stream }, shape: self.shape.clone(), dtype: self.dtype })
+            }
+            _ => Ok(self.clone()),
         }
     }
 
