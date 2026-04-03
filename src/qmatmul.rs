@@ -284,9 +284,8 @@ impl QMatMul {
             let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(out_features)
                 .map_err(|e| TqError::Msg(format!("output alloc: {}", e)))?;
 
-            let reg = crate::cuda::kernels::KernelRegistry::new(
-                &stream.context(), &stream,
-            ).map_err(|e| TqError::Msg(format!("kernel init: {}", e)))?;
+            let reg = crate::cuda::kernels::global_registry()
+                .ok_or_else(|| TqError::Msg("no GPU kernel registry".into()))?;
 
             let x_gpu = x.cuda_data();
 
