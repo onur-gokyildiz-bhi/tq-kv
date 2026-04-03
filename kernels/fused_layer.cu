@@ -153,13 +153,15 @@ extern "C" __global__ void fused_norm_q4km_qkv_bias_f32(
     }
 }
 
-// ─── Kernel 3: Fused Add+Norm + Gate/Up Projection + SiLU*Mul ─
+// ─── Kernel 3: Fused Norm + Gate/Up Projection + SiLU*Mul ─────
 // Grid: intermediate_dim blocks, 256 threads
-// Each block: compute (attn_out + residual), norm, gate+up matvec, silu*mul
+// Each block: compute RmsNorm(input) → shared, then gate+up matvec, silu*mul
+// NOTE: input should be pre-combined (residual + attn_out) by caller.
+// Previous version had a race condition writing to residual across blocks.
 
 extern "C" __global__ void fused_addnorm_q4km_gateup_silu_f32(
-    const float* __restrict__ attn_out,
-    float* __restrict__ residual,          // updated in-place (idempotent writes)
+    const float* __restrict__ input,       // pre-combined: residual + attn_out
+    const float* __restrict__ _unused,     // kept for ABI compat, ignored
     const float* __restrict__ norm_weight,
     const uint8_t* __restrict__ W_gate,
     const uint8_t* __restrict__ W_up,
@@ -173,11 +175,10 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_f32(
     const int row = blockIdx.x;
     if (row >= intermediate_dim) return;
 
-    // Phase 1: residual += attn_out, then RmsNorm → shared memory
+    // Phase 1: RmsNorm(input) → shared memory
     float sum_sq = 0.0f;
     for (int i = tid; i < hidden_dim; i += blockDim.x) {
-        float val = attn_out[i] + residual[i];
-        residual[i] = val;  // idempotent: all blocks write same value
+        float val = input[i];
         sum_sq += val * val;
         s_normed[i] = val;
     }

@@ -39,6 +39,8 @@ pub struct KernelRegistry {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     modules: std::collections::HashMap<&'static str, Arc<CudaModule>>,
+    /// Cached cuBLAS handle (expensive to create, reuse across all matmul calls).
+    pub cublas: std::sync::OnceLock<cudarc::cublas::CudaBlas>,
 }
 
 impl KernelRegistry {
@@ -48,9 +50,18 @@ impl KernelRegistry {
             ctx: ctx.clone(),
             stream: stream.clone(),
             modules: std::collections::HashMap::new(),
+            cublas: std::sync::OnceLock::new(),
         };
         reg.load_all_ptx()?;
         Ok(reg)
+    }
+
+    /// Get or create the cached cuBLAS handle.
+    pub fn get_cublas(&self) -> &cudarc::cublas::CudaBlas {
+        self.cublas.get_or_init(|| {
+            cudarc::cublas::CudaBlas::new(self.stream.clone())
+                .expect("cuBLAS handle creation failed")
+        })
     }
 
     /// Load all compiled PTX modules from embedded strings.
@@ -60,6 +71,7 @@ impl KernelRegistry {
             // flash_attention: deferred (PTX JIT issue on sm_86)
             // ("flash_attention", PTX_FLASH_ATTENTION),
             ("fused_attention", PTX_FUSED_ATTENTION),
+            ("fused_layer", PTX_FUSED_LAYER),
             ("tensor_ops", PTX_TENSOR_OPS),
             ("fused_mlp", PTX_FUSED_MLP),
             ("fused_norm", PTX_FUSED_NORM),
@@ -688,6 +700,141 @@ pub fn concat_copy(
         reg.stream.launch_builder(&f)
             .arg(src).arg(dst).arg(&ni).arg(&di)
             .launch(launch_1d(n))?;
+    }
+    Ok(())
+}
+
+/// F32 matvec: output = W @ x. No dequant — for pre-dequantized cached weights.
+/// 1 block per output row, 256 threads. Replaces cuBLAS SGEMM for decode (m=1).
+pub fn f32_matvec(
+    reg: &KernelRegistry,
+    w: &CudaSlice<f32>,
+    x: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "f32_matvec")?;
+    let cfg = launch_per_row(out_features, 256);
+    let of = out_features as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w).arg(x).arg(output)
+            .arg(&of).arg(&inf)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+// ─── Fused layer kernels (fused_layer.cu) ──────────────────────
+//
+// These replace 13 separate kernel launches per layer with 3:
+//   Kernel 1: norm + QKV projection + bias
+//   Kernel 2: residual add + norm + gate/up projection + silu*mul
+//   Kernel 3: down projection + residual add
+
+/// Fused RmsNorm + Q4_K_M QKV projection + bias.
+/// Replaces: rms_norm + 3× q4km_matvec + 3× add (7 launches → 1).
+/// Grid: (q_out + k_out + v_out) blocks, 256 threads.
+pub fn fused_norm_q4km_qkv_bias(
+    reg: &KernelRegistry,
+    input: &CudaSlice<f32>,
+    norm_weight: &CudaSlice<f32>,
+    w_q: &CudaSlice<u8>,
+    w_k: &CudaSlice<u8>,
+    w_v: &CudaSlice<u8>,
+    bias_q: Option<&CudaSlice<f32>>,
+    bias_k: Option<&CudaSlice<f32>>,
+    bias_v: Option<&CudaSlice<f32>>,
+    out_q: &mut CudaSlice<f32>,
+    out_k: &mut CudaSlice<f32>,
+    out_v: &mut CudaSlice<f32>,
+    hidden_dim: usize,
+    q_out: usize,
+    k_out: usize,
+    v_out: usize,
+    eps: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_layer", "fused_norm_q4km_qkv_bias_f32")?;
+    let total_rows = (q_out + k_out + v_out) as u32;
+    let block = 256u32;
+    let shmem = (hidden_dim as u32) * 4; // f32 per element
+    let cfg = launch_with_shmem(total_rows, block, shmem);
+    let hd = hidden_dim as i32;
+    let qo = q_out as i32;
+    let ko = k_out as i32;
+    let vo = v_out as i32;
+    let null: u64 = 0;
+    unsafe {
+        let mut builder = reg.stream.launch_builder(&f);
+        builder.arg(input).arg(norm_weight)
+            .arg(w_q).arg(w_k).arg(w_v);
+        // Bias pointers: pass null (0u64) when None
+        if let Some(b) = bias_q { builder.arg(b); } else { builder.arg(&null); }
+        if let Some(b) = bias_k { builder.arg(b); } else { builder.arg(&null); }
+        if let Some(b) = bias_v { builder.arg(b); } else { builder.arg(&null); }
+        builder.arg(out_q).arg(out_k).arg(out_v)
+            .arg(&hd).arg(&qo).arg(&ko).arg(&vo).arg(&eps)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Fused RmsNorm + gate/up Q4_K_M projection + SiLU*mul.
+/// Input must be pre-combined (residual + attn_out) by caller.
+/// Replaces: rms_norm + 2× q4km_matvec + silu_mul (4 launches → 1).
+/// Grid: intermediate_dim blocks, 256 threads.
+pub fn fused_addnorm_q4km_gateup_silu(
+    reg: &KernelRegistry,
+    input: &CudaSlice<f32>,          // pre-combined: residual + attn_out
+    norm_weight: &CudaSlice<f32>,
+    w_gate: &CudaSlice<u8>,
+    w_up: &CudaSlice<u8>,
+    intermediate_out: &mut CudaSlice<f32>,
+    hidden_dim: usize,
+    intermediate_dim: usize,
+    eps: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_layer", "fused_addnorm_q4km_gateup_silu_f32")?;
+    let block = 256u32;
+    let shmem = (hidden_dim as u32) * 4;
+    let cfg = launch_with_shmem(intermediate_dim as u32, block, shmem);
+    let hd = hidden_dim as i32;
+    let id = intermediate_dim as i32;
+    let null: u64 = 0; // _unused param (ABI compat)
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input).arg(&null).arg(norm_weight)
+            .arg(w_gate).arg(w_up)
+            .arg(intermediate_out)
+            .arg(&hd).arg(&id).arg(&eps)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Fused Q4_K_M down projection + residual add.
+/// Replaces: q4km_matvec + add (2 launches → 1).
+/// Grid: hidden_dim blocks, 256 threads.
+/// NOTE: residual is updated in-place (residual += W_down @ intermediate).
+pub fn fused_q4km_down_residual(
+    reg: &KernelRegistry,
+    w_down: &CudaSlice<u8>,
+    intermediate: &CudaSlice<f32>,
+    residual: &mut CudaSlice<f32>,
+    hidden_dim: usize,
+    intermediate_dim: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_layer", "fused_q4km_down_residual_f32")?;
+    let cfg = launch_per_row(hidden_dim, 256);
+    let hd = hidden_dim as i32;
+    let id = intermediate_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_down).arg(intermediate).arg(residual)
+            .arg(&hd).arg(&id)
+            .launch(cfg)?;
     }
     Ok(())
 }

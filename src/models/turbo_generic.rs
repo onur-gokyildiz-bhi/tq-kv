@@ -175,6 +175,24 @@ impl QMatMul {
         }
     }
 
+    /// Get inner QWeight if it's Q4_K_M quantized (for fused kernel launches).
+    fn q4k_weight(&self) -> Option<&qmm::QWeight> {
+        match &self.inner {
+            qmm::QMatMul::Quantized(qw) if matches!(qw.dtype, crate::gguf::GgmlDType::Q4K) => Some(qw),
+            _ => None,
+        }
+    }
+
+    /// Get GPU-resident raw Q4_K_M weight bytes for fused kernel launches.
+    /// Lazily uploads on first call, cached for all subsequent calls.
+    #[cfg(feature = "cuda")]
+    fn q4k_gpu_data(&self) -> Option<(&cudarc::driver::CudaSlice<u8>, usize, usize)> {
+        let qw = self.q4k_weight()?;
+        let reg = crate::cuda::kernels::global_registry()?;
+        let gpu = qw.gpu_cache_or_upload(&reg.stream);
+        Some((gpu, qw.out_features(), qw.in_features()))
+    }
+
     fn forward(&self, xs: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
         let _enter = self.span.enter();
         match &self.inner {
@@ -191,7 +209,7 @@ impl QMatMul {
                         );
                         return xs.qmatmul_gpu(w_gpu, qw.dtype, qw.out_features(), qw.in_features());
                     }
-                    // Prefill (batch>1) or unsupported dtype: download to CPU
+                    // Prefill (batch>1) or unsupported dtype (Q6K etc): download to CPU
                 }
 
                 let x_shape = xs.shape().to_vec();
@@ -920,8 +938,28 @@ struct LayerWeights {
 impl LayerWeights {
     fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let _enter = self.span_rot.enter();
-        let (_b_sz, _n_head, seq_len, _head_dim) = x.dims4()?;
-        // RoPE via tensor ops (stays on CPU — broadcast shape mismatch prevents GPU)
+        let (_b_sz, n_head, seq_len, _head_dim) = x.dims4()?;
+
+        // GPU path: single kernel launch, no shape/stride metadata uploads.
+        // Replaces ~6 tensor-op kernels + ~12 clone_htod transfers per call.
+        #[cfg(feature = "cuda")]
+        if x.is_cuda() && self.cos.is_cuda() {
+            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                let mut x_out = x.clone();
+                let rope_fn = match self.rope_style {
+                    RopeStyle::Halved => crate::cuda::kernels::rope_halved,
+                    RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved,
+                };
+                rope_fn(
+                    reg, x_out.cuda_data_mut(),
+                    self.cos.cuda_data(), self.sin.cuda_data(),
+                    seq_len, n_head, self.head_dim, self.rope_dim, index_pos,
+                ).map_err(|e| TqError::Msg(format!("rope GPU: {}", e)))?;
+                return Ok(x_out);
+            }
+        }
+
+        // CPU fallback: tensor-op RoPE
         let cos = self.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.sin.narrow(0, index_pos, seq_len)?;
         let x = x.contiguous()?;
@@ -944,13 +982,17 @@ impl LayerWeights {
     fn forward_attn(
         &mut self,
         x: &Tensor,
+        pre_qkv: Option<(Tensor, Tensor, Tensor)>,
         mask: Option<&Tensor>,
         index_pos: usize,
         backend: &dyn ComputeBackend,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
-        let (mut q, mut k, mut v) = match &self.qkv {
+        let (mut q, mut k, mut v) = if let Some(qkv) = pre_qkv {
+            qkv
+        } else {
+            match &self.qkv {
             QkvWeights::Separate { wq, wk, wv } => {
                 (wq.forward(x, backend)?, wk.forward(x, backend)?, wv.forward(x, backend)?)
             }
@@ -963,7 +1005,8 @@ impl LayerWeights {
                 let v = qkv.narrow(2, q_size + kv_size, kv_size)?;
                 (q, k, v)
             }
-        };
+        }
+        }; // end if let Some(qkv) / else
 
         // Calibration hook: collect RAW key vectors (before attention bias, before RoPE).
         // These have consistent per-channel statistics — no positional or bias contamination.
@@ -2211,9 +2254,120 @@ impl GenericTurboModel {
         }
         for layer in self.layers.iter_mut() {
             let x = layer_in;
+
+            // ── Fused kernel path: 5 launches replace ~13 per layer ──
+            // Conditions: CUDA decode (seq_len=1), Q4K separate QKV, standard Mlp, no post-norms.
+            // Phases are scoped to avoid borrow conflicts with &mut self in forward_attn.
+            #[cfg(feature = "cuda")]
+            if seq_len == 1 && x.is_cuda()
+                && layer.post_attention_norm.is_none()
+                && layer.post_ffn_norm.is_none()
+                && matches!(&layer.qkv, QkvWeights::Separate { .. })
+                && matches!(&layer.mlp_or_moe, MlpOrMoe::Mlp(_))
+            {
+                // Phase 1: extract QKV GPU data + launch kernel 1 (scoped borrow)
+                let fused_qkv: Option<(Tensor, Tensor, Tensor, usize)> = {
+                    let qkv_data = if let QkvWeights::Separate { wq, wk, wv } = &layer.qkv {
+                        match (wq.q4k_gpu_data(), wk.q4k_gpu_data(), wv.q4k_gpu_data()) {
+                            (Some((wq_g, qo, hd)), Some((wk_g, ko, _)), Some((wv_g, vo, _))) =>
+                                Some((wq_g, wk_g, wv_g, qo, ko, vo, hd)),
+                            _ => None,
+                        }
+                    } else { None };
+
+                    if let Some((wq_gpu, wk_gpu, wv_gpu, q_out, k_out, v_out, hidden_dim)) = qkv_data {
+                        let reg = crate::cuda::kernels::global_registry().unwrap();
+                        let stream = &reg.stream;
+                        let input_gpu = x.cuda_data();
+                        let norm_w = layer.attention_norm.weight.cuda_data();
+                        let bq = layer.attention_bq.as_ref().map(|b| b.cuda_data());
+                        let bk = layer.attention_bk.as_ref().map(|b| b.cuda_data());
+                        let bv = layer.attention_bv.as_ref().map(|b| b.cuda_data());
+
+                        let mut out_q = stream.alloc_zeros(q_out)
+                            .map_err(|e| TqError::Msg(format!("fused QKV alloc: {}", e)))?;
+                        let mut out_k = stream.alloc_zeros(k_out)
+                            .map_err(|e| TqError::Msg(format!("fused QKV alloc: {}", e)))?;
+                        let mut out_v = stream.alloc_zeros(v_out)
+                            .map_err(|e| TqError::Msg(format!("fused QKV alloc: {}", e)))?;
+
+                        crate::cuda::kernels::fused_norm_q4km_qkv_bias(
+                            reg, input_gpu, norm_w,
+                            wq_gpu, wk_gpu, wv_gpu,
+                            bq, bk, bv,
+                            &mut out_q, &mut out_k, &mut out_v,
+                            hidden_dim, q_out, k_out, v_out,
+                            layer.attention_norm.eps as f32,
+                        ).map_err(|e| TqError::Msg(format!("fused norm+QKV: {}", e)))?;
+
+                        let q_t = Tensor::from_cuda(out_q, vec![1, 1, q_out], stream.clone());
+                        let k_t = Tensor::from_cuda(out_k, vec![1, 1, k_out], stream.clone());
+                        let v_t = Tensor::from_cuda(out_v, vec![1, 1, v_out], stream.clone());
+                        Some((q_t, k_t, v_t, hidden_dim))
+                    } else { None }
+                }; // QKV borrows released
+
+                if let Some((q_t, k_t, v_t, hidden_dim)) = fused_qkv {
+                    // Phase 2: attention middle (takes &mut layer — no borrow conflict)
+                    let attn = layer.forward_attn(
+                        &x, Some((q_t, k_t, v_t)), mask.as_ref(), index_pos, backend,
+                    )?;
+
+                    // Phase 3: extract MLP GPU data + launch kernels 2+3 (scoped borrow)
+                    let fused_mlp_result: Result<Tensor> = (|| {
+                        let mlp_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                            match (
+                                mlp.feed_forward_w1.q4k_gpu_data(),
+                                mlp.feed_forward_w3.q4k_gpu_data(),
+                                mlp.feed_forward_w2.q4k_gpu_data(),
+                            ) {
+                                (Some((g, idim, _)), Some((u, _, _)), Some((d, _, _))) =>
+                                    Some((g, u, d, idim)),
+                                _ => None,
+                            }
+                        } else { None };
+                        let (wgate_gpu, wup_gpu, wdown_gpu, intermediate_dim) =
+                            mlp_data.ok_or_else(|| TqError::Msg("fused MLP: not Q4K".into()))?;
+
+                        let reg = crate::cuda::kernels::global_registry().unwrap();
+                        let stream = &reg.stream;
+                        let _enter = layer.span_mlp.enter();
+                        let attn_f32 = attn.to_dtype(DType::F32)?;
+                        let residual_f32 = x.to_dtype(DType::F32)?;
+
+                        // Pre-combine residual + attn_out (GPU elementwise add)
+                        let mut combined = (residual_f32 + attn_f32)?;
+
+                        // Kernel 2: norm + gate/up + silu*mul
+                        let mut intermediate: cudarc::driver::CudaSlice<f32> =
+                            stream.alloc_zeros(intermediate_dim)
+                                .map_err(|e| TqError::Msg(format!("fused MLP alloc: {}", e)))?;
+                        crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
+                            reg, combined.cuda_data(), layer.ffn_norm.weight.cuda_data(),
+                            wgate_gpu, wup_gpu,
+                            &mut intermediate,
+                            hidden_dim, intermediate_dim,
+                            layer.ffn_norm.eps as f32,
+                        ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
+
+                        // Kernel 3: down projection + residual add
+                        crate::cuda::kernels::fused_q4km_down_residual(
+                            reg, wdown_gpu, &intermediate, combined.cuda_data_mut(),
+                            hidden_dim, intermediate_dim,
+                        ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+
+                        Ok(combined)
+                    })(); // MLP borrows released
+
+                    layer_in = fused_mlp_result?;
+                    continue; // skip fallback path
+                }
+            }
+
+            // ── Fallback: original separate-kernel path ──
             let residual = &x;
             let x = layer.attention_norm.forward(&x, backend)?;
-            let attn = layer.forward_attn(&x, mask.as_ref(), index_pos, backend)?;
+            let attn = layer.forward_attn(&x, None, mask.as_ref(), index_pos, backend)?;
             // Optional post-attention norm (Gemma2)
             let attn = match &layer.post_attention_norm {
                 Some(norm) => norm.forward(&attn, backend)?,

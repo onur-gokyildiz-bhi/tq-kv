@@ -29,6 +29,10 @@ pub struct QWeight {
     /// Lazily uploaded GPU copy of raw_data (avoids re-upload per forward).
     #[cfg(feature = "cuda")]
     gpu_cache: OnceLock<CudaSlice<u8>>,
+    /// Lazily dequantized + uploaded f32 weights on GPU (for Q6K and other dtypes
+    /// without fused GPU kernels — avoids re-dequant + re-upload per forward).
+    #[cfg(feature = "cuda")]
+    gpu_f32_cache: OnceLock<CudaSlice<f32>>,
 }
 
 impl Clone for QWeight {
@@ -40,6 +44,8 @@ impl Clone for QWeight {
             cpu_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
             gpu_cache: OnceLock::new(),
+            #[cfg(feature = "cuda")]
+            gpu_f32_cache: OnceLock::new(),
         }
     }
 }
@@ -62,6 +68,8 @@ impl QWeight {
             cpu_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
             gpu_cache: OnceLock::new(),
+            #[cfg(feature = "cuda")]
+            gpu_f32_cache: OnceLock::new(),
         }
     }
 
@@ -314,24 +322,46 @@ impl QMatMul {
         }
     }
 
-    /// GPU fallback: dequant on CPU, upload to GPU, standard matmul.
+    /// GPU fallback: dequant on CPU, upload to GPU, f32 matvec kernel.
+    /// Used for Q6K and other dtypes without fused dequant GPU kernels.
+    /// Weight is dequantized + uploaded ONCE (row-major, not transposed),
+    /// then custom f32_matvec kernel (1 block/row, no cuBLAS overhead).
     #[cfg(feature = "cuda")]
-    fn forward_gpu_fallback(qw: &QWeight, x: &TqTensor) -> Result<TqTensor> {
-        // Dequant on CPU then upload
-        let w_f32 = qw.dequantize();
-        let stream = x.cuda_stream();
-        let w_gpu = stream.clone_htod(&w_f32)
-            .map_err(|e| TqError::Msg(format!("weight upload: {}", e)))?;
+    pub fn forward_gpu_fallback(qw: &QWeight, x: &TqTensor) -> Result<TqTensor> {
+        let out_f = qw.out_features();
+        let in_f = qw.in_features();
 
-        let w_tensor = TqTensor::from_cuda(
-            w_gpu,
-            vec![qw.out_features(), qw.in_features()],
-            stream.clone(),
-        );
+        let reg = crate::cuda::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+        let stream = &reg.stream;
 
-        // x @ W^T
-        let wt = w_tensor.t()?;
-        x.matmul(&wt)
+        // Lazily dequant + upload to GPU (row-major, cached for all subsequent calls).
+        let w_gpu = qw.gpu_f32_cache.get_or_init(|| {
+            let w_f32 = qw.dequantize(); // [out_features * in_features] row-major
+            stream.clone_htod(&w_f32).expect("Q6K f32 weight upload failed")
+        });
+
+        let x_shape = x.shape().to_vec();
+        let batch: usize = x_shape[..x_shape.len() - 1].iter().product::<usize>().max(1);
+
+        if batch == 1 {
+            // Decode: custom f32_matvec kernel (zero cuBLAS overhead)
+            let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(out_f)
+                .map_err(|e| TqError::Msg(format!("f32_matvec alloc: {}", e)))?;
+            crate::cuda::kernels::f32_matvec(
+                reg, w_gpu, x.cuda_data(), &mut out_gpu, out_f, in_f,
+            ).map_err(|e| TqError::Msg(format!("f32_matvec: {}", e)))?;
+            let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+            out_shape.push(out_f);
+            Ok(TqTensor::from_cuda(out_gpu, out_shape, stream.clone()))
+        } else {
+            // Prefill: cuBLAS SGEMM via matmul (batch>1, overhead amortized)
+            let w_tensor = TqTensor::from_cuda(
+                w_gpu.clone(), vec![out_f, in_f], stream.clone(),
+            );
+            let wt = w_tensor.t()?;
+            x.matmul(&wt)
+        }
     }
 }
 

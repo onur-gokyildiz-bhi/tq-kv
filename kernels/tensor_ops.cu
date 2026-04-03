@@ -239,3 +239,34 @@ extern "C" __global__ void reduce_max_last_f32(
     }
     output[row] = mx;
 }
+
+// ─── F32 Matvec ─────────────────────────────────────────────
+// Single-vector matrix-vector multiply: output = W @ x
+// W: [out_features, in_features] row-major f32 (pre-dequantized, cached on GPU)
+// x: [in_features] f32
+// output: [out_features] f32
+// Grid: out_features blocks, 256 threads
+// Used for Q6K and other dtypes without fused dequant kernels.
+
+extern "C" __global__ void f32_matvec(
+    const float* __restrict__ W,      // [out_features, in_features]
+    const float* __restrict__ x,      // [in_features]
+    float* __restrict__ output,       // [out_features]
+    const int out_features,
+    const int in_features
+) {
+    const int row = blockIdx.x;
+    if (row >= out_features) return;
+    const int tid = threadIdx.x;
+
+    const float* w_row = W + row * in_features;
+    float sum = 0.0f;
+    for (int i = tid; i < in_features; i += blockDim.x) {
+        sum += w_row[i] * x[i];
+    }
+
+    sum = block_reduce_sum(sum);
+    if (tid == 0) {
+        output[row] = sum;
+    }
+}

@@ -1113,8 +1113,9 @@ impl TqTensor {
         }
 
         let stream = self.cuda_stream().clone();
-        let blas = CudaBlas::new(stream.clone())
-            .map_err(|e| TqError::Msg(format!("cuBLAS init: {}", e)))?;
+        let reg = super::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU kernel registry for matmul".into()))?;
+        let blas = reg.get_cublas();
 
         let batch: usize = a_shape[..a_rank - 2].iter().product();
 
@@ -1159,6 +1160,57 @@ impl TqTensor {
 
         let mut out_shape = a_shape[..a_rank - 2].to_vec();
         out_shape.push(m);
+        out_shape.push(n);
+        Ok(Self::from_cuda(out_gpu, out_shape, stream))
+    }
+
+    /// GPU matvec with pre-transposed cached weight: output = x @ W^T.
+    /// W^T is a borrowed &CudaSlice<f32> [in_features, out_features] — no clone needed.
+    /// Used for Q6K and other dtypes where weight is dequantized + pre-transposed once.
+    pub fn matvec_with_cached_wt(
+        &self,
+        wt: &cudarc::driver::CudaSlice<f32>,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Self> {
+        use cudarc::cublas::{Gemm, GemmConfig};
+        use cudarc::cublas::sys::cublasOperation_t;
+
+        let stream = self.cuda_stream().clone();
+        let reg = super::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry for matvec".into()))?;
+        let blas = reg.get_cublas();
+
+        let x_shape = self.shape().to_vec();
+        let batch: usize = x_shape[..x_shape.len() - 1].iter().product::<usize>().max(1);
+        let m = batch;          // rows of x
+        let k = in_features;    // cols of x = rows of W^T
+        let n = out_features;   // cols of W^T
+
+        let mut out_gpu = stream.alloc_zeros::<f32>(m * n)
+            .map_err(|e| TqError::Msg(format!("matvec alloc: {}", e)))?;
+
+        // cuBLAS col-major: C^T = B^T @ A^T gives row-major C = A @ B
+        // A = x [m, k], B = W^T [k, n]
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_N,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0f32,
+            lda: n as i32,
+            ldb: k as i32,
+            beta: 0.0f32,
+            ldc: n as i32,
+        };
+
+        unsafe {
+            blas.gemm(cfg, wt, self.cuda_data(), &mut out_gpu)
+                .map_err(|e| TqError::Msg(format!("cuBLAS matvec: {}", e)))?;
+        }
+
+        let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
         out_shape.push(n);
         Ok(Self::from_cuda(out_gpu, out_shape, stream))
     }
