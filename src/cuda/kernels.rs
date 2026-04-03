@@ -14,6 +14,19 @@ use cudarc::driver::{
 use cudarc::driver::PushKernelArg;
 use cudarc::nvrtc::Ptx;
 
+/// Global kernel registry — initialized once, accessible from any GPU tensor op.
+static GLOBAL_REGISTRY: std::sync::OnceLock<Arc<KernelRegistry>> = std::sync::OnceLock::new();
+
+/// Get or initialize the global kernel registry.
+pub fn global_registry() -> Option<&'static Arc<KernelRegistry>> {
+    GLOBAL_REGISTRY.get()
+}
+
+/// Set the global kernel registry (called during device init).
+pub fn set_global_registry(reg: Arc<KernelRegistry>) {
+    let _ = GLOBAL_REGISTRY.set(reg);
+}
+
 // ─── PTX sources (embedded by build.rs) ────────────────────────
 
 // Include the auto-generated PTX module from build.rs

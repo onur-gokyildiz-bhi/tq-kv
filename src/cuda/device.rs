@@ -1,16 +1,21 @@
 //! Device abstraction — CPU or CUDA GPU.
+//!
+//! TqDevice::Cuda holds both the CUDA context and a shared KernelRegistry,
+//! so any GPU tensor can access kernel launchers through its device.
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaContext;
 
 /// Compute device for tensor operations.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum TqDevice {
     Cpu,
     #[cfg(feature = "cuda")]
     Cuda {
         context: std::sync::Arc<CudaContext>,
         ordinal: usize,
+        /// Shared kernel registry — every GPU tensor can launch kernels via this.
+        registry: std::sync::Arc<super::kernels::KernelRegistry>,
     },
 }
 
@@ -21,12 +26,21 @@ impl TqDevice {
     }
 
     /// Select CUDA device if available, otherwise fall back to CPU.
+    /// Initializes the kernel registry for GPU tensor operations.
     #[cfg(feature = "cuda")]
     pub fn cuda_if_available(ordinal: usize) -> super::Result<Self> {
         match CudaContext::new(ordinal) {
             Ok(ctx) => {
                 eprintln!("CUDA device {} initialized", ordinal);
-                Ok(TqDevice::Cuda { context: ctx, ordinal })
+                let stream = ctx.default_stream();
+                let registry = super::kernels::KernelRegistry::new(&ctx, &stream)
+                    .map_err(|e| super::TqError::Msg(format!("kernel init: {}", e)))?;
+                let registry = std::sync::Arc::new(registry);
+                // Set global registry so GPU tensor ops can access kernels
+                super::kernels::set_global_registry(registry.clone());
+                Ok(TqDevice::Cuda {
+                    context: ctx, ordinal, registry,
+                })
             }
             Err(e) => {
                 eprintln!("CUDA not available ({}), falling back to CPU", e);
@@ -75,12 +89,33 @@ impl TqDevice {
     }
 }
 
+impl std::fmt::Debug for TqDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TqDevice::Cpu => write!(f, "Cpu"),
+            #[cfg(feature = "cuda")]
+            TqDevice::Cuda { ordinal, .. } => write!(f, "Cuda({})", ordinal),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl TqDevice {
+    /// Get the kernel registry for GPU tensor operations.
+    pub fn registry(&self) -> &super::kernels::KernelRegistry {
+        match self {
+            TqDevice::Cuda { registry, .. } => registry,
+            _ => panic!("registry() called on CPU device"),
+        }
+    }
+}
+
 impl PartialEq for TqDevice {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (TqDevice::Cpu, TqDevice::Cpu) => true,
             #[cfg(feature = "cuda")]
-            (TqDevice::Cuda { ordinal: a, .. }, TqDevice::Cuda { ordinal: b, .. }) => a == b,
+            (TqDevice::Cuda { ordinal: a, .. }, TqDevice::Cuda { ordinal: b, .. }) => a == b,  // registry ignored for equality
             #[cfg(feature = "cuda")]
             _ => false,
         }

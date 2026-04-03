@@ -176,36 +176,64 @@ impl TqTensor {
         let d2 = self.resolve_dim(d2)?;
         if d1 == d2 { return Ok(self.clone()); }
 
-        let data = self.as_slice();
         let rank = self.rank();
         let n = self.elem_count();
-        let mut result = vec![0.0f32; n];
 
-        // Compute strides for old layout
-        let mut old_strides = vec![1usize; rank];
+        // Source strides
+        let mut old_strides = vec![1i32; rank];
         for i in (0..rank - 1).rev() {
-            old_strides[i] = old_strides[i + 1] * self.shape[i + 1];
+            old_strides[i] = old_strides[i + 1] * self.shape[i + 1] as i32;
         }
 
-        // New shape and strides
+        // New shape and strides (output layout)
         let mut new_shape = self.shape.clone();
         new_shape.swap(d1, d2);
-        let mut new_strides = vec![1usize; rank];
+        let mut new_strides = vec![1i32; rank];
         for i in (0..rank - 1).rev() {
-            new_strides[i] = new_strides[i + 1] * new_shape[i + 1];
+            new_strides[i] = new_strides[i + 1] * new_shape[i + 1] as i32;
         }
 
-        // Copy with transposed indexing
+        // Source strides remapped: for the output's coordinate system,
+        // source stride at dim d1 maps to original stride at d2 and vice versa
+        let mut src_strides = old_strides.clone();
+        src_strides.swap(d1, d2);
+
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            if let Some(reg) = super::kernels::global_registry() {
+                let mut out_gpu = stream.alloc_zeros::<f32>(n)
+                    .map_err(|e| TqError::Msg(format!("transpose alloc: {}", e)))?;
+                let out_shape_gpu = stream.clone_htod(&new_shape.iter().map(|&x| x as i32).collect::<Vec<_>>())
+                    .map_err(|e| TqError::Msg(format!("transpose: {}", e)))?;
+                let out_strides_gpu = stream.clone_htod(&new_strides)
+                    .map_err(|e| TqError::Msg(format!("transpose: {}", e)))?;
+                let src_strides_gpu = stream.clone_htod(&src_strides)
+                    .map_err(|e| TqError::Msg(format!("transpose: {}", e)))?;
+
+                super::kernels::strided_copy(
+                    reg, src, &mut out_gpu, n, rank,
+                    &out_shape_gpu, &out_strides_gpu, &src_strides_gpu, 0,
+                ).map_err(|e| TqError::Msg(format!("transpose kernel: {}", e)))?;
+
+                return Ok(Self::from_cuda(out_gpu, new_shape, stream.clone()));
+            }
+        }
+
+        // CPU path
+        let data = self.as_slice();
+        let mut result = vec![0.0f32; n];
+        let old_strides_u: Vec<usize> = old_strides.iter().map(|&s| s as usize).collect();
+        let new_strides_u: Vec<usize> = new_strides.iter().map(|&s| s as usize).collect();
+
         for flat_idx in 0..n {
             let mut remaining = flat_idx;
             let mut old_coords = vec![0usize; rank];
             for d in 0..rank {
-                old_coords[d] = remaining / old_strides[d];
-                remaining %= old_strides[d];
+                old_coords[d] = remaining / old_strides_u[d];
+                remaining %= old_strides_u[d];
             }
-            // Swap coordinates
             old_coords.swap(d1, d2);
-            let new_flat: usize = old_coords.iter().zip(new_strides.iter())
+            let new_flat: usize = old_coords.iter().zip(new_strides_u.iter())
                 .map(|(&c, &s)| c * s).sum();
             result[new_flat] = data[flat_idx];
         }
@@ -221,28 +249,78 @@ impl TqTensor {
                 start, start + len, dim, self.shape[dim]);
         }
 
-        let data = self.as_slice();
-        let rank = self.rank();
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            let rank = self.rank();
+            let mut new_shape = self.shape.clone();
+            new_shape[dim] = len;
+            let new_n: usize = new_shape.iter().product();
+            let outer: usize = self.shape[..dim].iter().product();
+            let inner: usize = self.shape[dim + 1..].iter().product();
 
-        // Compute strides
-        let mut strides = vec![1usize; rank];
-        for i in (0..rank - 1).rev() {
-            strides[i] = strides[i + 1] * self.shape[i + 1];
+            // Build source strides and output strides for strided_copy kernel
+            let mut src_strides_v = vec![0i32; rank];
+            let mut out_strides_v = vec![1i32; rank];
+            for i in (0..rank.saturating_sub(1)).rev() {
+                src_strides_v[i] = src_strides_v[i + 1] * self.shape[i + 1] as i32;
+                out_strides_v[i] = out_strides_v[i + 1] * new_shape[i + 1] as i32;
+            }
+            // Source strides are same as output strides (same layout) but with original dim sizes
+            for i in (0..rank.saturating_sub(1)).rev() {
+                src_strides_v[i] = if i + 1 < rank { src_strides_v[i + 1] * self.shape[i + 1] as i32 } else { 1 };
+            }
+            let src_offset = (start * inner) as i32;
+
+            // Simple contiguous copy approach: for contiguous narrow, use sliced memcpy
+            let mut out_gpu = stream.alloc_zeros::<f32>(new_n)
+                .map_err(|e| TqError::Msg(format!("narrow alloc: {}", e)))?;
+
+            if let Some(reg) = super::kernels::global_registry() {
+                let out_shape_gpu = stream.clone_htod(&new_shape.iter().map(|&x| x as i32).collect::<Vec<_>>())
+                    .map_err(|e| TqError::Msg(format!("narrow shape upload: {}", e)))?;
+                let out_strides_gpu = stream.clone_htod(&out_strides_v)
+                    .map_err(|e| TqError::Msg(format!("narrow strides upload: {}", e)))?;
+
+                // For narrow: source strides match original tensor layout
+                let mut real_src_strides = vec![1i32; rank];
+                for i in (0..rank.saturating_sub(1)).rev() {
+                    real_src_strides[i] = real_src_strides[i + 1] * self.shape[i + 1] as i32;
+                }
+                // Adjust: the dim we're narrowing has offset applied via src_offset
+                // Actually for narrow, src and dst have same strides except at narrow dim
+                // Simplest: use the general strided_copy with correct offset
+                let src_strides_gpu = stream.clone_htod(&real_src_strides)
+                    .map_err(|e| TqError::Msg(format!("narrow src strides: {}", e)))?;
+
+                // Source offset = start position in the narrowed dimension
+                let base_offset = if dim == 0 {
+                    (start * inner) as i32
+                } else {
+                    // General: start * stride_of_dim_in_source
+                    (start as i32) * real_src_strides[dim]
+                };
+
+                super::kernels::strided_copy(
+                    reg, src, &mut out_gpu, new_n, rank,
+                    &out_shape_gpu, &out_strides_gpu, &src_strides_gpu, base_offset,
+                ).map_err(|e| TqError::Msg(format!("narrow kernel: {}", e)))?;
+
+                return Ok(Self::from_cuda(out_gpu, new_shape, stream.clone()));
+            }
+            // Fallback: download, narrow on CPU, re-upload
         }
 
+        // CPU path
+        let data = self.as_slice();
+        let rank = self.rank();
         let mut new_shape = self.shape.clone();
         new_shape[dim] = len;
-        let new_n: usize = new_shape.iter().product();
-        let mut result = Vec::with_capacity(new_n);
-
-        // Iterate over all elements in the new tensor
         let outer: usize = self.shape[..dim].iter().product();
         let inner: usize = self.shape[dim + 1..].iter().product();
+        let mut result = Vec::with_capacity(new_shape.iter().product());
 
         for o in 0..outer {
             for s in start..start + len {
-                let _base = o * strides[dim] * self.shape[dim] + s * inner;
-                // Wait, simpler approach for contiguous:
                 let src_offset = o * (self.shape[dim] * inner) + s * inner;
                 result.extend_from_slice(&data[src_offset..src_offset + inner]);
             }
@@ -278,14 +356,17 @@ impl TqTensor {
 
         let total_dim: usize = tensors.iter().map(|t| t.shape[dim]).sum();
         let new_n = outer * total_dim * inner;
-        let mut result = Vec::with_capacity(new_n);
 
+        // CPU path (handles both CPU and GPU tensors via to_vec1 download)
+        let mut result = Vec::with_capacity(new_n);
+        let data_vecs: Vec<Vec<f32>> = tensors.iter()
+            .map(|t| t.to_vec1())
+            .collect::<Result<Vec<_>>>()?;
         for o in 0..outer {
-            for t in tensors {
-                let t_data = t.as_slice();
+            for (i, t) in tensors.iter().enumerate() {
                 let t_dim = t.shape[dim];
                 let src_offset = o * t_dim * inner;
-                result.extend_from_slice(&t_data[src_offset..src_offset + t_dim * inner]);
+                result.extend_from_slice(&data_vecs[i][src_offset..src_offset + t_dim * inner]);
             }
         }
 
@@ -319,16 +400,58 @@ impl TqTensor {
 
     /// Element-wise multiply with broadcasting.
     pub fn broadcast_mul(&self, other: &TqTensor) -> Result<Self> {
+        // If both are same-shape CUDA tensors, use simple elementwise kernel
+        #[cfg(feature = "cuda")]
+        if self.is_cuda() && other.is_cuda() && self.shape == other.shape {
+            if let (TqStorage::Cuda { data: a, stream }, TqStorage::Cuda { data: b, .. }) = (&self.storage, &other.storage) {
+                if let Some(reg) = super::kernels::global_registry() {
+                    let n = self.elem_count();
+                    let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                    super::kernels::mul(reg, a, b, &mut out, n).map_err(|e| TqError::Msg(format!("mul: {}", e)))?;
+                    return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+                }
+            }
+        }
         super::ops::TqOps::broadcast_binop(self, other, |a, b| a * b)
     }
 
     /// Element-wise add with broadcasting.
     pub fn broadcast_add(&self, other: &TqTensor) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if self.is_cuda() && other.is_cuda() && self.shape == other.shape {
+            if let (TqStorage::Cuda { data: a, stream }, TqStorage::Cuda { data: b, .. }) = (&self.storage, &other.storage) {
+                if let Some(reg) = super::kernels::global_registry() {
+                    let n = self.elem_count();
+                    let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                    super::kernels::add(reg, a, b, &mut out, n).map_err(|e| TqError::Msg(format!("add: {}", e)))?;
+                    return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+                }
+            }
+        }
         super::ops::TqOps::broadcast_binop(self, other, |a, b| a + b)
     }
 
     /// Element-wise sub with broadcasting.
     pub fn broadcast_sub(&self, other: &TqTensor) -> Result<Self> {
+        // GPU same-shape fast path
+        #[cfg(feature = "cuda")]
+        if self.is_cuda() && other.is_cuda() && self.shape == other.shape {
+            if let (TqStorage::Cuda { data: a, stream }, TqStorage::Cuda { data: b, .. }) = (&self.storage, &other.storage) {
+                if let Some(reg) = super::kernels::global_registry() {
+                    let n = self.elem_count();
+                    let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                    // sub = a + (-1 * b) — use broadcast_sub kernel
+                    super::kernels::gpu_broadcast_sub(
+                        reg, a, b, &mut out, n, 1,
+                        &stream.clone_htod(&[n as i32]).map_err(|e| TqError::Msg(format!("{}", e)))?,
+                        &stream.clone_htod(&[1i32]).map_err(|e| TqError::Msg(format!("{}", e)))?,
+                        &stream.clone_htod(&[1i32]).map_err(|e| TqError::Msg(format!("{}", e)))?,
+                        &stream.clone_htod(&[1i32]).map_err(|e| TqError::Msg(format!("{}", e)))?,
+                    ).map_err(|e| TqError::Msg(format!("sub: {}", e)))?;
+                    return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+                }
+            }
+        }
         super::ops::TqOps::broadcast_binop(self, other, |a, b| a - b)
     }
 
@@ -339,6 +462,19 @@ impl TqTensor {
 
     /// Scalar multiply.
     pub fn mul_scalar(&self, s: f32) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            if let Some(reg) = super::kernels::global_registry() {
+                let n = self.elem_count();
+                let s_gpu = stream.clone_htod(&[s]).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                // Use broadcast_mul with scalar (broadcast s to all elements)
+                // Simpler: use scalar_mul kernel from elementwise.cu
+                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                super::kernels::scalar_mul(reg, src, &mut out, s, n)
+                    .map_err(|e| TqError::Msg(format!("scalar_mul: {}", e)))?;
+                return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+            }
+        }
         let data: Vec<f32> = self.as_slice().iter().map(|&v| v * s).collect();
         Self::from_vec(data, self.shape.clone(), self.device())
     }
@@ -350,24 +486,60 @@ impl TqTensor {
 
     /// Element-wise exp.
     pub fn exp(&self) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            if let Some(reg) = super::kernels::global_registry() {
+                let n = self.elem_count();
+                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                super::kernels::gpu_exp(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("exp: {}", e)))?;
+                return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+            }
+        }
         let data: Vec<f32> = self.as_slice().iter().map(|v| v.exp()).collect();
         Self::from_vec(data, self.shape.clone(), self.device())
     }
 
     /// Element-wise sqrt.
     pub fn sqrt(&self) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            if let Some(reg) = super::kernels::global_registry() {
+                let n = self.elem_count();
+                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                super::kernels::gpu_sqrt(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("sqrt: {}", e)))?;
+                return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+            }
+        }
         let data: Vec<f32> = self.as_slice().iter().map(|v| v.sqrt()).collect();
         Self::from_vec(data, self.shape.clone(), self.device())
     }
 
     /// Element-wise square.
     pub fn sqr(&self) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            if let Some(reg) = super::kernels::global_registry() {
+                let n = self.elem_count();
+                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                super::kernels::gpu_sqr(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("sqr: {}", e)))?;
+                return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+            }
+        }
         let data: Vec<f32> = self.as_slice().iter().map(|v| v * v).collect();
         Self::from_vec(data, self.shape.clone(), self.device())
     }
 
     /// Element-wise SiLU (x * sigmoid(x)).
     pub fn silu(&self) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            if let Some(reg) = super::kernels::global_registry() {
+                let n = self.elem_count();
+                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                super::kernels::silu(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("silu: {}", e)))?;
+                return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+            }
+        }
         let data: Vec<f32> = self.as_slice().iter()
             .map(|&x| x / (1.0 + (-x).exp()))
             .collect();
@@ -376,12 +548,30 @@ impl TqTensor {
 
     /// Element-wise cosine.
     pub fn cos(&self) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            if let Some(reg) = super::kernels::global_registry() {
+                let n = self.elem_count();
+                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                super::kernels::gpu_cos(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("cos: {}", e)))?;
+                return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+            }
+        }
         let data: Vec<f32> = self.as_slice().iter().map(|v| v.cos()).collect();
         Self::from_vec(data, self.shape.clone(), self.device())
     }
 
     /// Element-wise sine.
     pub fn sin(&self) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        if let TqStorage::Cuda { data: src, stream } = &self.storage {
+            if let Some(reg) = super::kernels::global_registry() {
+                let n = self.elem_count();
+                let mut out = stream.alloc_zeros::<f32>(n).map_err(|e| TqError::Msg(format!("{}", e)))?;
+                super::kernels::gpu_sin(reg, src, &mut out, n).map_err(|e| TqError::Msg(format!("sin: {}", e)))?;
+                return Ok(Self::from_cuda(out, self.shape.clone(), stream.clone()));
+            }
+        }
         let data: Vec<f32> = self.as_slice().iter().map(|v| v.sin()).collect();
         Self::from_vec(data, self.shape.clone(), self.device())
     }
