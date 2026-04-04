@@ -477,6 +477,46 @@ pub fn tq_fused_attention(
     Ok(())
 }
 
+/// Full fused TQ decode attention: compressed score + online softmax + V accumulation.
+/// Single kernel replaces: decompress → matmul → softmax → matmul chain.
+pub fn tq_fused_decode_attention(
+    reg: &KernelRegistry,
+    query: &CudaSlice<f32>,          // [n_heads, head_dim] pre-rotated
+    packed_indices: &CudaSlice<u8>,  // [n_kv_heads, n_keys * bytes_per_key]
+    norms: &CudaSlice<f32>,          // [n_kv_heads, n_keys]
+    centroids: &CudaSlice<f32>,      // [n_centroids]
+    v: &CudaSlice<f32>,              // [n_kv_heads, n_keys, head_dim]
+    output: &mut CudaSlice<f32>,     // [n_heads, head_dim]
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_keys: usize,
+    head_dim: usize,
+    bits: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_attention", "tq_fused_decode_attention_f32")?;
+    // blockDim: 32 threads (each handles head_dim/32 = 4 dims for 128-dim heads)
+    let block_dim = 32u32.min(head_dim as u32);
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let nk = n_keys as i32;
+    let hd = head_dim as i32;
+    let b = bits as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(query).arg(packed_indices).arg(norms).arg(centroids)
+            .arg(v).arg(output)
+            .arg(&nh).arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&scale)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Launch hadamard_inverse_batch_f32 for key decompression.
 pub fn hadamard_inverse_batch(
     reg: &KernelRegistry,
