@@ -1198,6 +1198,19 @@ impl GpuKvCache {
         )
     }
 
+    /// Get K narrowed to valid tokens only: [1, n_kv_head, seq_len, head_dim].
+    /// No padding waste — attention only computes over actual positions.
+    fn k_tensor_valid(&self) -> Result<Tensor> {
+        let full = self.k_tensor();
+        full.narrow(2, 0, self.seq_len)
+    }
+
+    /// Get V narrowed to valid tokens: [1, n_kv_head, seq_len, head_dim].
+    fn v_tensor_valid(&self) -> Result<Tensor> {
+        let full = self.v_tensor();
+        full.narrow(2, 0, self.seq_len)
+    }
+
     /// Get attention mask as tensor [1, 1, 1, max_seq] for broadcasting.
     fn mask_tensor(&self) -> Tensor {
         Tensor::from_cuda_arc(
@@ -2276,21 +2289,20 @@ impl LayerWeights {
         } else {
             // UNCOMPRESSED PATH: standard fp16 KV cache (first N layers)
             //
-            // GPU path: pre-allocated GpuKvCache with pad+mask (graph-compatible).
-            // CPU path: Tensor::cat (original, allocation per step).
+            // GPU path: pre-allocated GpuKvCache with in-place append + narrow.
+            //   Eliminates Tensor::cat (which copies entire history per step).
+            //   Uses narrow() for exact-length attention (no padding waste).
+            // CPU path: Tensor::cat fallback.
             #[cfg(feature = "cuda")]
-            let graph_mode = std::env::var("TQ_GRAPH").map(|v| v == "1").unwrap_or(false);
-            #[cfg(feature = "cuda")]
-            if k.is_cuda() && seq_len == 1 && graph_mode {
-                // Initialize GPU KV cache on first decode step (graph mode only)
+            if k.is_cuda() && seq_len == 1 {
+                // Initialize GPU KV cache on first decode step
                 if self.gpu_kv_cache.is_none() {
                     if let Some(reg) = crate::cuda::kernels::global_registry() {
                         match GpuKvCache::new(reg.stream.clone(), self.n_kv_head, self.head_dim, get_max_kv_seq()) {
                             Ok(mut cache) => {
                                 // Seed with prefill KV data from the CPU-path kv_cache
                                 if let Some((prev_k, prev_v)) = &self.kv_cache {
-                                    let prefill_len = prev_k.shape()[2]; // [1, n_kv_head, seq, head_dim]
-                                    // Ensure KV data is on GPU (prefill may have produced CPU tensors)
+                                    let prefill_len = prev_k.shape()[2];
                                     let gk = if prev_k.is_cuda() { prev_k.clone() } else {
                                         prev_k.to_device_auto().unwrap_or_else(|_| prev_k.clone())
                                     };
@@ -2303,10 +2315,6 @@ impl LayerWeights {
                                         }
                                     }
                                 }
-                                eprintln!("[gpu-kv] L{}: pre-allocated {}×{}×{} = {:.1}MB per K/V (seeded {})",
-                                    self.layer_idx, self.n_kv_head, get_max_kv_seq(), self.head_dim,
-                                    (self.n_kv_head * get_max_kv_seq() * self.head_dim * 4) as f64 / 1e6,
-                                    cache.seq_len);
                                 self.gpu_kv_cache = Some(cache);
                             }
                             Err(e) => eprintln!("[gpu-kv] L{}: alloc failed: {}", self.layer_idx, e),
@@ -2317,20 +2325,19 @@ impl LayerWeights {
                     if index_pos == 0 {
                         gpu_kv.reset();
                     }
-                    // Append new K/V to pre-allocated buffers
+                    // Append new K/V to pre-allocated buffers (in-place, zero-copy)
                     gpu_kv.append(&k, &v, seq_len)?;
 
-                    // Get padded K/V tensors [1, n_kv_head, max_seq, head_dim]
+                    // Use padded K/V with mask (avoids expensive narrow copies).
+                    // Padding positions are masked to -inf before softmax.
                     let k_full = gpu_kv.k_tensor();
                     let v_full = gpu_kv.v_tensor();
-                    let kv_mask = gpu_kv.mask_tensor(); // [1, 1, 1, max_seq]
+                    let kv_mask = gpu_kv.mask_tensor();
 
                     let k_full = repeat_kv(k_full, n_rep)?;
                     let v_full = repeat_kv(v_full, n_rep)?;
 
-                    // Q@K^T: [1, n_head, 1, max_seq] (fixed shape)
                     let att = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
-                    // Apply padding mask: -1e10 for unfilled positions
                     let kv_mask = kv_mask.broadcast_as(att.shape())?;
                     let att = (att + kv_mask)?;
                     let att = softmax_last_dim(&att, backend)?;
