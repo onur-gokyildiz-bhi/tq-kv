@@ -1153,6 +1153,11 @@ impl TqTensor {
         Ok(dim)
     }
 
+    /// Access the underlying storage.
+    pub fn storage(&self) -> &TqStorage {
+        &self.storage
+    }
+
     /// True if this tensor lives on a CUDA device.
     pub fn is_cuda(&self) -> bool {
         match &self.storage {

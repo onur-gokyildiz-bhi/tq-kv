@@ -2107,6 +2107,10 @@ pub struct GenericTurboModel {
     /// Pre-allocated intermediate buffers for graph capture (DecodeBufferPool).
     #[cfg(feature = "cuda")]
     graph_pool_buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
+    /// GPU buffer address of the input embedding (for updating before graph replay).
+    /// This is the same CudaSlice that the graph reads from — memcpy new embedding here.
+    #[cfg(feature = "cuda")]
+    graph_input_buffer: Option<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
 }
 
 fn precompute_freqs_cis(
@@ -2414,6 +2418,8 @@ impl GenericTurboModel {
             graph_retained_buffers: Vec::new(),
             #[cfg(feature = "cuda")]
             graph_pool_buffers: Vec::new(),
+            #[cfg(feature = "cuda")]
+            graph_input_buffer: None,
         };
 
         // Pre-warm weight caches: dequant on CPU + upload to GPU.
@@ -2509,15 +2515,37 @@ impl GenericTurboModel {
         #[cfg(feature = "cuda")]
         if seq_len == 1 && self.graph_manager.is_ready(1) {
             let reg = crate::cuda::kernels::global_registry().unwrap();
-            // Clear stale error_state + sync before replay
+
+            // Update input embedding: compute new token's embedding, memcpy to graph's input buffer.
+            if let Some(ref mut input_buf) = self.graph_input_buffer {
+                let new_emb = self.tok_embeddings.forward(x)?;
+                let emb_data = new_emb.as_slice();
+                let _ = reg.stream.context().check_err();
+                let buf_mut = std::sync::Arc::make_mut(input_buf);
+                if let Err(e) = reg.stream.memcpy_htod(emb_data, buf_mut) {
+                    eprintln!("[graph-replay] input update failed: {}", e);
+                }
+            }
+
+            // Update KV cache mask: valid_len grows by 1 each replay
+            for layer in &mut self.layers {
+                if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
+                    gpu_kv.seq_len += 1;
+                    let new_len = gpu_kv.seq_len as i32;
+                    let _ = reg.stream.memcpy_htod(&[new_len], &mut gpu_kv.valid_len_gpu);
+                    // Regenerate mask (kernel runs on stream, before graph launch)
+                    let mask_mut = std::sync::Arc::make_mut(&mut gpu_kv.mask_buf);
+                    let _ = crate::cuda::kernels::generate_kv_mask(&reg, mask_mut, &gpu_kv.valid_len_gpu, gpu_kv.max_seq);
+                }
+            }
+
             let _ = reg.stream.synchronize();
             let _ = reg.stream.context().check_err();
             self.graph_manager.replay(&reg.stream, 1)
                 .map_err(|e| TqError::Msg(format!("graph replay: {}", e)))?;
-            // Sync after replay to ensure output is ready for dtoh
             reg.stream.synchronize()
                 .map_err(|e| TqError::Msg(format!("graph sync: {}", e)))?;
-            let _ = reg.stream.context().check_err(); // clear post-replay errors
+            let _ = reg.stream.context().check_err();
             if let Some(ref out) = self.graph_output {
                 return Ok(out.clone());
             }
@@ -2554,9 +2582,20 @@ impl GenericTurboModel {
             }
         }
 
+        // Save input buffer address for graph replay (allows updating embedding before replay).
+        #[cfg(feature = "cuda")]
+        if capturing || recording {
+            if layer_in.is_cuda() {
+                self.graph_input_buffer = Some(std::sync::Arc::clone(
+                    match &layer_in.storage() {
+                        crate::cuda::TqStorage::Cuda { data, .. } => data,
+                        _ => unreachable!(),
+                    }
+                ));
+            }
+        }
+
         // Begin graph capture AFTER embedding upload (H2D copy must be outside capture).
-        // Graph capture only works when ALL ops stay on GPU (no to_vec1/dtoh sync).
-        // TQ compressed path has CPU-side key compression → incompatible.
         #[cfg(feature = "cuda")]
         if capturing {
             // Restore pool buffers and set Pooled mode: kernel launches use
