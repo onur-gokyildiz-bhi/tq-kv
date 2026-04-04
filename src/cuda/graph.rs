@@ -92,6 +92,13 @@ impl CudaGraphManager {
         self.eager_count > self.warmup_runs
     }
 
+    /// Is this the last warm-up pass before capture?
+    /// If true, the caller should enable Recording mode to pre-allocate pool buffers.
+    pub fn is_recording_pass(&self) -> bool {
+        self.enabled && self.eager_count == self.warmup_runs
+            && self.status == GraphStatus::NotCaptured
+    }
+
     /// Begin graph capture — uses raw CUDA API to bypass cudarc's error_state mechanism.
     #[cfg(feature = "cuda")]
     pub fn begin_capture(&mut self, stream: &cudarc::driver::CudaStream) -> Result<(), super::TqError> {
@@ -138,7 +145,9 @@ impl CudaGraphManager {
         // Instantiate
         let mut exec: sys::CUgraphExec = std::ptr::null_mut();
         let res = unsafe {
-            sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0)
+            // Flag 1 = CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH:
+            // automatically free memory from previous launch before re-launching.
+            sys::cuGraphInstantiateWithFlags(&mut exec, graph, 1)
         };
         // Destroy the graph template (exec is standalone)
         unsafe { sys::cuGraphDestroy(graph); }
@@ -167,6 +176,10 @@ impl CudaGraphManager {
         use cudarc::driver::sys;
         let exec = self.raw_graph_execs.get(&batch_size)
             .ok_or_else(|| super::TqError::Msg(format!("no graph for batch_size={}", batch_size)))?;
+        // Check if graph exec handle is valid (non-null)
+        if (*exec).is_null() {
+            return Err(super::TqError::Msg("graph exec is null".into()));
+        }
         let res = unsafe { sys::cuGraphLaunch(*exec, stream.cu_stream()) };
         if res != sys::cudaError_enum::CUDA_SUCCESS {
             return Err(super::TqError::Msg(format!("graph launch raw: {:?}", res)));

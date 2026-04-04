@@ -2100,6 +2100,9 @@ pub struct GenericTurboModel {
     /// GPU buffers kept alive for graph replay (prevents ILLEGAL_ADDRESS from freed pointers).
     #[cfg(feature = "cuda")]
     graph_retained_buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
+    /// Pre-allocated intermediate buffers for graph capture (DecodeBufferPool).
+    #[cfg(feature = "cuda")]
+    graph_pool_buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
 }
 
 fn precompute_freqs_cis(
@@ -2405,6 +2408,8 @@ impl GenericTurboModel {
             graph_output: None,
             #[cfg(feature = "cuda")]
             graph_retained_buffers: Vec::new(),
+            #[cfg(feature = "cuda")]
+            graph_pool_buffers: Vec::new(),
         };
 
         // Pre-warm weight caches: dequant on CPU + upload to GPU.
@@ -2492,14 +2497,16 @@ impl GenericTurboModel {
         if seq_len > 1 {
             self.graph_manager.reset();
             self.graph_output = None;
-            self.graph_retained_buffers.clear(); // release GPU buffers from previous graph
+            self.graph_retained_buffers.clear();
+            self.graph_pool_buffers.clear();
         }
 
         // ── CUDA Graph replay ──
         #[cfg(feature = "cuda")]
         if seq_len == 1 && self.graph_manager.is_ready(1) {
             let reg = crate::cuda::kernels::global_registry().unwrap();
-            // Clear stale error_state before replay (capture may leave benign errors)
+            // Clear stale error_state + sync before replay
+            let _ = reg.stream.synchronize();
             let _ = reg.stream.context().check_err();
             self.graph_manager.replay(&reg.stream, 1)
                 .map_err(|e| TqError::Msg(format!("graph replay: {}", e)))?;
@@ -2515,6 +2522,14 @@ impl GenericTurboModel {
         // ── CUDA Graph capture ──
         #[cfg(feature = "cuda")]
         let capturing = seq_len == 1 && self.graph_manager.should_capture(1);
+        // Recording pass: last warm-up before capture → pre-allocate pool buffers.
+        // should_capture already incremented eager_count; check if this was the recording pass.
+        #[cfg(feature = "cuda")]
+        let recording = !capturing && self.graph_manager.is_recording_pass();
+        #[cfg(feature = "cuda")]
+        if recording {
+            crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Recording);
+        }
 
         let mask = if seq_len == 1 {
             None
@@ -2540,9 +2555,11 @@ impl GenericTurboModel {
         // TQ compressed path has CPU-side key compression → incompatible.
         #[cfg(feature = "cuda")]
         if capturing {
-            // Start collecting GPU buffer references — prevents intermediate CudaSlice
-            // from being freed while graph holds baked pointers to them.
-            crate::cuda::graph_retention_start();
+            // Restore pool buffers and set Pooled mode: kernel launches use
+            // pre-allocated (Recording-pass) pointers that persist across graph replay.
+            crate::cuda::decode_pool_restore(std::mem::take(&mut self.graph_pool_buffers));
+            crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Pooled);
+            crate::cuda::decode_pool_reset_cursor();
             if let Some(reg) = crate::cuda::kernels::global_registry() {
                 if let Err(e) = self.graph_manager.begin_capture(&reg.stream) {
                     eprintln!("[cuda-graph] begin_capture failed: {}", e);
@@ -2603,11 +2620,11 @@ impl GenericTurboModel {
                         let bk = layer.attention_bk.as_ref().map(|b| b.cuda_data());
                         let bv = layer.attention_bv.as_ref().map(|b| b.cuda_data());
 
-                        let mut out_q = stream.alloc_zeros(q_out)
+                        let mut out_q = crate::cuda::gpu_alloc_zeros_pub(stream, q_out)
                             .map_err(|e| TqError::Msg(format!("fused QKV alloc: {}", e)))?;
-                        let mut out_k = stream.alloc_zeros(k_out)
+                        let mut out_k = crate::cuda::gpu_alloc_zeros_pub(stream, k_out)
                             .map_err(|e| TqError::Msg(format!("fused QKV alloc: {}", e)))?;
-                        let mut out_v = stream.alloc_zeros(v_out)
+                        let mut out_v = crate::cuda::gpu_alloc_zeros_pub(stream, v_out)
                             .map_err(|e| TqError::Msg(format!("fused QKV alloc: {}", e)))?;
 
                         crate::cuda::kernels::fused_norm_q4km_qkv_bias(
@@ -2834,6 +2851,19 @@ impl GenericTurboModel {
                     }
                 }
             }
+        }
+
+        // After forward pass: handle pool mode transitions
+        #[cfg(feature = "cuda")]
+        if recording {
+            // Drain pool from warm-up pass → store for capture pass
+            self.graph_pool_buffers = crate::cuda::decode_pool_drain();
+            crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
+            eprintln!("[cuda-graph] recording pass done: {} pool buffers saved", self.graph_pool_buffers.len());
+        }
+        #[cfg(feature = "cuda")]
+        if capturing {
+            crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
         }
 
         Ok(output)
