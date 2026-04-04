@@ -122,6 +122,19 @@ extern "C" __global__ void f16_to_f32_kernel(
     }
 }
 
+// ─── F32 → F16 ─────────────────────────────────────────────
+extern "C" __global__ void f32_to_f16_kernel(
+    const float* __restrict__ input,
+    uint16_t* __restrict__ output,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        __half h = __float2half(input[idx]);
+        output[idx] = *reinterpret_cast<uint16_t*>(&h);
+    }
+}
+
 // ─── BF16 → F32 ─────────────────────────────────────────────
 extern "C" __global__ void bf16_to_f32_kernel(
     const uint16_t* __restrict__ input,

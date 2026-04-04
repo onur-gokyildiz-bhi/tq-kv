@@ -14,7 +14,7 @@ cuda = ["cudarc", "half"]
 
 [dependencies]
 tq-kv = { path = "tq-kv" }
-cudarc = { version = "0.19", features = ["driver", "cublas", "nvrtc", "cuda-version-from-build-system"], optional = true }
+cudarc = { version = "0.19", features = ["driver", "cublas", "nvrtc", "cuda-version-from-build-system", "f16"], optional = true }
 half = { version = "2", optional = true }
 tokenizers = "0.20"
 clap = { version = "4", features = ["derive"] }

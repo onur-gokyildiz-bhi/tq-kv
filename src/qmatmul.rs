@@ -33,6 +33,10 @@ pub struct QWeight {
     /// without fused GPU kernels — avoids re-dequant + re-upload per forward).
     #[cfg(feature = "cuda")]
     gpu_f32_cache: OnceLock<CudaSlice<f32>>,
+    /// Lazily dequantized + converted to f16 + uploaded weights on GPU.
+    /// Used for cuBLAS HGEMM prefill path (tensor core acceleration).
+    #[cfg(feature = "cuda")]
+    gpu_f16_cache: OnceLock<CudaSlice<half::f16>>,
 }
 
 impl Clone for QWeight {
@@ -46,6 +50,8 @@ impl Clone for QWeight {
             gpu_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
             gpu_f32_cache: OnceLock::new(),
+            #[cfg(feature = "cuda")]
+            gpu_f16_cache: OnceLock::new(),
         }
     }
 }
@@ -70,6 +76,8 @@ impl QWeight {
             gpu_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
             gpu_f32_cache: OnceLock::new(),
+            #[cfg(feature = "cuda")]
+            gpu_f16_cache: OnceLock::new(),
         }
     }
 
@@ -108,6 +116,17 @@ impl QWeight {
     /// Call during model load to avoid first-forward dequant latency.
     pub fn warmup_cpu(&self) {
         self.cpu_cache.get_or_init(|| self.dequantize());
+    }
+
+    /// Eagerly dequantize, convert to f16, and upload to GPU.
+    /// Call during model load to avoid first-prefill HGEMM latency.
+    #[cfg(feature = "cuda")]
+    pub fn warmup_f16_gpu(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) {
+        self.gpu_f16_cache.get_or_init(|| {
+            let w_f32 = self.cpu_cache.get_or_init(|| self.dequantize());
+            let w_f16: Vec<half::f16> = w_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+            stream.clone_htod(&w_f16).expect("weight f16 upload failed")
+        });
     }
 
     /// Get cached dequantized weights, or dequantize and cache on first call.
@@ -318,7 +337,7 @@ impl QMatMul {
             out_shape.push(out_features);
             Ok(TqTensor::from_cuda(out_gpu, out_shape, stream.clone()))
         } else {
-            // Prefill: fall back to dequant + standard matmul (future: cuBLAS)
+            // Prefill (batch>1): dequant + cuBLAS SGEMM
             Self::forward_gpu_fallback(qw, x)
         }
     }
@@ -338,8 +357,8 @@ impl QMatMul {
 
         // Lazily dequant + upload to GPU (row-major, cached for all subsequent calls).
         let w_gpu = qw.gpu_f32_cache.get_or_init(|| {
-            let w_f32 = qw.dequantize(); // [out_features * in_features] row-major
-            stream.clone_htod(&w_f32).expect("Q6K f32 weight upload failed")
+            let w_f32 = qw.dequantize();
+            stream.clone_htod(&w_f32).expect("weight f32 upload failed")
         });
 
         let x_shape = x.shape().to_vec();
@@ -357,13 +376,160 @@ impl QMatMul {
             out_shape.push(out_f);
             Ok(TqTensor::from_cuda(out_gpu, out_shape, stream.clone()))
         } else {
-            // Prefill: cuBLAS SGEMM via matmul (batch>1, overhead amortized)
+            // Prefill (batch>1): cuBLAS SGEMM via TqTensor::matmul
             let w_tensor = TqTensor::from_cuda(
                 w_gpu.clone(), vec![out_f, in_f], stream.clone(),
             );
             let wt = w_tensor.t()?;
             x.matmul(&wt)
         }
+    }
+
+    /// Prefill SGEMM with TF32 tensor core acceleration.
+    /// Uses cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_TF32 on SM80+.
+    /// Falls back to regular f32 SGEMM on older GPUs.
+    #[cfg(feature = "cuda")]
+    fn forward_gpu_sgemm_tf32(qw: &QWeight, x: &TqTensor, w_gpu: &CudaSlice<f32>) -> Result<TqTensor> {
+        use cudarc::cublas::sys;
+
+        let out_f = qw.out_features();
+        let in_f = qw.in_features();
+        let x_shape = x.shape().to_vec();
+        let m = x_shape[..x_shape.len() - 1].iter().product::<usize>().max(1);
+
+        let reg = crate::cuda::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+        let stream = &reg.stream;
+        let blas = reg.get_cublas();
+
+        let x_gpu = x.cuda_data();
+        let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(m * out_f)
+            .map_err(|e| TqError::Msg(format!("sgemm alloc: {}", e)))?;
+
+        // cublasGemmEx: C = alpha * op(A) * op(B) + beta * C
+        // Row-major X[M,K] @ W[N,K]^T = C[M,N]
+        // cuBLAS col-major: C^T[N,M] = W[N,K] @ X[M,K]^T
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        // Scope the device_ptr borrows so out_gpu can be moved after
+        let result = {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (w_ptr, _g1) = w_gpu.device_ptr(stream.as_ref());
+            let (x_ptr, _g2) = x_gpu.device_ptr(stream.as_ref());
+            let (c_ptr, _g3) = out_gpu.device_ptr_mut(stream.as_ref());
+
+            unsafe {
+                sys::cublasGemmEx(
+                    *blas.handle(),
+                    sys::cublasOperation_t::CUBLAS_OP_T,  // W transposed
+                    sys::cublasOperation_t::CUBLAS_OP_N,  // X not transposed (row-major)
+                    out_f as i32,   // M (rows of result in col-major = N)
+                    m as i32,       // N (cols of result = M batch)
+                    in_f as i32,    // K
+                    &alpha as *const f32 as *const _,
+                    w_ptr as *const _,
+                    sys::cudaDataType_t::CUDA_R_32F,
+                    in_f as i32,    // lda (leading dim of W = K)
+                    x_ptr as *const _,
+                    sys::cudaDataType_t::CUDA_R_32F,
+                    in_f as i32,    // ldb (leading dim of X = K)
+                    &beta as *const f32 as *const _,
+                    c_ptr as *mut _,
+                    sys::cudaDataType_t::CUDA_R_32F,
+                    out_f as i32,   // ldc (leading dim of C = N)
+                    sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+                    sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+            }
+        };
+
+        if result != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            // Fallback: regular f32 matmul if TF32 not supported
+            let w_tensor = TqTensor::from_cuda(
+                w_gpu.clone(), vec![out_f, in_f], stream.clone(),
+            );
+            let wt = w_tensor.t()?;
+            return x.matmul(&wt);
+        }
+
+        let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+        out_shape.push(out_f);
+        Ok(TqTensor::from_cuda(out_gpu, out_shape, stream.clone()))
+    }
+
+    /// FP16 HGEMM prefill: dequant → f16 → cuBLAS GemmEx (tensor core accelerated).
+    ///
+    /// Weight: dequant to f32 → convert to f16 → upload once (cached in gpu_f16_cache).
+    /// Activation: f32 → f16 on GPU (per-call, small relative to weight).
+    /// Output: f16 → f32 conversion.
+    ///
+    /// Uses CUBLAS_COMPUTE_32F accumulation for accuracy with FP16 inputs.
+    /// This engages FP16 tensor cores on SM75+ (Turing, Ampere, Ada, Hopper).
+    #[cfg(feature = "cuda")]
+    fn forward_gpu_hgemm(qw: &QWeight, x: &TqTensor) -> Result<TqTensor> {
+        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+        use cudarc::cublas::sys::cublasOperation_t;
+
+        let out_f = qw.out_features(); // N (rows of W = cols of output)
+        let in_f = qw.in_features();   // K
+        let x_shape = x.shape().to_vec();
+        let m = x_shape[..x_shape.len() - 1].iter().product::<usize>().max(1); // M (batch * seq_len)
+
+        let reg = crate::cuda::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+        let stream = &reg.stream;
+
+        // Lazily dequant → f16 → upload (cached for all subsequent calls).
+        let w_f16_gpu = qw.gpu_f16_cache.get_or_init(|| {
+            let w_f32 = qw.dequantize();
+            let w_f16: Vec<half::f16> = w_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+            stream.clone_htod(&w_f16).expect("weight f16 upload failed")
+        });
+
+        // Convert f32 activation → f16 on GPU
+        let x_gpu = x.cuda_data();
+        let x_n = x.elem_count();
+        let mut x_f16: CudaSlice<half::f16> = stream.alloc_zeros(x_n)
+            .map_err(|e| TqError::Msg(format!("x f16 alloc: {}", e)))?;
+        crate::cuda::kernels::f32_to_f16(reg, x_gpu, &mut x_f16, x_n)
+            .map_err(|e| TqError::Msg(format!("f32→f16: {}", e)))?;
+
+        // Allocate f16 output
+        let mut out_f16: CudaSlice<half::f16> = stream.alloc_zeros(m * out_f)
+            .map_err(|e| TqError::Msg(format!("out f16 alloc: {}", e)))?;
+
+        // cuBLAS HGEMM: C = X @ W^T
+        // X is [M, K] row-major, W is [N, K] row-major → C = X @ W^T = [M, N]
+        // cuBLAS is column-major: C^T[N, M] = W @ X^T
+        let blas = reg.get_cublas();
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_T,  // W^T in col-major = W transposed
+            transb: cublasOperation_t::CUBLAS_OP_N,  // X in col-major = X^T (row-major X)
+            m: out_f as i32,    // rows of output (cols of C^T = N)
+            n: m as i32,        // cols of output (rows of C^T = M)
+            k: in_f as i32,     // inner dim
+            alpha: half::f16::from_f32(1.0),
+            lda: in_f as i32,   // leading dim of W (stored row-major, so K)
+            ldb: in_f as i32,   // leading dim of X (stored row-major, so K)
+            beta: half::f16::from_f32(0.0),
+            ldc: out_f as i32,  // leading dim of C (col-major, so N)
+        };
+
+        unsafe {
+            blas.gemm(cfg, w_f16_gpu, &x_f16, &mut out_f16)
+                .map_err(|e| TqError::Msg(format!("cuBLAS HGEMM: {}", e)))?;
+        }
+
+        // Convert f16 output → f32
+        let mut out_f32: CudaSlice<f32> = stream.alloc_zeros(m * out_f)
+            .map_err(|e| TqError::Msg(format!("out f32 alloc: {}", e)))?;
+        crate::cuda::kernels::f16_to_f32(reg, &out_f16, &mut out_f32, m * out_f)
+            .map_err(|e| TqError::Msg(format!("f16→f32: {}", e)))?;
+
+        let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+        out_shape.push(out_f);
+        Ok(TqTensor::from_cuda(out_f32, out_shape, stream.clone()))
     }
 }
 

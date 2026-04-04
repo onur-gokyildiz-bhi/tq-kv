@@ -2407,6 +2407,12 @@ pub struct GenericTurboModel {
     /// GPU scalar for RoPE position offset (updated before graph replay).
     #[cfg(feature = "cuda")]
     rope_pos_gpu: Option<cudarc::driver::CudaSlice<i32>>,
+    /// Arena buffer pool for decode (reuses allocs across decode steps without CUDA Graph).
+    #[cfg(feature = "cuda")]
+    arena_pool_buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
+    /// Number of decode steps completed (0 = first decode records, 1+ = arena reuse).
+    #[cfg(feature = "cuda")]
+    arena_decode_count: usize,
 }
 
 fn precompute_freqs_cis(
@@ -2720,6 +2726,10 @@ impl GenericTurboModel {
             graph_input_buffer: None,
             #[cfg(feature = "cuda")]
             rope_pos_gpu: None,
+            #[cfg(feature = "cuda")]
+            arena_pool_buffers: Vec::new(),
+            #[cfg(feature = "cuda")]
+            arena_decode_count: 0,
         };
 
         // Pre-warm weight caches: dequant on CPU + upload to GPU.
@@ -2778,6 +2788,9 @@ impl GenericTurboModel {
                 if let Ok(gpu) = layer.neg_inf.to_device_auto() { layer.neg_inf = gpu; }
             }
             eprintln!("  Persistent tensors uploaded to GPU.");
+
+            // FP16 weight caches for HGEMM are initialized lazily on first large prefill.
+            // Eager warmup would double VRAM usage (f32 + f16 caches).
         }
 
         eprintln!("  Weight caches warmed.");
@@ -2802,13 +2815,15 @@ impl GenericTurboModel {
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
 
-        // Reset graph on new sequence (prefill)
+        // Reset graph + arena on new sequence (prefill)
         #[cfg(feature = "cuda")]
         if seq_len > 1 {
             self.graph_manager.reset();
             self.graph_output = None;
             self.graph_retained_buffers.clear();
             self.graph_pool_buffers.clear();
+            self.arena_pool_buffers.clear();
+            self.arena_decode_count = 0;
         }
 
         // ── CUDA Graph replay ──
@@ -2892,6 +2907,26 @@ impl GenericTurboModel {
         #[cfg(feature = "cuda")]
         if recording {
             crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Recording);
+        }
+
+        // ── Arena buffer reuse for decode (when CUDA Graph is not active) ──
+        #[cfg(feature = "cuda")]
+        let arena_active = seq_len == 1 && !capturing && !recording
+            && !self.graph_manager.is_ready(1)
+            && crate::cuda::kernels::global_registry().is_some();
+        #[cfg(not(feature = "cuda"))]
+        let arena_active = false;
+        #[cfg(feature = "cuda")]
+        if arena_active {
+            if self.arena_decode_count == 0 {
+                // First decode step: record all alloc sizes
+                crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Recording);
+            } else {
+                // Subsequent decode steps: reuse recorded buffers
+                crate::cuda::decode_pool_restore(std::mem::take(&mut self.arena_pool_buffers));
+                crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Arena);
+                crate::cuda::decode_pool_reset_cursor();
+            }
         }
 
         let mask = if seq_len == 1 {
@@ -3238,6 +3273,22 @@ impl GenericTurboModel {
         #[cfg(feature = "cuda")]
         if capturing {
             crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
+        }
+
+        // After forward pass: handle arena mode transitions
+        #[cfg(feature = "cuda")]
+        if arena_active {
+            if self.arena_decode_count == 0 {
+                // First decode done: drain recorded buffers for reuse
+                self.arena_pool_buffers = crate::cuda::decode_pool_drain();
+                crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
+                eprintln!("[arena] recording done: {} buffers saved for reuse", self.arena_pool_buffers.len());
+            } else {
+                // Arena reuse done: drain back to self, reset mode
+                self.arena_pool_buffers = crate::cuda::decode_pool_drain();
+                crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
+            }
+            self.arena_decode_count += 1;
         }
 
         Ok(output)

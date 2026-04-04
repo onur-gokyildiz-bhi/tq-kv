@@ -115,6 +115,13 @@ impl KernelRegistry {
     }
 }
 
+/// Pre-bind CUDA context to current thread.
+/// Call once at the start of each forward pass to make subsequent
+/// bind_to_thread() calls a cheap no-op (context is already current).
+pub fn bind_context(reg: &KernelRegistry) {
+    let _ = reg.stream.context().bind_to_thread();
+}
+
 // ─── Launch configuration helpers ──────────────────────────────
 
 /// Standard 1D launch: n elements, 256 threads per block.
@@ -390,6 +397,46 @@ pub fn silu(
     n: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("elementwise", "silu_f32")?;
+    let cfg = launch_1d(n);
+    let ni = n as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input)
+            .arg(output)
+            .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Convert f32 → f16 on GPU.
+pub fn f32_to_f16(
+    reg: &KernelRegistry,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<half::f16>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("elementwise", "f32_to_f16_kernel")?;
+    let cfg = launch_1d(n);
+    let ni = n as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input)
+            .arg(output)
+            .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Convert f16 → f32 on GPU.
+pub fn f16_to_f32(
+    reg: &KernelRegistry,
+    input: &CudaSlice<half::f16>,
+    output: &mut CudaSlice<f32>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("elementwise", "f16_to_f32_kernel")?;
     let cfg = launch_1d(n);
     let ni = n as i32;
     unsafe {

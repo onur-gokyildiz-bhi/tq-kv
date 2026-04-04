@@ -23,8 +23,12 @@ pub enum PoolMode {
     Off,
     /// Recording: alloc normally + push to pool (warm-up pass before capture)
     Recording,
-    /// Pooled: return pool[cursor++] instead of allocating (capture + replay passes)
+    /// Pooled: return pool[cursor++] instead of allocating (capture + replay passes).
+    /// Also signals KV cache to skip memcpy_htod (graph bakes addresses).
     Pooled,
+    /// Arena: like Pooled (reuses buffers) but does NOT skip KV cache updates.
+    /// Used for normal decode buffer reuse without CUDA Graph capture.
+    Arena,
 }
 
 #[cfg(feature = "cuda")]
@@ -100,7 +104,7 @@ fn pool_alloc_f32(
             DECODE_POOL_BUFFERS.with(|b| b.borrow_mut().push(arc.clone()));
             Ok(arc)
         }
-        PoolMode::Pooled => {
+        PoolMode::Pooled | PoolMode::Arena => {
             let idx = DECODE_POOL_CURSOR.with(|c| {
                 let i = c.get();
                 c.set(i + 1);
@@ -151,7 +155,7 @@ fn pool_clone_htod_i32(
             META_POOL_BUFFERS.with(|b| b.borrow_mut().push(unsafe { std::ptr::read(&buf) }));
             Ok(buf)
         }
-        PoolMode::Pooled => {
+        PoolMode::Pooled | PoolMode::Arena => {
             let idx = META_POOL_CURSOR.with(|c| { let i = c.get(); c.set(i + 1); i });
             META_POOL_BUFFERS.with(|b| {
                 let bufs = b.borrow();
@@ -208,7 +212,7 @@ fn gpu_alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBi
     len: usize,
 ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::result::DriverError> {
     let mode = DECODE_POOL_MODE.with(|m| m.get());
-    if mode == PoolMode::Pooled && std::mem::size_of::<T>() == std::mem::size_of::<f32>() {
+    if (mode == PoolMode::Pooled || mode == PoolMode::Arena) && std::mem::size_of::<T>() == std::mem::size_of::<f32>() {
         // Pooled mode: return a non-owning bitwise copy of pool buffer.
         // Peek at current cursor (from_cuda will advance it).
         let idx = DECODE_POOL_CURSOR.with(|c| c.get());
@@ -1296,7 +1300,7 @@ impl TqTensor {
                 Self { storage: TqStorage::Cuda { data: arc, stream }, shape, dtype: TqDType::F32 }
             }
             #[cfg(feature = "cuda")]
-            PoolMode::Pooled => {
+            PoolMode::Pooled | PoolMode::Arena => {
                 // data is a ptr::read copy sharing pool buffer's device pointer.
                 // mem::forget prevents double-free.
                 std::mem::forget(data);

@@ -404,10 +404,11 @@ impl Engine {
 
             let logits = extract_last_logits(&logits)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            // Apply repetition penalty
-            let logits = if params.repeat_penalty != 1.0 && !all_tokens.is_empty() {
-                let mut logits_vec = logits.to_vec1()
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            // Download logits once — sampler needs CPU data anyway.
+            // Apply repeat penalty on CPU to avoid GPU re-upload round-trip.
+            let mut logits_vec = logits.to_vec1()
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            if params.repeat_penalty != 1.0 && !all_tokens.is_empty() {
                 for &token_id in &all_tokens {
                     let idx = token_id as usize;
                     if idx < logits_vec.len() {
@@ -419,19 +420,15 @@ impl Engine {
                         };
                     }
                 }
-                Tensor::from_vec(logits_vec, logits.shape().to_vec(), &self.device)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?
-            } else {
-                logits
-            };
+            }
+            let logits_cpu = Tensor::from_vec(logits_vec.clone(), logits.shape().to_vec(), &Device::Cpu)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            next_token = sampler.sample(&logits)
+            next_token = sampler.sample(&logits_cpu)
                 .map_err(|e| anyhow::anyhow!("Sampling error: {}", e))?;
 
-            // Quality gate: monitor running PPL
+            // Quality gate: reuse already-downloaded logits (no second DtoH)
             if let Some(ref mut gate) = self.quality_gate {
-                let logits_vec = logits.to_vec1()
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
                 if let Some(ppl) = gate.update(&logits_vec, next_token) {
                     eprintln!(
                         "Warning: Quality gate: PPL {:.1} exceeds threshold {:.1} at token {}. \
