@@ -564,6 +564,43 @@ pub fn tq_fused_decode_attention(
     Ok(())
 }
 
+/// GQA decode attention: fused Q@K^T + scale + softmax + @V.
+/// Handles GQA head mapping internally — no repeat_kv copy needed.
+/// K/V are pre-allocated padded buffers [n_kv_heads, max_seq, head_dim].
+pub fn gqa_decode_attention(
+    reg: &KernelRegistry,
+    q: &CudaSlice<f32>,           // [n_heads, head_dim] (flattened [1, n_heads, 1, head_dim])
+    k: &CudaSlice<f32>,           // [n_kv_heads, max_seq, head_dim]
+    v: &CudaSlice<f32>,           // [n_kv_heads, max_seq, head_dim]
+    output: &mut CudaSlice<f32>,  // [n_heads, head_dim]
+    n_heads: usize,
+    n_kv_heads: usize,
+    seq_len: usize,
+    max_seq: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_attention", "gqa_decode_attention_f32")?;
+    let block_dim = 32u32.min(head_dim as u32);
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let sl = seq_len as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q).arg(k).arg(v).arg(output)
+            .arg(&nh).arg(&nkv).arg(&sl).arg(&ms).arg(&hd).arg(&scale)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Launch hadamard_inverse_batch_f32 for key decompression.
 pub fn hadamard_inverse_batch(
     reg: &KernelRegistry,

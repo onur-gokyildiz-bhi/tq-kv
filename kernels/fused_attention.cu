@@ -316,3 +316,97 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
         }
     }
 }
+
+// ─── GQA Decode Attention (uncompressed FP32 KV cache) ──────
+//
+// Fused Q@K^T + scale + softmax + @V for standard decode (seq_len=1).
+// Handles GQA head mapping internally — NO repeat_kv copy needed.
+//
+// K/V layout: [n_kv_heads, max_seq, head_dim] (pre-allocated padded buffer).
+// Only reads positions [0, seq_len) per head (ignores padding).
+//
+// One block per Q head. Threads cooperate on dot product + V accumulation.
+// Online softmax (numerically stable, single pass).
+extern "C" __global__ void gqa_decode_attention_f32(
+    const float* __restrict__ Q,     // [n_heads, 1, head_dim] (current query)
+    const float* __restrict__ K,     // [n_kv_heads, max_seq, head_dim] (padded KV cache)
+    const float* __restrict__ V,     // [n_kv_heads, max_seq, head_dim]
+    float* __restrict__ output,      // [n_heads, head_dim]
+    const int n_heads,
+    const int n_kv_heads,
+    const int seq_len,               // actual valid length (not max_seq)
+    const int max_seq,               // padded buffer size
+    const int head_dim,
+    const float scale                // 1/sqrt(head_dim)
+) {
+    const int head_idx = blockIdx.x;
+    if (head_idx >= n_heads) return;
+    const int tid = threadIdx.x;
+    const int kv_head = head_idx / (n_heads / n_kv_heads);  // GQA mapping
+
+    // Load query into shared memory
+    __shared__ float s_q[MAX_HEAD_DIM];
+    __shared__ float s_max;
+    __shared__ float s_sum_exp;
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        s_q[d] = Q[head_idx * head_dim + d];
+    }
+    __syncthreads();
+
+    // Per-thread V accumulator
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e10f;
+    float running_sum = 0.0f;
+
+    const float* kv_k = K + kv_head * max_seq * head_dim;
+    const float* kv_v = V + kv_head * max_seq * head_dim;
+
+    // Stream over valid KV positions
+    for (int k = 0; k < seq_len; ++k) {
+        // Cooperative dot product: Q[head] · K[kv_head, k]
+        const float* k_row = kv_k + k * head_dim;
+        float partial_dot = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            partial_dot += s_q[d] * k_row[d];
+        }
+        float score_local = block_reduce_sum(partial_dot) * scale;
+
+        // Broadcast score to all threads via shared memory
+        __shared__ float s_score;
+        if (tid == 0) s_score = score_local;
+        __syncthreads();
+        float score = s_score;
+
+        // Online softmax
+        if (tid == 0) {
+            float new_max = fmaxf(running_max, score);
+            float rescale = expf(running_max - new_max);
+            running_sum = running_sum * rescale + expf(score - new_max);
+            running_max = new_max;
+            s_max = running_max;
+            s_sum_exp = running_sum;
+        }
+        __syncthreads();
+
+        float w = expf(score - s_max);
+        float rescale = expf(running_max - s_max);
+        const float* v_row = kv_v + k * head_dim;
+        for (int i = 0; i < 4; ++i) {
+            int d = tid + i * blockDim.x;
+            if (d < head_dim) {
+                acc[i] = acc[i] * rescale + w * v_row[d];
+            }
+        }
+        running_max = s_max;
+    }
+
+    // Final output: acc / sum_exp
+    float inv_sum = (s_sum_exp > 0.0f) ? 1.0f / s_sum_exp : 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        int d = tid + i * blockDim.x;
+        if (d < head_dim) {
+            output[head_idx * head_dim + d] = acc[i] * inv_sum;
+        }
+    }
+}

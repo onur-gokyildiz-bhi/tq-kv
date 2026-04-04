@@ -2328,8 +2328,7 @@ impl LayerWeights {
                     // Append new K/V to pre-allocated buffers (in-place, zero-copy)
                     gpu_kv.append(&k, &v, seq_len)?;
 
-                    // Use padded K/V with mask (avoids expensive narrow copies).
-                    // Padding positions are masked to -inf before softmax.
+                    // Padded attention with mask (cuBLAS matmul is faster than custom kernel).
                     let k_full = gpu_kv.k_tensor();
                     let v_full = gpu_kv.v_tensor();
                     let kv_mask = gpu_kv.mask_tensor();
