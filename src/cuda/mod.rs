@@ -19,7 +19,7 @@ pub use tensor::{TqTensor, TqStorage};
 #[cfg(feature = "cuda")]
 pub use tensor::{graph_retention_start, graph_retention_drain, gpu_alloc_zeros_pub};
 #[cfg(feature = "cuda")]
-pub use tensor::{PoolMode, decode_pool_set_mode, decode_pool_reset_cursor, decode_pool_drain, decode_pool_restore};
+pub use tensor::{PoolMode, decode_pool_set_mode, decode_pool_mode, decode_pool_reset_cursor, decode_pool_drain, decode_pool_restore};
 pub use ops::TqOps;
 
 /// Result type for tensor operations.

@@ -257,6 +257,46 @@ extern "C" __global__ void copy_with_offsets_f32(
     dst[dst_offset + idx] = src[src_offset + idx];
 }
 
+// ─── KV Cache Append (graph-replay-safe) ────────────────────
+// Copy new K/V tokens into pre-allocated KV cache at dynamic offset.
+// Reads base_dst_offset from a GPU scalar (updated before graph replay).
+// Per-head: dst_off = head_idx * head_stride + *base_offset_ptr + intra_offset
+//
+// This replaces per-head copy_with_offsets calls with a single kernel launch
+// that handles all heads, and reads the sequence position from GPU memory.
+
+extern "C" __global__ void kv_cache_append_f32(
+    const float* __restrict__ src,       // [n_kv_head * n_new * head_dim]
+    float* __restrict__ dst,             // [n_kv_head * max_seq * head_dim]
+    const int* __restrict__ seq_pos_ptr, // GPU scalar: current seq position (tokens already in cache)
+    const int n_kv_head,
+    const int max_seq,
+    const int head_dim,
+    const int n_new                      // number of new tokens (usually 1 for decode)
+) {
+    // Grid: (n_kv_head * n_new * head_dim) threads total
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = n_kv_head * n_new * head_dim;
+    if (idx >= total) return;
+
+    const int seq_pos = *seq_pos_ptr;
+
+    // Decompose flat idx → (head, token_in_new, dim)
+    const int dim_idx = idx % head_dim;
+    const int token_idx = (idx / head_dim) % n_new;
+    const int head_idx = idx / (n_new * head_dim);
+
+    // Source: contiguous [n_kv_head, n_new, head_dim]
+    // (idx is already the linear index into src)
+
+    // Dest: [n_kv_head, max_seq, head_dim] — head h at offset h*max_seq*head_dim
+    const int dst_idx = head_idx * max_seq * head_dim
+                      + (seq_pos + token_idx) * head_dim
+                      + dim_idx;
+
+    dst[dst_idx] = src[idx];
+}
+
 // ─── KV Cache Attention Mask ────────────────────────────────
 // Generates padding mask for pre-allocated KV cache.
 // Positions 0..valid_len → 0.0, positions valid_len..max_seq → -1e10.
@@ -265,12 +305,13 @@ extern "C" __global__ void copy_with_offsets_f32(
 
 extern "C" __global__ void generate_kv_mask_f32(
     float* __restrict__ mask,
-    const int* __restrict__ valid_len_ptr,   // GPU scalar: number of valid positions
-    const int max_seq
+    const int* __restrict__ valid_len_ptr,   // GPU scalar: number of valid positions (pre-append)
+    const int max_seq,
+    const int extra                          // tokens being appended (usually 1), added to *valid_len_ptr
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= max_seq) return;
-    const int valid_len = *valid_len_ptr;
+    const int valid_len = *valid_len_ptr + extra;
     mask[idx] = (idx < valid_len) ? 0.0f : -1e10f;
 }
 

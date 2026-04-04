@@ -51,6 +51,12 @@ pub fn decode_pool_set_mode(mode: PoolMode) {
     META_POOL_CURSOR.with(|c| c.set(0));
 }
 
+/// Get current pool mode.
+#[cfg(feature = "cuda")]
+pub fn decode_pool_mode() -> PoolMode {
+    DECODE_POOL_MODE.with(|m| m.get())
+}
+
 /// Reset pool cursor to 0 (call at start of each forward pass in Pooled mode).
 #[cfg(feature = "cuda")]
 pub fn decode_pool_reset_cursor() {

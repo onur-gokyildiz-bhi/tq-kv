@@ -772,6 +772,34 @@ pub fn copy_with_offsets(
     Ok(())
 }
 
+/// KV cache append: copy new K/V tokens into pre-allocated cache at dynamic GPU offset.
+/// Single kernel launch for all heads (replaces per-head copy_with_offsets loop).
+/// seq_pos_ptr is a GPU i32 scalar: updated before graph replay.
+pub fn kv_cache_append(
+    reg: &KernelRegistry,
+    src: &CudaSlice<f32>,
+    dst: &mut CudaSlice<f32>,
+    seq_pos_ptr: &CudaSlice<i32>,
+    n_kv_head: usize,
+    max_seq: usize,
+    head_dim: usize,
+    n_new: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "kv_cache_append_f32")?;
+    let total = n_kv_head * n_new * head_dim;
+    let nkv = n_kv_head as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    let nn = n_new as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(src).arg(dst).arg(seq_pos_ptr)
+            .arg(&nkv).arg(&ms).arg(&hd).arg(&nn)
+            .launch(launch_1d(total))?;
+    }
+    Ok(())
+}
+
 /// F32 matvec: output = W @ x. No dequant — for pre-dequantized cached weights.
 /// 1 block per output row, 256 threads. Replaces cuBLAS SGEMM for decode (m=1).
 pub fn f32_matvec(
@@ -797,17 +825,20 @@ pub fn f32_matvec(
 
 /// Generate KV cache attention mask: 0.0 for valid positions, -1e10 for padding.
 /// Reads valid_len from a GPU scalar buffer (graph-replay-safe: update the scalar before replay).
+/// Generate KV cache attention mask. `extra` = tokens being appended (added to *valid_len_ptr).
 pub fn generate_kv_mask(
     reg: &KernelRegistry,
     mask: &CudaSlice<f32>,
     valid_len_ptr: &CudaSlice<i32>,
     max_seq: usize,
+    extra: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("tensor_ops", "generate_kv_mask_f32")?;
     let ms = max_seq as i32;
+    let ex = extra as i32;
     unsafe {
         reg.stream.launch_builder(&f)
-            .arg(mask).arg(valid_len_ptr).arg(&ms)
+            .arg(mask).arg(valid_len_ptr).arg(&ms).arg(&ex)
             .launch(launch_1d(max_seq))?;
     }
     Ok(())

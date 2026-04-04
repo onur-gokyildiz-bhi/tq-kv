@@ -1006,28 +1006,50 @@ impl GpuKvCache {
             .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
         let k_src = new_k.cuda_data();
         let v_src = new_v.cuda_data();
-        let k_dst = std::sync::Arc::make_mut(&mut self.k_buf);
-        let v_dst = std::sync::Arc::make_mut(&mut self.v_buf);
 
-        // Copy each head's new tokens to the correct offset in the pre-allocated buffer.
-        // Per-head layout: head h data at [h * max_seq * head_dim .. (h+1) * max_seq * head_dim]
-        for h in 0..self.n_kv_head {
-            let src_off = (h * n_new * self.head_dim) as usize;
-            let dst_off = h * self.max_seq * self.head_dim + self.seq_len * self.head_dim;
-            let count = n_new * self.head_dim;
-            crate::cuda::kernels::copy_with_offsets(reg, k_src, k_dst, count, src_off, dst_off)
-                .map_err(|e| TqError::Msg(format!("kv append k: {}", e)))?;
-            crate::cuda::kernels::copy_with_offsets(reg, v_src, v_dst, count, src_off, dst_off)
-                .map_err(|e| TqError::Msg(format!("kv append v: {}", e)))?;
+        // In Pooled mode (graph capture), skip memcpy_htod — it would be captured as a
+        // graph node with baked host address. The pre-replay code updates valid_len_gpu.
+        // In Recording/Off mode, update normally.
+        #[cfg(feature = "cuda")]
+        let pooled = crate::cuda::decode_pool_mode() == crate::cuda::PoolMode::Pooled;
+        #[cfg(not(feature = "cuda"))]
+        let pooled = false;
+
+        if !pooled {
+            let pos_val = self.seq_len as i32;
+            let _ = self.stream.memcpy_htod(&[pos_val], &mut self.valid_len_gpu);
         }
+
+        // Single kernel per K and V: handles all heads, reads seq_pos from GPU scalar.
+        let k_dst = std::sync::Arc::make_mut(&mut self.k_buf);
+        crate::cuda::kernels::kv_cache_append(
+            reg, k_src, k_dst, &self.valid_len_gpu,
+            self.n_kv_head, self.max_seq, self.head_dim, n_new,
+        ).map_err(|e| TqError::Msg(format!("kv append k: {}", e)))?;
+
+        let v_dst = std::sync::Arc::make_mut(&mut self.v_buf);
+        crate::cuda::kernels::kv_cache_append(
+            reg, v_src, v_dst, &self.valid_len_gpu,
+            self.n_kv_head, self.max_seq, self.head_dim, n_new,
+        ).map_err(|e| TqError::Msg(format!("kv append v: {}", e)))?;
+
         self.seq_len += n_new;
 
-        // Update GPU scalar + regenerate mask (graph-safe: kernel reads from GPU buffer)
-        let new_len = self.seq_len as i32;
-        let _ = self.stream.memcpy_htod(&[new_len], &mut self.valid_len_gpu);
-        let mask_mut = std::sync::Arc::make_mut(&mut self.mask_buf);
-        crate::cuda::kernels::generate_kv_mask(reg, mask_mut, &self.valid_len_gpu, self.max_seq)
-            .map_err(|e| TqError::Msg(format!("kv mask gen: {}", e)))?;
+        if !pooled {
+            // Normal mode: update valid_len to post-append total, generate mask
+            let new_len = self.seq_len as i32;
+            let _ = self.stream.memcpy_htod(&[new_len], &mut self.valid_len_gpu);
+            let mask_mut = std::sync::Arc::make_mut(&mut self.mask_buf);
+            crate::cuda::kernels::generate_kv_mask(reg, mask_mut, &self.valid_len_gpu, self.max_seq, 0)
+                .map_err(|e| TqError::Msg(format!("kv mask gen: {}", e)))?;
+        } else {
+            // Pooled mode (graph capture): valid_len_gpu has pre_pos (set externally).
+            // Generate mask with extra=n_new so valid_len = pre_pos + n_new = post_pos.
+            // This kernel launch IS captured in the graph.
+            let mask_mut = std::sync::Arc::make_mut(&mut self.mask_buf);
+            crate::cuda::kernels::generate_kv_mask(reg, mask_mut, &self.valid_len_gpu, self.max_seq, n_new)
+                .map_err(|e| TqError::Msg(format!("kv mask gen: {}", e)))?;
+        }
         Ok(())
     }
 
@@ -2561,15 +2583,14 @@ impl GenericTurboModel {
                 let _ = reg.stream.memcpy_htod(&[pos_val], rope_buf);
             }
 
-            // Update KV cache mask: valid_len grows by 1 each replay
+            // Update KV cache: set valid_len_gpu to CURRENT seq_len (pre-append position).
+            // The graph's kv_cache_append kernel reads this to know WHERE to write.
+            // After graph replay, seq_len is incremented.
             for layer in &mut self.layers {
                 if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
-                    gpu_kv.seq_len += 1;
-                    let new_len = gpu_kv.seq_len as i32;
-                    let _ = reg.stream.memcpy_htod(&[new_len], &mut gpu_kv.valid_len_gpu);
-                    // Regenerate mask (kernel runs on stream, before graph launch)
-                    let mask_mut = std::sync::Arc::make_mut(&mut gpu_kv.mask_buf);
-                    let _ = crate::cuda::kernels::generate_kv_mask(&reg, mask_mut, &gpu_kv.valid_len_gpu, gpu_kv.max_seq);
+                    // Set pre-append position (where new token goes)
+                    let pre_pos = gpu_kv.seq_len as i32;
+                    let _ = reg.stream.memcpy_htod(&[pre_pos], &mut gpu_kv.valid_len_gpu);
                 }
             }
 
@@ -2580,6 +2601,14 @@ impl GenericTurboModel {
             reg.stream.synchronize()
                 .map_err(|e| TqError::Msg(format!("graph sync: {}", e)))?;
             let _ = reg.stream.context().check_err();
+
+            // Post-replay: increment seq_len (graph appended 1 token to each layer's KV cache)
+            for layer in &mut self.layers {
+                if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
+                    gpu_kv.seq_len += 1;
+                }
+            }
+
             if let Some(ref out) = self.graph_output {
                 return Ok(out.clone());
             }
