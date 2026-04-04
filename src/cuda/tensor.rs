@@ -478,22 +478,11 @@ impl TqTensor {
                 let _ = stream.context().check_err();
                 let mut out_gpu = gpu_alloc_zeros::<f32>(stream,n)
                     .map_err(|e| TqError::Msg(format!("transpose alloc: {}", e)))?;
-                let out_shape_gpu = pool_clone_htod_i32(stream, &new_shape.iter().map(|&x| x as i32).collect::<Vec<_>>())
-                    .map_err(|e| TqError::Msg(format!("transpose: {}", e)))?;
-                let out_strides_gpu = pool_clone_htod_i32(stream, &new_strides)
-                    .map_err(|e| TqError::Msg(format!("transpose: {}", e)))?;
-                let src_strides_gpu = pool_clone_htod_i32(stream, &src_strides)
-                    .map_err(|e| TqError::Msg(format!("transpose: {}", e)))?;
-
-                super::kernels::strided_copy(
+                let shape_i32: Vec<i32> = new_shape.iter().map(|&x| x as i32).collect();
+                super::kernels::strided_copy_args(
                     reg, src.as_ref(), &mut out_gpu, n, rank,
-                    &out_shape_gpu, &out_strides_gpu, &src_strides_gpu, 0,
+                    &shape_i32, &new_strides, &src_strides, 0,
                 ).map_err(|e| TqError::Msg(format!("transpose kernel: {}", e)))?;
-
-                // Leak metadata to prevent cuMemFreeAsync during graph capture
-                std::mem::forget(out_shape_gpu);
-                std::mem::forget(out_strides_gpu);
-                std::mem::forget(src_strides_gpu);
 
                 return Ok(Self::from_cuda(out_gpu, new_shape, stream.clone()));
             }
@@ -557,34 +546,20 @@ impl TqTensor {
                 .map_err(|e| TqError::Msg(format!("narrow alloc: {}", e)))?;
 
             if let Some(reg) = super::kernels::global_registry() {
-                let out_shape_gpu = pool_clone_htod_i32(stream, &new_shape.iter().map(|&x| x as i32).collect::<Vec<_>>())
-                    .map_err(|e| TqError::Msg(format!("narrow shape upload: {}", e)))?;
-                let out_strides_gpu = pool_clone_htod_i32(stream, &out_strides_v)
-                    .map_err(|e| TqError::Msg(format!("narrow strides upload: {}", e)))?;
-
                 let mut real_src_strides = vec![1i32; rank];
                 for i in (0..rank.saturating_sub(1)).rev() {
                     real_src_strides[i] = real_src_strides[i + 1] * self.shape[i + 1] as i32;
                 }
-                let src_strides_gpu = pool_clone_htod_i32(stream, &real_src_strides)
-                    .map_err(|e| TqError::Msg(format!("narrow src strides: {}", e)))?;
-
-                // Source offset = start position in the narrowed dimension
                 let base_offset = if dim == 0 {
                     (start * inner) as i32
                 } else {
-                    // General: start * stride_of_dim_in_source
                     (start as i32) * real_src_strides[dim]
                 };
-
-                super::kernels::strided_copy(
+                let shape_i32: Vec<i32> = new_shape.iter().map(|&x| x as i32).collect();
+                super::kernels::strided_copy_args(
                     reg, src.as_ref(), &mut out_gpu, new_n, rank,
-                    &out_shape_gpu, &out_strides_gpu, &src_strides_gpu, base_offset,
+                    &shape_i32, &out_strides_v, &real_src_strides, base_offset,
                 ).map_err(|e| TqError::Msg(format!("narrow kernel: {}", e)))?;
-
-                std::mem::forget(out_shape_gpu);
-                std::mem::forget(out_strides_gpu);
-                std::mem::forget(src_strides_gpu);
 
                 return Ok(Self::from_cuda(out_gpu, new_shape, stream.clone()));
             }
@@ -747,15 +722,9 @@ impl TqTensor {
         Ok((out, a_str, b_str))
     }
 
-    /// GPU broadcast binary op helper.
+    /// GPU broadcast binary op helper (kernel-arg version, no GPU buffer uploads).
     #[cfg(feature = "cuda")]
-    fn gpu_broadcast_binop(
-        &self, other: &TqTensor,
-        kernel_fn: fn(&super::kernels::KernelRegistry, &cudarc::driver::CudaSlice<f32>, &cudarc::driver::CudaSlice<f32>,
-            &mut cudarc::driver::CudaSlice<f32>, usize, usize,
-            &cudarc::driver::CudaSlice<i32>, &cudarc::driver::CudaSlice<i32>,
-            &cudarc::driver::CudaSlice<i32>, &cudarc::driver::CudaSlice<i32>) -> std::result::Result<(), cudarc::driver::result::DriverError>,
-    ) -> Result<Self> {
+    fn gpu_broadcast_binop(&self, other: &TqTensor, op: &str) -> Result<Self> {
         let (TqStorage::Cuda { data: a, stream }, TqStorage::Cuda { data: b, .. }) = (&self.storage, &other.storage) else {
             tq_bail!("gpu_broadcast_binop: both must be CUDA");
         };
@@ -769,24 +738,12 @@ impl TqTensor {
             out_strides[i] = out_strides[i + 1] * out_shape[i + 1] as i32;
         }
 
-        let os_gpu = pool_clone_htod_i32(stream, &out_shape.iter().map(|&x| x as i32).collect::<Vec<_>>()).map_err(|e| TqError::Msg(format!("{}", e)))?;
-        let ost_gpu = pool_clone_htod_i32(stream, &out_strides).map_err(|e| TqError::Msg(format!("{}", e)))?;
-        let ast_gpu = pool_clone_htod_i32(stream, &a_str).map_err(|e| TqError::Msg(format!("{}", e)))?;
-        let bst_gpu = pool_clone_htod_i32(stream, &b_str).map_err(|e| TqError::Msg(format!("{}", e)))?;
-
-        let _ = stream.context().check_err(); // clear stale errors from CudaSlice drops
+        let _ = stream.context().check_err();
         let mut out = gpu_alloc_zeros::<f32>(stream,n).map_err(|e| TqError::Msg(format!("{}", e)))?;
-        kernel_fn(reg, a.as_ref(), b.as_ref(), &mut out, n, rank, &os_gpu, &ost_gpu, &ast_gpu, &bst_gpu)
-            .map_err(|e| TqError::Msg(format!("broadcast kernel: {}", e)))?;
-
-        // Leak metadata GPU buffers to prevent cuMemFreeAsync during graph capture.
-        // cuMemFreeAsync of graph-internal allocations can set error_state, which causes
-        // subsequent bind_to_thread → check_err to surface stale INVALID_VALUE errors.
-        // Memory is small (16-32 bytes per call) and reclaimed on context destroy.
-        std::mem::forget(os_gpu);
-        std::mem::forget(ost_gpu);
-        std::mem::forget(ast_gpu);
-        std::mem::forget(bst_gpu);
+        super::kernels::broadcast_binop_args(
+            reg, a.as_ref(), b.as_ref(), &mut out, n, rank,
+            &out_strides, &a_str, &b_str, op,
+        ).map_err(|e| TqError::Msg(format!("broadcast {} kernel: {}", op, e)))?;
 
         Ok(Self::from_cuda(out, out_shape, stream.clone()))
     }
@@ -795,7 +752,7 @@ impl TqTensor {
     pub fn broadcast_mul(&self, other: &TqTensor) -> Result<Self> {
         #[cfg(feature = "cuda")]
         if self.is_cuda() && other.is_cuda() {
-            return self.gpu_broadcast_binop(other, super::kernels::gpu_broadcast_mul);
+            return self.gpu_broadcast_binop(other, "mul");
         }
         super::ops::TqOps::broadcast_binop(self, other, |a, b| a * b)
     }
@@ -804,7 +761,7 @@ impl TqTensor {
     pub fn broadcast_add(&self, other: &TqTensor) -> Result<Self> {
         #[cfg(feature = "cuda")]
         if self.is_cuda() && other.is_cuda() {
-            return self.gpu_broadcast_binop(other, super::kernels::gpu_broadcast_add);
+            return self.gpu_broadcast_binop(other, "add");
         }
         super::ops::TqOps::broadcast_binop(self, other, |a, b| a + b)
     }
@@ -813,7 +770,7 @@ impl TqTensor {
     pub fn broadcast_sub(&self, other: &TqTensor) -> Result<Self> {
         #[cfg(feature = "cuda")]
         if self.is_cuda() && other.is_cuda() {
-            return self.gpu_broadcast_binop(other, super::kernels::gpu_broadcast_sub);
+            return self.gpu_broadcast_binop(other, "sub");
         }
         super::ops::TqOps::broadcast_binop(self, other, |a, b| a - b)
     }
@@ -1095,19 +1052,11 @@ impl TqTensor {
                 let _ = stream.context().check_err();
                 let mut out = gpu_alloc_zeros::<f32>(stream,n)
                     .map_err(|e| TqError::Msg(format!("expand alloc (n={}): {}", n, e)))?;
-                let shape_gpu = pool_clone_htod_i32(stream, &target.iter().map(|&x| x as i32).collect::<Vec<_>>())
-                    .map_err(|e| TqError::Msg(format!("expand: {}", e)))?;
-                let tgt_gpu = pool_clone_htod_i32(stream, &tgt_strides)
-                    .map_err(|e| TqError::Msg(format!("expand: {}", e)))?;
-                let src_gpu = pool_clone_htod_i32(stream, &src_strides)
-                    .map_err(|e| TqError::Msg(format!("expand: {}", e)))?;
-
-                super::kernels::strided_copy(reg, src.as_ref(), &mut out, n, rank, &shape_gpu, &tgt_gpu, &src_gpu, 0)
-                    .map_err(|e| TqError::Msg(format!("expand kernel: {}", e)))?;
-
-                std::mem::forget(shape_gpu);
-                std::mem::forget(tgt_gpu);
-                std::mem::forget(src_gpu);
+                let shape_i32: Vec<i32> = target.iter().map(|&x| x as i32).collect();
+                super::kernels::strided_copy_args(
+                    reg, src.as_ref(), &mut out, n, rank,
+                    &shape_i32, &tgt_strides, &src_strides, 0,
+                ).map_err(|e| TqError::Msg(format!("expand kernel: {}", e)))?;
 
                 return Ok(Self::from_cuda(out, target, stream.clone()));
             }

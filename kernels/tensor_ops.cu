@@ -34,6 +34,74 @@ extern "C" __global__ void strided_copy_f32(
     output[idx] = input[src_idx];
 }
 
+// ─── Strided Copy (kernel-arg version, no GPU buffer uploads) ──
+// Same as strided_copy_f32 but shape/strides passed as kernel args.
+// Supports rank 1-6 (covers all LLM tensor shapes).
+// Eliminates 3 clone_htod calls per invocation.
+
+extern "C" __global__ void strided_copy_args_f32(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    const int n,
+    const int rank,
+    // shape (padded to 6)
+    const int s0, const int s1, const int s2, const int s3, const int s4, const int s5,
+    // out_strides (padded to 6)
+    const int os0, const int os1, const int os2, const int os3, const int os4, const int os5,
+    // src_strides (padded to 6)
+    const int ss0, const int ss1, const int ss2, const int ss3, const int ss4, const int ss5,
+    const int src_offset
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    const int out_strides[6] = {os0, os1, os2, os3, os4, os5};
+    const int src_strides[6] = {ss0, ss1, ss2, ss3, ss4, ss5};
+
+    int remaining = idx;
+    int src_idx = src_offset;
+    for (int d = 0; d < rank; d++) {
+        int coord = remaining / out_strides[d];
+        remaining %= out_strides[d];
+        src_idx += coord * src_strides[d];
+    }
+    output[idx] = input[src_idx];
+}
+
+// ─── Broadcast Binary Ops (kernel-arg version) ─────────────────
+// Eliminates 4 clone_htod calls per invocation.
+
+#define BROADCAST_BINOP_ARGS(NAME, OP) \
+extern "C" __global__ void NAME##_args_f32( \
+    const float* __restrict__ a, \
+    const float* __restrict__ b, \
+    float* __restrict__ output, \
+    const int n, const int rank, \
+    const int os0, const int os1, const int os2, const int os3, const int os4, const int os5, \
+    const int as0, const int as1, const int as2, const int as3, const int as4, const int as5, \
+    const int bs0, const int bs1, const int bs2, const int bs3, const int bs4, const int bs5  \
+) { \
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x; \
+    if (idx >= n) return; \
+    const int ost[6] = {os0, os1, os2, os3, os4, os5}; \
+    const int ast[6] = {as0, as1, as2, as3, as4, as5}; \
+    const int bst[6] = {bs0, bs1, bs2, bs3, bs4, bs5}; \
+    int remaining = idx; \
+    int a_idx = 0, b_idx = 0; \
+    for (int d = 0; d < rank; d++) { \
+        int coord = remaining / ost[d]; \
+        remaining %= ost[d]; \
+        a_idx += coord * ast[d]; \
+        b_idx += coord * bst[d]; \
+    } \
+    output[idx] = a[a_idx] OP b[b_idx]; \
+}
+
+BROADCAST_BINOP_ARGS(broadcast_add, +)
+BROADCAST_BINOP_ARGS(broadcast_mul, *)
+BROADCAST_BINOP_ARGS(broadcast_sub, -)
+BROADCAST_BINOP_ARGS(broadcast_div, /)
+
 // ─── Concatenate Along Dimension ─────────────────────────────
 // Copies N source buffers into one output buffer along a given dimension.
 // Each source has the same shape except at the cat dimension.

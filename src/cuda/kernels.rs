@@ -675,6 +675,65 @@ pub fn strided_copy(
     Ok(())
 }
 
+/// Strided copy with shape/strides as kernel args (no GPU buffer uploads).
+/// Eliminates 3 clone_htod calls per invocation.
+pub fn strided_copy_args(
+    reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>,
+    n: usize, rank: usize,
+    out_shape: &[i32], out_strides: &[i32], src_strides: &[i32], src_offset: i32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tensor_ops", "strided_copy_args_f32")?;
+    let ni = n as i32; let ri = rank as i32;
+    let pad = |s: &[i32]| -> [i32; 6] {
+        let mut a = [0i32; 6];
+        for (i, &v) in s.iter().enumerate().take(6) { a[i] = v; }
+        a
+    };
+    let sh = pad(out_shape);
+    let os = pad(out_strides);
+    let ss = pad(src_strides);
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(input).arg(output).arg(&ni).arg(&ri)
+            .arg(&sh[0]).arg(&sh[1]).arg(&sh[2]).arg(&sh[3]).arg(&sh[4]).arg(&sh[5])
+            .arg(&os[0]).arg(&os[1]).arg(&os[2]).arg(&os[3]).arg(&os[4]).arg(&os[5])
+            .arg(&ss[0]).arg(&ss[1]).arg(&ss[2]).arg(&ss[3]).arg(&ss[4]).arg(&ss[5])
+            .arg(&src_offset)
+            .launch(launch_1d(n))?;
+    }
+    Ok(())
+}
+
+/// Broadcast binary op with strides as kernel args (no GPU buffer uploads).
+/// Eliminates 4 clone_htod calls per invocation. `op`: "add", "mul", "sub", "div".
+pub fn broadcast_binop_args(
+    reg: &KernelRegistry, a: &CudaSlice<f32>, b: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>, n: usize, rank: usize,
+    out_strides: &[i32], a_strides: &[i32], b_strides: &[i32],
+    op: &str,
+) -> Result<(), DriverError> {
+    let kernel_name = format!("broadcast_{}_args_f32", op);
+    let f = reg.get_fn("tensor_ops", &kernel_name)?;
+    let ni = n as i32; let ri = rank as i32;
+    let pad = |s: &[i32]| -> [i32; 6] {
+        let mut a = [0i32; 6];
+        for (i, &v) in s.iter().enumerate().take(6) { a[i] = v; }
+        a
+    };
+    let os = pad(out_strides);
+    let ast = pad(a_strides);
+    let bs = pad(b_strides);
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(a).arg(b).arg(output).arg(&ni).arg(&ri)
+            .arg(&os[0]).arg(&os[1]).arg(&os[2]).arg(&os[3]).arg(&os[4]).arg(&os[5])
+            .arg(&ast[0]).arg(&ast[1]).arg(&ast[2]).arg(&ast[3]).arg(&ast[4]).arg(&ast[5])
+            .arg(&bs[0]).arg(&bs[1]).arg(&bs[2]).arg(&bs[3]).arg(&bs[4]).arg(&bs[5])
+            .launch(launch_1d(n))?;
+    }
+    Ok(())
+}
+
 pub fn gpu_exp(reg: &KernelRegistry, input: &CudaSlice<f32>, output: &mut CudaSlice<f32>, n: usize) -> Result<(), DriverError> {
     let f = reg.get_fn("tensor_ops", "exp_f32")?;
     unsafe { reg.stream.launch_builder(&f).arg(input).arg(output).arg(&(n as i32)).launch(launch_1d(n))?; }
