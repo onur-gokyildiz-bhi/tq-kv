@@ -105,11 +105,7 @@ fn pool_alloc_f32(
             Ok(arc)
         }
         PoolMode::Pooled | PoolMode::Arena => {
-            let idx = DECODE_POOL_CURSOR.with(|c| {
-                let i = c.get();
-                c.set(i + 1);
-                i
-            });
+            let idx = DECODE_POOL_CURSOR.with(|c| c.get());
             let arc = DECODE_POOL_BUFFERS.with(|b| {
                 let bufs = b.borrow();
                 if idx < bufs.len() {
@@ -120,13 +116,18 @@ fn pool_alloc_f32(
             });
             match arc {
                 Some(a) => {
-                    // Verify size matches (sanity check)
+                    // Only advance cursor on successful pool hit
+                    DECODE_POOL_CURSOR.with(|c| c.set(idx + 1));
                     if a.len() != len {
                         eprintln!("[pool] WARNING: size mismatch at idx {}: pool={} requested={}", idx, a.len(), len);
+                        // Reallocate with correct size instead of using wrong buffer
+                        let buf = gpu_alloc_zeros::<f32>(stream, len)?;
+                        return Ok(std::sync::Arc::new(buf));
                     }
                     Ok(a)
                 }
                 None => {
+                    // Pool miss: DON'T advance cursor (keeps sequence aligned)
                     eprintln!("[pool] WARNING: pool exhausted at idx {} (pool has {} buffers), allocating fresh",
                         idx, DECODE_POOL_BUFFERS.with(|b| b.borrow().len()));
                     let buf = gpu_alloc_zeros::<f32>(stream, len)?;
@@ -386,16 +387,26 @@ impl TqTensor {
     }
 
     /// Borrow underlying f32 slice.
-    /// For CUDA tensors: downloads to CPU transparently (allocates).
+    /// For CUDA tensors: downloads to CPU into a thread-local cache.
+    /// The cache is reused across calls (previous data is dropped).
+    /// WARNING: The returned slice is only valid until the NEXT as_slice() call
+    /// on ANY CUDA tensor from this thread. Use to_vec1() for persistent data.
     pub fn as_slice(&self) -> &[f32] {
         match &self.storage {
             TqStorage::Cpu(data) => data,
             #[cfg(feature = "cuda")]
             TqStorage::Cuda { data, stream } => {
-                // Transitional auto-download for ops without GPU dispatch yet.
+                thread_local! {
+                    static CACHE: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+                }
                 let cpu_data = stream.clone_dtoh(data.as_ref()).expect("as_slice GPU download failed");
-                let leaked: &'static [f32] = Box::leak(cpu_data.into_boxed_slice());
-                leaked
+                CACHE.with(|c| {
+                    let mut cache = c.borrow_mut();
+                    *cache = cpu_data;
+                    // SAFETY: cache lives in thread-local, reference valid until next borrow_mut.
+                    // Caller must not hold reference across another as_slice() call.
+                    unsafe { std::slice::from_raw_parts(cache.as_ptr(), cache.len()) }
+                })
             }
         }
     }
