@@ -893,10 +893,14 @@ fn compute_smooth_scales(
 // ============================================================
 
 /// Maximum sequence length for pre-allocated KV cache.
-/// Determines GPU memory usage: 2 * n_layers * n_kv_head * MAX_KV_SEQ * head_dim * 4 bytes.
-/// For Qwen2-7B (n_kv_head=4, head_dim=128, 28 layers): 2*28*4*4096*128*4 = 3.5GB.
-/// Use a smaller default to be practical on 10GB GPUs.
-const MAX_KV_SEQ: usize = 2048;
+/// Maximum pre-allocated KV cache sequence length (for graph-compatible padded attention).
+/// Configurable via TQ_MAX_SEQ env var. Default 128 is efficient for benchmarks.
+/// For production: set higher (e.g., 2048 or 4096).
+fn get_max_kv_seq() -> usize {
+    std::env::var("TQ_MAX_SEQ").ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128)
+}
 
 /// Pre-allocated GPU KV cache for CUDA Graph compatible inference.
 ///
@@ -1987,7 +1991,7 @@ impl LayerWeights {
                 // Initialize GPU KV cache on first decode step (graph mode only)
                 if self.gpu_kv_cache.is_none() {
                     if let Some(reg) = crate::cuda::kernels::global_registry() {
-                        match GpuKvCache::new(reg.stream.clone(), self.n_kv_head, self.head_dim, MAX_KV_SEQ) {
+                        match GpuKvCache::new(reg.stream.clone(), self.n_kv_head, self.head_dim, get_max_kv_seq()) {
                             Ok(mut cache) => {
                                 // Seed with prefill KV data from the CPU-path kv_cache
                                 if let Some((prev_k, prev_v)) = &self.kv_cache {
@@ -2006,8 +2010,8 @@ impl LayerWeights {
                                     }
                                 }
                                 eprintln!("[gpu-kv] L{}: pre-allocated {}×{}×{} = {:.1}MB per K/V (seeded {})",
-                                    self.layer_idx, self.n_kv_head, MAX_KV_SEQ, self.head_dim,
-                                    (self.n_kv_head * MAX_KV_SEQ * self.head_dim * 4) as f64 / 1e6,
+                                    self.layer_idx, self.n_kv_head, get_max_kv_seq(), self.head_dim,
+                                    (self.n_kv_head * get_max_kv_seq() * self.head_dim * 4) as f64 / 1e6,
                                     cache.seq_len);
                                 self.gpu_kv_cache = Some(cache);
                             }
