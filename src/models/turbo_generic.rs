@@ -13,6 +13,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Thread-local raw device pointer for RoPE position GPU scalar.
+/// Points to the model's rope_pos_gpu CudaSlice. Updated before capture/replay.
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static ROPE_POS_GPU_PTR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 use crate::backend::ComputeBackend;
 use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
 use crate::cuda::Result;
@@ -1112,20 +1119,37 @@ impl LayerWeights {
         let (_b_sz, n_head, seq_len, _head_dim) = x.dims4()?;
 
         // GPU path: single kernel launch, no shape/stride metadata uploads.
-        // Replaces ~6 tensor-op kernels + ~12 clone_htod transfers per call.
         #[cfg(feature = "cuda")]
         if x.is_cuda() && self.cos.is_cuda() {
             if let Some(reg) = crate::cuda::kernels::global_registry() {
                 let mut x_out = x.clone();
-                let rope_fn = match self.rope_style {
-                    RopeStyle::Halved => crate::cuda::kernels::rope_halved,
-                    RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved,
-                };
-                rope_fn(
-                    reg, x_out.cuda_data_mut(),
-                    self.cos.cuda_data(), self.sin.cuda_data(),
-                    seq_len, n_head, self.head_dim, self.rope_dim, index_pos,
-                ).map_err(|e| TqError::Msg(format!("rope GPU: {}", e)))?;
+                // Check if graph-mode GPU position scalar is available
+                let gpu_pos_ref = ROPE_POS_GPU_PTR.with(|p| p.get());
+                if gpu_pos_ref != 0 {
+                    // Graph mode: read position from GPU scalar
+                    // SAFETY: pointer set by forward() before capture, valid for model lifetime
+                    let gpu_slice = unsafe { &*(gpu_pos_ref as *const cudarc::driver::CudaSlice<i32>) };
+                    let rope_with_gpu = match self.rope_style {
+                        RopeStyle::Halved => crate::cuda::kernels::rope_halved_with_gpu_pos,
+                        RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_with_gpu_pos,
+                    };
+                    rope_with_gpu(
+                        reg, x_out.cuda_data_mut(),
+                        self.cos.cuda_data(), self.sin.cuda_data(),
+                        seq_len, n_head, self.head_dim, self.rope_dim, index_pos,
+                        Some(gpu_slice),
+                    ).map_err(|e| TqError::Msg(format!("rope GPU: {}", e)))?;
+                } else {
+                    let rope_fn = match self.rope_style {
+                        RopeStyle::Halved => crate::cuda::kernels::rope_halved,
+                        RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved,
+                    };
+                    rope_fn(
+                        reg, x_out.cuda_data_mut(),
+                        self.cos.cuda_data(), self.sin.cuda_data(),
+                        seq_len, n_head, self.head_dim, self.rope_dim, index_pos,
+                    ).map_err(|e| TqError::Msg(format!("rope GPU: {}", e)))?;
+                }
                 return Ok(x_out);
             }
         }
@@ -2108,9 +2132,11 @@ pub struct GenericTurboModel {
     #[cfg(feature = "cuda")]
     graph_pool_buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
     /// GPU buffer address of the input embedding (for updating before graph replay).
-    /// This is the same CudaSlice that the graph reads from — memcpy new embedding here.
     #[cfg(feature = "cuda")]
     graph_input_buffer: Option<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
+    /// GPU scalar for RoPE position offset (updated before graph replay).
+    #[cfg(feature = "cuda")]
+    rope_pos_gpu: Option<cudarc::driver::CudaSlice<i32>>,
 }
 
 fn precompute_freqs_cis(
@@ -2420,6 +2446,8 @@ impl GenericTurboModel {
             graph_pool_buffers: Vec::new(),
             #[cfg(feature = "cuda")]
             graph_input_buffer: None,
+            #[cfg(feature = "cuda")]
+            rope_pos_gpu: None,
         };
 
         // Pre-warm weight caches: dequant on CPU + upload to GPU.
@@ -2527,6 +2555,12 @@ impl GenericTurboModel {
                 }
             }
 
+            // Update RoPE position GPU scalar
+            if let Some(ref mut rope_buf) = self.rope_pos_gpu {
+                let pos_val = index_pos as i32;
+                let _ = reg.stream.memcpy_htod(&[pos_val], rope_buf);
+            }
+
             // Update KV cache mask: valid_len grows by 1 each replay
             for layer in &mut self.layers {
                 if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
@@ -2558,6 +2592,24 @@ impl GenericTurboModel {
         // should_capture already incremented eager_count; check if this was the recording pass.
         #[cfg(feature = "cuda")]
         let recording = !capturing && self.graph_manager.is_recording_pass();
+        #[cfg(feature = "cuda")]
+        if recording || capturing {
+            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                let pos_val = index_pos as i32;
+                let _ = reg.stream.context().check_err();
+                if self.rope_pos_gpu.is_none() {
+                    if let Ok(buf) = reg.stream.clone_htod(&[pos_val]) {
+                        self.rope_pos_gpu = Some(buf);
+                    }
+                } else if let Some(ref mut existing) = self.rope_pos_gpu {
+                    let _ = reg.stream.memcpy_htod(&[pos_val], existing);
+                }
+                // Set thread-local raw pointer for apply_rotary_emb to read
+                if let Some(ref buf) = self.rope_pos_gpu {
+                    ROPE_POS_GPU_PTR.with(|p| p.set(buf as *const _ as u64));
+                }
+            }
+        }
         #[cfg(feature = "cuda")]
         if recording {
             crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Recording);

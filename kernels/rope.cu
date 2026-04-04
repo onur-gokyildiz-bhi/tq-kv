@@ -25,7 +25,8 @@ extern "C" __global__ void rope_halved_f32(
     const int n_heads,
     const int head_dim,
     const int rope_dim,                  // typically == head_dim
-    const int pos_offset                 // global position offset (if positions is NULL)
+    const int pos_offset,                // global position offset (if positions is NULL)
+    const int* __restrict__ pos_offset_gpu // GPU scalar: overrides pos_offset when non-NULL (graph-replay-safe)
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -34,7 +35,8 @@ extern "C" __global__ void rope_halved_f32(
     if (token_idx >= n_tokens) return;
 
     const int half = rope_dim / 2;
-    const int pos = positions ? positions[token_idx] : (token_idx + pos_offset);
+    const int effective_offset = pos_offset_gpu ? *pos_offset_gpu : pos_offset;
+    const int pos = positions ? positions[token_idx] : (token_idx + effective_offset);
 
     float* head_ptr = x + (token_idx * n_heads + head_idx) * head_dim;
     const float* cos_ptr = cos_table + pos * half;
@@ -65,7 +67,8 @@ extern "C" __global__ void rope_interleaved_f32(
     const int n_heads,
     const int head_dim,
     const int rope_dim,
-    const int pos_offset
+    const int pos_offset,
+    const int* __restrict__ pos_offset_gpu // GPU scalar: overrides pos_offset when non-NULL (graph-replay-safe)
 ) {
     const int token_idx = blockIdx.x;
     const int head_idx  = blockIdx.y;
@@ -74,7 +77,8 @@ extern "C" __global__ void rope_interleaved_f32(
     if (token_idx >= n_tokens) return;
 
     const int n_pairs = rope_dim / 2;
-    const int pos = positions ? positions[token_idx] : (token_idx + pos_offset);
+    const int effective_offset = pos_offset_gpu ? *pos_offset_gpu : pos_offset;
+    const int pos = positions ? positions[token_idx] : (token_idx + effective_offset);
 
     float* head_ptr = x + (token_idx * n_heads + head_idx) * head_dim;
     const float* cos_ptr = cos_table + pos * n_pairs;

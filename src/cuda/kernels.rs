@@ -515,6 +515,22 @@ pub fn rope_halved(
     rope_dim: usize,
     pos_offset: usize,
 ) -> Result<(), DriverError> {
+    rope_halved_with_gpu_pos(reg, x, cos, sin, n_tokens, n_heads, head_dim, rope_dim, pos_offset, None)
+}
+
+/// Launch rope_halved_f32 with optional GPU position scalar (graph-replay-safe).
+pub fn rope_halved_with_gpu_pos(
+    reg: &KernelRegistry,
+    x: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos_offset: usize,
+    pos_offset_gpu: Option<&CudaSlice<i32>>,
+) -> Result<(), DriverError> {
     let f = reg.get_fn("rope", "rope_halved_f32")?;
     let total_half_pairs = n_tokens * n_heads * (rope_dim / 2);
     let cfg = launch_1d(total_half_pairs);
@@ -524,14 +540,21 @@ pub fn rope_halved(
     let rd = rope_dim as i32;
     let po = pos_offset as i32;
     let null_positions: u64 = 0;
+    let null_gpu_pos: u64 = 0;
     unsafe {
-        reg.stream.launch_builder(&f)
-            .arg(x)
-            .arg(cos)
-            .arg(sin)
-            .arg(&null_positions)
-            .arg(&nt).arg(&nh).arg(&hd).arg(&rd).arg(&po)
-            .launch(cfg)?;
+        if let Some(gpu_ptr) = pos_offset_gpu {
+            reg.stream.launch_builder(&f)
+                .arg(x).arg(cos).arg(sin).arg(&null_positions)
+                .arg(&nt).arg(&nh).arg(&hd).arg(&rd).arg(&po)
+                .arg(gpu_ptr)
+                .launch(cfg)?;
+        } else {
+            reg.stream.launch_builder(&f)
+                .arg(x).arg(cos).arg(sin).arg(&null_positions)
+                .arg(&nt).arg(&nh).arg(&hd).arg(&rd).arg(&po)
+                .arg(&null_gpu_pos)
+                .launch(cfg)?;
+        }
     }
     Ok(())
 }
@@ -548,6 +571,22 @@ pub fn rope_interleaved(
     rope_dim: usize,
     pos_offset: usize,
 ) -> Result<(), DriverError> {
+    rope_interleaved_with_gpu_pos(reg, x, cos, sin, n_tokens, n_heads, head_dim, rope_dim, pos_offset, None)
+}
+
+/// Launch rope_interleaved_f32 with optional GPU position scalar.
+pub fn rope_interleaved_with_gpu_pos(
+    reg: &KernelRegistry,
+    x: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_tokens: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos_offset: usize,
+    pos_offset_gpu: Option<&CudaSlice<i32>>,
+) -> Result<(), DriverError> {
     let f = reg.get_fn("rope", "rope_interleaved_f32")?;
     let total_half_pairs = n_tokens * n_heads * (rope_dim / 2);
     let cfg = launch_1d(total_half_pairs);
@@ -557,14 +596,21 @@ pub fn rope_interleaved(
     let rd = rope_dim as i32;
     let po = pos_offset as i32;
     let null_positions: u64 = 0;
+    let null_gpu_pos: u64 = 0;
     unsafe {
-        reg.stream.launch_builder(&f)
-            .arg(x)
-            .arg(cos)
-            .arg(sin)
-            .arg(&null_positions)
-            .arg(&nt).arg(&nh).arg(&hd).arg(&rd).arg(&po)
-            .launch(cfg)?;
+        if let Some(gpu_ptr) = pos_offset_gpu {
+            reg.stream.launch_builder(&f)
+                .arg(x).arg(cos).arg(sin).arg(&null_positions)
+                .arg(&nt).arg(&nh).arg(&hd).arg(&rd).arg(&po)
+                .arg(gpu_ptr)
+                .launch(cfg)?;
+        } else {
+            reg.stream.launch_builder(&f)
+                .arg(x).arg(cos).arg(sin).arg(&null_positions)
+                .arg(&nt).arg(&nh).arg(&hd).arg(&rd).arg(&po)
+                .arg(&null_gpu_pos)
+                .launch(cfg)?;
+        }
     }
     Ok(())
 }
