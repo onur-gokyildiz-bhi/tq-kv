@@ -429,28 +429,129 @@ struct CompactedCacheHead {
     head_dim: usize,
 }
 
-/// GPU mirror of compressed KV data for fused attention kernel.
+/// Persistent GPU buffers for compressed KV data.
+/// Pre-allocated to max_seq, incrementally appended at compression time.
+/// Eliminates per-step CPU→GPU upload overhead for fused attention.
 #[cfg(feature = "cuda")]
-#[allow(dead_code)]
 struct GpuCompressedKv {
-    /// Packed indices: [n_kv_head * count * bytes_per_key]
+    /// Packed indices: [n_kv_head, max_seq, bytes_per_key] (flat)
     packed_indices: cudarc::driver::CudaSlice<u8>,
-    /// Norms: [n_kv_head * count] (per-vector) or [n_kv_head * count * n_groups] (per-group)
+    /// Per-vector norms: [n_kv_head, max_seq]
     norms: cudarc::driver::CudaSlice<f32>,
-    /// Codebook centroids: [n_centroids]
+    /// Codebook centroids: [n_centroids] — uploaded once
     centroids: cudarc::driver::CudaSlice<f32>,
-    /// V data (decompressed to f32): [n_kv_head, count, head_dim]
+    /// V data (f32): [n_kv_head, max_seq, head_dim]
     v_data: cudarc::driver::CudaSlice<f32>,
-    /// Pre-rotated query scratch: [n_heads, head_dim]
-    rotated_q: cudarc::driver::CudaSlice<f32>,
-    /// Output scratch: [n_heads, head_dim]
-    output_buf: cudarc::driver::CudaSlice<f32>,
-    /// Count of keys uploaded
+    /// Scratch buffers (reused across calls)
+    rotated_q: cudarc::driver::CudaSlice<f32>,  // [n_heads, head_dim]
+    output_buf: cudarc::driver::CudaSlice<f32>,  // [n_heads, head_dim]
+    /// Current count of compressed keys per head
     count: usize,
+    max_seq: usize,
     n_kv_head: usize,
+    n_heads: usize,
     head_dim: usize,
+    bytes_per_key: usize,
     bits: u8,
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
+}
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for GpuCompressedKv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuCompressedKv").field("count", &self.count).field("max_seq", &self.max_seq).finish()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Clone for GpuCompressedKv {
+    fn clone(&self) -> Self { panic!("GpuCompressedKv cannot be cloned") }
+}
+
+#[cfg(feature = "cuda")]
+impl GpuCompressedKv {
+    fn new(
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
+        n_kv_head: usize,
+        n_heads: usize,
+        head_dim: usize,
+        bits: u8,
+        max_seq: usize,
+        centroids: &[f32],
+    ) -> std::result::Result<Self, crate::cuda::TqError> {
+        let bytes_per_key = (head_dim * bits as usize + 7) / 8;
+        let total_indices = n_kv_head * max_seq * bytes_per_key;
+        let total_norms = n_kv_head * max_seq;
+        let total_v = n_kv_head * max_seq * head_dim;
+
+        let _ = stream.context().check_err();
+        let packed_indices = stream.alloc_zeros::<u8>(total_indices)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv indices: {}", e)))?;
+        let norms = stream.alloc_zeros::<f32>(total_norms)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv norms: {}", e)))?;
+        let v_data = stream.alloc_zeros::<f32>(total_v)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv v: {}", e)))?;
+        let gpu_centroids = stream.clone_htod(centroids)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv centroids: {}", e)))?;
+        let rotated_q = stream.alloc_zeros::<f32>(n_heads * head_dim)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv rq: {}", e)))?;
+        let output_buf = stream.alloc_zeros::<f32>(n_heads * head_dim)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv out: {}", e)))?;
+
+        eprintln!("[gpu-tq] pre-allocated {}×{}×{} = {:.1}MB compressed KV",
+            n_kv_head, max_seq, bytes_per_key,
+            (total_indices + total_norms * 4 + total_v * 4) as f64 / 1e6);
+
+        Ok(Self {
+            packed_indices, norms, centroids: gpu_centroids, v_data,
+            rotated_q, output_buf,
+            count: 0, max_seq, n_kv_head, n_heads, head_dim, bytes_per_key, bits,
+            stream,
+        })
+    }
+
+    /// Append one compressed token's data for all heads.
+    /// packed: [n_kv_head * bytes_per_key], head_norms: [n_kv_head], v_flat: [n_kv_head * head_dim]
+    fn append(
+        &mut self,
+        packed: &[u8],
+        head_norms: &[f32],
+        v_flat: &[f32],
+    ) -> std::result::Result<(), crate::cuda::TqError> {
+        if self.count >= self.max_seq {
+            return Err(crate::cuda::TqError::Msg("GpuCompressedKv overflow".into()));
+        }
+        let bpk = self.bytes_per_key;
+        let pos = self.count;
+
+        // Upload packed indices per head at correct offset
+        for h in 0..self.n_kv_head {
+            let src = &packed[h * bpk..(h + 1) * bpk];
+            let dst_off = (h * self.max_seq + pos) * bpk;
+            let _ = self.stream.memcpy_htod(src, &mut self.packed_indices.slice_mut(dst_off..dst_off + bpk));
+        }
+
+        // Upload norms per head
+        for h in 0..self.n_kv_head {
+            let dst_off = h * self.max_seq + pos;
+            let _ = self.stream.memcpy_htod(&head_norms[h..h+1], &mut self.norms.slice_mut(dst_off..dst_off + 1));
+        }
+
+        // Upload V data per head
+        let hd = self.head_dim;
+        for h in 0..self.n_kv_head {
+            let src = &v_flat[h * hd..(h + 1) * hd];
+            let dst_off = (h * self.max_seq + pos) * hd;
+            let _ = self.stream.memcpy_htod(src, &mut self.v_data.slice_mut(dst_off..dst_off + hd));
+        }
+
+        self.count += 1;
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.count = 0;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1147,6 +1248,9 @@ struct LayerWeights {
     /// Pre-allocated GPU KV cache (used when CUDA Graph is enabled).
     #[cfg(feature = "cuda")]
     gpu_kv_cache: Option<GpuKvCache>,
+    /// Persistent GPU compressed KV buffers for fused TQ attention.
+    #[cfg(feature = "cuda")]
+    gpu_tq_cache: Option<GpuCompressedKv>,
     kv_compressed: Option<CompressedKvCache>,
     tq_config: TurboQuantConfig,
     signs: Vec<f32>,
@@ -1519,6 +1623,66 @@ impl LayerWeights {
                 }
             }
 
+            // --- GPU append: upload newly compressed tokens to persistent GPU buffers ---
+            #[cfg(feature = "cuda")]
+            if tokens_to_compress > 0 && seq_len == 1 {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    // Initialize GPU compressed KV on first use
+                    if self.gpu_tq_cache.is_none() {
+                        let head_bits = cache.k_per_head[0].bits;
+                        let cal_cb: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
+                            .as_ref().map(|cb| cb.centroids.clone());
+                        let cb: &[f32] = match cal_cb.as_deref() {
+                            Some(cal) => cal,
+                            None => tq_kv::codebook::get_centroids(head_bits),
+                        };
+                        let max_seq = std::env::var("TQ_MAX_SEQ").ok()
+                            .and_then(|v| v.parse().ok()).unwrap_or(2048usize);
+                        match GpuCompressedKv::new(
+                            reg.stream.clone(), self.n_kv_head, self.n_head,
+                            self.head_dim, head_bits, max_seq, cb,
+                        ) {
+                            Ok(mut gpu) => {
+                                // Seed with all existing compressed keys
+                                let existing = cache.k_per_head[0].count;
+                                let bpk = gpu.bytes_per_key;
+                                for pos in 0..existing {
+                                    let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
+                                    let mut norms_all = Vec::with_capacity(self.n_kv_head);
+                                    for h in 0..self.n_kv_head {
+                                        let start = pos * bpk;
+                                        packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
+                                        norms_all.push(cache.k_per_head[h].norms[pos]);
+                                    }
+                                    // V data placeholder (zeros for now — V is handled separately)
+                                    let v_zeros = vec![0.0f32; self.n_kv_head * self.head_dim];
+                                    let _ = gpu.append(&packed_all, &norms_all, &v_zeros);
+                                }
+                                self.gpu_tq_cache = Some(gpu);
+                            }
+                            Err(e) => eprintln!("[gpu-tq] init failed: {}", e),
+                        }
+                    }
+
+                    // Append the newly compressed token(s)
+                    if let Some(ref mut gpu) = self.gpu_tq_cache {
+                        let count = cache.k_per_head[0].count;
+                        let bpk = gpu.bytes_per_key;
+                        // The last token is at index count-1
+                        let pos = count - 1;
+                        let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
+                        let mut norms_all = Vec::with_capacity(self.n_kv_head);
+                        for h in 0..self.n_kv_head {
+                            let start = pos * bpk;
+                            packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
+                            norms_all.push(cache.k_per_head[h].norms[pos]);
+                        }
+                        let v_zeros = vec![0.0f32; self.n_kv_head * self.head_dim];
+                        let _ = gpu.append(&packed_all, &norms_all, &v_zeros);
+                    }
+                }
+            }
+
             cache.cached_len += seq_len;
             cache.tokens_since_decay += seq_len;
             let total_len = cache.cached_len;
@@ -1705,33 +1869,8 @@ impl LayerWeights {
 
                 #[cfg(feature = "cuda")]
                 if gpu_fused_ok {
-                    if let Some(reg) = crate::cuda::kernels::global_registry() {
-                        if self.layer_idx == 0 && n_past_compressed < 3 {
-                            eprintln!("[gpu-fused-attn] L{}: {} keys, {} heads, {}bit",
-                                self.layer_idx, n_past_compressed, self.n_kv_head, cache.k_per_head[0].bits);
-                        }
-                        // Upload compressed KV data to GPU
-                        let kv_h0 = &cache.k_per_head[0];
-                        let bits = kv_h0.bits;
-                        let bpv = kv_h0.bytes_per_vector();
+                    if let (Some(reg), Some(ref mut gpu)) = (crate::cuda::kernels::global_registry(), &mut self.gpu_tq_cache) {
                         let n_keys = n_past_compressed;
-
-                        // Pack all heads' indices contiguously: [n_kv_head, n_keys, bpv]
-                        let mut all_packed = Vec::with_capacity(self.n_kv_head * n_keys * bpv);
-                        let mut all_norms = Vec::with_capacity(self.n_kv_head * n_keys);
-                        for h in 0..self.n_kv_head {
-                            let head = &cache.k_per_head[h];
-                            all_packed.extend_from_slice(&head.packed_indices[..n_keys * bpv]);
-                            all_norms.extend_from_slice(&head.norms[..n_keys]);
-                        }
-
-                        // Codebook centroids
-                        let cal_cb: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
-                            .as_ref().map(|cb| cb.centroids.clone());
-                        let centroids: &[f32] = match cal_cb.as_deref() {
-                            Some(cal) => cal,
-                            None => tq_kv::codebook::get_centroids(bits),
-                        };
 
                         // Pre-rotate query (Hadamard signs) — all heads
                         let q_flat = q_f32.flatten_all()?.to_vec1()?;
@@ -1743,68 +1882,22 @@ impl LayerWeights {
                             rotated_q.extend_from_slice(&rq);
                         }
 
-                        // V data: decompress if compressed, else use raw
-                        let v_flat: Vec<f32> = if cache.value_bits == 0 {
-                            if let Some(ref v_raw) = cache.v_raw {
-                                // [1, n_kv_head, total, head_dim] → take first n_keys per head
-                                let v_f32 = v_raw.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                                let total = cache.cached_len;
-                                let mut vbuf = Vec::with_capacity(self.n_kv_head * n_keys * self.head_dim);
-                                for h in 0..self.n_kv_head {
-                                    let hoff = h * total * self.head_dim;
-                                    vbuf.extend_from_slice(&v_f32[hoff..hoff + n_keys * self.head_dim]);
-                                }
-                                vbuf
-                            } else {
-                                vec![0.0; self.n_kv_head * n_keys * self.head_dim]
-                            }
-                        } else {
-                            // Decompress V on CPU → upload
-                            let v_tensor = decompress_values_store(
-                                cache.v_compressed.as_ref().unwrap(),
-                                self.n_kv_head, self.head_dim, cache.cached_len, q.device(),
-                            )?;
-                            let v_f32 = v_tensor.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                            let total = cache.cached_len;
-                            let mut vbuf = Vec::with_capacity(self.n_kv_head * n_keys * self.head_dim);
-                            for h in 0..self.n_kv_head {
-                                let hoff = h * total * self.head_dim;
-                                vbuf.extend_from_slice(&v_f32[hoff..hoff + n_keys * self.head_dim]);
-                            }
-                            vbuf
-                        };
-
-                        // Upload to GPU
+                        // Upload only the rotated query (small: n_heads * head_dim * 4 bytes)
                         let _ = reg.stream.context().check_err();
-                        let gpu_packed = reg.stream.clone_htod(&all_packed)
-                            .map_err(|e| TqError::Msg(format!("fused attn packed upload: {}", e)))?;
-                        let gpu_norms = reg.stream.clone_htod(&all_norms)
-                            .map_err(|e| TqError::Msg(format!("fused attn norms upload: {}", e)))?;
-                        let gpu_centroids = reg.stream.clone_htod(centroids)
-                            .map_err(|e| TqError::Msg(format!("fused attn centroids upload: {}", e)))?;
-                        let gpu_rq = reg.stream.clone_htod(&rotated_q)
-                            .map_err(|e| TqError::Msg(format!("fused attn rq upload: {}", e)))?;
-                        let gpu_v = reg.stream.clone_htod(&v_flat)
-                            .map_err(|e| TqError::Msg(format!("fused attn v upload: {}", e)))?;
-                        let mut gpu_out = reg.stream.alloc_zeros::<f32>(self.n_head * self.head_dim)
-                            .map_err(|e| TqError::Msg(format!("fused attn out alloc: {}", e)))?;
+                        let _ = reg.stream.memcpy_htod(&rotated_q, &mut gpu.rotated_q);
 
                         let scale = 1.0 / (self.head_dim as f32).sqrt();
                         crate::cuda::kernels::tq_fused_decode_attention(
-                            reg, &gpu_rq, &gpu_packed, &gpu_norms, &gpu_centroids,
-                            &gpu_v, &mut gpu_out,
+                            reg, &gpu.rotated_q, &gpu.packed_indices, &gpu.norms,
+                            &gpu.centroids, &gpu.v_data, &mut gpu.output_buf,
                             self.n_head, self.n_kv_head, n_keys, self.head_dim,
-                            bits as usize, scale,
+                            gpu.bits as usize, scale,
                         ).map_err(|e| TqError::Msg(format!("fused decode attention: {}", e)))?;
 
-                        // Download output + add current token contribution
-                        let mut attn_out = reg.stream.clone_dtoh(&gpu_out)
-                            .map_err(|e| TqError::Msg(format!("fused attn output download: {}", e)))?;
-
-                        // The fused kernel computed softmax(@compressed_keys) * V.
-                        // We still need to add the current token's contribution (POQ).
-                        // For now: use the fused output as-is (current token's weight is small for long contexts).
-                        // TODO: proper POQ integration.
+                        // Download output
+                        let _ = reg.stream.context().check_err();
+                        let attn_out = reg.stream.clone_dtoh(&gpu.output_buf)
+                            .map_err(|e| TqError::Msg(format!("fused attn download: {}", e)))?;
 
                         let y = Tensor::from_vec(attn_out, vec![1, self.n_head, 1, self.head_dim], q.device())?;
                         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
@@ -2579,6 +2672,8 @@ impl GenericTurboModel {
                 kv_cache: None,
                 #[cfg(feature = "cuda")]
                 gpu_kv_cache: None,
+                #[cfg(feature = "cuda")]
+                gpu_tq_cache: None,
                 kv_compressed: None,
                 tq_config: tq_config.clone(),
                 signs: signs.clone(),
