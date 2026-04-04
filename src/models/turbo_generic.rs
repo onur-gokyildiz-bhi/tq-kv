@@ -1504,8 +1504,13 @@ impl LayerWeights {
                     cache.v_raw = Some(v.clone());
                 }
             } else {
-                // Compressed path: quantize per head × position
-                let v_f32 = v.to_dtype(DType::F32)?.contiguous()?.flatten_all()?.to_vec1()?;
+                // Compressed path: quantize per head × position.
+                // Use as_slice() for CPU or direct download for GPU (avoids extra allocs).
+                let v_f32: Vec<f32> = if v.is_cuda() {
+                    v.to_vec1()?
+                } else {
+                    v.as_slice().to_vec()
+                };
                 let v_store = cache.v_compressed.as_mut().unwrap();
                 match v_store {
                     CompressedValueStore::Bits8(v_comp) => {
@@ -1565,7 +1570,12 @@ impl LayerWeights {
                     &k
                 };
                 let k_to_compress = k_source.narrow(2, compress_start, tokens_to_compress)?;
-                let k_flat = k_to_compress.contiguous()?.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                // Direct download: skip contiguous+to_dtype+flatten chain for decode (already f32 contiguous)
+                let k_flat: Vec<f32> = if k_to_compress.is_cuda() {
+                    k_to_compress.contiguous()?.to_vec1()?
+                } else {
+                    k_to_compress.contiguous()?.as_slice().to_vec()
+                };
                 let hdim = self.head_dim;
                 let use_grouped = layer_tq_config.group_size > 0 && hdim % layer_tq_config.group_size == 0;
                 for h in 0..self.n_kv_head {
