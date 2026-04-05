@@ -214,15 +214,13 @@ fn gpu_alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBi
 ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::result::DriverError> {
     let mode = DECODE_POOL_MODE.with(|m| m.get());
     if (mode == PoolMode::Pooled || mode == PoolMode::Arena) && std::mem::size_of::<T>() == std::mem::size_of::<f32>() {
-        // Pooled mode: return a non-owning bitwise copy of pool buffer.
+        // Pooled/Arena mode: return a non-owning bitwise copy of pool buffer.
         // Peek at current cursor (from_cuda will advance it).
         let idx = DECODE_POOL_CURSOR.with(|c| c.get());
         let result = DECODE_POOL_BUFFERS.with(|b| {
             let bufs = b.borrow();
             if idx < bufs.len() {
                 // SAFETY: CudaSlice<f32> and CudaSlice<T> have identical layout
-                // (T is phantom, struct is {ptr, len, events, stream}).
-                // The copy is non-owning — from_cuda will mem::forget it.
                 let copy = unsafe {
                     std::ptr::read(
                         &*bufs[idx] as *const cudarc::driver::CudaSlice<f32>
@@ -387,26 +385,18 @@ impl TqTensor {
     }
 
     /// Borrow underlying f32 slice.
-    /// For CUDA tensors: downloads to CPU into a thread-local cache.
-    /// The cache is reused across calls (previous data is dropped).
-    /// WARNING: The returned slice is only valid until the NEXT as_slice() call
-    /// on ANY CUDA tensor from this thread. Use to_vec1() for persistent data.
+    /// For CUDA tensors: downloads to CPU transparently.
+    /// NOTE: Uses Box::leak for lifetime — each call leaks memory.
+    /// Use to_vec1() when possible. This is a transitional API for ops
+    /// without GPU dispatch.
     pub fn as_slice(&self) -> &[f32] {
         match &self.storage {
             TqStorage::Cpu(data) => data,
             #[cfg(feature = "cuda")]
             TqStorage::Cuda { data, stream } => {
-                thread_local! {
-                    static CACHE: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
-                }
                 let cpu_data = stream.clone_dtoh(data.as_ref()).expect("as_slice GPU download failed");
-                CACHE.with(|c| {
-                    let mut cache = c.borrow_mut();
-                    *cache = cpu_data;
-                    // SAFETY: cache lives in thread-local, reference valid until next borrow_mut.
-                    // Caller must not hold reference across another as_slice() call.
-                    unsafe { std::slice::from_raw_parts(cache.as_ptr(), cache.len()) }
-                })
+                let leaked: &'static [f32] = Box::leak(cpu_data.into_boxed_slice());
+                leaked
             }
         }
     }

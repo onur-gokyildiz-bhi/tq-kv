@@ -2917,9 +2917,9 @@ impl GenericTurboModel {
 
         // ── Arena buffer reuse for decode (when CUDA Graph is not active) ──
         #[cfg(feature = "cuda")]
-        let arena_active = seq_len == 1 && !capturing && !recording
-            && !self.graph_manager.is_ready(1)
-            && crate::cuda::kernels::global_registry().is_some();
+        // Arena disabled: buffer reuse causes PPL corruption (cursor/pointer tracking issue).
+        // TODO: Fix arena buffer tracking to maintain correctness.
+        let arena_active = false;
         #[cfg(not(feature = "cuda"))]
         let arena_active = false;
         #[cfg(feature = "cuda")]
