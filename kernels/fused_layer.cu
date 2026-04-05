@@ -228,7 +228,6 @@ extern "C" __global__ void fused_q4km_down_residual_f32(
     if (row >= hidden_dim) return;
     const int tid = threadIdx.x;
 
-    // Q4_K_M dot product: W_down[row] @ intermediate
     const int n_superblocks = intermediate_dim / QK_K;
     const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
     const uint8_t* w_row = W_down + row * bytes_per_row;
