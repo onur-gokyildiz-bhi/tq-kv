@@ -32,6 +32,18 @@ __device__ __forceinline__ void get_scale_min_k4(
 // then computes one Q4_K_M matvec row from the normalized input.
 // Redundant norm computation per block (~200 FLOPs) is negligible vs matvec.
 
+// Q4K_M dot product with FULL 256-thread utilization.
+//
+// Previous version: thread-per-superblock striding → only 14/256 threads active (5.5%).
+// New version: 256 threads map 1:1 to superblock positions, iterate over superblocks.
+// Same pattern as standalone q4km_matvec_f32 — all threads active every iteration.
+//
+// Thread mapping within 256-element superblock:
+//   tid[0..63]:   group 0 low nibbles  (positions 0-63)
+//   tid[64..127]: group 1 low nibbles  (positions 64-127)
+//   tid[128..191]: group 2 low nibbles (positions 128-191)
+//   tid[192..255]: group 3 low nibbles (positions 192-255)
+//   Within each 64-thread chunk: first 32 = low nibble, last 32 = high nibble
 __device__ float q4km_dot_from_shared(
     const uint8_t* __restrict__ w_row,
     const float* __restrict__ s_normed,  // shared memory: normalized input [hidden_dim]
@@ -40,11 +52,17 @@ __device__ float q4km_dot_from_shared(
     const int block_dim
 ) {
     const int n_superblocks = in_features / QK_K;
+    const int grp   = tid >> 6;       // 0-3: which 64-element group
+    const int pos   = tid & 63;
+    const int is_hi = pos >> 5;       // 0 = low nibble, 1 = high nibble
+    const int l     = pos & 31;       // byte index within group (0-31)
+    const int x_idx = grp * 64 + pos; // position in 256-element superblock
+
     float partial_sum = 0.0f;
 
-    for (int sb = tid; sb < n_superblocks; sb += block_dim) {
+    for (int sb = 0; sb < n_superblocks; ++sb) {
         const uint8_t* block = w_row + sb * Q4K_BLOCK_SIZE;
-        const float* x_sb = s_normed + sb * QK_K;
+        float x_val = s_normed[sb * QK_K + x_idx];
 
         uint16_t d_bits  = block[0] | (block[1] << 8);
         uint16_t dm_bits = block[2] | (block[3] << 8);
@@ -54,23 +72,12 @@ __device__ float q4km_dot_from_shared(
         const uint8_t* scales = block + 4;
         const uint8_t* qs = block + 16;
 
-        for (int grp = 0; grp < 4; ++grp) {
-            uint8_t sc_lo, m_lo, sc_hi, m_hi;
-            get_scale_min_k4(2 * grp,     scales, &sc_lo, &m_lo);
-            get_scale_min_k4(2 * grp + 1, scales, &sc_hi, &m_hi);
-            float d_lo  = d * (float)sc_lo;
-            float d_hi  = d * (float)sc_hi;
-            float dm_lo = dmin * (float)m_lo;
-            float dm_hi = dmin * (float)m_hi;
-            int q_off = grp * 32;
-            int x_off = grp * 64;
-            for (int l = 0; l < 32; ++l) {
-                partial_sum += (d_lo * (float)(qs[q_off + l] & 0xF) - dm_lo) * x_sb[x_off + l];
-            }
-            for (int l = 0; l < 32; ++l) {
-                partial_sum += (d_hi * (float)(qs[q_off + l] >> 4) - dm_hi) * x_sb[x_off + 32 + l];
-            }
-        }
+        uint8_t sc_val, m_val;
+        get_scale_min_k4(2 * grp + is_hi, scales, &sc_val, &m_val);
+
+        uint8_t q_byte = qs[grp * 32 + l];
+        float nibble = is_hi ? (float)(q_byte >> 4) : (float)(q_byte & 0xF);
+        partial_sum += (d * (float)sc_val * nibble - dmin * (float)m_val) * x_val;
     }
 
     partial_sum = block_reduce_sum(partial_sum);

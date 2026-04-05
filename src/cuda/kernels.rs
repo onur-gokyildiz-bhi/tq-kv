@@ -283,8 +283,8 @@ pub fn q4km_matvec(
     in_features: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("qmatmul", "q4km_matvec_f32")?;
-    // Multi-row: 2 rows per block → ceil(out_features / 2) blocks
-    let rows_per_block = 2u32;
+    // Multi-row: 4 rows per block → ceil(out_features / 4) blocks
+    let rows_per_block = 4u32;
     let n_blocks = (out_features as u32 + rows_per_block - 1) / rows_per_block;
     let cfg = LaunchConfig {
         grid_dim: (n_blocks, 1, 1),

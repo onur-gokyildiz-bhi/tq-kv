@@ -41,7 +41,7 @@ __device__ __forceinline__ void get_scale_min_k4(
 // Multi-row Q4K_M matvec: 2 output rows per block, shared memory x cache.
 // x loaded ONCE per superblock, reused for both rows → halves x bandwidth.
 // 256 threads map 1:1 to the 256 values per superblock.
-#define MATVEC_ROWS_PER_BLOCK 2
+#define MATVEC_ROWS_PER_BLOCK 4
 
 extern "C" __global__ void q4km_matvec_f32(
     const uint8_t* __restrict__ W_packed,  // [out_features * bytes_per_row]

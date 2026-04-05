@@ -1845,6 +1845,35 @@ impl TqTensor {
             tq_bail!("qmatmul_gpu: batch>1 not yet supported (use cuBLAS path)");
         }
     }
+
+    /// Like qmatmul_gpu but writes into a pre-allocated output buffer (zero alloc).
+    /// Used by DecodeScratch to avoid GPU allocation during decode.
+    pub fn qmatmul_gpu_into(
+        &self,
+        w_gpu: &cudarc::driver::CudaSlice<u8>,
+        dtype: crate::gguf::GgmlDType,
+        out_features: usize,
+        in_features: usize,
+        output: &mut cudarc::driver::CudaSlice<f32>,
+    ) -> Result<()> {
+        let TqStorage::Cuda { data: x, .. } = &self.storage else {
+            tq_bail!("qmatmul_gpu_into: input not on GPU");
+        };
+        let reg = super::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+        match dtype {
+            crate::gguf::GgmlDType::Q4K => {
+                super::kernels::q4km_matvec(reg, w_gpu, x, output, out_features, in_features)
+                    .map_err(|e| TqError::Msg(format!("q4km_matvec: {}", e)))?;
+            }
+            crate::gguf::GgmlDType::Q8_0 => {
+                super::kernels::q8_0_matvec(reg, w_gpu, x, output, out_features, in_features)
+                    .map_err(|e| TqError::Msg(format!("q8_0_matvec: {}", e)))?;
+            }
+            _ => tq_bail!("qmatmul_gpu_into: unsupported dtype {:?}", dtype),
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

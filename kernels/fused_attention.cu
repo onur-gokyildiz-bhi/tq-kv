@@ -378,24 +378,26 @@ extern "C" __global__ void gqa_decode_attention_f32(
         __syncthreads();
         float score = s_score;
 
-        // Online softmax
+        // Online softmax — broadcast rescale factor via shared memory
+        // so all threads (including tid==0) apply the same correction.
+        __shared__ float s_rescale;
         if (tid == 0) {
             float new_max = fmaxf(running_max, score);
-            float rescale = expf(running_max - new_max);
-            running_sum = running_sum * rescale + expf(score - new_max);
+            float rf = expf(running_max - new_max);
+            running_sum = running_sum * rf + expf(score - new_max);
             running_max = new_max;
-            s_max = running_max;
+            s_max = new_max;
             s_sum_exp = running_sum;
+            s_rescale = rf;
         }
         __syncthreads();
 
         float w = expf(score - s_max);
-        float rescale = expf(running_max - s_max);
         const float* v_row = kv_v + k * head_dim;
         for (int i = 0; i < 4; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
-                acc[i] = acc[i] * rescale + w * v_row[d];
+                acc[i] = acc[i] * s_rescale + w * v_row[d];
             }
         }
         running_max = s_max;
