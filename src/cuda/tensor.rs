@@ -1541,6 +1541,7 @@ impl TqTensor {
         let n_tokens = self.elem_count() / hidden;
         let n = n_tokens * hidden;
 
+
         let mut out = gpu_alloc_zeros::<f32>(stream,n)
             .map_err(|e| TqError::Msg(format!("rms_norm alloc: {}", e)))?;
 
