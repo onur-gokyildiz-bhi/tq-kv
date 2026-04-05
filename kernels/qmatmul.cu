@@ -38,9 +38,11 @@ __device__ __forceinline__ void get_scale_min_k4(
 // W layout: [out_features, in_features] packed as Q4_K_M blocks.
 // in_features must be divisible by QK_K (256).
 
-// Optimized Q4K_M matvec: all 256 threads active, shared memory x cache.
-// Each block processes one output row. 256 threads map 1:1 to the 256
-// values within each superblock (4 groups × 64 values).
+// Multi-row Q4K_M matvec: 2 output rows per block, shared memory x cache.
+// x loaded ONCE per superblock, reused for both rows → halves x bandwidth.
+// 256 threads map 1:1 to the 256 values per superblock.
+#define MATVEC_ROWS_PER_BLOCK 2
+
 extern "C" __global__ void q4km_matvec_f32(
     const uint8_t* __restrict__ W_packed,  // [out_features * bytes_per_row]
     const float* __restrict__ x,           // [in_features]
@@ -48,57 +50,67 @@ extern "C" __global__ void q4km_matvec_f32(
     const int out_features,
     const int in_features
 ) {
-    const int row = blockIdx.x;
-    if (row >= out_features) return;
+    const int base_row = blockIdx.x * MATVEC_ROWS_PER_BLOCK;
     const int tid = threadIdx.x;
 
     const int n_superblocks = in_features / QK_K;
     const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
-    const uint8_t* w_row = W_packed + row * bytes_per_row;
 
-    // Shared memory: cache x for current superblock
     __shared__ float s_x[QK_K];
 
-    // Thread → (group, position) mapping, constant across superblocks
-    const int grp = tid >> 6;       // 0-3
-    const int pos = tid & 63;       // 0-63
-    const int is_hi = pos >> 5;     // 0 or 1
-    const int l = pos & 31;         // 0-31
+    const int grp = tid >> 6;
+    const int pos = tid & 63;
+    const int is_hi = pos >> 5;
+    const int l = pos & 31;
+    const int x_idx = grp * 64 + pos;  // position in 256-element superblock
 
-    float partial_sum = 0.0f;
+    float sums[MATVEC_ROWS_PER_BLOCK] = {0.0f};
 
     for (int sb = 0; sb < n_superblocks; ++sb) {
-        const uint8_t* block = w_row + sb * Q4K_BLOCK_SIZE;
-
-        // Cooperative x load: 256 threads load 256 floats
+        // Cooperative x load: 256 threads load 256 floats (ONCE for all rows)
         s_x[tid] = x[sb * QK_K + tid];
         __syncthreads();
 
-        // Decode block header (broadcast read, L1 cached)
-        uint16_t d_bits  = block[0] | (block[1] << 8);
-        uint16_t dm_bits = block[2] | (block[3] << 8);
-        float d    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
-        float dmin = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+        float x_val = s_x[x_idx];
 
-        const uint8_t* scales = block + 4;
-        const uint8_t* qs = block + 16;
+        // Process each row: read weight, dequant, multiply with cached x
+        #pragma unroll
+        for (int r = 0; r < MATVEC_ROWS_PER_BLOCK; ++r) {
+            int row = base_row + r;
+            if (row >= out_features) break;
 
-        // Each thread dequantizes and multiplies its one value
-        uint8_t sc_val, m_val;
-        get_scale_min_k4(2 * grp + is_hi, scales, &sc_val, &m_val);
+            const uint8_t* block = W_packed + row * bytes_per_row + sb * Q4K_BLOCK_SIZE;
 
-        uint8_t q_byte = qs[grp * 32 + l];
-        float nibble = is_hi ? (float)(q_byte >> 4) : (float)(q_byte & 0xF);
-        float w_val = d * (float)sc_val * nibble - dmin * (float)m_val;
-        partial_sum += w_val * s_x[grp * 64 + pos];
+            uint16_t d_bits  = block[0] | (block[1] << 8);
+            uint16_t dm_bits = block[2] | (block[3] << 8);
+            float d    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+            float dmin = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+            const uint8_t* scales = block + 4;
+            const uint8_t* qs = block + 16;
+
+            uint8_t sc_val, m_val;
+            get_scale_min_k4(2 * grp + is_hi, scales, &sc_val, &m_val);
+
+            uint8_t q_byte = qs[grp * 32 + l];
+            float nibble = is_hi ? (float)(q_byte >> 4) : (float)(q_byte & 0xF);
+            sums[r] += (d * (float)sc_val * nibble - dmin * (float)m_val) * x_val;
+        }
 
         __syncthreads();
     }
 
-    // Block-level reduction
-    partial_sum = block_reduce_sum(partial_sum);
-    if (tid == 0) {
-        output[row] = partial_sum;
+    // Reduce and write each row
+    #pragma unroll
+    for (int r = 0; r < MATVEC_ROWS_PER_BLOCK; ++r) {
+        int row = base_row + r;
+        if (row >= out_features) break;
+        float result = block_reduce_sum(sums[r]);
+        if (tid == 0) {
+            output[row] = result;
+        }
+        // sync between reductions (block_reduce_sum uses shared memory)
+        if (r < MATVEC_ROWS_PER_BLOCK - 1) __syncthreads();
     }
 }
 
