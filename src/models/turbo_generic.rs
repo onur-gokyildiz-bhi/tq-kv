@@ -1057,6 +1057,9 @@ struct DecodeScratch {
     attn_out: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
     /// Wo projection output (qmatmul_gpu_into writes here)
     wo_out: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    /// Combined residual + attn — ping-pong pair.
+    /// Even layers write to [0], odd to [1]. Previous layer's output is read from the other.
+    combined_bufs: [std::sync::Arc<cudarc::driver::CudaSlice<f32>>; 2],
     /// Cached stream for tensor wrapping
     stream: std::sync::Arc<cudarc::driver::CudaStream>,
     /// Dimension metadata
@@ -1093,9 +1096,11 @@ impl DecodeScratch {
         let intermediate_buf = alloc("intermediate", intermediate_dim)?;
         let attn_out = alloc("attn_out", q_out)?;
         let wo_out = alloc("wo_out", hidden_dim)?;
-        let total_kb = (q_out * 2 + k_out + v_out + intermediate_dim + hidden_dim) * 4 / 1024;
-        eprintln!("  DecodeScratch allocated: qkv={}+{}+{} attn={} wo={} inter={} ({}KB)",
-            q_out, k_out, v_out, q_out, hidden_dim, intermediate_dim, total_kb);
+        let combined_a = alloc("combined_a", hidden_dim)?;
+        let combined_b = alloc("combined_b", hidden_dim)?;
+        let total_kb = (q_out * 2 + k_out + v_out + intermediate_dim + hidden_dim * 3) * 4 / 1024;
+        eprintln!("  DecodeScratch allocated: qkv={}+{}+{} attn={} wo={} comb={}x2 inter={} ({}KB)",
+            q_out, k_out, v_out, q_out, hidden_dim, hidden_dim, intermediate_dim, total_kb);
         Ok(Self {
             q_buf: std::sync::Arc::new(q_buf),
             k_buf: std::sync::Arc::new(k_buf),
@@ -1103,6 +1108,7 @@ impl DecodeScratch {
             intermediate_buf: std::sync::Arc::new(intermediate_buf),
             attn_out: std::sync::Arc::new(attn_out),
             wo_out: std::sync::Arc::new(wo_out),
+            combined_bufs: [std::sync::Arc::new(combined_a), std::sync::Arc::new(combined_b)],
             stream,
             q_out,
             k_out,
@@ -3403,46 +3409,62 @@ impl GenericTurboModel {
                         let attn_f32 = attn.to_dtype(DType::F32)?;
                         let residual_f32 = x.to_dtype(DType::F32)?;
 
-                        // Pre-combine residual + attn_out (GPU elementwise add)
-                        let mut combined = (residual_f32 + attn_f32)?;
-
                         // Kernel 2: norm + gate/up + silu*mul
                         // Kernel 3: down projection + residual add
                         if let Some(ref mut scratch) = decode_scratch {
-                            // DecodeScratch path: reuse intermediate buffer
+                            // DecodeScratch path: zero-alloc combined + intermediate.
+                            // Ping-pong: even layers → bufs[0], odd → bufs[1].
+                            // Previous layer's output lives in the OTHER buffer (held by x/layer_in).
+                            let ci = layer_idx & 1;
+                            // 1. combined = residual + attn
+                            {
+                                let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
+                                    .expect("scratch combined ping-pong aliased");
+                                crate::cuda::kernels::add(
+                                    reg, residual_f32.cuda_data(), attn_f32.cuda_data(),
+                                    comb, hidden_dim,
+                                ).map_err(|e| TqError::Msg(format!("scratch add: {}", e)))?;
+                            }
+                            // 2. fused gateup+silu into intermediate
                             {
                                 let inter = Arc::get_mut(&mut scratch.intermediate_buf)
                                     .expect("scratch intermediate_buf aliased");
                                 crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
-                                    reg, combined.cuda_data(), layer.ffn_norm.weight.cuda_data(),
+                                    reg, &*scratch.combined_bufs[ci], layer.ffn_norm.weight.cuda_data(),
                                     wgate_gpu, wup_gpu,
                                     inter,
                                     hidden_dim, intermediate_dim,
                                     layer.ffn_norm.eps as f32,
                                 ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
                             }
-                            crate::cuda::kernels::fused_q4km_down_residual(
-                                reg, wdown_gpu, &*scratch.intermediate_buf, combined.cuda_data_mut(),
-                                hidden_dim, intermediate_dim,
-                            ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
-                        } else {
-                            // Fallback: allocate fresh intermediate buffer
-                            let mut intermediate: cudarc::driver::CudaSlice<f32> =
-                                stream.alloc_zeros(intermediate_dim)
-                                    .map_err(|e| TqError::Msg(format!("fused MLP alloc: {}", e)))?;
-                            crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
-                                reg, combined.cuda_data(), layer.ffn_norm.weight.cuda_data(),
-                                wgate_gpu, wup_gpu,
-                                &mut intermediate,
-                                hidden_dim, intermediate_dim,
-                                layer.ffn_norm.eps as f32,
-                            ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
-                            crate::cuda::kernels::fused_q4km_down_residual(
-                                reg, wdown_gpu, &intermediate, combined.cuda_data_mut(),
-                                hidden_dim, intermediate_dim,
-                            ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+                            // 3. down+residual writes back into combined
+                            {
+                                let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
+                                    .expect("scratch combined ping-pong aliased");
+                                crate::cuda::kernels::fused_q4km_down_residual(
+                                    reg, wdown_gpu, &*scratch.intermediate_buf, comb,
+                                    hidden_dim, intermediate_dim,
+                                ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+                            }
+                            return Ok(Tensor::from_cuda_arc(Arc::clone(&scratch.combined_bufs[ci]),
+                                vec![1, 1, hidden_dim], scratch.stream.clone()));
                         }
-
+                        // Fallback: allocate combined + intermediate
+                        let mut combined = (residual_f32 + attn_f32)?;
+                        let mut intermediate: cudarc::driver::CudaSlice<f32> =
+                            stream.alloc_zeros(intermediate_dim)
+                                .map_err(|e| TqError::Msg(format!("fused MLP alloc: {}", e)))?;
+                        crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
+                            reg, combined.cuda_data(), layer.ffn_norm.weight.cuda_data(),
+                            wgate_gpu, wup_gpu,
+                            &mut intermediate,
+                            hidden_dim, intermediate_dim,
+                            layer.ffn_norm.eps as f32,
+                        ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
+                        crate::cuda::kernels::fused_q4km_down_residual(
+                            reg, wdown_gpu, &intermediate, combined.cuda_data_mut(),
+                            hidden_dim, intermediate_dim,
+                        ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
                         Ok(combined)
                     })(); // MLP borrows released
 

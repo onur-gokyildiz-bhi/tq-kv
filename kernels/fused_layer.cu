@@ -223,6 +223,7 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_f32(
 
 // ─── Kernel 4: Fused Down Projection + Residual Add ──────────
 // Grid: hidden_dim blocks, 256 threads
+// Thread-per-superblock striding for down projection (intermediate_dim=18944 → 74 sb).
 
 extern "C" __global__ void fused_q4km_down_residual_f32(
     const uint8_t* __restrict__ W_down,
