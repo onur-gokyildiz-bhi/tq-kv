@@ -1147,12 +1147,20 @@ impl GpuKvCache {
         }
 
         // Single kernel per K and V: handles all heads, reads seq_pos from GPU scalar.
+        let k_refs = std::sync::Arc::strong_count(&self.k_buf);
+        if k_refs > 1 {
+            eprintln!("[WARN] GpuKvCache::append k_buf Arc ref_count={} — external alias will see stale data", k_refs);
+        }
         let k_dst = std::sync::Arc::make_mut(&mut self.k_buf);
         crate::cuda::kernels::kv_cache_append(
             reg, k_src, k_dst, &self.valid_len_gpu,
             self.n_kv_head, self.max_seq, self.head_dim, n_new,
         ).map_err(|e| TqError::Msg(format!("kv append k: {}", e)))?;
 
+        let v_refs = std::sync::Arc::strong_count(&self.v_buf);
+        if v_refs > 1 {
+            eprintln!("[WARN] GpuKvCache::append v_buf Arc ref_count={} — external alias will see stale data", v_refs);
+        }
         let v_dst = std::sync::Arc::make_mut(&mut self.v_buf);
         crate::cuda::kernels::kv_cache_append(
             reg, v_src, v_dst, &self.valid_len_gpu,
@@ -1348,6 +1356,7 @@ impl LayerWeights {
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
+        let used_fused_qkv = pre_qkv.is_some();
         let (mut q, mut k, mut v) = if let Some(qkv) = pre_qkv {
             qkv
         } else {
@@ -1378,15 +1387,18 @@ impl LayerWeights {
             }
         }
 
-        // Apply biases if present (Qwen2 has them, Llama/Phi/Gemma don't)
-        if let Some(bq) = &self.attention_bq {
-            q = q.broadcast_add(bq)?;
-        }
-        if let Some(bk) = &self.attention_bk {
-            k = k.broadcast_add(bk)?;
-        }
-        if let Some(bv) = &self.attention_bv {
-            v = v.broadcast_add(bv)?;
+        // Apply biases if present (Qwen2 has them, Llama/Phi/Gemma don't).
+        // Skip if pre_qkv was provided — fused kernel already includes bias.
+        if !used_fused_qkv {
+            if let Some(bq) = &self.attention_bq {
+                q = q.broadcast_add(bq)?;
+            }
+            if let Some(bk) = &self.attention_bk {
+                k = k.broadcast_add(bk)?;
+            }
+            if let Some(bv) = &self.attention_bv {
+                v = v.broadcast_add(bv)?;
+            }
         }
         let q = q.reshape(vec![b_sz, seq_len, self.n_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
         let k = k.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
@@ -1872,7 +1884,7 @@ impl LayerWeights {
 
                 // Fused attention incompatible with pre-RoPE and compaction
                 let has_compacted = cache.compacted.is_some();
-                let use_fused = get_use_fused() && q.device().is_cpu()
+                let use_fused = get_use_fused() && q.is_cpu()
                     && !cache.pre_rope && !has_compacted;
                 let n_compressed = cache.k_per_head[0].count;
                 let n_past_compressed = if n_compressed > 0 { n_compressed - 1 } else { 0 };
@@ -2218,7 +2230,7 @@ impl LayerWeights {
                     let v_full = repeat_kv(v_full, n_rep)?;
                     att.matmul(&v_full.contiguous()?)?.to_dtype(cache.dtype)?
 
-                } else if sparse_thresh > 0.0 && att.device().is_cpu() && cache.value_bits > 0 {
+                } else if sparse_thresh > 0.0 && att.is_cpu() && cache.value_bits > 0 {
                     // Fused sparse-decompress path: decompress only active V rows
                     let att_flat = att.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
                     let v_store = cache.v_compressed.as_ref().unwrap();
@@ -2252,7 +2264,7 @@ impl LayerWeights {
                         repeat_kv(v_tensor, n_rep)?
                     };
 
-                    if sparse_thresh > 0.0 && att.device().is_cpu() {
+                    if sparse_thresh > 0.0 && att.is_cpu() {
                         sparse_attn_v(&att, &v_f32, self.n_head, self.head_dim, sparse_thresh)?
                             .to_dtype(cache.dtype)?
                     } else {
@@ -2294,7 +2306,9 @@ impl LayerWeights {
             //   Uses narrow() for exact-length attention (no padding waste).
             // CPU path: Tensor::cat fallback.
             #[cfg(feature = "cuda")]
-            if k.is_cuda() && seq_len == 1 {
+            let gpu_kv_disabled = std::env::var("TQ_NO_GPU_KV").map(|v| v == "1").unwrap_or(false);
+            #[cfg(feature = "cuda")]
+            if k.is_cuda() && seq_len == 1 && !gpu_kv_disabled {
                 // Initialize GPU KV cache on first decode step
                 if self.gpu_kv_cache.is_none() {
                     if let Some(reg) = crate::cuda::kernels::global_registry() {
@@ -2339,7 +2353,37 @@ impl LayerWeights {
                     let att = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
                     let kv_mask = kv_mask.broadcast_as(att.shape())?;
                     let att = (att + kv_mask)?;
+
+                    // Debug: attention scores before softmax (head 0, first 10 positions)
+                    let gpu_debug = std::env::var("TQ_GPU_DEBUG").map(|v| v == "1").unwrap_or(false);
+                    if gpu_debug && self.layer_idx < 2 {
+                        if let Ok(scores) = att.to_vec1() {
+                            let max_seq_show = gpu_kv.seq_len.min(10);
+                            let head0_scores: Vec<f32> = scores[..max_seq_show].to_vec();
+                            eprintln!("[gpu-debug] L{} GpuKV att-pre-softmax head0[..{}]: {:?}",
+                                self.layer_idx, max_seq_show, head0_scores);
+                            // Show mask values too
+                            let n_pad = scores.len() / self.n_head; // max_seq
+                            let n_masked = scores[gpu_kv.seq_len..n_pad].iter()
+                                .filter(|&&v| v < -1e9).count();
+                            eprintln!("[gpu-debug] L{} GpuKV valid={} max_seq={} masked_positions={}",
+                                self.layer_idx, gpu_kv.seq_len, gpu_kv.max_seq, n_masked);
+                        }
+                    }
+
                     let att = softmax_last_dim(&att, backend)?;
+
+                    // Debug: attention weights after softmax (head 0)
+                    if gpu_debug && self.layer_idx < 2 {
+                        if let Ok(weights) = att.to_vec1() {
+                            let max_seq_show = gpu_kv.seq_len.min(10);
+                            let head0_weights: Vec<f32> = weights[..max_seq_show].to_vec();
+                            let head0_sum: f32 = weights[..gpu_kv.max_seq].iter().sum();
+                            eprintln!("[gpu-debug] L{} GpuKV att-post-softmax head0[..{}]: {:?} sum={:.6}",
+                                self.layer_idx, max_seq_show, head0_weights, head0_sum);
+                        }
+                    }
+
                     let y = att.matmul(&v_full.contiguous()?)?;
 
                     let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
@@ -2916,19 +2960,22 @@ impl GenericTurboModel {
         }
 
         // ── Arena buffer reuse for decode (when CUDA Graph is not active) ──
+        // Disabled: Arc::make_mut copy-on-write bypasses pool, causing alloc pattern mismatch.
+        // Needs redesign: size-based buffer pool instead of cursor-based replay.
         #[cfg(feature = "cuda")]
-        // Arena disabled: buffer reuse causes PPL corruption (cursor/pointer tracking issue).
-        // TODO: Fix arena buffer tracking to maintain correctness.
         let arena_active = false;
         #[cfg(not(feature = "cuda"))]
         let arena_active = false;
         #[cfg(feature = "cuda")]
         if arena_active {
             if self.arena_decode_count == 0 {
-                // First decode step: record all alloc sizes
+                // First decode: warm-up pass (GpuKvCache creation happens here).
+                // Don't record — alloc pattern differs from steady state.
+            } else if self.arena_decode_count == 1 {
+                // Second decode: record steady-state alloc pattern.
                 crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Recording);
             } else {
-                // Subsequent decode steps: reuse recorded buffers
+                // Third+ decode: reuse recorded buffers.
                 crate::cuda::decode_pool_restore(std::mem::take(&mut self.arena_pool_buffers));
                 crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Arena);
                 crate::cuda::decode_pool_reset_cursor();
@@ -2988,8 +3035,44 @@ impl GenericTurboModel {
             }
         }
 
+        // GPU vs CPU debug: print tensor stats at each layer boundary for divergence analysis.
+        // Run with TQ_GPU_DEBUG=1, compare output between GPU and CPU runs.
+        let gpu_debug = std::env::var("TQ_GPU_DEBUG").map(|v| v == "1").unwrap_or(false);
+
+        // TQ_PROFILE=1: per-component timing (requires stream sync per measurement — slower but accurate).
+        let profiling = std::env::var("TQ_PROFILE").map(|v| v == "1").unwrap_or(false);
+        #[cfg(feature = "cuda")]
+        let prof_stream = if profiling { crate::cuda::kernels::global_registry().map(|r| r.stream.clone()) } else { None };
+        #[cfg(not(feature = "cuda"))]
+        let prof_stream: Option<()> = None;
+        struct ProfAccum { qkv_ns: u64, rope_ns: u64, attn_ns: u64, mlp_ns: u64, norm_ns: u64, other_ns: u64, n: u32 }
+        let mut prof = ProfAccum { qkv_ns: 0, rope_ns: 0, attn_ns: 0, mlp_ns: 0, norm_ns: 0, other_ns: 0, n: 0 };
+        macro_rules! prof_sync {
+            ($stream:expr) => {
+                #[cfg(feature = "cuda")]
+                if profiling { if let Some(ref s) = $stream { let _ = s.synchronize(); } }
+                #[cfg(not(feature = "cuda"))]
+                let _ = &$stream;
+            }
+        }
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let x = layer_in;
+            // prof_sync macro defined before loop
+
+            // Debug checkpoint: layer input stats
+            if gpu_debug && seq_len == 1 {
+                if let Ok(data) = x.to_vec1() {
+                    let n = data.len();
+                    let sum: f64 = data.iter().map(|&v| v as f64).sum();
+                    let mean = sum / n as f64;
+                    let l2: f64 = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+                    let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+                        |(mn, mx), &v| (mn.min(v), mx.max(v)));
+                    eprintln!("[gpu-debug] L{} input: mean={:.6} l2={:.4} min={:.6} max={:.6} first5={:?}",
+                        layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
+                }
+            }
 
             // Debug: unconditional capture status check
             #[cfg(feature = "cuda")]
@@ -3010,7 +3093,9 @@ impl GenericTurboModel {
             #[cfg(feature = "cuda")]
             let layer_uses_compression = get_layer_bits(layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers).is_some();
             #[cfg(feature = "cuda")]
-            if seq_len == 1 && x.is_cuda() && !layer_uses_compression
+            let fused_disabled = std::env::var("TQ_NO_FUSED").map(|v| v == "1").unwrap_or(false);
+            #[cfg(feature = "cuda")]
+            if seq_len == 1 && x.is_cuda() && !layer_uses_compression && !fused_disabled
                 && layer.post_attention_norm.is_none()
                 && layer.post_ffn_norm.is_none()
                 && matches!(&layer.qkv, QkvWeights::Separate { .. })
@@ -3113,6 +3198,19 @@ impl GenericTurboModel {
                     match fused_mlp_result {
                         Ok(result) => {
                             layer_in = result;
+                            // Debug checkpoint: fused path output
+                            if gpu_debug {
+                                if let Ok(data) = layer_in.to_vec1() {
+                                    let n = data.len();
+                                    let sum: f64 = data.iter().map(|&v| v as f64).sum();
+                                    let mean = sum / n as f64;
+                                    let l2: f64 = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+                                    let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+                                        |(mn, mx), &v| (mn.min(v), mx.max(v)));
+                                    eprintln!("[gpu-debug] L{} fused-out: mean={:.6} l2={:.4} min={:.6} max={:.6} first5={:?}",
+                                        layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
+                                }
+                            }
                             continue; // skip fallback path
                         }
                         Err(_) => {
@@ -3153,6 +3251,19 @@ impl GenericTurboModel {
                             };
                             let mlp_out = layer.mlp_or_moe.forward(&mlp_in, backend)?;
                             layer_in = (mlp_out + &residual_owned)?;
+                            // Debug checkpoint: fused-QKV + fallback-MLP output
+                            if gpu_debug {
+                                if let Ok(data) = layer_in.to_vec1() {
+                                    let n = data.len();
+                                    let sum: f64 = data.iter().map(|&v| v as f64).sum();
+                                    let mean = sum / n as f64;
+                                    let l2: f64 = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+                                    let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+                                        |(mn, mx), &v| (mn.min(v), mx.max(v)));
+                                    eprintln!("[gpu-debug] L{} fused-qkv+fb-mlp: mean={:.6} l2={:.4} min={:.6} max={:.6} first5={:?}",
+                                        layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
+                                }
+                            }
                             continue;
                         }
                     }
@@ -3160,8 +3271,16 @@ impl GenericTurboModel {
             }
 
             // ── Fallback: original separate-kernel path ──
+            let _t0 = if profiling { Some(std::time::Instant::now()) } else { None };
+
             let residual = &x;
+            prof_sync!(prof_stream);
+            let _t_norm = if profiling { Some(std::time::Instant::now()) } else { None };
             let x = layer.attention_norm.forward(&x, backend)?;
+            prof_sync!(prof_stream);
+            if let Some(t) = _t_norm { prof.norm_ns += t.elapsed().as_nanos() as u64; }
+
+            let _t_attn = if profiling { Some(std::time::Instant::now()) } else { None };
             let attn = layer.forward_attn(&x, None, mask.as_ref(), index_pos, backend)?;
             #[cfg(feature = "cuda")]
             if false { // placeholder for future graph capture status checks
@@ -3180,7 +3299,11 @@ impl GenericTurboModel {
                 Some(norm) => norm.forward(&attn, backend)?,
                 None => attn,
             };
+            prof_sync!(prof_stream);
+            if let Some(t) = _t_attn { prof.attn_ns += t.elapsed().as_nanos() as u64; }
+
             // Fused residual add + FFN norm: residual += attn; x = rms_norm(residual)
+            let _t_mlp = if profiling { Some(std::time::Instant::now()) } else { None };
             let _enter = layer.span_mlp.enter();
             let attn_f32 = attn.to_dtype(DType::F32)?;
             let residual_f32 = residual.to_dtype(DType::F32)?;
@@ -3224,12 +3347,46 @@ impl GenericTurboModel {
                 None => x,
             };
             let x = (x + residual)?;
+            prof_sync!(prof_stream);
+            if let Some(t) = _t_mlp { prof.mlp_ns += t.elapsed().as_nanos() as u64; }
+            prof.n += 1;
             layer_in = x;
+
+            // Debug checkpoint: layer output stats
+            if gpu_debug && seq_len == 1 {
+                if let Ok(data) = layer_in.to_vec1() {
+                    let n = data.len();
+                    let sum: f64 = data.iter().map(|&v| v as f64).sum();
+                    let mean = sum / n as f64;
+                    let l2: f64 = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+                    let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+                        |(mn, mx), &v| (mn.min(v), mx.max(v)));
+                    eprintln!("[gpu-debug] L{} output: mean={:.6} l2={:.4} min={:.6} max={:.6} first5={:?}",
+                        layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
+                }
+            }
         }
         let x = self.norm.forward(&layer_in, backend)?;
         let x = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
         let _enter = self.span_output.enter();
+        prof_sync!(prof_stream);
+        let _t_out = if profiling { Some(std::time::Instant::now()) } else { None };
         let output = self.output.forward(&x, backend)?;
+        prof_sync!(prof_stream);
+        if let Some(t) = _t_out { prof.other_ns += t.elapsed().as_nanos() as u64; }
+
+        if profiling && prof.n > 0 {
+            let total = prof.norm_ns + prof.attn_ns + prof.mlp_ns + prof.other_ns;
+            if total > 0 {
+                eprintln!("[profile] norm {:.1}% | attn {:.1}% | mlp {:.1}% | output {:.1}% | total {:.1}ms",
+                    prof.norm_ns as f64 / total as f64 * 100.0,
+                    prof.attn_ns as f64 / total as f64 * 100.0,
+                    prof.mlp_ns as f64 / total as f64 * 100.0,
+                    prof.other_ns as f64 / total as f64 * 100.0,
+                    total as f64 / 1e6,
+                );
+            }
+        }
 
         // End graph capture
         #[cfg(feature = "cuda")]
@@ -3285,12 +3442,14 @@ impl GenericTurboModel {
         #[cfg(feature = "cuda")]
         if arena_active {
             if self.arena_decode_count == 0 {
-                // First decode done: drain recorded buffers for reuse
+                // First decode done: warm-up pass, no recording. Just increment.
+            } else if self.arena_decode_count == 1 {
+                // Second decode done: drain recorded steady-state buffers for reuse.
                 self.arena_pool_buffers = crate::cuda::decode_pool_drain();
                 crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
                 eprintln!("[arena] recording done: {} buffers saved for reuse", self.arena_pool_buffers.len());
             } else {
-                // Arena reuse done: drain back to self, reset mode
+                // Arena reuse done: drain back to self, reset mode.
                 self.arena_pool_buffers = crate::cuda::decode_pool_drain();
                 crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
             }

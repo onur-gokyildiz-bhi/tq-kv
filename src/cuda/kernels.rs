@@ -656,8 +656,15 @@ pub fn rope_halved_with_gpu_pos(
     pos_offset_gpu: Option<&CudaSlice<i32>>,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("rope", "rope_halved_f32")?;
-    let total_half_pairs = n_tokens * n_heads * (rope_dim / 2);
-    let cfg = launch_1d(total_half_pairs);
+    // Kernel uses 2D grid: blockIdx.x = token, blockIdx.y = head.
+    // Each block needs enough threads to cover rope_dim/2 elements.
+    let half = rope_dim / 2;
+    let threads = ((half.max(32) + 31) / 32 * 32).min(256) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_tokens as u32, n_heads as u32, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let nt = n_tokens as i32;
     let nh = n_heads as i32;
     let hd = head_dim as i32;
@@ -712,8 +719,14 @@ pub fn rope_interleaved_with_gpu_pos(
     pos_offset_gpu: Option<&CudaSlice<i32>>,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("rope", "rope_interleaved_f32")?;
-    let total_half_pairs = n_tokens * n_heads * (rope_dim / 2);
-    let cfg = launch_1d(total_half_pairs);
+    // Kernel uses 2D grid: blockIdx.x = token, blockIdx.y = head.
+    let half = rope_dim / 2;
+    let threads = ((half.max(32) + 31) / 32 * 32).min(256) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_tokens as u32, n_heads as u32, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let nt = n_tokens as i32;
     let nh = n_heads as i32;
     let hd = head_dim as i32;

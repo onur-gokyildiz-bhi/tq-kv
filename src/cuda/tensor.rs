@@ -37,6 +37,8 @@ std::thread_local! {
     static DECODE_POOL_BUFFERS: std::cell::RefCell<Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>>
         = const { std::cell::RefCell::new(Vec::new()) };
     static DECODE_POOL_CURSOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Separate cursor for from_cuda wrapping (may lag behind alloc cursor in fused paths).
+    static DECODE_POOL_WRAP_CURSOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // Metadata pool: i32 GPU buffers for shape/stride arrays (clone_htod during capture).
     static META_POOL_BUFFERS: std::cell::RefCell<Vec<cudarc::driver::CudaSlice<i32>>>
         = const { std::cell::RefCell::new(Vec::new()) };
@@ -52,6 +54,7 @@ pub fn decode_pool_set_mode(mode: PoolMode) {
         META_POOL_BUFFERS.with(|b| b.borrow_mut().clear());
     }
     DECODE_POOL_CURSOR.with(|c| c.set(0));
+    DECODE_POOL_WRAP_CURSOR.with(|c| c.set(0));
     META_POOL_CURSOR.with(|c| c.set(0));
 }
 
@@ -65,6 +68,7 @@ pub fn decode_pool_mode() -> PoolMode {
 #[cfg(feature = "cuda")]
 pub fn decode_pool_reset_cursor() {
     DECODE_POOL_CURSOR.with(|c| c.set(0));
+    DECODE_POOL_WRAP_CURSOR.with(|c| c.set(0));
     META_POOL_CURSOR.with(|c| c.set(0));
 }
 
@@ -215,8 +219,9 @@ fn gpu_alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBi
     let mode = DECODE_POOL_MODE.with(|m| m.get());
     if (mode == PoolMode::Pooled || mode == PoolMode::Arena) && std::mem::size_of::<T>() == std::mem::size_of::<f32>() {
         // Pooled/Arena mode: return a non-owning bitwise copy of pool buffer.
-        // Peek at current cursor (from_cuda will advance it).
-        let idx = DECODE_POOL_CURSOR.with(|c| c.get());
+        // Advance cursor HERE (not in from_cuda) to handle back-to-back allocs
+        // before from_cuda is called (e.g., fused QKV path allocates Q, K, V, then wraps).
+        let idx = DECODE_POOL_CURSOR.with(|c| { let i = c.get(); c.set(i + 1); i });
         let result = DECODE_POOL_BUFFERS.with(|b| {
             let bufs = b.borrow();
             if idx < bufs.len() {
@@ -334,12 +339,13 @@ impl TqTensor {
         Ok((self.shape[0], self.shape[1], self.shape[2], self.shape[3]))
     }
 
+    /// WARNING: Returns &TqDevice::Cpu even for CUDA tensors because TqTensor
+    /// does not store a TqDevice. Use is_cuda()/is_cpu() for dispatch decisions.
+    /// This is safe because from_vec (the main consumer) ignores the device param.
     pub fn device(&self) -> &TqDevice {
-        match &self.storage {
-            TqStorage::Cpu(_) => &TqDevice::Cpu,
-            #[cfg(feature = "cuda")]
-            TqStorage::Cuda { .. } => &TqDevice::Cpu, // TODO: return actual device
-        }
+        // NOTE: Cannot return &TqDevice::Cuda here — no stored device to reference.
+        // Callers using this for dispatch MUST use is_cuda()/is_cpu() instead.
+        &TqDevice::Cpu
     }
 
     /// Get underlying f32 data.
@@ -1126,6 +1132,11 @@ impl TqTensor {
             TqStorage::Cuda { .. } => true,
         }
     }
+
+    /// True if this tensor lives on CPU.
+    pub fn is_cpu(&self) -> bool {
+        !self.is_cuda()
+    }
 }
 
 // ─── GPU dispatch (cuda feature only) ─────────────────────────
@@ -1298,6 +1309,7 @@ impl TqTensor {
                 let arc = std::sync::Arc::new(data);
                 DECODE_POOL_BUFFERS.with(|b| b.borrow_mut().push(arc.clone()));
                 DECODE_POOL_CURSOR.with(|c| c.set(c.get() + 1));
+                DECODE_POOL_WRAP_CURSOR.with(|c| c.set(c.get() + 1));
                 Self { storage: TqStorage::Cuda { data: arc, stream }, shape, dtype: TqDType::F32 }
             }
             #[cfg(feature = "cuda")]
@@ -1305,7 +1317,8 @@ impl TqTensor {
                 // data is a ptr::read copy sharing pool buffer's device pointer.
                 // mem::forget prevents double-free.
                 std::mem::forget(data);
-                let idx = DECODE_POOL_CURSOR.with(|c| { let i = c.get(); c.set(i + 1); i });
+                // Use separate wrap cursor (alloc cursor may be ahead due to back-to-back allocs).
+                let idx = DECODE_POOL_WRAP_CURSOR.with(|c| { let i = c.get(); c.set(i + 1); i });
                 let arc = DECODE_POOL_BUFFERS.with(|b| bufs_get_cloned(&b.borrow(), idx));
                 match arc {
                     Some(pool_arc) => Self { storage: TqStorage::Cuda { data: pool_arc, stream }, shape, dtype: TqDType::F32 },
@@ -1621,6 +1634,14 @@ impl TqTensor {
         // Residual: need a mutable copy (kernel modifies in-place).
         // Arc::make_mut ensures copy-on-write: clones only if ref count > 1.
         let mut res_arc = res.clone();
+        let ref_count = std::sync::Arc::strong_count(&res_arc);
+        if ref_count > 1 {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("[WARN] fused_add_rms_norm_gpu: Arc ref_count={} — copy-on-write will clone GPU buffer (this warning shown once)", ref_count);
+            }
+        }
         let res_mut = std::sync::Arc::make_mut(&mut res_arc);
         let mut out = gpu_alloc_zeros::<f32>(stream,n)
             .map_err(|e| TqError::Msg(format!("fused norm alloc: {}", e)))?;

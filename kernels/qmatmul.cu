@@ -38,6 +38,9 @@ __device__ __forceinline__ void get_scale_min_k4(
 // W layout: [out_features, in_features] packed as Q4_K_M blocks.
 // in_features must be divisible by QK_K (256).
 
+// Optimized Q4K_M matvec: all 256 threads active, shared memory x cache.
+// Each block processes one output row. 256 threads map 1:1 to the 256
+// values within each superblock (4 groups × 64 values).
 extern "C" __global__ void q4km_matvec_f32(
     const uint8_t* __restrict__ W_packed,  // [out_features * bytes_per_row]
     const float* __restrict__ x,           // [in_features]
@@ -53,49 +56,43 @@ extern "C" __global__ void q4km_matvec_f32(
     const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
     const uint8_t* w_row = W_packed + row * bytes_per_row;
 
+    // Shared memory: cache x for current superblock
+    __shared__ float s_x[QK_K];
+
+    // Thread → (group, position) mapping, constant across superblocks
+    const int grp = tid >> 6;       // 0-3
+    const int pos = tid & 63;       // 0-63
+    const int is_hi = pos >> 5;     // 0 or 1
+    const int l = pos & 31;         // 0-31
+
     float partial_sum = 0.0f;
 
-    // Each thread handles a subset of super-blocks
-    for (int sb = tid; sb < n_superblocks; sb += blockDim.x) {
+    for (int sb = 0; sb < n_superblocks; ++sb) {
         const uint8_t* block = w_row + sb * Q4K_BLOCK_SIZE;
-        const float* x_sb = x + sb * QK_K;
 
-        // Decode f16 d, dmin
+        // Cooperative x load: 256 threads load 256 floats
+        s_x[tid] = x[sb * QK_K + tid];
+        __syncthreads();
+
+        // Decode block header (broadcast read, L1 cached)
         uint16_t d_bits  = block[0] | (block[1] << 8);
         uint16_t dm_bits = block[2] | (block[3] << 8);
-        // f16 → f32 (inline)
         float d    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
         float dmin = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
 
         const uint8_t* scales = block + 4;
         const uint8_t* qs = block + 16;
 
-        // Canonical GGML Q4_K layout: 128 qs bytes in 4 groups of 32 bytes.
-        // Each group covers 2 sub-blocks: lo nibbles → sub 2*j, hi nibbles → sub 2*j+1.
-        // Output order: [32 lo values, 32 hi values] per group = 64 per group.
-        for (int grp = 0; grp < 4; ++grp) {
-            uint8_t sc_lo, m_lo, sc_hi, m_hi;
-            get_scale_min_k4(2 * grp,     scales, &sc_lo, &m_lo);
-            get_scale_min_k4(2 * grp + 1, scales, &sc_hi, &m_hi);
-            float d_lo  = d * (float)sc_lo;
-            float d_hi  = d * (float)sc_hi;
-            float dm_lo = dmin * (float)m_lo;
-            float dm_hi = dmin * (float)m_hi;
+        // Each thread dequantizes and multiplies its one value
+        uint8_t sc_val, m_val;
+        get_scale_min_k4(2 * grp + is_hi, scales, &sc_val, &m_val);
 
-            int q_off = grp * 32;
-            int x_off = grp * 64;
+        uint8_t q_byte = qs[grp * 32 + l];
+        float nibble = is_hi ? (float)(q_byte >> 4) : (float)(q_byte & 0xF);
+        float w_val = d * (float)sc_val * nibble - dmin * (float)m_val;
+        partial_sum += w_val * s_x[grp * 64 + pos];
 
-            // Lo nibbles: 32 values for sub-block 2*grp
-            for (int l = 0; l < 32; ++l) {
-                float v = d_lo * (float)(qs[q_off + l] & 0xF) - dm_lo;
-                partial_sum += v * x_sb[x_off + l];
-            }
-            // Hi nibbles: 32 values for sub-block 2*grp+1
-            for (int l = 0; l < 32; ++l) {
-                float v = d_hi * (float)(qs[q_off + l] >> 4) - dm_hi;
-                partial_sum += v * x_sb[x_off + 32 + l];
-            }
-        }
+        __syncthreads();
     }
 
     // Block-level reduction
