@@ -2959,13 +2959,27 @@ impl GenericTurboModel {
             crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Recording);
         }
 
-        // ── Arena buffer reuse for decode (when CUDA Graph is not active) ──
-        // Disabled: Arc::make_mut copy-on-write bypasses pool, causing alloc pattern mismatch.
-        // Needs redesign: size-based buffer pool instead of cursor-based replay.
+        // ── Size-based buffer pool for decode (replaces broken cursor-based arena) ──
+        // Order-independent: buffers matched by size, not cursor position.
+        // Arc::make_mut clones create new pool entries that get reused next token.
+        // Size pool starts from decode step 1+ (step 0 discovers buffer pattern).
+        #[cfg(feature = "cuda")]
+        // Size pool disabled: cudarc CudaSlice internal state breaks on ptr::read.
+        // CUDA's cuMemAllocAsync already uses an internal memory pool.
+        // TODO: Revisit with cudarc raw pointer API or custom allocator.
+        let size_pool_active = false;
+        #[cfg(feature = "cuda")]
+        if size_pool_active {
+            crate::cuda::size_pool_activate();
+        }
+
+        // Legacy arena disabled.
         #[cfg(feature = "cuda")]
         let arena_active = false;
         #[cfg(not(feature = "cuda"))]
         let arena_active = false;
+        #[cfg(not(feature = "cuda"))]
+        let size_pool_active = false;
         #[cfg(feature = "cuda")]
         if arena_active {
             if self.arena_decode_count == 0 {
@@ -3438,7 +3452,19 @@ impl GenericTurboModel {
             crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
         }
 
-        // After forward pass: handle arena mode transitions
+        // After forward pass: deactivate size pool + track decode count
+        #[cfg(feature = "cuda")]
+        if seq_len == 1 && !capturing && !recording {
+            if size_pool_active {
+                crate::cuda::size_pool_deactivate();
+                if self.arena_decode_count % 50 == 0 {
+                    crate::cuda::size_pool_report();
+                }
+            }
+            self.arena_decode_count += 1;
+        }
+
+        // After forward pass: handle arena mode transitions (legacy, disabled)
         #[cfg(feature = "cuda")]
         if arena_active {
             if self.arena_decode_count == 0 {

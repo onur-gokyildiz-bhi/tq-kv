@@ -45,6 +45,121 @@ std::thread_local! {
     static META_POOL_CURSOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// ── Size-based buffer pool ─────────────────────────────────────
+// Order-independent reuse: buffers matched by size, not cursor position.
+// Compatible with Arc::make_mut copy-on-write (clones create new buffers,
+// pool entries keep their device pointers).
+
+#[cfg(feature = "cuda")]
+struct SizePoolEntry {
+    arc: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    id: u64,
+    in_use: bool,
+}
+
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static SIZE_POOL: std::cell::RefCell<std::collections::HashMap<usize, Vec<SizePoolEntry>>>
+        = std::cell::RefCell::new(std::collections::HashMap::new());
+    static SIZE_POOL_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SIZE_POOL_HITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static SIZE_POOL_MISSES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// ID of the last buffer returned by size_pool_try_alloc (for from_cuda matching).
+    static SIZE_POOL_LAST_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SIZE_POOL_NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// Activate size pool: mark all entries as available for reuse.
+#[cfg(feature = "cuda")]
+pub fn size_pool_activate() {
+    SIZE_POOL_ACTIVE.with(|a| a.set(true));
+    SIZE_POOL.with(|p| {
+        for bucket in p.borrow_mut().values_mut() {
+            for entry in bucket.iter_mut() {
+                entry.in_use = false;
+            }
+        }
+    });
+}
+
+/// Deactivate size pool (normal alloc mode).
+#[cfg(feature = "cuda")]
+pub fn size_pool_deactivate() {
+    SIZE_POOL_ACTIVE.with(|a| a.set(false));
+}
+
+/// Print size pool stats and reset counters.
+#[cfg(feature = "cuda")]
+pub fn size_pool_report() {
+    let hits = SIZE_POOL_HITS.with(|h| h.replace(0));
+    let misses = SIZE_POOL_MISSES.with(|m| m.replace(0));
+    let total_bufs = SIZE_POOL.with(|p| p.borrow().values().map(|b| b.len()).sum::<usize>());
+    if hits + misses > 0 {
+        eprintln!("[size-pool] hits={} misses={} pool_size={} reuse_rate={:.0}%",
+            hits, misses, total_bufs, hits as f64 / (hits + misses) as f64 * 100.0);
+    }
+}
+
+/// Try to get a reusable buffer of exactly `len` elements from the size pool.
+/// Returns ptr::read copy (caller must mem::forget or use via from_cuda).
+#[cfg(feature = "cuda")]
+fn size_pool_try_alloc(len: usize) -> Option<cudarc::driver::CudaSlice<f32>> {
+    if !SIZE_POOL_ACTIVE.with(|a| a.get()) { return None; }
+    SIZE_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        if let Some(bucket) = pool.get_mut(&len) {
+            if let Some(entry) = bucket.iter_mut().find(|e| !e.in_use) {
+                entry.in_use = true;
+                // Cache ID for from_cuda to match this exact buffer.
+                SIZE_POOL_LAST_ID.with(|d| d.set(entry.id));
+                SIZE_POOL_HITS.with(|h| h.set(h.get() + 1));
+                // Return ptr::read copy — shares device pointer with pool Arc.
+                return Some(unsafe { std::ptr::read(&*entry.arc as *const cudarc::driver::CudaSlice<f32>) });
+            }
+        }
+        SIZE_POOL_MISSES.with(|m| m.set(m.get() + 1));
+        None
+    })
+}
+
+/// Register a newly created Arc in the size pool (called by from_cuda).
+/// Only registers during the first pool-active pass (recording).
+/// Cap at 200MB total to prevent OOM.
+#[cfg(feature = "cuda")]
+fn size_pool_register(len: usize, arc: &std::sync::Arc<cudarc::driver::CudaSlice<f32>>) {
+    if !SIZE_POOL_ACTIVE.with(|a| a.get()) { return; }
+    SIZE_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        // Cap: don't register if pool is already large
+        let total_elems: usize = pool.values().map(|b| b.iter().map(|e| e.arc.len()).sum::<usize>()).sum();
+        if total_elems * 4 > 200 * 1024 * 1024 { return; } // 200MB cap
+        let bucket = pool.entry(len).or_default();
+        let id = SIZE_POOL_NEXT_ID.with(|c| { let i = c.get(); c.set(i + 1); i });
+        bucket.push(SizePoolEntry { arc: arc.clone(), id, in_use: true });
+    });
+}
+
+/// Find pool Arc whose CudaSlice shares the same allocation as `data`.
+/// Uses Arc raw pointer matching: if gpu_alloc_zeros returned a ptr::read copy
+/// from pool, the copy and pool entry share the same heap allocation.
+#[cfg(feature = "cuda")]
+fn size_pool_find_arc(len: usize) -> Option<std::sync::Arc<cudarc::driver::CudaSlice<f32>>> {
+    // Match by ID cached from the last size_pool_try_alloc call.
+    let target_id = SIZE_POOL_LAST_ID.with(|d| d.replace(0));
+    if target_id == 0 { return None; } // no recent pool alloc
+    SIZE_POOL.with(|p| {
+        let pool = p.borrow();
+        if let Some(bucket) = pool.get(&len) {
+            for entry in bucket {
+                if entry.id == target_id {
+                    return Some(entry.arc.clone());
+                }
+            }
+        }
+        None
+    })
+}
+
 /// Set pool mode.
 #[cfg(feature = "cuda")]
 pub fn decode_pool_set_mode(mode: PoolMode) {
@@ -216,6 +331,17 @@ fn gpu_alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBi
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     len: usize,
 ) -> std::result::Result<cudarc::driver::CudaSlice<T>, cudarc::driver::result::DriverError> {
+    // Size pool: order-independent reuse by buffer size.
+    if std::mem::size_of::<T>() == std::mem::size_of::<f32>() {
+        if let Some(reused) = size_pool_try_alloc(len) {
+            // SAFETY: CudaSlice<f32> and CudaSlice<T> have identical layout.
+            // transmute_copy + forget: copy bits then prevent Drop on the source
+            // (source is a ptr::read copy sharing device pointer with pool Arc).
+            let result = unsafe { std::mem::transmute_copy(&reused) };
+            std::mem::forget(reused);
+            return Ok(result);
+        }
+    }
     let mode = DECODE_POOL_MODE.with(|m| m.get());
     if (mode == PoolMode::Pooled || mode == PoolMode::Arena) && std::mem::size_of::<T>() == std::mem::size_of::<f32>() {
         // Pooled/Arena mode: return a non-owning bitwise copy of pool buffer.
@@ -1332,6 +1458,20 @@ impl TqTensor {
                 }
             }
             _ => {
+                // Size pool: check if this data came from a pool reuse (ptr::read copy).
+                // If so, mem::forget to prevent double-free and use pool's Arc.
+                #[cfg(feature = "cuda")]
+                if SIZE_POOL_ACTIVE.with(|a| a.get()) {
+                    let len = data.len();
+                    if let Some(pool_arc) = size_pool_find_arc(len) {
+                        std::mem::forget(data);
+                        return Self { storage: TqStorage::Cuda { data: pool_arc, stream }, shape, dtype: TqDType::F32 };
+                    }
+                    // Fresh alloc — register in pool for future reuse.
+                    let arc = std::sync::Arc::new(data);
+                    size_pool_register(len, &arc);
+                    return Self { storage: TqStorage::Cuda { data: arc, stream }, shape, dtype: TqDType::F32 };
+                }
                 let arc = std::sync::Arc::new(data);
                 Self { storage: TqStorage::Cuda { data: arc, stream }, shape, dtype: TqDType::F32 }
             }
