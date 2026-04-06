@@ -3743,11 +3743,19 @@ impl GenericTurboModel {
         let x = self.norm.forward(&layer_in, backend)?;
         let x = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
         let _enter = self.span_output.enter();
-        prof_sync!(prof_stream);
-        let _t_out = if profiling { Some(std::time::Instant::now()) } else { None };
+        #[cfg(feature = "cuda")]
+        let _t_lm = if profiling {
+            if let Some(ref s) = prof_stream { let _ = s.synchronize(); }
+            Some(std::time::Instant::now())
+        } else { None };
+        #[cfg(not(feature = "cuda"))]
+        let _t_lm: Option<std::time::Instant> = None;
         let output = self.output.forward(&x, backend)?;
-        prof_sync!(prof_stream);
-        if let Some(t) = _t_out { prof.other_ns += t.elapsed().as_nanos() as u64; }
+        #[cfg(feature = "cuda")]
+        if let Some(t) = _t_lm {
+            if let Some(ref s) = prof_stream { let _ = s.synchronize(); }
+            eprintln!("[kernel] {:>12}: {:.1}μs", "lm_head", t.elapsed().as_nanos() as f64 / 1000.0);
+        }
 
         if profiling && prof.n > 0 {
             let total = prof.norm_ns + prof.attn_ns + prof.mlp_ns + prof.other_ns;
