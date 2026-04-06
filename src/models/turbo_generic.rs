@@ -216,10 +216,8 @@ impl QMatMul {
                         );
                         return xs.qmatmul_gpu(w_gpu, qw.dtype, qw.out_features(), qw.in_features());
                     }
-                    // Q6K/other dtypes on GPU: use f32_matvec (decode) or cuBLAS (prefill).
-                    // Critical: avoids to_vec1() sync that breaks GPU pipeline pipelining
-                    // and prevents CUDA Graph capture.
-                    return qmm::QMatMul::forward_gpu_fallback(qw, xs);
+                    // Prefill or Q6K on GPU: streaming GPU dequant + SGEMM
+                    return self.inner.forward(xs);
                 }
 
                 let x_shape = xs.shape().to_vec();
@@ -1193,15 +1191,19 @@ impl GpuKvCache {
         let k_src = new_k.cuda_data();
         let v_src = new_v.cuda_data();
 
-        // In Pooled mode (graph capture), skip memcpy_htod — it would be captured as a
+        // During graph capture, skip memcpy_htod — it would be captured as a
         // graph node with baked host address. The pre-replay code updates valid_len_gpu.
-        // In Recording/Off mode, update normally.
         #[cfg(feature = "cuda")]
-        let pooled = crate::cuda::decode_pool_mode() == crate::cuda::PoolMode::Pooled;
+        let capturing = {
+            match self.stream.capture_status() {
+                Ok(cudarc::driver::sys::CUstreamCaptureStatus_enum::CU_STREAM_CAPTURE_STATUS_ACTIVE) => true,
+                _ => false,
+            }
+        };
         #[cfg(not(feature = "cuda"))]
-        let pooled = false;
+        let capturing = false;
 
-        if !pooled {
+        if !capturing {
             let pos_val = self.seq_len as i32;
             let _ = self.stream.memcpy_htod(&[pos_val], &mut self.valid_len_gpu);
         }
@@ -1229,7 +1231,7 @@ impl GpuKvCache {
 
         self.seq_len += n_new;
 
-        if !pooled {
+        if !capturing {
             // Normal mode: update valid_len to post-append total, generate mask
             let new_len = self.seq_len as i32;
             let _ = self.stream.memcpy_htod(&[new_len], &mut self.valid_len_gpu);
@@ -1237,7 +1239,7 @@ impl GpuKvCache {
             crate::cuda::kernels::generate_kv_mask(reg, mask_mut, &self.valid_len_gpu, self.max_seq, 0)
                 .map_err(|e| TqError::Msg(format!("kv mask gen: {}", e)))?;
         } else {
-            // Pooled mode (graph capture): valid_len_gpu has pre_pos (set externally).
+            // Graph capture: valid_len_gpu has pre_pos (set by pre-replay code).
             // Generate mask with extra=n_new so valid_len = pre_pos + n_new = post_pos.
             // This kernel launch IS captured in the graph.
             let mask_mut = std::sync::Arc::make_mut(&mut self.mask_buf);
@@ -2345,10 +2347,10 @@ impl LayerWeights {
                     let att = match mask {
                         None => att,
                         Some(mask) => {
-                            // mask is [seq, seq], att is [batch, heads, seq, seq]
+                            // Additive mask: 0 for valid, -1e10 for masked
                             let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
                             let mask4d = mask4d.broadcast_as(att.shape())?;
-                            masked_fill(&att, &mask4d, &self.neg_inf)?
+                            (att + mask4d)?
                         }
                     };
                     let att = softmax_last_dim(&att, backend)?;
@@ -2477,9 +2479,10 @@ impl LayerWeights {
             let att = match mask {
                 None => att,
                 Some(mask) => {
+                    // Additive mask: 0 for valid, -1e10 for masked
                     let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
                     let mask4d = mask4d.broadcast_as(att.shape())?;
-                    masked_fill(&att, &mask4d, &self.neg_inf)?
+                    (att + mask4d)?
                 }
             };
             let att = softmax_last_dim(&att, backend)?;
@@ -2949,14 +2952,21 @@ impl GenericTurboModel {
         Ok(model)
     }
 
-    fn mask(&mut self, t: usize, device: &Device) -> Result<Tensor> {
+    fn mask(&mut self, t: usize, _device: &Device) -> Result<Tensor> {
         if let Some(mask) = self.masks.get(&t) {
             Ok(mask.clone())
         } else {
+            // Additive causal mask: 0.0 for valid (j <= i), -1e10 for masked (j > i).
+            // Can be added directly to attention scores — no masked_fill needed.
             let mask: Vec<f32> = (0..t)
-                .flat_map(|i| (0..t).map(move |j| if j > i { 1.0f32 } else { 0.0f32 }))
+                .flat_map(|i| (0..t).map(move |j| if j > i { -1e10f32 } else { 0.0f32 }))
                 .collect();
-            let mask = Tensor::from_slice(&mask, vec![t, t], device)?;
+            let mut mask = Tensor::from_slice(&mask, vec![t, t], _device)?;
+            // Upload to GPU if available
+            #[cfg(feature = "cuda")]
+            if let Ok(gpu) = mask.to_device_auto() {
+                mask = gpu;
+            }
             self.masks.insert(t, mask.clone());
             Ok(mask)
         }
@@ -3388,12 +3398,17 @@ impl GenericTurboModel {
                         ptime!("gqa_attn", {
                             let gpu_kv = layer.gpu_kv_cache.as_ref().unwrap();
                             let attn_mut = Arc::get_mut(&mut scratch.attn_out).expect("attn_out aliased");
+                            // During graph capture, valid_len_gpu has pre-append value
+                            // (H2D memcpy skipped). extra=1 compensates.
+                            // During normal mode, valid_len_gpu is post-append. extra=0.
+                            let attn_extra = if capturing { 1i32 } else { 0 };
                             crate::cuda::kernels::gqa_decode_attention_graph(
                                 reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
                                 attn_mut, &gpu_kv.valid_len_gpu,
                                 scratch.n_head, scratch.n_kv_head,
                                 gpu_kv.max_seq, scratch.head_dim,
                                 1.0 / (scratch.head_dim as f32).sqrt(),
+                                attn_extra,
                             ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))
                         })?;
 
@@ -3750,12 +3765,8 @@ impl GenericTurboModel {
                             Ok(()) => {
                                 let _ = reg.stream.synchronize();
                                 eprintln!("[cuda-graph] initial replay OK");
-                                // Post-replay: increment seq_len
-                                for layer in &mut self.layers {
-                                    if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
-                                        gpu_kv.seq_len += 1;
-                                    }
-                                }
+                                // seq_len already incremented by append() in the layer loop.
+                                // Do NOT increment again here.
                                 // Update layer_in from scratch combined buffer
                                 if let Some(ref scratch) = self.decode_scratch {
                                     let last_ci = (self.layers.len() - 1) & 1;

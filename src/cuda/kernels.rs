@@ -650,12 +650,13 @@ pub fn gqa_decode_attention_graph(
     k: &CudaSlice<f32>,
     v: &CudaSlice<f32>,
     output: &mut CudaSlice<f32>,
-    seq_len_ptr: &CudaSlice<i32>,     // GPU scalar
+    seq_len_ptr: &CudaSlice<i32>,     // GPU scalar (pre-append value)
     n_heads: usize,
     n_kv_heads: usize,
     max_seq: usize,
     head_dim: usize,
     scale: f32,
+    extra: i32,  // tokens appended after valid_len was set (typically 1)
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("fused_attention", "gqa_decode_attention_graph_f32")?;
     let block_dim = 32u32.min(head_dim as u32);
@@ -671,7 +672,7 @@ pub fn gqa_decode_attention_graph(
     unsafe {
         reg.stream.launch_builder(&f)
             .arg(q).arg(k).arg(v).arg(output).arg(seq_len_ptr)
-            .arg(&nh).arg(&nkv).arg(&ms).arg(&hd).arg(&scale)
+            .arg(&nh).arg(&nkv).arg(&ms).arg(&hd).arg(&scale).arg(&extra)
             .launch(cfg)?;
     }
     Ok(())
@@ -1105,6 +1106,95 @@ pub fn kv_cache_append(
             .arg(src).arg(dst).arg(seq_pos_ptr)
             .arg(&nkv).arg(&ms).arg(&hd).arg(&nn)
             .launch(launch_1d(total))?;
+    }
+    Ok(())
+}
+
+/// GPU-side Q4_K_M dequantize: packed Q4K → full F32 matrix.
+/// Grid: (n_superblocks, n_rows), Block: 128 threads.
+/// Used for prefill streaming: temp alloc → dequant → cuBLAS SGEMM → free.
+pub fn q4km_dequant_f32(
+    reg: &KernelRegistry,
+    w_packed: &CudaSlice<u8>,
+    w_f32: &mut CudaSlice<f32>,
+    n_rows: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("qmatmul", "q4km_dequant_f32")?;
+    let n_sb = in_features / 256; // QK_K = 256
+    let cfg = LaunchConfig {
+        grid_dim: (n_sb as u32, n_rows as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nr = n_rows as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_packed)
+            .arg(w_f32)
+            .arg(&nr)
+            .arg(&inf)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// GPU-side Q4_K_M dequantize to FP16: packed Q4K → half matrix.
+/// Grid: (n_superblocks, n_rows), Block: 128 threads.
+/// Half the scratch size of F32 dequant — feeds directly into cuBLAS HGEMM.
+pub fn q4km_dequant_f16(
+    reg: &KernelRegistry,
+    w_packed: &CudaSlice<u8>,
+    w_f16: &mut CudaSlice<half::f16>,
+    n_rows: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("qmatmul", "q4km_dequant_f16")?;
+    let n_sb = in_features / 256; // QK_K = 256
+    let cfg = LaunchConfig {
+        grid_dim: (n_sb as u32, n_rows as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nr = n_rows as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_packed)
+            .arg(w_f16)
+            .arg(&nr)
+            .arg(&inf)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// GPU-side Q6_K dequantize: packed Q6K → full F32 matrix.
+/// Grid: (n_superblocks, n_rows), Block: 256 threads (1 thread per value).
+pub fn q6k_dequant_f32(
+    reg: &KernelRegistry,
+    w_packed: &CudaSlice<u8>,
+    w_f32: &mut CudaSlice<f32>,
+    n_rows: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("qmatmul", "q6k_dequant_f32")?;
+    let n_sb = in_features / 256; // QK_K = 256
+    let cfg = LaunchConfig {
+        grid_dim: (n_sb as u32, n_rows as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nr = n_rows as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_packed)
+            .arg(w_f32)
+            .arg(&nr)
+            .arg(&inf)
+            .launch(cfg)?;
     }
     Ok(())
 }

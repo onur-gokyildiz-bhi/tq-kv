@@ -187,23 +187,26 @@ With Compaction (20x) + TQ 4-bit: effective 150x compression.
 | Qwen 2.5 7B | 200 | 6.55 | 6.04 | **-8%** | 2.22s | 2.32s |
 | Llama 3.1 8B | 200 | 4.20 | 3.47 | -17% | 2.69s | 2.75s |
 
-### CUDA Throughput (TQ 4-bit, RTX 3080)
+### CUDA Throughput (own kernels, RTX 3080)
 
-| Model | CUDA tok/s | CPU tok/s | GPU Speedup | TTFT |
-|:------|:---------:|:---------:|:-----------:|:----:|
-| Qwen 2.5 7B | **28.2** | 6.04 | **4.7x** | 0.118s |
-| Llama 3.1 8B | **19.2** | 3.47 | **5.5x** | 0.126s |
+> Custom CUDA backend: fused layer kernels, Q4K/Q6K matvec, CUDA Graph decode, GPU-side dequant + cuBLAS SGEMM prefill.
 
-### vs llama.cpp (CPU, Q4_K_M, same hardware)
+| Model | Config | Decode tok/s | TTFT | Notes |
+|:------|:-------|:-----------:|:----:|:------|
+| Qwen 2.5 7B | no TQ, CUDA Graph | **17.8** | **0.33s** | 100 token avg |
+| Qwen 2.5 7B | no TQ, steady-state | **19** | -- | decode only |
+| Qwen 2.5 7B | TQ 4-bit | **28.2** | 0.12s | w/ fused TQ attn |
+| Llama 3.1 8B | TQ 4-bit | **19.2** | 0.13s | |
+
+### vs llama.cpp (CUDA, Q4_K_M, same hardware)
 
 | Engine | Model | Decode tok/s | Note |
 |:-------|:------|:-----------:|:-----|
-| llama.cpp | Qwen 2.5 7B | **16.7** | Optimized GGML |
-| llama.cpp | Llama 3.1 8B | **15.1** | Optimized GGML |
-| tq-engine (TQ 4-bit) | Qwen 2.5 7B | 5.8 | candle framework |
-| tq-engine (TQ 4-bit) | Llama 3.1 8B | 3.5 | candle framework |
+| llama.cpp | Qwen 2.5 7B | **97** | Optimized GGML CUDA |
+| **tq-engine** | **Qwen 2.5 7B** | **17.8** | Own CUDA kernels |
+| Gap | | **5.5x** | Kernel optimization ongoing |
 
-> Decode gap (~2.8x) is candle vs GGML framework overhead, not TQ-specific.
+> Gap is primarily Q4K matvec instruction efficiency (833us/layer vs ~170us llama.cpp). Own kernel stack with zero external dependencies.
 
 ---
 
@@ -261,7 +264,7 @@ Compaction:       Attention-matching token reduction (up to 25x)
 Error Correction: SRHT QJL (115x faster than dense, +4.5 dB SNR)
 Fused attention:  AVX2+FMA SIMD centroid lookup (6-8.9x speedup)
 KV cache:         Incremental O(1) per token (~935x vs naive)
-CUDA support:     Custom RmsNorm, RoPE, softmax kernels
+CUDA support:     Full custom kernel stack (fused layers, Q4K/Q6K matvec, GQA attention, CUDA Graph, GPU dequant + cuBLAS SGEMM)
 Architectures:    Qwen2, Llama, Mistral, Phi3, Gemma2
 Tests:            86 passing
 ```

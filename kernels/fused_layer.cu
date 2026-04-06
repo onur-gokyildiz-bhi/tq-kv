@@ -262,6 +262,112 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_f32(
     }
 }
 
+// ─── Kernel 3b: Warp-shuffle LUT Fused Gateup ───────────────
+// Uses warp shuffle instead of shared memory for dequant LUT.
+// Each warp (32 threads) is in the same sub-block. Lanes 0-15 compute
+// gate LUT entries, lanes 16-31 compute up LUT entries.
+// __shfl_sync replaces shared memory read — zero extra syncs needed.
+// Saves ~15 instructions per thread per superblock vs original.
+
+extern "C" __global__ void fused_addnorm_q4km_gateup_silu_lut_f32(
+    const float* __restrict__ input,
+    const float* __restrict__ _unused,
+    const float* __restrict__ norm_weight,
+    const uint8_t* __restrict__ W_gate,
+    const uint8_t* __restrict__ W_up,
+    float* __restrict__ intermediate_out,
+    const int hidden_dim,
+    const int intermediate_dim,
+    const float eps
+) {
+    extern __shared__ float s_normed[];
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= intermediate_dim) return;
+
+    // Phase 1: RmsNorm(input) → shared memory
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float val = input[i];
+        sum_sq += val * val;
+        s_normed[i] = val;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float s_rms_inv;
+    if (tid == 0) {
+        s_rms_inv = rsqrtf(sum_sq / (float)hidden_dim + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        s_normed[i] = s_normed[i] * s_rms_inv * norm_weight[i];
+    }
+    __syncthreads();
+
+    // Thread mapping (same as original)
+    const int grp   = tid >> 6;   // 0-3
+    const int pos   = tid & 63;
+    const int is_hi = pos >> 5;   // 0 or 1
+    const int l     = pos & 31;   // 0-31
+    const int lane  = tid & 31;   // warp lane
+    const int x_idx = grp * 64 + pos;
+    const int j     = 2 * grp + is_hi;  // sub-block index 0-7
+
+    const int n_superblocks = hidden_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+    const uint8_t* gate_row = W_gate + row * bytes_per_row;
+    const uint8_t* up_row   = W_up   + row * bytes_per_row;
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        float x_val = s_normed[sb * QK_K + x_idx];
+
+        // ── Warp-shuffle LUT (divergence-free) ──
+        // All lanes compute BOTH gate and up LUT for nibble = lane & 15.
+        // Lanes 0-15 hold the canonical values; 16-31 are redundant but
+        // avoid branch divergence. Shuffles read from lanes 0-15 only.
+        const int nib = lane & 15;
+
+        const uint8_t* gblk = gate_row + sb * Q4K_BLOCK_SIZE;
+        uint16_t gd_bits  = gblk[0] | (gblk[1] << 8);
+        uint16_t gdm_bits = gblk[2] | (gblk[3] << 8);
+        float gd    = __half2float(*reinterpret_cast<const __half*>(&gd_bits));
+        float gdmin = __half2float(*reinterpret_cast<const __half*>(&gdm_bits));
+        uint8_t g_sc, g_m;
+        get_scale_min_k4(j, gblk + 4, &g_sc, &g_m);
+        float gate_lut = gd * (float)g_sc * (float)nib - gdmin * (float)g_m;
+
+        const uint8_t* ublk = up_row + sb * Q4K_BLOCK_SIZE;
+        uint16_t ud_bits  = ublk[0] | (ublk[1] << 8);
+        uint16_t udm_bits = ublk[2] | (ublk[3] << 8);
+        float ud    = __half2float(*reinterpret_cast<const __half*>(&ud_bits));
+        float udmin = __half2float(*reinterpret_cast<const __half*>(&udm_bits));
+        uint8_t u_sc, u_m;
+        get_scale_min_k4(j, ublk + 4, &u_sc, &u_m);
+        float up_lut = ud * (float)u_sc * (float)nib - udmin * (float)u_m;
+
+        // ── Lookup via warp shuffle ──
+        uint8_t g_byte = gblk[16 + grp * 32 + l];
+        int g_nib = is_hi ? (g_byte >> 4) : (g_byte & 0xF);
+        gate_sum += __shfl_sync(0xFFFFFFFF, gate_lut, g_nib) * x_val;
+
+        uint8_t u_byte = ublk[16 + grp * 32 + l];
+        int u_nib = is_hi ? (u_byte >> 4) : (u_byte & 0xF);
+        up_sum += __shfl_sync(0xFFFFFFFF, up_lut, u_nib) * x_val;
+    }
+
+    // Phase 3: reduce + SiLU(gate) * up
+    gate_sum = block_reduce_sum(gate_sum);
+    __syncthreads();
+    up_sum = block_reduce_sum(up_sum);
+
+    if (tid == 0) {
+        float silu_gate = gate_sum / (1.0f + expf(-gate_sum));
+        intermediate_out[row] = silu_gate * up_sum;
+    }
+}
+
 // ─── Kernel 4: Fused Down Projection + Residual Add ──────────
 // Grid: hidden_dim blocks, 256 threads
 // Thread-per-superblock striding for down projection (intermediate_dim=18944 → 74 sb).

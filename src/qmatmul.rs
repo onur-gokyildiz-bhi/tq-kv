@@ -13,6 +13,18 @@ use crate::quant;
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
 
+/// Reusable GPU scratch buffer for prefill streaming dequant (F32 path / Q6K).
+#[cfg(feature = "cuda")]
+static PREFILL_SCRATCH: std::sync::Mutex<Option<CudaSlice<f32>>> = std::sync::Mutex::new(None);
+
+/// Reusable GPU scratch buffer for prefill HGEMM (F16 path / Q4K).
+/// Half the size of F32 scratch — 136MB vs 272MB for gate/up.
+/// Currently unused: HGEMM slower than TF32 SGEMM for small prefills (<128 tokens).
+/// Reserved for future long-prompt optimization.
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+static PREFILL_SCRATCH_F16: std::sync::Mutex<Option<CudaSlice<half::f16>>> = std::sync::Mutex::new(None);
+
 /// Quantized weight matrix stored in GGML block format.
 ///
 /// When CUDA is enabled, raw weight bytes are lazily uploaded to GPU
@@ -333,6 +345,11 @@ impl QMatMul {
                         &reg, w_gpu, x_gpu, &mut out_gpu, out_features, in_features,
                     ).map_err(|e| TqError::Msg(format!("q4km_matvec: {}", e)))?;
                 }
+                GgmlDType::Q6K => {
+                    crate::cuda::kernels::q6k_matvec(
+                        &reg, w_gpu, x_gpu, &mut out_gpu, out_features, in_features,
+                    ).map_err(|e| TqError::Msg(format!("q6k_matvec: {}", e)))?;
+                }
                 GgmlDType::Q8_0 => {
                     crate::cuda::kernels::q8_0_matvec(
                         &reg, w_gpu, x_gpu, &mut out_gpu, out_features, in_features,
@@ -347,8 +364,11 @@ impl QMatMul {
             out_shape.push(out_features);
             Ok(TqTensor::from_cuda(out_gpu, out_shape, stream.clone()))
         } else {
-            // Prefill (batch>1): dequant + cuBLAS SGEMM
-            Self::forward_gpu_fallback(qw, x)
+            // Prefill (batch>1): GPU streaming dequant + cuBLAS SGEMM
+            match qw.dtype {
+                GgmlDType::Q4K | GgmlDType::Q6K => Self::forward_gpu_streaming_dequant(qw, x, w_gpu),
+                _ => Self::forward_gpu_fallback(qw, x),
+            }
         }
     }
 
@@ -393,6 +413,95 @@ impl QMatMul {
             let wt = w_tensor.t()?;
             x.matmul(&wt)
         }
+    }
+
+    /// GPU streaming prefill: temp F32 alloc → GPU dequant → cuBLAS SGEMM → drop.
+    /// Supports Q4K and Q6K. No persistent F32 cache (26GB wouldn't fit on 10GB GPU).
+    /// Peak VRAM: out_features × in_features × 4 bytes (e.g. 272MB for gate/up).
+    #[cfg(feature = "cuda")]
+    fn forward_gpu_streaming_dequant(qw: &QWeight, x: &TqTensor, w_packed: &CudaSlice<u8>) -> Result<TqTensor> {
+        use cudarc::cublas::sys;
+
+        let out_f = qw.out_features();
+        let in_f = qw.in_features();
+        let x_shape = x.shape().to_vec();
+        let m = x_shape[..x_shape.len() - 1].iter().product::<usize>().max(1);
+
+        let reg = crate::cuda::kernels::global_registry()
+            .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
+        let stream = &reg.stream;
+        let blas = reg.get_cublas();
+
+        // Step 1: Get or grow reusable F32 scratch buffer
+        let needed = out_f * in_f;
+        let mut scratch_guard = PREFILL_SCRATCH.lock().unwrap();
+        let scratch = scratch_guard.get_or_insert_with(|| {
+            stream.alloc_zeros::<f32>(needed).expect("prefill scratch alloc")
+        });
+        if scratch.len() < needed {
+            *scratch = stream.alloc_zeros::<f32>(needed).expect("prefill scratch grow");
+        }
+
+        // Step 2: GPU-side dequant → F32
+        match qw.dtype {
+            GgmlDType::Q4K => {
+                crate::cuda::kernels::q4km_dequant_f32(
+                    &reg, w_packed, scratch, out_f, in_f,
+                ).map_err(|e| TqError::Msg(format!("q4km_dequant_f32: {}", e)))?;
+            }
+            GgmlDType::Q6K => {
+                crate::cuda::kernels::q6k_dequant_f32(
+                    &reg, w_packed, scratch, out_f, in_f,
+                ).map_err(|e| TqError::Msg(format!("q6k_dequant_f32: {}", e)))?;
+            }
+            _ => return Self::forward_gpu_fallback(qw, x),
+        }
+
+        // Step 3: cuBLAS SGEMM with TF32 tensor cores
+        let mut out_gpu: CudaSlice<f32> = stream.alloc_zeros(m * out_f)
+            .map_err(|e| TqError::Msg(format!("sgemm out alloc: {}", e)))?;
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        let result = {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (w_ptr, _g1) = scratch.device_ptr(stream.as_ref());
+            let (x_ptr, _g2) = x.cuda_data().device_ptr(stream.as_ref());
+            let (c_ptr, _g3) = out_gpu.device_ptr_mut(stream.as_ref());
+
+            unsafe {
+                sys::cublasGemmEx(
+                    *blas.handle(),
+                    sys::cublasOperation_t::CUBLAS_OP_T,
+                    sys::cublasOperation_t::CUBLAS_OP_N,
+                    out_f as i32, m as i32, in_f as i32,
+                    &alpha as *const f32 as *const _,
+                    w_ptr as *const _,
+                    sys::cudaDataType_t::CUDA_R_32F,
+                    in_f as i32,
+                    x_ptr as *const _,
+                    sys::cudaDataType_t::CUDA_R_32F,
+                    in_f as i32,
+                    &beta as *const f32 as *const _,
+                    c_ptr as *mut _,
+                    sys::cudaDataType_t::CUDA_R_32F,
+                    out_f as i32,
+                    sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+                    sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+            }
+        };
+
+        drop(scratch_guard);
+
+        if result != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return Self::forward_gpu_fallback(qw, x);
+        }
+
+        let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+        out_shape.push(out_f);
+        Ok(TqTensor::from_cuda(out_gpu, out_shape, stream.clone()))
     }
 
     /// Prefill SGEMM with TF32 tensor core acceleration.

@@ -273,6 +273,39 @@ Web UI at localhost:11435. Works with ChatBox and Open WebUI.
 
 ---
 
+## GPU Inference Performance
+
+> RTX 3080 10GB, Qwen 2.5 7B Q4_K_M, own CUDA kernels (no candle/llama.cpp dependency)
+
+| Metric | Value |
+|:-------|------:|
+| **Decode (steady-state, CUDA Graph)** | **19 tok/s** |
+| **Decode (100 token average)** | **17.8 tok/s** |
+| **TTFT (12 token prompt)** | **0.33s** |
+| **PPL** | **13.296** |
+| **Peak VRAM** | ~4.5 GB |
+
+### Custom CUDA Kernel Stack
+
+- **Fused layer kernels**: RmsNorm + Q4K QKV + bias, gateup + SiLU, down + residual (3 launches/layer vs 13)
+- **Q4K/Q6K fused matvec**: dequant + dot product in single kernel (no intermediate F32 buffer)
+- **GQA decode attention**: online softmax, graph-safe (seq_len from GPU scalar)
+- **GPU-side dequant**: Q4K/Q6K to F32 for cuBLAS SGEMM prefill (streaming, no persistent cache)
+- **CUDA Graph replay**: entire decode layer loop as single GPU operation (zero CPU dispatch)
+- **GPU argmax**: 4 bytes D2H instead of 600KB vocabulary transfer
+
+### Optimization History
+
+| Phase | tok/s | TTFT | Key Change |
+|:------|------:|-----:|:-----------|
+| Baseline (candle) | 1.3 | -- | candle framework |
+| Custom CUDA kernels | 1.9 | -- | Own matvec, RoPE, attention |
+| DecodeScratch + fused | 10.1 | 4.8s | Zero-alloc decode, fused kernels |
+| **GPU prefill pipeline** | **11.0** | **1.05s** | GPU dequant + SGEMM, GPU causal mask |
+| **+ CUDA Graph** | **17.8** | **0.33s** | Graph replay, Q6K matvec for lm_head |
+
+---
+
 ## Benchmark
 
 ```bash

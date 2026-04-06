@@ -334,14 +334,15 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ output,
-    const int* __restrict__ seq_len_ptr,  // GPU scalar: actual valid length
+    const int* __restrict__ seq_len_ptr,  // GPU scalar: pre-append valid length
     const int n_heads,
     const int n_kv_heads,
     const int max_seq,
     const int head_dim,
-    const float scale
+    const float scale,
+    const int extra  // added after kv_append (typically 1 for decode)
 ) {
-    const int seq_len = *seq_len_ptr;  // read from GPU memory (updated before replay)
+    const int seq_len = *seq_len_ptr + extra;  // post-append length
     const int head_idx = blockIdx.x;
     if (head_idx >= n_heads) return;
     const int tid = threadIdx.x;
