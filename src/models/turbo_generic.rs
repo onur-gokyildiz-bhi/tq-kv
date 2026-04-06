@@ -3898,51 +3898,126 @@ impl GenericTurboModel {
             prof_sync!(prof_stream);
             if let Some(t) = _t_attn { prof.attn_ns += t.elapsed().as_nanos() as u64; }
 
-            // Fused residual add + FFN norm: residual += attn; x = rms_norm(residual)
+            // ── MLP: try fused kernels first (works for both compressed and uncompressed layers) ──
             let _t_mlp = if profiling { Some(std::time::Instant::now()) } else { None };
             let _enter = layer.span_mlp.enter();
             let attn_f32 = attn.to_dtype(DType::F32)?;
             let residual_f32 = residual.to_dtype(DType::F32)?;
 
+            // Fused MLP: residual+attn → scratch → fused_gateup_silu → fused_down_residual
+            // The fused_addnorm kernel does its OWN RmsNorm internally, so we skip
+            // the separate fused_add_rms_norm step. Input = residual + attn (not normed).
             #[cfg(feature = "cuda")]
-            let (x, residual_owned) = if attn_f32.is_cuda() {
-                let (normed, new_res) = attn_f32.fused_add_rms_norm_gpu(
-                    &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
-                )?;
-                (normed, new_res)
-            } else {
-                let shape = attn_f32.shape().to_vec();
-                let hidden = *shape.last().unwrap();
-                let n_tokens = attn_f32.elem_count() / hidden;
-                let (normed, new_residual) = backend.fused_add_rms_norm(
-                    attn_f32.as_slice(), residual_f32.as_slice(),
-                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
-                    n_tokens, hidden,
-                );
-                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
-                 Tensor::from_vec(new_residual, shape, attn_f32.device())?)
-            };
+            let fused_mlp_done = if seq_len == 1 && attn_f32.is_cuda() && layer.post_ffn_norm.is_none() {
+                let gateup_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                    match (mlp.feed_forward_w1.q4k_gpu_data(), mlp.feed_forward_w3.q4k_gpu_data()) {
+                        (Some((g, idim, _)), Some((u, _, _))) => Some((g, u, idim)),
+                        _ => None,
+                    }
+                } else { None };
+
+                if let Some((wgate_gpu, wup_gpu, intermediate_dim)) = gateup_data {
+                    if let Some(ref mut scratch) = decode_scratch {
+                        let reg = crate::cuda::kernels::global_registry().unwrap();
+                        let hidden_dim = scratch.hidden_dim;
+                        let ci = layer_idx & 1;
+
+                        // 1. combined = residual + attn → scratch
+                        {
+                            let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
+                                .expect("scratch combined aliased in fallback fused MLP");
+                            crate::cuda::kernels::add(
+                                reg, residual_f32.cuda_data(), attn_f32.cuda_data(), comb, hidden_dim,
+                            ).map_err(|e| TqError::Msg(format!("fused mlp add: {}", e)))?;
+                        }
+
+                        // 2. fused norm + gateup + silu (norm is INSIDE this kernel)
+                        {
+                            let inter = Arc::get_mut(&mut scratch.intermediate_buf)
+                                .expect("scratch intermediate aliased");
+                            crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
+                                reg, &*scratch.combined_bufs[ci], layer.ffn_norm.weight.cuda_data(),
+                                wgate_gpu, wup_gpu, inter,
+                                hidden_dim, intermediate_dim, layer.ffn_norm.eps as f32,
+                            ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
+                        }
+
+                        // 3. down + residual
+                        {
+                            let wdown = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                                &mlp.feed_forward_w2
+                            } else { unreachable!() };
+                            let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
+                                .expect("scratch combined down");
+                            if let Some((wd_gpu, _, _)) = wdown.q4k_gpu_data() {
+                                crate::cuda::kernels::fused_q4km_down_residual(
+                                    reg, wd_gpu, &*scratch.intermediate_buf, comb,
+                                    hidden_dim, intermediate_dim,
+                                ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+                            } else if let qmm::QMatMul::Quantized(qw) = &wdown.inner {
+                                let w_raw = qw.gpu_cache_or_upload(&reg.stream);
+                                let wo_tmp = Arc::get_mut(&mut scratch.attn_out).expect("attn_out temp");
+                                crate::cuda::kernels::q6k_matvec(
+                                    reg, w_raw, &*scratch.intermediate_buf, wo_tmp,
+                                    qw.out_features(), qw.in_features(),
+                                ).map_err(|e| TqError::Msg(format!("down q6k: {}", e)))?;
+                                crate::cuda::kernels::bias_add_inplace(
+                                    reg, comb, &*scratch.attn_out, hidden_dim,
+                                ).map_err(|e| TqError::Msg(format!("down+res: {}", e)))?;
+                            } else {
+                                return Err(TqError::Msg("fused MLP: unsupported down weight".into()));
+                            }
+                        }
+
+                        layer_in = Tensor::from_cuda_arc(Arc::clone(&scratch.combined_bufs[ci]),
+                            vec![1, 1, hidden_dim], scratch.stream.clone());
+                        true
+                    } else { false }
+                } else { false }
+            } else { false };
             #[cfg(not(feature = "cuda"))]
-            let (x, residual_owned) = {
-                let shape = attn_f32.shape().to_vec();
-                let hidden = *shape.last().unwrap();
-                let n_tokens = attn_f32.elem_count() / hidden;
-                let (normed, new_residual) = backend.fused_add_rms_norm(
-                    attn_f32.as_slice(), residual_f32.as_slice(),
-                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
-                    n_tokens, hidden,
-                );
-                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
-                 Tensor::from_vec(new_residual, shape, attn_f32.device())?)
-            };
-            let residual = &residual_owned;
-            let x = layer.mlp_or_moe.forward(&x, backend)?;
-            // Optional post-FFN norm (Gemma2)
-            let x = match &layer.post_ffn_norm {
-                Some(norm) => norm.forward(&x, backend)?,
-                None => x,
-            };
-            let x = (x + residual)?;
+            let fused_mlp_done = false;
+
+            if !fused_mlp_done {
+                // CPU/fallback path: separate norm + individual MLP forwards
+                #[cfg(feature = "cuda")]
+                let (x, residual_owned) = if attn_f32.is_cuda() {
+                    attn_f32.fused_add_rms_norm_gpu(
+                        &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
+                    )?
+                } else {
+                    let shape = attn_f32.shape().to_vec();
+                    let hidden = *shape.last().unwrap();
+                    let n_tokens = attn_f32.elem_count() / hidden;
+                    let (normed, new_res) = backend.fused_add_rms_norm(
+                        attn_f32.as_slice(), residual_f32.as_slice(),
+                        layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                        n_tokens, hidden,
+                    );
+                    (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                     Tensor::from_vec(new_res, shape, attn_f32.device())?)
+                };
+                #[cfg(not(feature = "cuda"))]
+                let (x, residual_owned) = {
+                    let shape = attn_f32.shape().to_vec();
+                    let hidden = *shape.last().unwrap();
+                    let n_tokens = attn_f32.elem_count() / hidden;
+                    let (normed, new_res) = backend.fused_add_rms_norm(
+                        attn_f32.as_slice(), residual_f32.as_slice(),
+                        layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                        n_tokens, hidden,
+                    );
+                    (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                     Tensor::from_vec(new_res, shape, attn_f32.device())?)
+                };
+                let residual = &residual_owned;
+                let x = layer.mlp_or_moe.forward(&x, backend)?;
+                let x = match &layer.post_ffn_norm {
+                    Some(norm) => norm.forward(&x, backend)?,
+                    None => x,
+                };
+                layer_in = (x + residual)?;
+            }
             prof_sync!(prof_stream);
             if let Some(t) = _t_mlp { prof.mlp_ns += t.elapsed().as_nanos() as u64; }
             prof.n += 1;
