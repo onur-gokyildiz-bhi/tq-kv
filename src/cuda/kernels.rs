@@ -729,9 +729,13 @@ pub fn tq_fused_decode_attention(
     head_dim: usize,
     bits: usize,
     scale: f32,
+    // Sink token support (set n_sink=0 to disable)
+    sink_k: Option<&CudaSlice<f32>>,  // [n_kv_heads, n_sink, head_dim]
+    sink_v: Option<&CudaSlice<f32>>,  // [n_kv_heads, n_sink, head_dim]
+    raw_query: Option<&CudaSlice<f32>>,  // [n_heads, head_dim] non-rotated
+    n_sink: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("fused_attention", "tq_fused_decode_attention_f32")?;
-    // blockDim: 32 threads (each handles head_dim/32 = 4 dims for 128-dim heads)
     let block_dim = 32u32.min(head_dim as u32);
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
@@ -743,11 +747,20 @@ pub fn tq_fused_decode_attention(
     let nk = n_keys as i32;
     let hd = head_dim as i32;
     let b = bits as i32;
+    let ns = n_sink as i32;
+    // For sink support: upload tiny placeholder buffers when sinks not provided
+    // (avoids null pointer issues with CUDA kernel args)
+    let empty_f32: CudaSlice<f32> = reg.stream.alloc_zeros(1)
+        .map_err(|e| DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
+    let sk = sink_k.unwrap_or(&empty_f32);
+    let sv = sink_v.unwrap_or(&empty_f32);
+    let rq = raw_query.unwrap_or(&empty_f32);
     unsafe {
         reg.stream.launch_builder(&f)
             .arg(query).arg(packed_indices).arg(norms).arg(centroids)
             .arg(v).arg(output)
             .arg(&nh).arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&scale)
+            .arg(sk).arg(sv).arg(rq).arg(&ns)
             .launch(cfg)?;
     }
     Ok(())

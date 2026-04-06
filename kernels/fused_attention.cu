@@ -219,7 +219,13 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
     const int n_keys,
     const int head_dim,
     const int bits,
-    const float scale                          // 1/sqrt(head_dim)
+    const float scale,                         // 1/sqrt(head_dim)
+    // Sink token support: uncompressed FP32 keys processed before compressed keys.
+    // Set n_sink=0 and sink_K/sink_V=NULL to disable.
+    const float* __restrict__ sink_K,          // [n_kv_heads, n_sink, head_dim] or NULL
+    const float* __restrict__ sink_V,          // [n_kv_heads, n_sink, head_dim] or NULL
+    const float* __restrict__ raw_query,       // [n_heads, head_dim] non-rotated (for sink dot product)
+    const int n_sink
 ) {
     const int head_idx = blockIdx.x;
     if (head_idx >= n_heads) return;
@@ -228,7 +234,8 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
 
     // --- Shared memory ---
     __shared__ float s_centroids[MAX_CENTROIDS];
-    __shared__ float s_q[MAX_HEAD_DIM];
+    __shared__ float s_q[MAX_HEAD_DIM];     // rotated query (for compressed keys)
+    __shared__ float s_q_raw[MAX_HEAD_DIM]; // raw query (for sink keys)
     __shared__ float s_max;     // running max score
     __shared__ float s_sum_exp; // running sum of exp(score - max)
 
@@ -236,6 +243,9 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
     if (tid < n_centroids) s_centroids[tid] = centroids[tid];
     for (int d = tid; d < head_dim; d += blockDim.x) {
         s_q[d] = rotated_query[head_idx * head_dim + d];
+        if (raw_query && n_sink > 0) {
+            s_q_raw[d] = raw_query[head_idx * head_dim + d];
+        }
     }
     __syncthreads();
 
@@ -244,12 +254,48 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
     float running_max = -1e10f;
     float running_sum = 0.0f;
 
+    // --- Phase 1: Sink tokens (uncompressed FP32 Q@K dot product) ---
+    if (sink_K && sink_V && n_sink > 0) {
+        const float* sink_k_head = sink_K + kv_head * n_sink * head_dim;
+        const float* sink_v_head = sink_V + kv_head * n_sink * head_dim;
+
+        for (int k = 0; k < n_sink; ++k) {
+            float partial_dot = 0.0f;
+            const float* k_row = sink_k_head + k * head_dim;
+            for (int d = tid; d < head_dim; d += blockDim.x) {
+                partial_dot += s_q_raw[d] * k_row[d];
+            }
+            float score = block_reduce_sum(partial_dot) * scale;
+
+            if (tid == 0) {
+                float new_max = fmaxf(running_max, score);
+                float rescale = expf(running_max - new_max);
+                running_sum = running_sum * rescale + expf(score - new_max);
+                running_max = new_max;
+                s_max = running_max;
+                s_sum_exp = running_sum;
+            }
+            __syncthreads();
+
+            float w = expf(score - s_max);
+            float rescale = expf(running_max - s_max);
+            const float* v_row = sink_v_head + k * head_dim;
+            for (int i = 0; i < 4; ++i) {
+                int d = tid + i * blockDim.x;
+                if (d < head_dim) {
+                    acc[i] = acc[i] * rescale + w * v_row[d];
+                }
+            }
+            running_max = s_max;
+        }
+    }
+
+    // --- Phase 2: Compressed keys (codebook lookup) ---
     const int bytes_per_key = (head_dim * bits + 7) / 8;
     const uint8_t* kv_packed = packed_indices + kv_head * n_keys * bytes_per_key;
     const float* kv_norms = norms + kv_head * n_keys;
     const float* kv_v = V + kv_head * n_keys * head_dim;
 
-    // --- Stream over KV tokens ---
     for (int k = 0; k < n_keys; ++k) {
         float norm_k = kv_norms[k];
 
