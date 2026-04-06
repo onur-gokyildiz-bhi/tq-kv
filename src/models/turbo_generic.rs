@@ -3395,21 +3395,57 @@ impl GenericTurboModel {
                         })?;
 
                         // 3. Fused GQA decode attention (graph-safe: reads seq_len from GPU scalar)
+                        // Flash decode for long context (seq_len > 256) in eager mode only.
+                        // CUDA Graph mode always uses gqa_decode (fixed buffer addresses).
                         ptime!("gqa_attn", {
                             let gpu_kv = layer.gpu_kv_cache.as_ref().unwrap();
                             let attn_mut = Arc::get_mut(&mut scratch.attn_out).expect("attn_out aliased");
-                            // During graph capture, valid_len_gpu has pre-append value
-                            // (H2D memcpy skipped). extra=1 compensates.
-                            // During normal mode, valid_len_gpu is post-append. extra=0.
-                            let attn_extra = if capturing { 1i32 } else { 0 };
-                            crate::cuda::kernels::gqa_decode_attention_graph(
-                                reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
-                                attn_mut, &gpu_kv.valid_len_gpu,
-                                scratch.n_head, scratch.n_kv_head,
-                                gpu_kv.max_seq, scratch.head_dim,
-                                1.0 / (scratch.head_dim as f32).sqrt(),
-                                attn_extra,
-                            ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))
+                            let use_flash = !capturing && !graph_replayed
+                                && gpu_kv.seq_len > 256;
+
+                            if use_flash {
+                                // Flash decode: split KV across blocks for parallelism
+                                let actual_seq = gpu_kv.seq_len;
+                                let split_size = 256usize;
+                                let n_splits = (actual_seq + split_size - 1) / split_size;
+                                let scale = 1.0 / (scratch.head_dim as f32).sqrt();
+
+                                let mut partial_o: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+                                    scratch.n_head * n_splits * scratch.head_dim
+                                ).map_err(|e| TqError::Msg(format!("flash partial_o: {}", e)))?;
+                                let mut partial_max: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+                                    scratch.n_head * n_splits
+                                ).map_err(|e| TqError::Msg(format!("flash partial_max: {}", e)))?;
+                                let mut partial_sum: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+                                    scratch.n_head * n_splits
+                                ).map_err(|e| TqError::Msg(format!("flash partial_sum: {}", e)))?;
+
+                                crate::cuda::kernels::flash_decode_partial(
+                                    reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
+                                    &mut partial_o, &mut partial_max, &mut partial_sum,
+                                    1, scratch.n_head, scratch.n_kv_head,
+                                    actual_seq, scratch.head_dim, scale, split_size,
+                                ).map_err(|e| TqError::Msg(format!("flash_decode_partial: {}", e)))?;
+
+                                crate::cuda::kernels::flash_decode_reduce(
+                                    reg, &partial_o, &partial_max, &partial_sum,
+                                    attn_mut,
+                                    scratch.n_head, n_splits, scratch.head_dim, 1,
+                                ).map_err(|e| TqError::Msg(format!("flash_decode_reduce: {}", e)))?;
+                                Ok::<(), TqError>(())
+                            } else {
+                                // Graph-safe single-block attention
+                                let attn_extra = if capturing { 1i32 } else { 0 };
+                                crate::cuda::kernels::gqa_decode_attention_graph(
+                                    reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
+                                    attn_mut, &gpu_kv.valid_len_gpu,
+                                    scratch.n_head, scratch.n_kv_head,
+                                    gpu_kv.max_seq, scratch.head_dim,
+                                    1.0 / (scratch.head_dim as f32).sqrt(),
+                                    attn_extra,
+                                ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))?;
+                                Ok(())
+                            }
                         })?;
 
                         // 4. Wo projection

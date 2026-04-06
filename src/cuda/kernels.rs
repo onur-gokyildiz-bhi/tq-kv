@@ -68,8 +68,9 @@ impl KernelRegistry {
     fn load_all_ptx(&mut self) -> Result<(), DriverError> {
         let ptx_sources: &[(&str, &str)] = &[
             ("elementwise", PTX_ELEMENTWISE),
-            // flash_attention: deferred (PTX JIT issue on sm_86)
+            // flash_attention: deferred (PTX JIT issue with mma.h on sm_86)
             // ("flash_attention", PTX_FLASH_ATTENTION),
+            ("flash_decode", PTX_FLASH_DECODE),
             ("fused_attention", PTX_FUSED_ATTENTION),
             ("fused_layer", PTX_FUSED_LAYER),
             ("tensor_ops", PTX_TENSOR_OPS),
@@ -522,6 +523,79 @@ pub fn f16_to_f32(
             .arg(input)
             .arg(output)
             .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Flash decode partial: split KV across blocks, each computes partial attention.
+/// Grid: (n_splits, n_heads, batch), Block: 32 threads.
+/// Call flash_decode_reduce after to combine partial results.
+pub fn flash_decode_partial(
+    reg: &KernelRegistry,
+    q: &CudaSlice<f32>,
+    k: &CudaSlice<f32>,
+    v: &CudaSlice<f32>,
+    partial_o: &mut CudaSlice<f32>,
+    partial_max: &mut CudaSlice<f32>,
+    partial_sum: &mut CudaSlice<f32>,
+    batch_size: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    seq_kv: usize,
+    head_dim: usize,
+    scale: f32,
+    split_size: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("flash_decode", "flash_decode_partial")?;
+    let n_splits = (seq_kv + split_size - 1) / split_size;
+    let cfg = LaunchConfig {
+        grid_dim: (n_splits as u32, n_heads as u32, batch_size as u32),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let bs = batch_size as i32;
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let skv = seq_kv as i32;
+    let hd = head_dim as i32;
+    let ss = split_size as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q).arg(k).arg(v)
+            .arg(partial_o).arg(partial_max).arg(partial_sum)
+            .arg(&bs).arg(&nh).arg(&nkv).arg(&skv).arg(&hd).arg(&scale).arg(&ss)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Flash decode reduce: combine partial results from split-KV decode.
+/// Grid: (1, n_heads, batch), Block: 32 threads.
+pub fn flash_decode_reduce(
+    reg: &KernelRegistry,
+    partial_o: &CudaSlice<f32>,
+    partial_max: &CudaSlice<f32>,
+    partial_sum: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_splits: usize,
+    head_dim: usize,
+    batch_size: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("flash_decode", "flash_decode_reduce")?;
+    let cfg = LaunchConfig {
+        grid_dim: (1, n_heads as u32, batch_size as u32),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nh = n_heads as i32;
+    let ns = n_splits as i32;
+    let hd = head_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(partial_o).arg(partial_max).arg(partial_sum).arg(output)
+            .arg(&nh).arg(&ns).arg(&hd)
             .launch(cfg)?;
     }
     Ok(())
