@@ -1368,6 +1368,9 @@ struct LayerWeights {
     boundaries_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     #[cfg(feature = "cuda")]
     centroids_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    /// Expanded signs [n_head × head_dim] for GPU Q pre-rotation
+    #[cfg(feature = "cuda")]
+    signs_expanded_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     /// Cached sink K/V on GPU (uploaded once, reused every decode step)
     #[cfg(feature = "cuda")]
     sink_k_gpu: Option<cudarc::driver::CudaSlice<f32>>,
@@ -2106,21 +2109,45 @@ impl LayerWeights {
                     if let (Some(reg), Some(ref mut gpu)) = (crate::cuda::kernels::global_registry(), &mut self.gpu_tq_cache) {
                         let n_keys = n_past_compressed;
 
-                        // Pre-rotate query (Hadamard signs) — all heads
-                        let q_flat = q_f32.flatten_all()?.to_vec1()?;
-                        let mut rotated_q = Vec::with_capacity(self.n_head * self.head_dim);
-                        for qh in 0..self.n_head {
-                            let qstart = qh * self.head_dim;
-                            let q_vec = &q_flat[qstart..qstart + self.head_dim];
-                            let rq = tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs);
-                            rotated_q.extend_from_slice(&rq);
+                        // ── ALL-GPU TQ attention path: zero CPU round-trips ──
+
+                        // Q is already on GPU. Flatten to [n_head * head_dim].
+                        let q_gpu_flat = q_f32.reshape(vec![self.n_head * self.head_dim])?;
+                        let q_gpu_data = q_gpu_flat.cuda_data();
+
+                        // GPU Hadamard pre-rotate: signs[i] * q[i] then butterfly transform
+                        // Upload signs once
+                        if self.signs_gpu.is_none() {
+                            self.signs_gpu = Some(reg.stream.clone_htod(&self.signs)
+                                .map_err(|e| TqError::Msg(format!("signs upload: {}", e)))?);
                         }
+                        // Apply sign flip + Hadamard per head on GPU
+                        // Step 1: Q × signs (broadcast signs across heads)
+                        {
+                            let signs_ref = self.signs_gpu.as_ref().unwrap();
+                            // Expand signs to [n_head, head_dim] if not already done
+                            if self.signs_expanded_gpu.is_none() {
+                                let mut expanded = Vec::with_capacity(self.n_head * self.head_dim);
+                                for _ in 0..self.n_head {
+                                    expanded.extend_from_slice(&self.signs);
+                                }
+                                self.signs_expanded_gpu = Some(reg.stream.clone_htod(&expanded)
+                                    .map_err(|e| TqError::Msg(format!("signs expand: {}", e)))?);
+                            }
+                            let n = self.n_head * self.head_dim;
+                            crate::cuda::kernels::mul(
+                                reg, q_gpu_data, self.signs_expanded_gpu.as_ref().unwrap(),
+                                &mut gpu.rotated_q, n,
+                            ).map_err(|e| TqError::Msg(format!("q sign flip: {}", e)))?;
+                        }
+                        // Step 2: Hadamard transform in-place per head
+                        // (WHT is self-inverse, signs already applied via mul)
+                        crate::cuda::kernels::hadamard_inverse_batch(
+                            reg, &mut gpu.rotated_q, self.signs_gpu.as_ref().unwrap(),
+                            self.n_head, self.head_dim,
+                        ).map_err(|e| TqError::Msg(format!("q hadamard: {}", e)))?;
 
-                        // Upload rotated query
-                        let _ = reg.stream.context().check_err();
-                        let _ = reg.stream.memcpy_htod(&rotated_q, &mut gpu.rotated_q);
-
-                        // Sink K/V: upload once and cache on GPU (they don't change during decode)
+                        // Sink K/V: upload once and cache (they don't change during decode)
                         if cache.sink_len > 0 && self.sink_k_gpu.is_none() {
                             if let Some(ref sink_k) = cache.sink_k {
                                 let sk_f32 = sink_k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
@@ -2136,11 +2163,6 @@ impl LayerWeights {
                                     .map_err(|e| TqError::Msg(format!("sink V upload: {}", e)))?);
                             }
                         }
-                        // Raw query still needs upload each step (changes per token)
-                        let raw_q_gpu = if cache.sink_len > 0 {
-                            Some(reg.stream.clone_htod(&q_flat)
-                                .map_err(|e| TqError::Msg(format!("raw Q upload: {}", e)))?)
-                        } else { None };
 
                         let scale = 1.0 / (self.head_dim as f32).sqrt();
                         crate::cuda::kernels::tq_fused_decode_attention(
@@ -2149,15 +2171,20 @@ impl LayerWeights {
                             self.n_head, self.n_kv_head, n_keys, self.head_dim,
                             gpu.bits as usize, scale,
                             self.sink_k_gpu.as_ref(), self.sink_v_gpu.as_ref(),
-                            raw_q_gpu.as_ref(), cache.sink_len,
+                            // Raw query for sink attention: use Q directly from GPU (not rotated)
+                            Some(q_gpu_data), cache.sink_len,
                         ).map_err(|e| TqError::Msg(format!("fused decode attention: {}", e)))?;
 
-                        // Download output
-                        let _ = reg.stream.context().check_err();
-                        let attn_out = reg.stream.clone_dtoh(&gpu.output_buf)
-                            .map_err(|e| TqError::Msg(format!("fused attn download: {}", e)))?;
-
-                        let y = Tensor::from_vec(attn_out, vec![1, self.n_head, 1, self.head_dim], q.device())?;
+                        // Output stays on GPU — D2D copy to new buffer (output_buf is reused)
+                        let n_out = self.n_head * self.head_dim;
+                        let mut out_copy: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(n_out)
+                            .map_err(|e| TqError::Msg(format!("attn out alloc: {}", e)))?;
+                        let _ = reg.stream.memcpy_dtod(&gpu.output_buf, &mut out_copy);
+                        let y = Tensor::from_cuda(
+                            out_copy,
+                            vec![1, self.n_head, 1, self.head_dim],
+                            reg.stream.clone(),
+                        );
                         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
                         return self.attention_wo.forward(&y, backend);
                     }
@@ -2981,6 +3008,8 @@ impl GenericTurboModel {
                 boundaries_gpu: None,
                 #[cfg(feature = "cuda")]
                 centroids_gpu: None,
+                #[cfg(feature = "cuda")]
+                signs_expanded_gpu: None,
                 #[cfg(feature = "cuda")]
                 sink_k_gpu: None,
                 #[cfg(feature = "cuda")]
