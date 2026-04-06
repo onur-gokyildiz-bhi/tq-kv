@@ -784,13 +784,14 @@ pub fn tq_fused_decode_attention(
     let hd = head_dim as i32;
     let b = bits as i32;
     let ns = n_sink as i32;
-    // For sink support: upload tiny placeholder buffers when sinks not provided
-    // (avoids null pointer issues with CUDA kernel args)
-    let empty_f32: CudaSlice<f32> = reg.stream.alloc_zeros(1)
-        .map_err(|e| DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY))?;
-    let sk = sink_k.unwrap_or(&empty_f32);
-    let sv = sink_v.unwrap_or(&empty_f32);
-    let rq = raw_query.unwrap_or(&empty_f32);
+    // Placeholder for null sink buffers — cached to avoid alloc per call
+    static EMPTY_BUF: std::sync::OnceLock<CudaSlice<f32>> = std::sync::OnceLock::new();
+    let empty = EMPTY_BUF.get_or_init(|| {
+        reg.stream.alloc_zeros(1).expect("TQ empty buf alloc")
+    });
+    let sk = sink_k.unwrap_or(empty);
+    let sv = sink_v.unwrap_or(empty);
+    let rq = raw_query.unwrap_or(empty);
     unsafe {
         reg.stream.launch_builder(&f)
             .arg(query).arg(packed_indices).arg(norms).arg(centroids)

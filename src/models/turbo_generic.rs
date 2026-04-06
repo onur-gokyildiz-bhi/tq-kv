@@ -2175,13 +2175,10 @@ impl LayerWeights {
                             Some(q_gpu_data), cache.sink_len,
                         ).map_err(|e| TqError::Msg(format!("fused decode attention: {}", e)))?;
 
-                        // Output stays on GPU — D2D copy to new buffer (output_buf is reused)
-                        let n_out = self.n_head * self.head_dim;
-                        let mut out_copy: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(n_out)
-                            .map_err(|e| TqError::Msg(format!("attn out alloc: {}", e)))?;
-                        let _ = reg.stream.memcpy_dtod(&gpu.output_buf, &mut out_copy);
+                        // Output stays on GPU — view output_buf directly (no alloc/copy needed).
+                        // output_buf is read by Wo projection immediately, then overwritten next layer.
                         let y = Tensor::from_cuda(
-                            out_copy,
+                            gpu.output_buf.clone(),
                             vec![1, self.n_head, 1, self.head_dim],
                             reg.stream.clone(),
                         );
