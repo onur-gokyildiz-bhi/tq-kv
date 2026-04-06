@@ -3297,11 +3297,11 @@ impl GenericTurboModel {
                                         reg, wv_gpu, normed_ptr, ov, v_out, hidden_dim,
                                     ).map_err(|e| TqError::Msg(format!("scratch V Q4K: {}", e)))?;
                                 } else if let qmm::QMatMul::Quantized(qw) = &wv.inner {
-                                    // Q6K/other: use dequantized F32 weight + f32_matvec
-                                    let w_f32 = qw.gpu_f32_or_upload(&reg.stream);
-                                    crate::cuda::kernels::f32_matvec(
-                                        reg, w_f32, normed_ptr, ov, qw.out_features(), qw.in_features(),
-                                    ).map_err(|e| TqError::Msg(format!("scratch V f32: {}", e)))?;
+                                    // Q6K: native fused dequant matvec (4.9x less bandwidth than F32)
+                                    let w_raw = qw.gpu_cache_or_upload(&reg.stream);
+                                    crate::cuda::kernels::q6k_matvec(
+                                        reg, w_raw, normed_ptr, ov, qw.out_features(), qw.in_features(),
+                                    ).map_err(|e| TqError::Msg(format!("scratch V Q6K: {}", e)))?;
                                 } else {
                                     return Err(TqError::Msg("V weight: unsupported format".into()));
                                 }
@@ -3511,12 +3511,12 @@ impl GenericTurboModel {
                                         hidden_dim, intermediate_dim,
                                     ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
                                 } else if let qmm::QMatMul::Quantized(qw) = &wdown.inner {
-                                    // Q6K: f32_matvec into attn_out (temp — attention done), then add to combined
-                                    let w_f32 = qw.gpu_f32_or_upload(&reg.stream);
+                                    // Q6K: native fused dequant matvec (4.9x less bandwidth)
+                                    let w_raw = qw.gpu_cache_or_upload(&reg.stream);
                                     let wo_tmp = Arc::get_mut(&mut scratch.attn_out)
                                         .expect("attn_out temp aliased");
-                                    crate::cuda::kernels::f32_matvec(
-                                        reg, w_f32, &*scratch.intermediate_buf, wo_tmp,
+                                    crate::cuda::kernels::q6k_matvec(
+                                        reg, w_raw, &*scratch.intermediate_buf, wo_tmp,
                                         qw.out_features(), qw.in_features(),
                                     ).map_err(|e| TqError::Msg(format!("down f32: {}", e)))?;
                                     // residual += down_out

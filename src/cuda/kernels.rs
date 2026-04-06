@@ -306,6 +306,34 @@ pub fn q4km_matvec(
 }
 
 /// Launch q8_0_matvec_f32: fused Q8_0 dequant + matvec.
+/// Q6K fused dequant + matvec. 210 bytes/256 values = 4.9x less bandwidth than F32.
+pub fn q6k_matvec(
+    reg: &KernelRegistry,
+    w_packed: &CudaSlice<u8>,
+    x: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("qmatmul", "q6k_matvec_f32")?;
+    let rows_per_block = 4u32;
+    let n_blocks = (out_features as u32 + rows_per_block - 1) / rows_per_block;
+    let cfg = LaunchConfig {
+        grid_dim: (n_blocks, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let of = out_features as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_packed).arg(x).arg(output)
+            .arg(&of).arg(&inf)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 pub fn q8_0_matvec(
     reg: &KernelRegistry,
     w_packed: &CudaSlice<u8>,

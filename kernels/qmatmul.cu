@@ -114,6 +114,96 @@ extern "C" __global__ void q4km_matvec_f32(
     }
 }
 
+// ─── Q6_K Fused Matvec ──────────────────────────────────────
+// Native Q6K dequant+dot: reads 210 bytes/256 values instead of 1024 bytes F32.
+// 4.9x less bandwidth than f32_matvec with dequantized weights.
+//
+// Q6K block layout (210 bytes → 256 values):
+//   ql[0..127]:    4-bit lower quantized values
+//   qh[128..191]:  2-bit upper quantized values (combined: 6-bit per value)
+//   scales[192..207]: 16 × int8 scales
+//   d[208..209]:   float16 overall scale
+//
+// 256 values = 2 groups × 4 sub-blocks × 32 positions.
+// dequant: d * scale * (q6 - 32) where q6 = ql_nibble | (qh_bits << 4).
+#define Q6K_BLOCK_SIZE 210
+
+extern "C" __global__ void q6k_matvec_f32(
+    const uint8_t* __restrict__ W_packed,
+    const float* __restrict__ x,
+    float* __restrict__ output,
+    const int out_features,
+    const int in_features
+) {
+    const int base_row = blockIdx.x * MATVEC_ROWS_PER_BLOCK;
+    const int tid = threadIdx.x;
+
+    const int n_superblocks = in_features / QK_K;
+    const int bytes_per_row = n_superblocks * Q6K_BLOCK_SIZE;
+
+    __shared__ float s_x[QK_K];
+
+    // Thread mapping: 256 threads → 256 positions in superblock
+    const int grp = tid >> 7;        // 0 or 1 (which group of 128)
+    const int pos = tid & 127;
+    const int sub = pos >> 5;        // 0-3 (sub-block within group)
+    const int l   = pos & 31;        // position within sub-block
+    const int is  = l >> 4;          // 0 or 1 (scale pair index)
+
+    float sums[MATVEC_ROWS_PER_BLOCK] = {0.0f};
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        s_x[tid] = x[sb * QK_K + tid];
+        __syncthreads();
+
+        // x position: grp*128 + sub*32 + l
+        float x_val = s_x[grp * 128 + sub * 32 + l];
+
+        #pragma unroll
+        for (int r = 0; r < MATVEC_ROWS_PER_BLOCK; ++r) {
+            int row = base_row + r;
+            if (row >= out_features) break;
+
+            const uint8_t* block = W_packed + row * bytes_per_row + sb * Q6K_BLOCK_SIZE;
+            const uint8_t* ql = block;
+            const uint8_t* qh = block + 128;
+            const int8_t* scales = (const int8_t*)(block + 192);
+            float d = __half2float(*reinterpret_cast<const __half*>(block + 208));
+
+            int ql_off = grp * 64;
+            int qh_off = grp * 32;
+            int sc_off = grp * 8;
+
+            // ql byte (sub 0,2 share one byte; sub 1,3 share another)
+            uint8_t ql_byte = (sub & 1) ? ql[ql_off + l + 32] : ql[ql_off + l];
+            int q_lo = (sub < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
+
+            // qh bits (all 4 subs share same qh byte, different bit pairs)
+            uint8_t qh_byte = qh[qh_off + l];
+            int qh_bits = (qh_byte >> (sub * 2)) & 3;
+
+            // 6-bit value + scale
+            int q = q_lo | (qh_bits << 4);
+            float sc = (float)scales[sc_off + sub * 2 + is];
+
+            sums[r] += d * sc * (float)(q - 32) * x_val;
+        }
+
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int r = 0; r < MATVEC_ROWS_PER_BLOCK; ++r) {
+        int row = base_row + r;
+        if (row >= out_features) break;
+        float result = block_reduce_sum(sums[r]);
+        if (tid == 0) {
+            output[row] = result;
+        }
+        if (r < MATVEC_ROWS_PER_BLOCK - 1) __syncthreads();
+    }
+}
+
 // ─── Q8_0 Fused Matvec ───────────────────────────────────────
 // Simpler: each block is 34 bytes = [f16 d][i8 × 32]
 #define Q8_0_BLOCK_SIZE 34
