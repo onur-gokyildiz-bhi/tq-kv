@@ -220,6 +220,7 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
     const int head_dim,
     const int bits,
     const float scale,                         // 1/sqrt(head_dim)
+    const int max_seq,                         // buffer stride (packed/norms/V pre-allocated)
     // Sink token support: uncompressed FP32 keys processed before compressed keys.
     // Set n_sink=0 and sink_K/sink_V=NULL to disable.
     const float* __restrict__ sink_K,          // [n_kv_heads, n_sink, head_dim] or NULL
@@ -297,10 +298,11 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
     }
 
     // --- Phase 2: Compressed keys (codebook lookup) ---
+    // Use max_seq as stride (buffer is pre-allocated with max_seq slots per head)
     const int bytes_per_key = (head_dim * bits + 7) / 8;
-    const uint8_t* kv_packed = packed_indices + kv_head * n_keys * bytes_per_key;
-    const float* kv_norms = norms + kv_head * n_keys;
-    const float* kv_v = V + kv_head * n_keys * head_dim;
+    const uint8_t* kv_packed = packed_indices + kv_head * max_seq * bytes_per_key;
+    const float* kv_norms = norms + kv_head * max_seq;
+    const float* kv_v = V + kv_head * max_seq * head_dim;
 
     for (int k = 0; k < n_keys; ++k) {
         float norm_k = kv_norms[k];

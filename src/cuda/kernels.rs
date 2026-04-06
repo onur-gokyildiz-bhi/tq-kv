@@ -754,21 +754,22 @@ pub fn tq_fused_attention(
 pub fn tq_fused_decode_attention(
     reg: &KernelRegistry,
     query: &CudaSlice<f32>,          // [n_heads, head_dim] pre-rotated
-    packed_indices: &CudaSlice<u8>,  // [n_kv_heads, n_keys * bytes_per_key]
-    norms: &CudaSlice<f32>,          // [n_kv_heads, n_keys]
+    packed_indices: &CudaSlice<u8>,  // [n_kv_heads, max_seq, bytes_per_key]
+    norms: &CudaSlice<f32>,          // [n_kv_heads, max_seq]
     centroids: &CudaSlice<f32>,      // [n_centroids]
-    v: &CudaSlice<f32>,              // [n_kv_heads, n_keys, head_dim]
+    v: &CudaSlice<f32>,              // [n_kv_heads, max_seq, head_dim]
     output: &mut CudaSlice<f32>,     // [n_heads, head_dim]
     n_heads: usize,
     n_kv_heads: usize,
-    n_keys: usize,
+    n_keys: usize,                   // actual number of compressed keys
     head_dim: usize,
     bits: usize,
     scale: f32,
+    max_seq: usize,                  // buffer stride (pre-allocated size)
     // Sink token support (set n_sink=0 to disable)
-    sink_k: Option<&CudaSlice<f32>>,  // [n_kv_heads, n_sink, head_dim]
-    sink_v: Option<&CudaSlice<f32>>,  // [n_kv_heads, n_sink, head_dim]
-    raw_query: Option<&CudaSlice<f32>>,  // [n_heads, head_dim] non-rotated
+    sink_k: Option<&CudaSlice<f32>>,
+    sink_v: Option<&CudaSlice<f32>>,
+    raw_query: Option<&CudaSlice<f32>>,
     n_sink: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("fused_attention", "tq_fused_decode_attention_f32")?;
@@ -783,8 +784,8 @@ pub fn tq_fused_decode_attention(
     let nk = n_keys as i32;
     let hd = head_dim as i32;
     let b = bits as i32;
+    let ms = max_seq as i32;
     let ns = n_sink as i32;
-    // Placeholder for null sink buffers — cached to avoid alloc per call
     static EMPTY_BUF: std::sync::OnceLock<CudaSlice<f32>> = std::sync::OnceLock::new();
     let empty = EMPTY_BUF.get_or_init(|| {
         reg.stream.alloc_zeros(1).expect("TQ empty buf alloc")
@@ -796,7 +797,7 @@ pub fn tq_fused_decode_attention(
         reg.stream.launch_builder(&f)
             .arg(query).arg(packed_indices).arg(norms).arg(centroids)
             .arg(v).arg(output)
-            .arg(&nh).arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&scale)
+            .arg(&nh).arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&scale).arg(&ms)
             .arg(sk).arg(sv).arg(rq).arg(&ns)
             .launch(cfg)?;
     }

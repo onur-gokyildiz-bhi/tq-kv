@@ -1688,7 +1688,6 @@ impl LayerWeights {
             let tokens_to_compress = seq_len.saturating_sub(compress_start);
 
             // Check GPU compress eligibility once (used by both compress and skip logic)
-            // GPU compress: per-vector sigma (ignores group_size, slight quality diff, massive speed gain)
             #[cfg(feature = "cuda")]
             let gpu_compress_ok = tokens_to_compress > 0 && seq_len == 1
                 && k.is_cuda()
@@ -2169,9 +2168,8 @@ impl LayerWeights {
                             reg, &gpu.rotated_q, &gpu.packed_indices, &gpu.norms,
                             &gpu.centroids, &gpu.v_data, &mut gpu.output_buf,
                             self.n_head, self.n_kv_head, n_keys, self.head_dim,
-                            gpu.bits as usize, scale,
+                            gpu.bits as usize, scale, gpu.max_seq,
                             self.sink_k_gpu.as_ref(), self.sink_v_gpu.as_ref(),
-                            // Raw query for sink attention: use Q directly from GPU (not rotated)
                             Some(q_gpu_data), cache.sink_len,
                         ).map_err(|e| TqError::Msg(format!("fused decode attention: {}", e)))?;
 
