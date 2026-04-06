@@ -37,9 +37,17 @@ impl Sampler {
     /// logits: [vocab_size] or [1, vocab_size]
     /// Returns: token id (u32)
     pub fn sample(&mut self, logits: &TqTensor) -> Result<u32> {
-        let data = logits.as_slice();
         let vocab_size = *logits.shape().last()
             .ok_or_else(|| TqError::Msg("empty logits".into()))?;
+
+        // GPU argmax: 4 bytes D2H instead of 600KB
+        #[cfg(feature = "cuda")]
+        if matches!(self.mode, SamplingMode::ArgMax) && logits.is_cuda() {
+            let results = logits.argmax_last()?;
+            return Ok(results[0]);
+        }
+
+        let data = logits.as_slice();
 
         // Get the last row of logits (for batch=1)
         let logits_row = if data.len() > vocab_size {

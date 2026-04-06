@@ -970,9 +970,25 @@ impl TqTensor {
 
     /// Argmax along the last dimension, returns indices.
     pub fn argmax_last(&self) -> Result<Vec<u32>> {
-        let data = self.as_slice();
         let last_dim = *self.shape.last().ok_or("argmax: empty shape")?;
         let n_rows = self.elem_count() / last_dim;
+
+        // GPU path: single kernel, copies 4 bytes instead of 600KB
+        #[cfg(feature = "cuda")]
+        if self.is_cuda() && n_rows == 1 {
+            if let Some(reg) = super::kernels::global_registry() {
+                let mut out_buf: cudarc::driver::CudaSlice<u32> = reg.stream.alloc_zeros(1)
+                    .map_err(|e| TqError::Msg(format!("argmax alloc: {}", e)))?;
+                super::kernels::argmax_gpu(reg, self.cuda_data(), &mut out_buf, last_dim)
+                    .map_err(|e| TqError::Msg(format!("argmax kernel: {}", e)))?;
+                let mut result = vec![0u32; 1];
+                let _ = reg.stream.memcpy_dtoh(&out_buf, &mut result);
+                return Ok(result);
+            }
+        }
+
+        // CPU fallback
+        let data = self.as_slice();
         let mut indices = Vec::with_capacity(n_rows);
         for row in 0..n_rows {
             let start = row * last_dim;

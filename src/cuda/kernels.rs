@@ -380,6 +380,29 @@ pub fn add(
     Ok(())
 }
 
+/// GPU argmax: find index of maximum value. Single block, 256 threads.
+/// Returns u32 index via out_idx GPU buffer. Avoids 600KB D2H copy.
+pub fn argmax_gpu(
+    reg: &KernelRegistry,
+    data: &CudaSlice<f32>,
+    out_idx: &mut CudaSlice<u32>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("elementwise", "argmax_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let ni = n as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(data).arg(out_idx).arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// In-place bias add: data[i] += bias[i].
 pub fn bias_add_inplace(
     reg: &KernelRegistry,

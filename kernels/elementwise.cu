@@ -160,3 +160,48 @@ extern "C" __global__ void bf16_to_f32_kernel(
         output[idx] = *reinterpret_cast<float*>(&bits);
     }
 }
+
+// ─── GPU Argmax: find index of maximum value ────────────────
+// Single block, 256 threads. Each thread scans a chunk, then block reduction.
+// Output: single u32 index. Avoids 600KB D2H copy for lm_head argmax.
+extern "C" __global__ void argmax_f32(
+    const float* __restrict__ data,
+    unsigned int* __restrict__ out_idx,
+    const int n
+) {
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    // Each thread finds local max over its chunk
+    float local_max = -1e30f;
+    int local_idx = 0;
+    for (int i = tid; i < n; i += block_size) {
+        float v = data[i];
+        if (v > local_max) {
+            local_max = v;
+            local_idx = i;
+        }
+    }
+
+    // Block reduction: shared memory for (value, index) pairs
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+    s_val[tid] = local_max;
+    s_idx[tid] = local_idx;
+    __syncthreads();
+
+    // Tree reduction
+    for (int stride = block_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_val[tid + stride] > s_val[tid]) {
+                s_val[tid] = s_val[tid + stride];
+                s_idx[tid] = s_idx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *out_idx = (unsigned int)s_idx[0];
+    }
+}
