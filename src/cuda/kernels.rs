@@ -619,6 +619,41 @@ pub fn tq_fused_decode_attention(
     Ok(())
 }
 
+/// Graph-safe GQA decode attention: reads seq_len from GPU scalar.
+/// Use for CUDA Graph replay — update seq_len_ptr via memcpy_htod before launch.
+pub fn gqa_decode_attention_graph(
+    reg: &KernelRegistry,
+    q: &CudaSlice<f32>,
+    k: &CudaSlice<f32>,
+    v: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    seq_len_ptr: &CudaSlice<i32>,     // GPU scalar
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_seq: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_attention", "gqa_decode_attention_graph_f32")?;
+    let block_dim = 32u32.min(head_dim as u32);
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q).arg(k).arg(v).arg(output).arg(seq_len_ptr)
+            .arg(&nh).arg(&nkv).arg(&ms).arg(&hd).arg(&scale)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// GQA decode attention: fused Q@K^T + scale + softmax + @V.
 /// Handles GQA head mapping internally — no repeat_kv copy needed.
 /// K/V are pre-allocated padded buffers [n_kv_heads, max_seq, head_dim].

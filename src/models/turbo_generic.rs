@@ -3375,15 +3375,15 @@ impl GenericTurboModel {
                             layer.gpu_kv_cache.as_mut().unwrap().append(&k_view, &v_view, 1)
                         })?;
 
-                        // 3. Fused GQA decode attention
+                        // 3. Fused GQA decode attention (graph-safe: reads seq_len from GPU scalar)
                         ptime!("gqa_attn", {
                             let gpu_kv = layer.gpu_kv_cache.as_ref().unwrap();
                             let attn_mut = Arc::get_mut(&mut scratch.attn_out).expect("attn_out aliased");
-                            crate::cuda::kernels::gqa_decode_attention(
+                            crate::cuda::kernels::gqa_decode_attention_graph(
                                 reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
-                                attn_mut,
+                                attn_mut, &gpu_kv.valid_len_gpu,
                                 scratch.n_head, scratch.n_kv_head,
-                                gpu_kv.seq_len, gpu_kv.max_seq, scratch.head_dim,
+                                gpu_kv.max_seq, scratch.head_dim,
                                 1.0 / (scratch.head_dim as f32).sqrt(),
                             ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))
                         })?;

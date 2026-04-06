@@ -327,6 +327,88 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
 //
 // One block per Q head. Threads cooperate on dot product + V accumulation.
 // Online softmax (numerically stable, single pass).
+// Graph-safe variant: reads seq_len from GPU scalar pointer (not baked kernel arg).
+// Use for CUDA Graph replay — update the scalar via memcpy_htod before launch.
+extern "C" __global__ void gqa_decode_attention_graph_f32(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ output,
+    const int* __restrict__ seq_len_ptr,  // GPU scalar: actual valid length
+    const int n_heads,
+    const int n_kv_heads,
+    const int max_seq,
+    const int head_dim,
+    const float scale
+) {
+    const int seq_len = *seq_len_ptr;  // read from GPU memory (updated before replay)
+    const int head_idx = blockIdx.x;
+    if (head_idx >= n_heads) return;
+    const int tid = threadIdx.x;
+    const int kv_head = head_idx / (n_heads / n_kv_heads);
+
+    __shared__ float s_q[MAX_HEAD_DIM];
+    __shared__ float s_max;
+    __shared__ float s_sum_exp;
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        s_q[d] = Q[head_idx * head_dim + d];
+    }
+    __syncthreads();
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float running_max = -1e10f;
+    float running_sum = 0.0f;
+
+    const float* kv_k = K + kv_head * max_seq * head_dim;
+    const float* kv_v = V + kv_head * max_seq * head_dim;
+
+    for (int k = 0; k < seq_len; ++k) {
+        const float* k_row = kv_k + k * head_dim;
+        float partial_dot = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            partial_dot += s_q[d] * k_row[d];
+        }
+        float score_local = block_reduce_sum(partial_dot) * scale;
+
+        __shared__ float s_score;
+        if (tid == 0) s_score = score_local;
+        __syncthreads();
+        float score = s_score;
+
+        __shared__ float s_rescale;
+        if (tid == 0) {
+            float new_max = fmaxf(running_max, score);
+            float rf = expf(running_max - new_max);
+            running_sum = running_sum * rf + expf(score - new_max);
+            running_max = new_max;
+            s_max = new_max;
+            s_sum_exp = running_sum;
+            s_rescale = rf;
+        }
+        __syncthreads();
+
+        float w = expf(score - s_max);
+        const float* v_row = kv_v + k * head_dim;
+        for (int i = 0; i < 4; ++i) {
+            int d = tid + i * blockDim.x;
+            if (d < head_dim) {
+                acc[i] = acc[i] * s_rescale + w * v_row[d];
+            }
+        }
+        running_max = s_max;
+    }
+
+    float inv_sum = (s_sum_exp > 0.0f) ? 1.0f / s_sum_exp : 0.0f;
+    for (int i = 0; i < 4; ++i) {
+        int d = tid + i * blockDim.x;
+        if (d < head_dim) {
+            output[head_idx * head_dim + d] = acc[i] * inv_sum;
+        }
+    }
+}
+
+// Standard variant: seq_len as kernel argument (non-graph path).
 extern "C" __global__ void gqa_decode_attention_f32(
     const float* __restrict__ Q,     // [n_heads, 1, head_dim] (current query)
     const float* __restrict__ K,     // [n_kv_heads, max_seq, head_dim] (padded KV cache)
