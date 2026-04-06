@@ -3261,8 +3261,8 @@ impl GenericTurboModel {
                         let norm_w = layer.attention_norm.weight.cuda_data();
 
                         if let Some(ref mut scratch) = decode_scratch {
-                            // Step 1: RmsNorm input → scratch needs normed input for matvec.
-                            // Compute norm into scratch.combined_bufs (temp, overwritten later in MLP).
+                            let pdet_qkv = profiling && layer_idx == 0;
+                            let _tqkv = if pdet_qkv { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
                             let ci = layer_idx & 1;
                             {
                                 let normed = Arc::get_mut(&mut scratch.combined_bufs[ci])
@@ -3322,6 +3322,7 @@ impl GenericTurboModel {
                                 crate::cuda::kernels::bias_add_inplace(reg, ov, bv.cuda_data(), scratch.v_out)
                                     .map_err(|e| TqError::Msg(format!("V bias: {}", e)))?;
                             }
+                            if let Some(t) = _tqkv { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "norm+qkv", t.elapsed().as_nanos() as f64 / 1000.0); }
                             Some((true, None, hidden_dim))
                         } else {
                             // No scratch: compute via forward, wrap as tensors

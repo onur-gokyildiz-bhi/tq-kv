@@ -201,23 +201,64 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_f32(
     }
     __syncthreads();
 
-    // Phase 2: gate and up matvec from shared normalized input
+    // Phase 2: DUAL gate+up dot product in single loop (x_val shared, halves iterations)
     const int n_superblocks = hidden_dim / QK_K;
     const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
 
+    const int grp   = tid >> 6;
+    const int pos   = tid & 63;
+    const int is_hi = pos >> 5;
+    const int l     = pos & 31;
+    const int x_idx = grp * 64 + pos;
+    const int j     = 2 * grp + is_hi;
+
     const uint8_t* gate_row = W_gate + row * bytes_per_row;
-    float gate_val = q4km_dot_from_shared(gate_row, s_normed, hidden_dim, tid, blockDim.x);
+    const uint8_t* up_row   = W_up   + row * bytes_per_row;
 
-    // Need to sync before reusing shared memory for second reduction
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        float x_val = s_normed[sb * QK_K + x_idx];
+
+        // Gate weight dequant
+        const uint8_t* gblk = gate_row + sb * Q4K_BLOCK_SIZE;
+        uint16_t gd_bits  = gblk[0] | (gblk[1] << 8);
+        uint16_t gdm_bits = gblk[2] | (gblk[3] << 8);
+        float gd    = __half2float(*reinterpret_cast<const __half*>(&gd_bits));
+        float gdmin = __half2float(*reinterpret_cast<const __half*>(&gdm_bits));
+        const uint8_t* gsc = gblk + 4;
+        uint8_t g_sc, g_m;
+        if (j < 4) { g_sc = gsc[j] & 63; g_m = gsc[j+4] & 63; }
+        else { g_sc = (gsc[j+4]&0xF)|((gsc[j-4]>>6)<<4); g_m = (gsc[j+4]>>4)|((gsc[j]>>6)<<4); }
+        uint8_t g_byte = gblk[16 + grp * 32 + l];
+        float g_nib = is_hi ? (float)(g_byte >> 4) : (float)(g_byte & 0xF);
+        gate_sum += (gd * (float)g_sc * g_nib - gdmin * (float)g_m) * x_val;
+
+        // Up weight dequant (same x_val — no re-read from shared mem)
+        const uint8_t* ublk = up_row + sb * Q4K_BLOCK_SIZE;
+        uint16_t ud_bits  = ublk[0] | (ublk[1] << 8);
+        uint16_t udm_bits = ublk[2] | (ublk[3] << 8);
+        float ud    = __half2float(*reinterpret_cast<const __half*>(&ud_bits));
+        float udmin = __half2float(*reinterpret_cast<const __half*>(&udm_bits));
+        const uint8_t* usc = ublk + 4;
+        uint8_t u_sc, u_m;
+        if (j < 4) { u_sc = usc[j] & 63; u_m = usc[j+4] & 63; }
+        else { u_sc = (usc[j+4]&0xF)|((usc[j-4]>>6)<<4); u_m = (usc[j+4]>>4)|((usc[j]>>6)<<4); }
+        uint8_t u_byte = ublk[16 + grp * 32 + l];
+        float u_nib = is_hi ? (float)(u_byte >> 4) : (float)(u_byte & 0xF);
+        up_sum += (ud * (float)u_sc * u_nib - udmin * (float)u_m) * x_val;
+    }
+
+    // Single reduction pass for both gate and up
+    gate_sum = block_reduce_sum(gate_sum);
     __syncthreads();
-
-    const uint8_t* up_row = W_up + row * bytes_per_row;
-    float up_val = q4km_dot_from_shared(up_row, s_normed, hidden_dim, tid, blockDim.x);
+    up_sum = block_reduce_sum(up_sum);
 
     // Phase 3: SiLU(gate) * up
     if (tid == 0) {
-        float silu_gate = gate_val / (1.0f + expf(-gate_val));
-        intermediate_out[row] = silu_gate * up_val;
+        float silu_gate = gate_sum / (1.0f + expf(-gate_sum));
+        intermediate_out[row] = silu_gate * up_sum;
     }
 }
 
