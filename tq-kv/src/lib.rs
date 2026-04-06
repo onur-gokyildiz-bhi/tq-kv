@@ -100,6 +100,12 @@ pub struct TurboQuantConfig {
     pub qjl_mode: QjlMode,
     /// QJL projection dimension (0 = same as head_dim)
     pub qjl_proj_dim: usize,
+    /// Effective spectral dimension (SpectralQuant).
+    /// When set, QJL error correction is applied only to the top d_eff
+    /// dimensions (signal), skipping noise dimensions. Reduces QJL memory
+    /// cost by d_eff/dim factor and improves quality by avoiding noise injection.
+    /// Set by calibration (eigenvalue spectrum analysis). 0 = disabled (full dim).
+    pub spectral_d_eff: usize,
     /// Hadamard rotation seed
     pub rotation_seed: u64,
     /// QJL base seed
@@ -180,6 +186,7 @@ impl Default for TurboQuantConfig {
             qjl_mode: QjlMode::Off,
             use_qjl: false,
             qjl_proj_dim: 0,
+            spectral_d_eff: 0,
             rotation_seed: 0x0054_5552_4230,
             qjl_seed: 0x0051_4A4C_4232,
             sparse_v_threshold: 1e-6,
@@ -332,11 +339,18 @@ pub fn compress_vectors(data: &[f32], dim: usize, config: &TurboQuantConfig) -> 
 
     let polar_data = polar::quantize_batch(&rotated, dim, &polar_config);
 
-    // 2. QJL error correction
+    // 2. QJL error correction (SpectralQuant: selective on signal dimensions)
     let qjl_corrections = if config.use_qjl {
         let reconstructed = polar::dequantize_batch(&polar_data, dim);
-        let errors: Vec<f32> = rotated.iter().zip(reconstructed.iter())
+        let mut errors: Vec<f32> = rotated.iter().zip(reconstructed.iter())
             .map(|(orig, recon)| orig - recon).collect();
+        // SpectralQuant: zero out noise dimension errors
+        if config.spectral_d_eff > 0 && config.spectral_d_eff < dim {
+            let d_eff = config.spectral_d_eff;
+            for chunk in errors.chunks_exact_mut(dim) {
+                for i in d_eff..dim { chunk[i] = 0.0; }
+            }
+        }
         let proj_dim = if config.qjl_proj_dim == 0 { dim } else { config.qjl_proj_dim };
         Some(qjl::compute_batch(&errors, dim, proj_dim, config.qjl_seed))
     } else {
@@ -1127,6 +1141,16 @@ pub fn compress_keys(
             for (&orig, &idx) in chunk.iter().zip(indices.iter()) {
                 let recon = cb.dequantize(idx);
                 errors.push(orig - recon);
+            }
+        }
+        // SpectralQuant selective QJL: only correct error in signal dimensions.
+        // Noise dimensions (d_eff..dim) get zeroed out — QJL on noise is harmful.
+        if config.spectral_d_eff > 0 && config.spectral_d_eff < dim {
+            let d_eff = config.spectral_d_eff;
+            for chunk in errors.chunks_exact_mut(dim) {
+                for i in d_eff..dim {
+                    chunk[i] = 0.0; // zero out noise dimension errors
+                }
             }
         }
         let proj_dim = if config.qjl_proj_dim == 0 { dim } else { config.qjl_proj_dim };
@@ -2037,7 +2061,8 @@ pub fn sparse_v_stats(attn_weights: &[f32], threshold: f32) -> SparseVStats {
 ///
 /// Expected improvement: 10-25% quantization error reduction over random Hadamard.
 pub fn calibrate_rotation(data: &[f32], dim: usize) -> Vec<f32> {
-    hadamard::calibrate_pca_rotation(data, dim)
+    let (rotation, _eigenvalues) = hadamard::calibrate_pca_rotation(data, dim);
+    rotation
 }
 
 /// Calibrate codebook from a batch of key vectors.

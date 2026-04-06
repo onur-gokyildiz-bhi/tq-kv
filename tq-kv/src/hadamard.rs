@@ -217,7 +217,9 @@ pub fn random_orthogonal(dim: usize, seed: u64) -> Vec<f32> {
 /// Returns: row-major [dim × dim] orthogonal rotation matrix.
 /// Use with `TurboQuantConfig::rotation_matrix`.
 #[cfg(feature = "std")]
-pub fn calibrate_pca_rotation(data: &[f32], dim: usize) -> Vec<f32> {
+/// PCA rotation matrix from covariance eigendecomposition.
+/// Returns (rotation_matrix, eigenvalues_descending).
+pub fn calibrate_pca_rotation(data: &[f32], dim: usize) -> (Vec<f32>, Vec<f32>) {
     assert_eq!(data.len() % dim, 0);
     let n = data.len() / dim;
     assert!(n > 0, "Need at least one vector for PCA");
@@ -241,8 +243,30 @@ pub fn calibrate_pca_rotation(data: &[f32], dim: usize) -> Vec<f32> {
     // 2. Jacobi eigenvalue algorithm (symmetric matrix → eigenvalues + eigenvectors)
     let eigenvectors = jacobi_eigen(&mut cov, dim);
 
-    // 3. Return eigenvectors as rotation matrix (f32)
-    eigenvectors.iter().map(|&v| v as f32).collect()
+    // 3. Extract eigenvalues (diagonal of A after Jacobi, sorted descending)
+    let mut eigen_pairs: Vec<f64> = (0..dim).map(|i| cov[i * dim + i]).collect();
+    eigen_pairs.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let eigenvalues: Vec<f32> = eigen_pairs.iter().map(|&v| v as f32).collect();
+
+    // 4. Return eigenvectors as rotation matrix (f32) + eigenvalues
+    let rotation = eigenvectors.iter().map(|&v| v as f32).collect();
+    (rotation, eigenvalues)
+}
+
+/// Compute effective dimension from eigenvalue spectrum.
+/// d_eff = number of dimensions carrying >threshold fraction of total variance.
+/// SpectralQuant insight: typically d_eff ≈ 4 for key vectors across model families.
+pub fn compute_d_eff(eigenvalues: &[f32], threshold: f32) -> usize {
+    let total: f32 = eigenvalues.iter().sum();
+    if total <= 0.0 { return eigenvalues.len(); }
+    let mut cumulative = 0.0;
+    for (i, &ev) in eigenvalues.iter().enumerate() {
+        cumulative += ev;
+        if cumulative / total >= threshold {
+            return (i + 1).max(1);
+        }
+    }
+    eigenvalues.len()
 }
 
 /// Jacobi eigenvalue algorithm for symmetric matrices.

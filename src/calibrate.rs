@@ -60,6 +60,13 @@ pub struct CalibrationData {
     /// Subtracting this bias before Hadamard rotation restores the Gaussian assumption.
     #[serde(default)]
     pub key_channel_bias: Option<Vec<f32>>,
+    /// Eigenvalue spectrum from PCA (descending order).
+    /// SpectralQuant insight: only d_eff ≈ 4 dimensions carry signal.
+    #[serde(default)]
+    pub eigenvalues: Option<Vec<f32>>,
+    /// Effective dimension at 95% variance threshold.
+    #[serde(default)]
+    pub d_eff: Option<usize>,
 }
 
 impl CalibrationData {
@@ -104,6 +111,11 @@ impl CalibrationData {
             if !self.rotation_matrix.is_empty() {
                 config.rotation_matrix = Some(self.rotation_matrix.clone());
             }
+        }
+        // Spectral d_eff: apply if calibration computed it
+        if let Some(d_eff) = self.d_eff {
+            config.spectral_d_eff = d_eff;
+            eprintln!("  Spectral d_eff={} (QJL will target signal dimensions only)", d_eff);
         }
         // Apply auto-assigned per-head bits from calibration (env var TQ_HEAD_BITS overrides)
         if config.per_head_bits.is_none() {
@@ -328,9 +340,20 @@ pub fn compute_calibration(
         })
         .collect();
 
-    // 3. PCA rotation matrix (computed on scaled data)
+    // 3. PCA rotation matrix + eigenvalue spectrum (computed on scaled data)
     eprintln!("  PCA rotation...");
-    let rotation_matrix = tq_kv::hadamard::calibrate_pca_rotation(&scaled_data, head_dim);
+    let (rotation_matrix, eigenvalues) = tq_kv::hadamard::calibrate_pca_rotation(&scaled_data, head_dim);
+
+    // Compute effective dimension (SpectralQuant insight: d_eff ≈ 4 for keys)
+    let d_eff_95 = tq_kv::hadamard::compute_d_eff(&eigenvalues, 0.95);
+    let d_eff_99 = tq_kv::hadamard::compute_d_eff(&eigenvalues, 0.99);
+    eprintln!("  Spectral analysis: d_eff(95%)={}, d_eff(99%)={} out of {} dims",
+        d_eff_95, d_eff_99, head_dim);
+    if eigenvalues.len() >= 4 {
+        eprintln!("  Top eigenvalues: {:.4}, {:.4}, {:.4}, {:.4} (total={:.4})",
+            eigenvalues[0], eigenvalues[1], eigenvalues[2], eigenvalues[3],
+            eigenvalues.iter().sum::<f32>());
+    }
 
     // 4. Calibrated codebooks (2, 3, 4 bit)
     // Use the PCA rotation matrix for codebook calibration so that
@@ -380,6 +403,8 @@ pub fn compute_calibration(
         head_importance,
         auto_head_bits,
         key_channel_bias: Some(key_channel_bias),
+        eigenvalues: if eigenvalues.is_empty() { None } else { Some(eigenvalues) },
+        d_eff: Some(d_eff_95),
     }
 }
 
