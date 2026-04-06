@@ -565,6 +565,42 @@ pub fn tq_compress_key(
     Ok(())
 }
 
+/// D2D scatter: append compressed token to GpuCompressedKv at correct position.
+/// Zero CPU round-trip — all data stays on GPU.
+pub fn tq_cache_scatter(
+    reg: &KernelRegistry,
+    packed_src: &CudaSlice<u8>,
+    norms_src: &CudaSlice<f32>,
+    v_src: &CudaSlice<f32>,
+    packed_dst: &mut CudaSlice<u8>,
+    norms_dst: &mut CudaSlice<f32>,
+    v_dst: &mut CudaSlice<f32>,
+    pos: usize,
+    n_kv_heads: usize,
+    max_seq: usize,
+    head_dim: usize,
+    bytes_per_key: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tq_compress", "tq_cache_scatter")?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_heads as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let p = pos as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    let bpk = bytes_per_key as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(packed_src).arg(norms_src).arg(v_src)
+            .arg(packed_dst).arg(norms_dst).arg(v_dst)
+            .arg(&p).arg(&ms).arg(&hd).arg(&bpk)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Flash decode partial: split KV across blocks, each computes partial attention.
 /// Grid: (n_splits, n_heads, batch), Block: 32 threads.
 /// Call flash_decode_reduce after to combine partial results.

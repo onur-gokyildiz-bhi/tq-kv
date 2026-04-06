@@ -548,8 +548,7 @@ impl GpuCompressedKv {
     }
 
     /// Append one token's compressed K and raw V directly from GPU buffers.
-    /// No CPU round-trip — GPU compress kernel output goes straight to cache.
-    /// packed_gpu: [n_kv_head * bytes_per_key], norms_gpu: [n_kv_head], v_gpu: [n_kv_head * head_dim]
+    /// True D2D scatter — zero CPU round-trip via tq_cache_scatter kernel.
     fn append_gpu(
         &mut self,
         packed_gpu: &cudarc::driver::CudaSlice<u8>,
@@ -559,22 +558,17 @@ impl GpuCompressedKv {
         if self.count >= self.max_seq {
             return Err(crate::cuda::TqError::Msg("GpuCompressedKv overflow".into()));
         }
-        let bpk = self.bytes_per_key;
-        let pos = self.count;
-        let hd = self.head_dim;
+        let reg = crate::cuda::kernels::global_registry()
+            .ok_or_else(|| crate::cuda::TqError::Msg("no GPU registry".into()))?;
 
-        // Download small GPU buffers → CPU → upload to correct offsets.
-        // Total data: n_kv_head × (bpk + 4 + hd×4) ≈ 4 × 580 = 2.3 KB.
-        // The download is negligible (was ~2KB vs old approach downloading 2048B K vectors).
-        // True zero-copy D2D requires a dedicated scatter kernel (future optimization).
-        let packed_cpu = self.stream.clone_dtoh(packed_gpu)
-            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu packed dtoh: {}", e)))?;
-        let norms_cpu = self.stream.clone_dtoh(norms_gpu)
-            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu norms dtoh: {}", e)))?;
-        let v_cpu = self.stream.clone_dtoh(v_gpu)
-            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu v dtoh: {}", e)))?;
+        crate::cuda::kernels::tq_cache_scatter(
+            reg, packed_gpu, norms_gpu, v_gpu,
+            &mut self.packed_indices, &mut self.norms, &mut self.v_data,
+            self.count, self.n_kv_head, self.max_seq, self.head_dim, self.bytes_per_key,
+        ).map_err(|e| crate::cuda::TqError::Msg(format!("tq_cache_scatter: {}", e)))?;
 
-        self.append(&packed_cpu, &norms_cpu, &v_cpu)
+        self.count += 1;
+        Ok(())
     }
 
     fn reset(&mut self) {

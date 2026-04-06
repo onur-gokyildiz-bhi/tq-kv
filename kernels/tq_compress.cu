@@ -176,3 +176,45 @@ extern "C" __global__ void tq_compress_key_f32(
         norms_out[head] = (recon_norm > 1e-10f) ? (norm * norm / recon_norm) : norm;
     }
 }
+
+// ─── D2D Scatter: append compressed token to GpuCompressedKv ──
+// Copies packed indices, norms, and V data from compress output to
+// pre-allocated cache at the correct position. Zero CPU round-trip.
+//
+// Grid: (n_kv_heads, 1, 1), Block: 128 threads
+// Each block handles one KV head's scatter.
+
+extern "C" __global__ void tq_cache_scatter(
+    const uint8_t* __restrict__ packed_src,   // [n_kv_heads, bytes_per_key]
+    const float* __restrict__ norms_src,      // [n_kv_heads]
+    const float* __restrict__ v_src,          // [n_kv_heads, head_dim]
+    uint8_t* __restrict__ packed_dst,         // [n_kv_heads, max_seq, bytes_per_key]
+    float* __restrict__ norms_dst,            // [n_kv_heads, max_seq]
+    float* __restrict__ v_dst,                // [n_kv_heads, max_seq, head_dim]
+    const int pos,                            // write position in cache
+    const int max_seq,
+    const int head_dim,
+    const int bytes_per_key
+) {
+    const int head = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    // Scatter packed indices
+    const uint8_t* src_packed = packed_src + head * bytes_per_key;
+    uint8_t* dst_packed = packed_dst + (head * max_seq + pos) * bytes_per_key;
+    for (int i = tid; i < bytes_per_key; i += blockDim.x) {
+        dst_packed[i] = src_packed[i];
+    }
+
+    // Scatter norm (single float)
+    if (tid == 0) {
+        norms_dst[head * max_seq + pos] = norms_src[head];
+    }
+
+    // Scatter V data
+    const float* src_v = v_src + head * head_dim;
+    float* dst_v = v_dst + (head * max_seq + pos) * head_dim;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        dst_v[i] = src_v[i];
+    }
+}
