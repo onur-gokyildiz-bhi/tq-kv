@@ -399,6 +399,7 @@ impl QMatMul {
     /// Uses cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_TF32 on SM80+.
     /// Falls back to regular f32 SGEMM on older GPUs.
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)] // Reserved for future FP16/TF32 datapath (Phase 4)
     fn forward_gpu_sgemm_tf32(qw: &QWeight, x: &TqTensor, w_gpu: &CudaSlice<f32>) -> Result<TqTensor> {
         use cudarc::cublas::sys;
 
@@ -477,8 +478,9 @@ impl QMatMul {
     /// Uses CUBLAS_COMPUTE_32F accumulation for accuracy with FP16 inputs.
     /// This engages FP16 tensor cores on SM75+ (Turing, Ampere, Ada, Hopper).
     #[cfg(feature = "cuda")]
+    #[allow(dead_code)] // Reserved for future FP16 datapath (Phase 4)
     fn forward_gpu_hgemm(qw: &QWeight, x: &TqTensor) -> Result<TqTensor> {
-        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+        use cudarc::cublas::{Gemm, GemmConfig};
         use cudarc::cublas::sys::cublasOperation_t;
 
         let out_f = qw.out_features(); // N (rows of W = cols of output)

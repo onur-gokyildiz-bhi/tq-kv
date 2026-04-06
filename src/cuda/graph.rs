@@ -42,10 +42,7 @@ pub struct CudaGraphManager {
     pub warmup_runs: usize,
     /// Current eager run count.
     eager_count: usize,
-    /// Non-default stream for graph capture (created on demand).
-    /// Default/null stream doesn't support capture.
-    #[cfg(feature = "cuda")]
-    capture_stream: Option<std::sync::Arc<cudarc::driver::CudaStream>>,
+    // capture_stream removed — using default stream for scratch-based capture.
 }
 
 // SAFETY: CudaGraph is bound to a single GPU context. We only access
@@ -65,8 +62,6 @@ impl CudaGraphManager {
             enabled,
             warmup_runs: 2,
             eager_count: 0,
-            #[cfg(feature = "cuda")]
-            capture_stream: None,
         }
     }
 

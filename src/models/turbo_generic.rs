@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Thread-local raw device pointer for RoPE position GPU scalar.
-/// Points to the model's rope_pos_gpu CudaSlice. Updated before capture/replay.
+// Thread-local raw device pointer for RoPE position GPU scalar.
+// Points to the model's rope_pos_gpu CudaSlice. Updated before capture/replay.
 #[cfg(feature = "cuda")]
 std::thread_local! {
     static ROPE_POS_GPU_PTR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -3430,7 +3430,7 @@ impl GenericTurboModel {
 
                     // Phase 3: extract MLP GPU data + launch kernels 2+3 (scoped borrow)
                     let fused_mlp_result: Result<Tensor> = (|| {
-                        let mlp_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                        let _mlp_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
                             match (
                                 mlp.feed_forward_w1.q4k_gpu_data(),
                                 mlp.feed_forward_w3.q4k_gpu_data(),

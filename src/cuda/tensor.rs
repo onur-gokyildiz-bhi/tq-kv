@@ -204,91 +204,7 @@ pub fn decode_pool_restore(buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice
 
 /// Allocate or reuse a GPU buffer depending on pool mode.
 /// In Recording mode: alloc + save to pool.
-/// In Pooled mode: return pool[cursor++] (same pointer every time).
-/// In Off mode: normal alloc.
-#[cfg(feature = "cuda")]
-fn pool_alloc_f32(
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-    len: usize,
-) -> std::result::Result<std::sync::Arc<cudarc::driver::CudaSlice<f32>>, cudarc::driver::result::DriverError> {
-    let mode = DECODE_POOL_MODE.with(|m| m.get());
-    match mode {
-        PoolMode::Off => {
-            let buf = gpu_alloc_zeros::<f32>(stream, len)?;
-            Ok(std::sync::Arc::new(buf))
-        }
-        PoolMode::Recording => {
-            let buf = gpu_alloc_zeros::<f32>(stream, len)?;
-            let arc = std::sync::Arc::new(buf);
-            DECODE_POOL_BUFFERS.with(|b| b.borrow_mut().push(arc.clone()));
-            Ok(arc)
-        }
-        PoolMode::Pooled | PoolMode::Arena => {
-            let idx = DECODE_POOL_CURSOR.with(|c| c.get());
-            let arc = DECODE_POOL_BUFFERS.with(|b| {
-                let bufs = b.borrow();
-                if idx < bufs.len() {
-                    Some(bufs[idx].clone())
-                } else {
-                    None
-                }
-            });
-            match arc {
-                Some(a) => {
-                    // Only advance cursor on successful pool hit
-                    DECODE_POOL_CURSOR.with(|c| c.set(idx + 1));
-                    if a.len() != len {
-                        eprintln!("[pool] WARNING: size mismatch at idx {}: pool={} requested={}", idx, a.len(), len);
-                        // Reallocate with correct size instead of using wrong buffer
-                        let buf = gpu_alloc_zeros::<f32>(stream, len)?;
-                        return Ok(std::sync::Arc::new(buf));
-                    }
-                    Ok(a)
-                }
-                None => {
-                    // Pool miss: DON'T advance cursor (keeps sequence aligned)
-                    eprintln!("[pool] WARNING: pool exhausted at idx {} (pool has {} buffers), allocating fresh",
-                        idx, DECODE_POOL_BUFFERS.with(|b| b.borrow().len()));
-                    let buf = gpu_alloc_zeros::<f32>(stream, len)?;
-                    Ok(std::sync::Arc::new(buf))
-                }
-            }
-        }
-    }
-}
-
-/// Pool-aware i32 metadata upload.
-/// Recording: clone_htod + save to meta pool.
-/// Pooled: return ptr::read copy of saved buffer (same device pointer).
-/// Off: normal clone_htod.
-///
-/// Caller MUST mem::forget the result in ALL modes (metadata is ephemeral).
-#[cfg(feature = "cuda")]
-fn pool_clone_htod_i32(
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-    data: &[i32],
-) -> std::result::Result<cudarc::driver::CudaSlice<i32>, cudarc::driver::result::DriverError> {
-    let mode = DECODE_POOL_MODE.with(|m| m.get());
-    match mode {
-        PoolMode::Recording => {
-            let buf = stream.clone_htod(data)?;
-            META_POOL_BUFFERS.with(|b| b.borrow_mut().push(unsafe { std::ptr::read(&buf) }));
-            Ok(buf)
-        }
-        PoolMode::Pooled | PoolMode::Arena => {
-            let idx = META_POOL_CURSOR.with(|c| { let i = c.get(); c.set(i + 1); i });
-            META_POOL_BUFFERS.with(|b| {
-                let bufs = b.borrow();
-                if idx < bufs.len() {
-                    Ok(unsafe { std::ptr::read(&bufs[idx]) })
-                } else {
-                    stream.clone_htod(data)
-                }
-            })
-        }
-        PoolMode::Off => stream.clone_htod(data),
-    }
-}
+// Legacy pool_alloc_f32 and pool_clone_htod_i32 removed — replaced by DecodeScratch.
 
 #[cfg(feature = "cuda")]
 fn bufs_get_cloned(bufs: &[std::sync::Arc<cudarc::driver::CudaSlice<f32>>], idx: usize) -> Option<std::sync::Arc<cudarc::driver::CudaSlice<f32>>> {
@@ -495,7 +411,7 @@ impl TqTensor {
                         let _ = stream.context().check_err(); // clear error_state
                         let _ = stream.synchronize();
                         // Raw memcpy: bypass cudarc's bind_to_thread/check_err
-                        use cudarc::driver::{DevicePtr, DeviceSlice};
+                        use cudarc::driver::DevicePtr;
                         let n = data.len();
                         let mut dst = vec![0.0f32; n];
                         let (src_ptr, _guard) = data.as_ref().device_ptr(stream.as_ref());
@@ -661,7 +577,7 @@ impl TqTensor {
             let mut new_shape = self.shape.clone();
             new_shape[dim] = len;
             let new_n: usize = new_shape.iter().product();
-            let outer: usize = self.shape[..dim].iter().product();
+            let _outer: usize = self.shape[..dim].iter().product();
             let inner: usize = self.shape[dim + 1..].iter().product();
 
             // Build source strides and output strides for strided_copy kernel
@@ -675,7 +591,7 @@ impl TqTensor {
             for i in (0..rank.saturating_sub(1)).rev() {
                 src_strides_v[i] = if i + 1 < rank { src_strides_v[i + 1] * self.shape[i + 1] as i32 } else { 1 };
             }
-            let src_offset = (start * inner) as i32;
+            let _src_offset = (start * inner) as i32;
 
             // Simple contiguous copy approach: for contiguous narrow, use sliced memcpy
             let _ = stream.context().check_err();
@@ -705,7 +621,7 @@ impl TqTensor {
 
         // CPU path
         let data = self.as_slice();
-        let rank = self.rank();
+        let _rank = self.rank();
         let mut new_shape = self.shape.clone();
         new_shape[dim] = len;
         let outer: usize = self.shape[..dim].iter().product();
@@ -1502,7 +1418,7 @@ impl TqTensor {
     /// For 2D: standard SGEMM.
     /// For higher rank: strided batched SGEMM (batch dims broadcast).
     fn matmul_cublas(&self, other: &TqTensor) -> Result<Self> {
-        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+        use cudarc::cublas::{Gemm, GemmConfig};
         use cudarc::cublas::sys::cublasOperation_t;
 
         let a_shape = self.shape().to_vec();
