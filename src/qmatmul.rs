@@ -156,6 +156,16 @@ impl QWeight {
 
     /// Number of input features (columns).
     pub fn in_features(&self) -> usize { self.shape.1 }
+
+    /// Get or lazily create dequantized F32 weight cache on GPU.
+    /// Used by DecodeScratch for Q6K V weight f32_matvec.
+    #[cfg(feature = "cuda")]
+    pub fn gpu_f32_or_upload(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> &CudaSlice<f32> {
+        self.gpu_f32_cache.get_or_init(|| {
+            let w = self.dequantize();
+            stream.clone_htod(&w).expect("weight f32 upload failed")
+        })
+    }
 }
 
 /// Quantized matrix multiplication operator.

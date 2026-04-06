@@ -352,6 +352,26 @@ pub fn add(
     Ok(())
 }
 
+/// In-place bias add: data[i] += bias[i].
+pub fn bias_add_inplace(
+    reg: &KernelRegistry,
+    data: &mut CudaSlice<f32>,
+    bias: &CudaSlice<f32>,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("elementwise", "bias_add_f32")?;
+    let cfg = launch_1d(n);
+    let ni = n as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(data as &mut CudaSlice<f32>)
+            .arg(bias)
+            .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Launch elementwise mul_f32.
 pub fn mul(
     reg: &KernelRegistry,

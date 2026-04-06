@@ -45,6 +45,18 @@ extern "C" __global__ void add_f32(
     }
 }
 
+// ─── In-place bias add: data[i] += bias[i] ──────────────────
+extern "C" __global__ void bias_add_f32(
+    float* __restrict__ data,
+    const float* __restrict__ bias,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        data[idx] += bias[idx];
+    }
+}
+
 // ─── Element-wise Mul ────────────────────────────────────────
 extern "C" __global__ void mul_f32(
     const float* __restrict__ a,

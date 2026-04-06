@@ -3242,68 +3242,102 @@ impl GenericTurboModel {
                 && matches!(&layer.qkv, QkvWeights::Separate { .. })
                 && matches!(&layer.mlp_or_moe, MlpOrMoe::Mlp(_))
             {
-                // Phase 1: extract QKV GPU data + launch kernel (scoped borrow of layer.qkv).
-                // Returns: (qkv_in_scratch, Option<(Tensor,Tensor,Tensor)>, hidden_dim)
-                // When scratch is used: qkv_in_scratch=true, tensors=None (Arc refcounts stay 1).
+                // Phase 1: Compute QKV into scratch buffers (scoped borrow of layer.qkv).
+                // Q and K require Q4K. V can be Q4K or Q6K (fallback to f32_matvec).
+                // When scratch is used: qkv_in_scratch=true, tensors=None.
                 let fused_qkv: Option<(bool, Option<(Tensor, Tensor, Tensor)>, usize)> = {
-                    let qkv_data = if let QkvWeights::Separate { wq, wk, wv } = &layer.qkv {
-                        match (wq.q4k_gpu_data(), wk.q4k_gpu_data(), wv.q4k_gpu_data()) {
-                            (Some((wq_g, qo, hd)), Some((wk_g, ko, _)), Some((wv_g, vo, _))) =>
-                                Some((wq_g, wk_g, wv_g, qo, ko, vo, hd)),
+                    // Extract Q+K as Q4K, V as Q4K or Q6K fallback
+                    let qk_data = if let QkvWeights::Separate { wq, wk, wv: _ } = &layer.qkv {
+                        match (wq.q4k_gpu_data(), wk.q4k_gpu_data()) {
+                            (Some((wq_g, qo, hd)), Some((wk_g, ko, _))) =>
+                                Some((wq_g, wk_g, qo, ko, hd)),
                             _ => None,
                         }
                     } else { None };
 
-                    if let Some((wq_gpu, wk_gpu, wv_gpu, q_out, k_out, v_out, hidden_dim)) = qkv_data {
+                    if let Some((wq_gpu, wk_gpu, q_out, k_out, hidden_dim)) = qk_data {
                         let reg = crate::cuda::kernels::global_registry().unwrap();
-                        let stream = &reg.stream;
                         let input_gpu = x.cuda_data();
                         let norm_w = layer.attention_norm.weight.cuda_data();
-                        let bq = layer.attention_bq.as_ref().map(|b| b.cuda_data());
-                        let bk = layer.attention_bk.as_ref().map(|b| b.cuda_data());
-                        let bv = layer.attention_bv.as_ref().map(|b| b.cuda_data());
 
                         if let Some(ref mut scratch) = decode_scratch {
-                            // DecodeScratch: write into pre-allocated buffers, NO tensor views
-                            let oq = Arc::get_mut(&mut scratch.q_buf).expect("scratch q_buf aliased");
-                            let ok = Arc::get_mut(&mut scratch.k_buf).expect("scratch k_buf aliased");
-                            let ov = Arc::get_mut(&mut scratch.v_buf).expect("scratch v_buf aliased");
-                            crate::cuda::kernels::fused_norm_q4km_qkv_bias(
-                                reg, input_gpu, norm_w,
-                                wq_gpu, wk_gpu, wv_gpu,
-                                bq, bk, bv,
-                                oq, ok, ov,
-                                hidden_dim, q_out, k_out, v_out,
-                                layer.attention_norm.eps as f32,
-                            ).map_err(|e| TqError::Msg(format!("fused norm+QKV: {}", e)))?;
+                            // Step 1: RmsNorm input → scratch needs normed input for matvec.
+                            // Compute norm into scratch.combined_bufs (temp, overwritten later in MLP).
+                            let ci = layer_idx & 1;
+                            {
+                                let normed = Arc::get_mut(&mut scratch.combined_bufs[ci])
+                                    .expect("scratch combined aliased in QKV");
+                                crate::cuda::kernels::rms_norm(
+                                    reg, input_gpu, norm_w, normed,
+                                    1, hidden_dim, layer.attention_norm.eps as f32,
+                                ).map_err(|e| TqError::Msg(format!("scratch rms_norm: {}", e)))?;
+                            }
+                            let normed_ptr: &cudarc::driver::CudaSlice<f32> = &*scratch.combined_bufs[ci];
+
+                            // Step 2: Q matvec (Q4K) → scratch.q_buf
+                            {
+                                let oq = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
+                                crate::cuda::kernels::q4km_matvec(
+                                    reg, wq_gpu, normed_ptr, oq, q_out, hidden_dim,
+                                ).map_err(|e| TqError::Msg(format!("scratch Q matvec: {}", e)))?;
+                            }
+                            // Step 3: K matvec (Q4K) → scratch.k_buf
+                            {
+                                let ok = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
+                                crate::cuda::kernels::q4km_matvec(
+                                    reg, wk_gpu, normed_ptr, ok, k_out, hidden_dim,
+                                ).map_err(|e| TqError::Msg(format!("scratch K matvec: {}", e)))?;
+                            }
+                            // Step 4: V matvec (Q4K or Q6K fallback) → scratch.v_buf
+                            {
+                                let ov = Arc::get_mut(&mut scratch.v_buf).expect("v aliased");
+                                let wv = if let QkvWeights::Separate { wv, .. } = &layer.qkv { wv } else { unreachable!() };
+                                if let Some((wv_gpu, v_out, _)) = wv.q4k_gpu_data() {
+                                    crate::cuda::kernels::q4km_matvec(
+                                        reg, wv_gpu, normed_ptr, ov, v_out, hidden_dim,
+                                    ).map_err(|e| TqError::Msg(format!("scratch V Q4K: {}", e)))?;
+                                } else if let qmm::QMatMul::Quantized(qw) = &wv.inner {
+                                    // Q6K/other: use dequantized F32 weight + f32_matvec
+                                    let w_f32 = qw.gpu_f32_or_upload(&reg.stream);
+                                    crate::cuda::kernels::f32_matvec(
+                                        reg, w_f32, normed_ptr, ov, qw.out_features(), qw.in_features(),
+                                    ).map_err(|e| TqError::Msg(format!("scratch V f32: {}", e)))?;
+                                } else {
+                                    return Err(TqError::Msg("V weight: unsupported format".into()));
+                                }
+                            }
+                            // Step 5: Add biases in-place (Qwen2 has Q/K/V biases)
+                            if let Some(ref bq) = layer.attention_bq {
+                                let oq = Arc::get_mut(&mut scratch.q_buf).expect("q bias");
+                                crate::cuda::kernels::bias_add_inplace(reg, oq, bq.cuda_data(), q_out)
+                                    .map_err(|e| TqError::Msg(format!("Q bias: {}", e)))?;
+                            }
+                            if let Some(ref bk) = layer.attention_bk {
+                                let ok = Arc::get_mut(&mut scratch.k_buf).expect("k bias");
+                                crate::cuda::kernels::bias_add_inplace(reg, ok, bk.cuda_data(), k_out)
+                                    .map_err(|e| TqError::Msg(format!("K bias: {}", e)))?;
+                            }
+                            if let Some(ref bv) = layer.attention_bv {
+                                let ov = Arc::get_mut(&mut scratch.v_buf).expect("v bias");
+                                crate::cuda::kernels::bias_add_inplace(reg, ov, bv.cuda_data(), scratch.v_out)
+                                    .map_err(|e| TqError::Msg(format!("V bias: {}", e)))?;
+                            }
                             Some((true, None, hidden_dim))
                         } else {
-                            let mut out_q = crate::cuda::gpu_alloc_zeros_pub(stream, q_out)
-                                .map_err(|e| TqError::Msg(format!("fused QKV alloc: {}", e)))?;
-                            let mut out_k = crate::cuda::gpu_alloc_zeros_pub(stream, k_out)
-                                .map_err(|e| TqError::Msg(format!("fused QKV alloc: {}", e)))?;
-                            let mut out_v = crate::cuda::gpu_alloc_zeros_pub(stream, v_out)
-                                .map_err(|e| TqError::Msg(format!("fused QKV alloc: {}", e)))?;
-                            crate::cuda::kernels::fused_norm_q4km_qkv_bias(
-                                reg, input_gpu, norm_w,
-                                wq_gpu, wk_gpu, wv_gpu,
-                                bq, bk, bv,
-                                &mut out_q, &mut out_k, &mut out_v,
-                                hidden_dim, q_out, k_out, v_out,
-                                layer.attention_norm.eps as f32,
-                            ).map_err(|e| TqError::Msg(format!("fused norm+QKV: {}", e)))?;
-                            let q_t = Tensor::from_cuda(out_q, vec![1, 1, q_out], stream.clone());
-                            let k_t = Tensor::from_cuda(out_k, vec![1, 1, k_out], stream.clone());
-                            let v_t = Tensor::from_cuda(out_v, vec![1, 1, v_out], stream.clone());
+                            // No scratch: compute via forward, wrap as tensors
+                            let normed_x = layer.attention_norm.forward(&x, backend)?;
+                            let (wq_w, wk_w, wv_w) = if let QkvWeights::Separate { wq, wk, wv } = &layer.qkv {
+                                (wq, wk, wv)
+                            } else { unreachable!() };
+                            let q_t = wq_w.forward(&normed_x, backend)?;
+                            let k_t = wk_w.forward(&normed_x, backend)?;
+                            let v_t = wv_w.forward(&normed_x, backend)?;
                             Some((false, Some((q_t, k_t, v_t)), hidden_dim))
                         }
                     } else { None }
                 }; // QKV borrows released
 
                 if let Some((qkv_in_scratch, qkv_tensors, hidden_dim)) = fused_qkv {
-                    // Phase 2: attention
-                    // Ultra-fused path: RoPE in-place + GpuKvCache append + fused GQA attention + Wo
-                    // Eliminates ~15 GPU allocs/frees per layer (transpose, matmul, softmax, etc.)
                     let attn = if qkv_in_scratch
                         && layer.gpu_kv_cache.is_some()
                         && layer.attention_wo.q4k_gpu_data().is_some()
@@ -3312,8 +3346,19 @@ impl GenericTurboModel {
                         let scratch = decode_scratch.as_mut().unwrap();
                         let reg = crate::cuda::kernels::global_registry().unwrap();
 
+                        // Per-kernel detail profiling (TQ_PROFILE=1, layer 0 only)
+                        let pdet = profiling && layer_idx == 0;
+                        macro_rules! ptime {
+                            ($label:expr, $body:expr) => {{
+                                let _t = if pdet { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
+                                let r = $body;
+                                if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", $label, t.elapsed().as_nanos() as f64 / 1000.0); }
+                                r
+                            }};
+                        }
+
                         // 1. RoPE in-place on scratch Q and K (zero alloc)
-                        {
+                        ptime!("rope_q", {
                             let q_mut = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
                             let rope_fn = match layer.rope_style {
                                 RopeStyle::Halved => crate::cuda::kernels::rope_halved,
@@ -3321,9 +3366,9 @@ impl GenericTurboModel {
                             };
                             rope_fn(reg, q_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
                                 1, scratch.n_head, scratch.head_dim, layer.rope_dim, index_pos,
-                            ).map_err(|e| TqError::Msg(format!("scratch RoPE Q: {}", e)))?;
-                        }
-                        {
+                            ).map_err(|e| TqError::Msg(format!("scratch RoPE Q: {}", e)))
+                        })?;
+                        ptime!("rope_k", {
                             let k_mut = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
                             let rope_fn = match layer.rope_style {
                                 RopeStyle::Halved => crate::cuda::kernels::rope_halved,
@@ -3331,20 +3376,20 @@ impl GenericTurboModel {
                             };
                             rope_fn(reg, k_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
                                 1, scratch.n_kv_head, scratch.head_dim, layer.rope_dim, index_pos,
-                            ).map_err(|e| TqError::Msg(format!("scratch RoPE K: {}", e)))?;
-                        }
+                            ).map_err(|e| TqError::Msg(format!("scratch RoPE K: {}", e)))
+                        })?;
 
-                        // 2. Append K,V to GpuKvCache (temp tensor views, dropped after append)
-                        {
+                        // 2. Append K,V to GpuKvCache
+                        ptime!("kv_append", {
                             let k_view = Tensor::from_cuda_arc(Arc::clone(&scratch.k_buf),
                                 vec![1, scratch.n_kv_head, 1, scratch.head_dim], scratch.stream.clone());
                             let v_view = Tensor::from_cuda_arc(Arc::clone(&scratch.v_buf),
                                 vec![1, scratch.n_kv_head, 1, scratch.head_dim], scratch.stream.clone());
-                            layer.gpu_kv_cache.as_mut().unwrap().append(&k_view, &v_view, 1)?;
-                        } // k_view, v_view dropped → Arc refcounts back to 1
+                            layer.gpu_kv_cache.as_mut().unwrap().append(&k_view, &v_view, 1)
+                        })?;
 
-                        // 3. Fused GQA decode attention: Q@K^T + scale + softmax + @V (single kernel)
-                        {
+                        // 3. Fused GQA decode attention
+                        ptime!("gqa_attn", {
                             let gpu_kv = layer.gpu_kv_cache.as_ref().unwrap();
                             let attn_mut = Arc::get_mut(&mut scratch.attn_out).expect("attn_out aliased");
                             crate::cuda::kernels::gqa_decode_attention(
@@ -3353,18 +3398,18 @@ impl GenericTurboModel {
                                 scratch.n_head, scratch.n_kv_head,
                                 gpu_kv.seq_len, gpu_kv.max_seq, scratch.head_dim,
                                 1.0 / (scratch.head_dim as f32).sqrt(),
-                            ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))?;
-                        }
+                            ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))
+                        })?;
 
-                        // 4. Wo projection into scratch.wo_out (zero alloc)
-                        {
+                        // 4. Wo projection
+                        ptime!("wo_matvec", {
                             let (wo_gpu, wo_out_feat, wo_in_feat) = layer.attention_wo.q4k_gpu_data().unwrap();
                             let wo_mut = Arc::get_mut(&mut scratch.wo_out).expect("wo_out aliased");
                             crate::cuda::kernels::q4km_matvec(
                                 reg, wo_gpu, &*scratch.attn_out, wo_mut,
                                 wo_out_feat, wo_in_feat,
-                            ).map_err(|e| TqError::Msg(format!("scratch Wo matvec: {}", e)))?;
-                        }
+                            ).map_err(|e| TqError::Msg(format!("scratch Wo matvec: {}", e)))
+                        })?;
 
                         Tensor::from_cuda_arc(Arc::clone(&scratch.wo_out),
                             vec![1, 1, hidden_dim], scratch.stream.clone())
@@ -3412,11 +3457,11 @@ impl GenericTurboModel {
                         // Kernel 2: norm + gate/up + silu*mul
                         // Kernel 3: down projection + residual add
                         if let Some(ref mut scratch) = decode_scratch {
-                            // DecodeScratch path: zero-alloc combined + intermediate.
-                            // Ping-pong: even layers → bufs[0], odd → bufs[1].
-                            // Previous layer's output lives in the OTHER buffer (held by x/layer_in).
                             let ci = layer_idx & 1;
+                            let pdet = profiling && layer_idx == 0;
+
                             // 1. combined = residual + attn
+                            let _t = if pdet { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
                             {
                                 let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
                                     .expect("scratch combined ping-pong aliased");
@@ -3425,7 +3470,10 @@ impl GenericTurboModel {
                                     comb, hidden_dim,
                                 ).map_err(|e| TqError::Msg(format!("scratch add: {}", e)))?;
                             }
-                            // 2. fused gateup+silu into intermediate
+                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "res+attn", t.elapsed().as_nanos() as f64 / 1000.0); }
+
+                            // 2. fused gateup+silu
+                            let _t = if pdet { Some(std::time::Instant::now()) } else { None };
                             {
                                 let inter = Arc::get_mut(&mut scratch.intermediate_buf)
                                     .expect("scratch intermediate_buf aliased");
@@ -3437,7 +3485,10 @@ impl GenericTurboModel {
                                     layer.ffn_norm.eps as f32,
                                 ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
                             }
-                            // 3. down+residual writes back into combined
+                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "gateup", t.elapsed().as_nanos() as f64 / 1000.0); }
+
+                            // 3. down+residual
+                            let _t = if pdet { Some(std::time::Instant::now()) } else { None };
                             {
                                 let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
                                     .expect("scratch combined ping-pong aliased");
@@ -3446,6 +3497,8 @@ impl GenericTurboModel {
                                     hidden_dim, intermediate_dim,
                                 ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
                             }
+                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "down+res", t.elapsed().as_nanos() as f64 / 1000.0); }
+
                             return Ok(Tensor::from_cuda_arc(Arc::clone(&scratch.combined_bufs[ci]),
                                 vec![1, 1, hidden_dim], scratch.stream.clone()));
                         }
