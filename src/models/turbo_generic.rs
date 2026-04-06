@@ -3445,8 +3445,16 @@ impl GenericTurboModel {
                                 _ => None,
                             }
                         } else { None };
-                        let (wgate_gpu, wup_gpu, wdown_gpu, intermediate_dim) =
-                            mlp_data.ok_or_else(|| TqError::Msg("fused MLP: not Q4K".into()))?;
+                        // Gate+up must be Q4K for fused gateup kernel.
+                        // Down can be Q6K — handle separately.
+                        let gateup_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                            match (mlp.feed_forward_w1.q4k_gpu_data(), mlp.feed_forward_w3.q4k_gpu_data()) {
+                                (Some((g, idim, _)), Some((u, _, _))) => Some((g, u, idim)),
+                                _ => None,
+                            }
+                        } else { None };
+                        let (wgate_gpu, wup_gpu, intermediate_dim) =
+                            gateup_data.ok_or_else(|| TqError::Msg("fused gateup: not Q4K".into()))?;
 
                         let reg = crate::cuda::kernels::global_registry().unwrap();
                         let stream = &reg.stream;
@@ -3487,22 +3495,43 @@ impl GenericTurboModel {
                             }
                             if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "gateup", t.elapsed().as_nanos() as f64 / 1000.0); }
 
-                            // 3. down+residual
+                            // 3. down projection + residual add
                             let _t = if pdet { Some(std::time::Instant::now()) } else { None };
                             {
+                                let wdown = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                                    &mlp.feed_forward_w2
+                                } else { unreachable!() };
                                 let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
                                     .expect("scratch combined ping-pong aliased");
-                                crate::cuda::kernels::fused_q4km_down_residual(
-                                    reg, wdown_gpu, &*scratch.intermediate_buf, comb,
-                                    hidden_dim, intermediate_dim,
-                                ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+                                if let Some((wd_gpu, _, _)) = wdown.q4k_gpu_data() {
+                                    // Q4K: fused down + residual add
+                                    crate::cuda::kernels::fused_q4km_down_residual(
+                                        reg, wd_gpu, &*scratch.intermediate_buf, comb,
+                                        hidden_dim, intermediate_dim,
+                                    ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+                                } else if let qmm::QMatMul::Quantized(qw) = &wdown.inner {
+                                    // Q6K: f32_matvec into attn_out (temp — attention done), then add to combined
+                                    let w_f32 = qw.gpu_f32_or_upload(&reg.stream);
+                                    let wo_tmp = Arc::get_mut(&mut scratch.attn_out)
+                                        .expect("attn_out temp aliased");
+                                    crate::cuda::kernels::f32_matvec(
+                                        reg, w_f32, &*scratch.intermediate_buf, wo_tmp,
+                                        qw.out_features(), qw.in_features(),
+                                    ).map_err(|e| TqError::Msg(format!("down f32: {}", e)))?;
+                                    // residual += down_out
+                                    crate::cuda::kernels::bias_add_inplace(
+                                        reg, comb, &*scratch.attn_out, hidden_dim,
+                                    ).map_err(|e| TqError::Msg(format!("down+res add: {}", e)))?;
+                                } else {
+                                    return Err(TqError::Msg("down weight: unsupported".into()));
+                                }
                             }
                             if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "down+res", t.elapsed().as_nanos() as f64 / 1000.0); }
 
                             return Ok(Tensor::from_cuda_arc(Arc::clone(&scratch.combined_bufs[ci]),
                                 vec![1, 1, hidden_dim], scratch.stream.clone()));
                         }
-                        // Fallback: allocate combined + intermediate
+                        // Fallback: allocate combined + intermediate (no scratch)
                         let mut combined = (residual_f32 + attn_f32)?;
                         let mut intermediate: cudarc::driver::CudaSlice<f32> =
                             stream.alloc_zeros(intermediate_dim)
@@ -3514,10 +3543,23 @@ impl GenericTurboModel {
                             hidden_dim, intermediate_dim,
                             layer.ffn_norm.eps as f32,
                         ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
-                        crate::cuda::kernels::fused_q4km_down_residual(
-                            reg, wdown_gpu, &intermediate, combined.cuda_data_mut(),
-                            hidden_dim, intermediate_dim,
-                        ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+                        // Down projection: Q4K fused or Q6K fallback
+                        let wdown = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                            &mlp.feed_forward_w2
+                        } else { unreachable!() };
+                        if let Some((wd_gpu, _, _)) = wdown.q4k_gpu_data() {
+                            crate::cuda::kernels::fused_q4km_down_residual(
+                                reg, wd_gpu, &intermediate, combined.cuda_data_mut(),
+                                hidden_dim, intermediate_dim,
+                            ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+                        } else {
+                            // Q6K: separate matvec + add
+                            let down_out = wdown.forward(
+                                &Tensor::from_cuda(intermediate, vec![1, 1, intermediate_dim], stream.clone()),
+                                backend,
+                            )?;
+                            combined = (combined + &down_out)?;
+                        }
                         Ok(combined)
                     })(); // MLP borrows released
 
@@ -3540,7 +3582,7 @@ impl GenericTurboModel {
                             continue; // skip fallback path
                         }
                         Err(_) => {
-                            // Fused MLP failed (e.g., Q6K weights) — fall through to separate-kernel MLP.
+                            // Fused MLP failed (e.g., Q6K weights).
                             // Attention already computed; compute residual + norm + MLP below.
                             let _enter = layer.span_mlp.enter();
                             let attn_f32 = attn.to_dtype(DType::F32)?;
