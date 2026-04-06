@@ -265,7 +265,13 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
             for (int d = tid; d < head_dim; d += blockDim.x) {
                 partial_dot += s_q_raw[d] * k_row[d];
             }
-            float score = block_reduce_sum(partial_dot) * scale;
+            // block_reduce_sum only returns correct value to tid 0.
+            // Broadcast score to all threads via shared memory.
+            float score_local = block_reduce_sum(partial_dot) * scale;
+            __shared__ float s_score_sink;
+            if (tid == 0) s_score_sink = score_local;
+            __syncthreads();
+            float score = s_score_sink;
 
             if (tid == 0) {
                 float new_max = fmaxf(running_max, score);
@@ -322,7 +328,13 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
         }
 
         float sigma = (norm_k > 1e-10f) ? norm_k / sqrtf((float)head_dim) : 0.0f;
-        float score = block_reduce_sum(partial_dot) * sigma * scale;
+        // block_reduce_sum only returns correct result to tid 0.
+        // Broadcast score to all threads via shared memory.
+        float score_local = block_reduce_sum(partial_dot) * sigma * scale;
+        __shared__ float s_score_comp;
+        if (tid == 0) s_score_comp = score_local;
+        __syncthreads();
+        float score = s_score_comp;
 
         // --- Online softmax update (all threads see the same score via shared mem) ---
         if (tid == 0) {
