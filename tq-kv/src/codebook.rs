@@ -51,6 +51,17 @@ pub fn get_centroids(bits: u8) -> &'static [f32] {
     }
 }
 
+/// Return static boundary array for the given bit width.
+/// Used for GPU codebook quantize kernel.
+pub fn get_boundaries(bits: u8) -> &'static [f32] {
+    match bits {
+        2 => BOUNDARIES_2BIT,
+        3 => BOUNDARIES_3BIT,
+        4 => BOUNDARIES_4BIT,
+        _ => panic!("Unsupported bit width: {}. Supported: 2, 3, 4", bits),
+    }
+}
+
 /// Codebook configuration.
 #[derive(Clone, Debug)]
 pub struct Codebook {

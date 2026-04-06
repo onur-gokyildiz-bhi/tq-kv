@@ -82,6 +82,7 @@ impl KernelRegistry {
             ("sampling", PTX_SAMPLING),
             ("softmax", PTX_SOFTMAX),
             ("sparse_v", PTX_SPARSE_V),
+            ("tq_compress", PTX_TQ_COMPRESS),
         ];
         let mut loaded = 0;
         for &(name, ptx_src) in ptx_sources {
@@ -523,6 +524,42 @@ pub fn f16_to_f32(
             .arg(input)
             .arg(output)
             .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// GPU TurboQuant key compression: Hadamard + codebook quantize + pack.
+/// One block per KV head. Replaces CPU-side compress_single_key_with_signs.
+pub fn tq_compress_key(
+    reg: &KernelRegistry,
+    key_vectors: &CudaSlice<f32>,  // [n_kv_heads, head_dim]
+    signs: &CudaSlice<f32>,        // [head_dim]
+    boundaries: &CudaSlice<f32>,   // [n_centroids - 1]
+    centroids: &CudaSlice<f32>,    // [n_centroids]
+    packed_out: &mut CudaSlice<u8>,  // [n_kv_heads, bytes_per_key]
+    norms_out: &mut CudaSlice<f32>,  // [n_kv_heads]
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_centroids: usize,
+    bytes_per_key: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("tq_compress", "tq_compress_key_f32")?;
+    let n_boundaries = n_centroids - 1;
+    let shmem = ((head_dim + n_boundaries + n_centroids) * 4) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_heads as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: shmem,
+    };
+    let hd = head_dim as i32;
+    let nc = n_centroids as i32;
+    let bpk = bytes_per_key as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(key_vectors).arg(signs).arg(boundaries).arg(centroids)
+            .arg(packed_out).arg(norms_out)
+            .arg(&hd).arg(&nc).arg(&bpk)
             .launch(cfg)?;
     }
     Ok(())

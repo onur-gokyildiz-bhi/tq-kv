@@ -1034,7 +1034,11 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
         if tq_only { eprintln!("[1/1] Loading model (TQ 4-bit)..."); }
         else { eprintln!("[2/2] Loading model (TQ 4-bit)..."); }
     }
-    let tq_config = tq_kv::TurboQuantConfig::balanced(); // 4-bit
+    let mut tq_config = tq_kv::TurboQuantConfig::balanced(); // 4-bit
+    // Apply env var overrides (TQ_GROUP, TQ_SINK, etc.)
+    if let Ok(val) = std::env::var("TQ_GROUP") {
+        if let Ok(gs) = val.parse::<usize>() { tq_config.group_size = gs; }
+    }
     let mut engine_tq = load_engine(Some(tq_config))?;
 
     let tq_result = bench_run(&mut engine_tq, &formatted_prompt, &gen_params)?;

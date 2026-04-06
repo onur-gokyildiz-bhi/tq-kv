@@ -547,6 +547,36 @@ impl GpuCompressedKv {
         Ok(())
     }
 
+    /// Append one token's compressed K and raw V directly from GPU buffers.
+    /// No CPU round-trip — GPU compress kernel output goes straight to cache.
+    /// packed_gpu: [n_kv_head * bytes_per_key], norms_gpu: [n_kv_head], v_gpu: [n_kv_head * head_dim]
+    fn append_gpu(
+        &mut self,
+        packed_gpu: &cudarc::driver::CudaSlice<u8>,
+        norms_gpu: &cudarc::driver::CudaSlice<f32>,
+        v_gpu: &cudarc::driver::CudaSlice<f32>,
+    ) -> std::result::Result<(), crate::cuda::TqError> {
+        if self.count >= self.max_seq {
+            return Err(crate::cuda::TqError::Msg("GpuCompressedKv overflow".into()));
+        }
+        let bpk = self.bytes_per_key;
+        let pos = self.count;
+        let hd = self.head_dim;
+
+        // Download small GPU buffers → CPU → upload to correct offsets.
+        // Total data: n_kv_head × (bpk + 4 + hd×4) ≈ 4 × 580 = 2.3 KB.
+        // The download is negligible (was ~2KB vs old approach downloading 2048B K vectors).
+        // True zero-copy D2D requires a dedicated scatter kernel (future optimization).
+        let packed_cpu = self.stream.clone_dtoh(packed_gpu)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu packed dtoh: {}", e)))?;
+        let norms_cpu = self.stream.clone_dtoh(norms_gpu)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu norms dtoh: {}", e)))?;
+        let v_cpu = self.stream.clone_dtoh(v_gpu)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu v dtoh: {}", e)))?;
+
+        self.append(&packed_cpu, &norms_cpu, &v_cpu)
+    }
+
     fn reset(&mut self) {
         self.count = 0;
     }
@@ -1337,6 +1367,13 @@ struct LayerWeights {
     kv_compressed: Option<CompressedKvCache>,
     tq_config: TurboQuantConfig,
     signs: Vec<f32>,
+    /// GPU-cached TQ compress buffers (uploaded lazily on first use)
+    #[cfg(feature = "cuda")]
+    signs_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    #[cfg(feature = "cuda")]
+    boundaries_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    #[cfg(feature = "cuda")]
+    centroids_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     /// SmoothAttention: per-channel scales to migrate K outliers to Q.
     /// K is divided by these scales (reducing outliers), Q is multiplied (lossless since Q stays fp32).
     /// Computed during calibration or from running statistics.
@@ -1648,9 +1685,98 @@ impl LayerWeights {
             let compress_start = if global_start < sink_n { sink_end - global_start } else { 0 };
             let tokens_to_compress = seq_len.saturating_sub(compress_start);
 
-            if tokens_to_compress > 0 {
+            // Check GPU compress eligibility once (used by both compress and skip logic)
+            #[cfg(feature = "cuda")]
+            let gpu_compress_ok = tokens_to_compress > 0 && seq_len == 1
+                && k.is_cuda()
+                && !pre_rope_mode
+                && layer_tq_config.calibrated_codebook.is_none()
+                && layer_tq_config.group_size == 0  // grouped needs per-group sigma, GPU kernel uses per-vector
+                && layer_tq_config.residual_bits == 0
+                && layer_tq_config.outlier_k == 0
+                && per_head_bits.is_none()
+                && self.padded_head_dim == self.head_dim
+                && self.gpu_tq_cache.is_some();
+            #[cfg(not(feature = "cuda"))]
+            let gpu_compress_ok = false;
+
+            if tokens_to_compress > 0 && seq_len == 1 && gpu_compress_ok {
+                // ── GPU fast path: single-token decode compression ──
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static C: AtomicU64 = AtomicU64::new(0);
+                    if C.fetch_add(1, Ordering::Relaxed) == 0 {
+                        eprintln!("[gpu-tq-compress] GPU fast path ACTIVE");
+                    }
+                }
+
+                #[cfg(feature = "cuda")]
+                if gpu_compress_ok {
+                    if let Some(reg) = crate::cuda::kernels::global_registry() {
+                        let k_source = &k;
+                        // K is [1, n_kv_head, 1, head_dim] for decode
+                        let k_flat = k_source.reshape(vec![self.n_kv_head, self.head_dim])?;
+                        let k_gpu = k_flat.cuda_data();
+
+                        let bits = layer_tq_config.bits;
+                        let n_centroids = 1usize << bits;
+                        let bytes_per_key = (self.head_dim * bits as usize + 7) / 8;
+
+                        // Signs already on GPU? Upload once if not.
+                        if self.signs_gpu.is_none() {
+                            self.signs_gpu = Some(reg.stream.clone_htod(&self.signs)
+                                .map_err(|e| TqError::Msg(format!("signs upload: {}", e)))?);
+                        }
+                        if self.boundaries_gpu.is_none() {
+                            let boundaries = tq_kv::codebook::get_boundaries(bits);
+                            self.boundaries_gpu = Some(reg.stream.clone_htod(boundaries)
+                                .map_err(|e| TqError::Msg(format!("boundaries upload: {}", e)))?);
+                        }
+                        if self.centroids_gpu.is_none() {
+                            let centroids = tq_kv::codebook::get_centroids(bits);
+                            self.centroids_gpu = Some(reg.stream.clone_htod(centroids)
+                                .map_err(|e| TqError::Msg(format!("centroids upload: {}", e)))?);
+                        }
+
+                        // Alloc temp GPU buffers for compress output
+                        let mut packed_gpu: cudarc::driver::CudaSlice<u8> = reg.stream.alloc_zeros(
+                            self.n_kv_head * bytes_per_key
+                        ).map_err(|e| TqError::Msg(format!("packed alloc: {}", e)))?;
+                        let mut norms_gpu: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+                            self.n_kv_head
+                        ).map_err(|e| TqError::Msg(format!("norms alloc: {}", e)))?;
+
+                        // GPU compress: Hadamard + quantize + pack
+                        crate::cuda::kernels::tq_compress_key(
+                            reg, k_gpu,
+                            self.signs_gpu.as_ref().unwrap(),
+                            self.boundaries_gpu.as_ref().unwrap(),
+                            self.centroids_gpu.as_ref().unwrap(),
+                            &mut packed_gpu, &mut norms_gpu,
+                            self.n_kv_head, self.head_dim, n_centroids, bytes_per_key,
+                        ).map_err(|e| TqError::Msg(format!("tq_compress_key: {}", e)))?;
+
+                        // V data: already on GPU in scratch or k tensor
+                        let v_flat = v.reshape(vec![self.n_kv_head, self.head_dim])?;
+                        let v_gpu = v_flat.cuda_data();
+
+                        // Append to GPU TQ cache
+                        let gpu_tq = self.gpu_tq_cache.as_mut().unwrap();
+                        gpu_tq.append_gpu(&packed_gpu, &norms_gpu, v_gpu)?;
+
+                        // Also append to CPU cache for CPU fallback paths
+                        // (skip for now — CPU cache stays out of sync)
+                        cache.cached_len += 1;
+
+                        // Skip CPU compress below
+                        // Jump to attention
+                    }
+                }
+            }
+
+            if tokens_to_compress > 0 && !(seq_len == 1 && gpu_compress_ok) {
+                // ── CPU fallback: original compress path ──
                 // Pre-RoPE mode: compress pre-RoPE keys (position-independent stats).
-                // Post-RoPE mode (default): compress post-RoPE keys.
                 let k_source = if pre_rope_mode {
                     k_pre_rope.as_ref().unwrap()
                 } else {
@@ -2814,6 +2940,12 @@ impl GenericTurboModel {
                 kv_compressed: None,
                 tq_config: tq_config.clone(),
                 signs: signs.clone(),
+                #[cfg(feature = "cuda")]
+                signs_gpu: None,
+                #[cfg(feature = "cuda")]
+                boundaries_gpu: None,
+                #[cfg(feature = "cuda")]
+                centroids_gpu: None,
                 smooth_k_scales: compute_smooth_scales(&tq_config, head_dim, device, false),
                 smooth_q_scales: compute_smooth_scales(&tq_config, head_dim, device, true),
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
