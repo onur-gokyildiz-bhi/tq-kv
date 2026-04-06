@@ -1368,6 +1368,11 @@ struct LayerWeights {
     boundaries_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     #[cfg(feature = "cuda")]
     centroids_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    /// Cached sink K/V on GPU (uploaded once, reused every decode step)
+    #[cfg(feature = "cuda")]
+    sink_k_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    #[cfg(feature = "cuda")]
+    sink_v_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     /// SmoothAttention: per-channel scales to migrate K outliers to Q.
     /// K is divided by these scales (reducing outliers), Q is multiplied (lossless since Q stays fp32).
     /// Computed during calibration or from running statistics.
@@ -1761,14 +1766,10 @@ impl LayerWeights {
                         // Don't increment cache.cached_len here — it's incremented
                         // after the compress section at line ~1917.
 
-                        // V raw: store on CPU for sink V extraction (small overhead)
-                        if cache.value_bits == 0 {
-                            let v_cpu = v.to_dtype(DType::F32)?;
-                            cache.v_raw = Some(match &cache.v_raw {
-                                Some(prev) => Tensor::cat(&[prev, &v_cpu], 2)?,
-                                None => v_cpu,
-                            });
-                        }
+                        // V raw: only needed for sink token positions (first N tokens).
+                        // After sink phase, V is stored in GpuCompressedKv.v_data directly.
+                        // Skip CPU V cat during decode — eliminates GPU→CPU download overhead.
+                        // (Sink V was already captured during prefill via CPU compress path)
                     }
                 }
             }
@@ -2119,32 +2120,27 @@ impl LayerWeights {
                         let _ = reg.stream.context().check_err();
                         let _ = reg.stream.memcpy_htod(&rotated_q, &mut gpu.rotated_q);
 
-                        // Upload sink keys/values if present (small: sink_len × n_kv_head × head_dim)
-                        let (sink_k_gpu, sink_v_gpu, raw_q_gpu) = if cache.sink_len > 0 {
+                        // Sink K/V: upload once and cache on GPU (they don't change during decode)
+                        if cache.sink_len > 0 && self.sink_k_gpu.is_none() {
                             if let Some(ref sink_k) = cache.sink_k {
                                 let sk_f32 = sink_k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                                let sk_gpu = reg.stream.clone_htod(&sk_f32)
-                                    .map_err(|e| TqError::Msg(format!("sink K upload: {}", e)))?;
-                                // Sink V: use raw (uncompressed) V from cache
+                                self.sink_k_gpu = Some(reg.stream.clone_htod(&sk_f32)
+                                    .map_err(|e| TqError::Msg(format!("sink K upload: {}", e)))?);
                                 let sv_data = if let Some(ref v_raw) = cache.v_raw {
                                     let sv = v_raw.narrow(2, 0, cache.sink_len)?;
                                     sv.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
                                 } else {
-                                    // V compressed — decompress sink portion
                                     vec![0.0f32; self.n_kv_head * cache.sink_len * self.head_dim]
                                 };
-                                let sv_gpu = reg.stream.clone_htod(&sv_data)
-                                    .map_err(|e| TqError::Msg(format!("sink V upload: {}", e)))?;
-                                // Raw (non-rotated) query for sink dot product
-                                let rq_gpu = reg.stream.clone_htod(&q_flat)
-                                    .map_err(|e| TqError::Msg(format!("raw Q upload: {}", e)))?;
-                                (Some(sk_gpu), Some(sv_gpu), Some(rq_gpu))
-                            } else {
-                                (None, None, None)
+                                self.sink_v_gpu = Some(reg.stream.clone_htod(&sv_data)
+                                    .map_err(|e| TqError::Msg(format!("sink V upload: {}", e)))?);
                             }
-                        } else {
-                            (None, None, None)
-                        };
+                        }
+                        // Raw query still needs upload each step (changes per token)
+                        let raw_q_gpu = if cache.sink_len > 0 {
+                            Some(reg.stream.clone_htod(&q_flat)
+                                .map_err(|e| TqError::Msg(format!("raw Q upload: {}", e)))?)
+                        } else { None };
 
                         let scale = 1.0 / (self.head_dim as f32).sqrt();
                         crate::cuda::kernels::tq_fused_decode_attention(
@@ -2152,7 +2148,7 @@ impl LayerWeights {
                             &gpu.centroids, &gpu.v_data, &mut gpu.output_buf,
                             self.n_head, self.n_kv_head, n_keys, self.head_dim,
                             gpu.bits as usize, scale,
-                            sink_k_gpu.as_ref(), sink_v_gpu.as_ref(),
+                            self.sink_k_gpu.as_ref(), self.sink_v_gpu.as_ref(),
                             raw_q_gpu.as_ref(), cache.sink_len,
                         ).map_err(|e| TqError::Msg(format!("fused decode attention: {}", e)))?;
 
@@ -2985,6 +2981,10 @@ impl GenericTurboModel {
                 boundaries_gpu: None,
                 #[cfg(feature = "cuda")]
                 centroids_gpu: None,
+                #[cfg(feature = "cuda")]
+                sink_k_gpu: None,
+                #[cfg(feature = "cuda")]
+                sink_v_gpu: None,
                 smooth_k_scales: compute_smooth_scales(&tq_config, head_dim, device, false),
                 smooth_q_scales: compute_smooth_scales(&tq_config, head_dim, device, true),
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
