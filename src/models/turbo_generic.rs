@@ -768,14 +768,13 @@ enum RopeStyle {
 const TQ_SKIP_FIRST_LAYERS: usize = 4;
 
 fn get_skip_layers(config: &tq_kv::TurboQuantConfig) -> usize {
-    // Config field takes priority, then env var, then default
     if let Some(skip) = config.skip_layers {
         return skip;
     }
-    std::env::var("TQ_SKIP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(TQ_SKIP_FIRST_LAYERS)
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TQ_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(TQ_SKIP_FIRST_LAYERS)
+    })
 }
 
 /// Number of final layers to keep uncompressed (fp16 KV cache).
@@ -787,10 +786,10 @@ fn get_protect_last_layers(config: &tq_kv::TurboQuantConfig) -> usize {
     if let Some(n) = config.protect_last_layers {
         return n;
     }
-    std::env::var("TQ_PROTECT_LAST")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TQ_PROTECT_LAST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
 }
 
 /// Parsed layer bit ranges, cached at first use.
@@ -896,68 +895,43 @@ fn resolve_per_head_bits(n_kv_head: usize, default_bits: u8) -> Option<Vec<u8>> 
 const TQ_SPARSE_V_DEFAULT: f32 = 1e-6;
 
 fn get_sparse_v_threshold() -> f32 {
-    std::env::var("TQ_SPARSE_V")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(TQ_SPARSE_V_DEFAULT)
+    static C: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_SPARSE_V").ok().and_then(|v| v.parse().ok()).unwrap_or(TQ_SPARSE_V_DEFAULT))
 }
 
 /// Fused attention: compute attention scores directly from compressed indices
 /// instead of decompressing keys first. Saves memory bandwidth on CPU.
 /// Set TQ_FUSED=1 to enable. Default: off (decompress path).
 fn get_use_fused() -> bool {
-    std::env::var("TQ_FUSED")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_FUSED").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false))
 }
 
-/// Softmax bias correction: pre-compensate quantization-induced attention drift.
-/// Set TQ_BIAS_CORRECT=1 to enable. Default: off.
 fn get_bias_correction() -> bool {
-    std::env::var("TQ_BIAS_CORRECT")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_BIAS_CORRECT").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false))
 }
 
-/// Pre-RoPE quantization: compress keys BEFORE RoPE for position-independent statistics.
-/// Enable with TQ_PRE_ROPE=1. Incompatible with fused attention (auto-disabled).
 fn get_pre_rope() -> bool {
-    std::env::var("TQ_PRE_ROPE")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_PRE_ROPE").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false))
 }
 
-/// Compaction threshold: run compact_head() when hot tokens exceed this count.
-/// 0 = disabled. Set TQ_COMPACT=N to enable (e.g. TQ_COMPACT=512).
 fn get_compact_threshold() -> usize {
-    std::env::var("TQ_COMPACT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_COMPACT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
-/// Compaction target ratio: compact to N% of original tokens.
-/// Default: 5 (5% = 20x reduction). Set TQ_COMPACT_RATIO=N.
 fn get_compact_ratio() -> usize {
-    std::env::var("TQ_COMPACT_RATIO")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5)
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_COMPACT_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(5))
 }
 
-/// Value cache quantization bits. 0 = uncompressed fp16, 4 = 4-bit per-group (~3.2x),
-/// 8 = 8-bit per-vector absmax (~1.9x).
-/// Override with TQ_VBITS env var (e.g. TQ_VBITS=4 for 3.2x value savings).
 const TQ_VBITS_DEFAULT: u8 = 0;
 
 fn get_value_bits() -> u8 {
-    std::env::var("TQ_VBITS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(TQ_VBITS_DEFAULT)
+    static C: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_VBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(TQ_VBITS_DEFAULT))
 }
 
 /// Temporal decay: demote old tokens to lower bit widths.
@@ -1030,9 +1004,8 @@ fn compute_smooth_scales(
 /// Configurable via TQ_MAX_SEQ env var. Default 128 is efficient for benchmarks.
 /// For production: set higher (e.g., 2048 or 4096).
 fn get_max_kv_seq() -> usize {
-    std::env::var("TQ_MAX_SEQ").ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128)
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_MAX_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(128))
 }
 
 /// Pre-allocated scratch buffers for zero-alloc decode (seq_len=1).
@@ -2393,7 +2366,10 @@ impl LayerWeights {
             //   Uses narrow() for exact-length attention (no padding waste).
             // CPU path: Tensor::cat fallback.
             #[cfg(feature = "cuda")]
-            let gpu_kv_disabled = std::env::var("TQ_NO_GPU_KV").map(|v| v == "1").unwrap_or(false);
+            let gpu_kv_disabled = {
+                static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *C.get_or_init(|| std::env::var("TQ_NO_GPU_KV").map(|v| v == "1").unwrap_or(false))
+            };
             #[cfg(feature = "cuda")]
             if k.is_cuda() && seq_len == 1 && !gpu_kv_disabled {
                 // Initialize GPU KV cache on first decode step
@@ -2441,8 +2417,10 @@ impl LayerWeights {
                     let kv_mask = kv_mask.broadcast_as(att.shape())?;
                     let att = (att + kv_mask)?;
 
-                    // Debug: attention scores before softmax (head 0, first 10 positions)
-                    let gpu_debug = std::env::var("TQ_GPU_DEBUG").map(|v| v == "1").unwrap_or(false);
+                    let gpu_debug = {
+                        static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        *C.get_or_init(|| std::env::var("TQ_GPU_DEBUG").map(|v| v == "1").unwrap_or(false))
+                    };
                     if gpu_debug && self.layer_idx < 2 {
                         if let Ok(scores) = att.to_vec1() {
                             let max_seq_show = gpu_kv.seq_len.min(10);
@@ -3173,10 +3151,15 @@ impl GenericTurboModel {
 
         // GPU vs CPU debug: print tensor stats at each layer boundary for divergence analysis.
         // Run with TQ_GPU_DEBUG=1, compare output between GPU and CPU runs.
-        let gpu_debug = std::env::var("TQ_GPU_DEBUG").map(|v| v == "1").unwrap_or(false);
-
-        // TQ_PROFILE=1: per-component timing (requires stream sync per measurement — slower but accurate).
-        let profiling = std::env::var("TQ_PROFILE").map(|v| v == "1").unwrap_or(false);
+        // Cache env vars ONCE before layer loop (avoid ~168 syscalls/token).
+        let gpu_debug = {
+            static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *C.get_or_init(|| std::env::var("TQ_GPU_DEBUG").map(|v| v == "1").unwrap_or(false))
+        };
+        let profiling = {
+            static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *C.get_or_init(|| std::env::var("TQ_PROFILE").map(|v| v == "1").unwrap_or(false))
+        };
         #[cfg(feature = "cuda")]
         let prof_stream = if profiling { crate::cuda::kernels::global_registry().map(|r| r.stream.clone()) } else { None };
         #[cfg(not(feature = "cuda"))]
@@ -3234,7 +3217,10 @@ impl GenericTurboModel {
             #[cfg(feature = "cuda")]
             let layer_uses_compression = get_layer_bits(layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers).is_some();
             #[cfg(feature = "cuda")]
-            let fused_disabled = std::env::var("TQ_NO_FUSED").map(|v| v == "1").unwrap_or(false);
+            let fused_disabled = {
+                static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *C.get_or_init(|| std::env::var("TQ_NO_FUSED").map(|v| v == "1").unwrap_or(false))
+            };
             #[cfg(feature = "cuda")]
             if seq_len == 1 && x.is_cuda() && !layer_uses_compression && !fused_disabled
                 && layer.post_attention_norm.is_none()
