@@ -145,6 +145,12 @@ enum Commands {
         /// Skip standard (non-TQ) run — use when CUDA lacks stock model support
         #[arg(long)]
         tq_only: bool,
+        /// Draft model for speculative decoding (e.g., qwen2:0.5b)
+        #[arg(long)]
+        draft: Option<String>,
+        /// Number of speculative tokens per step (default: 5)
+        #[arg(long, default_value = "5")]
+        speculate: usize,
     },
     /// Check system compatibility
     Doctor,
@@ -948,9 +954,9 @@ fn cmd_perplexity(cli: &Cli) -> Result<()> {
 }
 
 fn cmd_bench(cli: &Cli) -> Result<()> {
-    let (model_name, tokens, json_output, custom_prompt, tq_only) = match &cli.command {
-        Some(Commands::Bench { model, tokens, json, prompt, tq_only }) => {
-            (model.as_str(), *tokens, *json, prompt.as_deref(), *tq_only)
+    let (model_name, tokens, json_output, custom_prompt, tq_only, draft_model, spec_k) = match &cli.command {
+        Some(Commands::Bench { model, tokens, json, prompt, tq_only, draft, speculate }) => {
+            (model.as_str(), *tokens, *json, prompt.as_deref(), *tq_only, draft.as_deref(), *speculate)
         }
         _ => unreachable!(),
     };
@@ -1032,12 +1038,56 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
     let mut engine_tq = load_engine(Some(tq_config))?;
 
     let tq_result = bench_run(&mut engine_tq, &formatted_prompt, &gen_params)?;
-    drop(engine_tq);
 
     if !json_output {
         eprintln!("  TQ 4-bit: {:.1} tok/s, {:.2}s total, TTFT {:.3}s\n",
             tq_result.tok_per_sec, tq_result.total_secs, tq_result.ttft_secs);
     }
+
+    // --- Speculative decoding (optional) ---
+    let spec_result = if let Some(draft_name) = draft_model {
+        if !json_output {
+            eprintln!("Loading draft model ({}) for speculative decoding (K={})...", draft_name, spec_k);
+        }
+        // Load draft engine (same TQ config as target or none)
+        let mut draft_engine = if let Some(model_config) = config::get_model(draft_name) {
+            model::load_engine(model_config, None, None, None, cli.cpu)?
+        } else {
+            let (gguf_path, tokenizer_path) = hub::resolve(draft_name)?;
+            let tok_path = tokenizer_path.with_context(|| {
+                format!("No tokenizer found for draft model '{}'", draft_name)
+            })?;
+            let arch = config::detect_arch(&gguf_path.to_string_lossy().as_ref());
+            Engine::load_with_device(&gguf_path, &tok_path, arch, None, cli.cpu)?
+        };
+
+        // Clear target engine KV cache for fresh speculative run
+        engine_tq.clear_cache();
+        engine_tq.model.0.clear_kv_cache();
+
+        let t0 = std::time::Instant::now();
+        let (spec_output, avg_accepted) = Engine::speculative_generate(
+            &mut engine_tq, &mut draft_engine,
+            &formatted_prompt, &gen_params, spec_k,
+            |_| {},
+        )?;
+        let elapsed = t0.elapsed().as_secs_f64();
+        let n_tokens = spec_output.split_whitespace().count(); // approximate
+        // Count actual generated tokens from tokenizer
+        let spec_tokens = engine_tq.tokenizer.encode(&*spec_output, false)
+            .map(|e| e.get_ids().len() as u32)
+            .unwrap_or(0);
+
+        if !json_output {
+            eprintln!("  Speculative (K={}): {:.1} tok/s, {:.1} accepted/step, {} tokens in {:.2}s",
+                spec_k, spec_tokens as f64 / elapsed, avg_accepted, spec_tokens, elapsed);
+        }
+        drop(draft_engine);
+        Some((spec_tokens as f64 / elapsed, avg_accepted))
+    } else {
+        None
+    };
+    drop(engine_tq);
 
     // --- KV cache estimates ---
     let (n_layers, n_kv_heads, head_dim) = if let Some(entry) = catalog::find(model_name) {

@@ -2972,6 +2972,16 @@ impl GenericTurboModel {
         }
     }
 
+    /// Clear all KV caches (CPU + GPU) for fresh generation.
+    pub fn clear_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.kv_cache = None;
+            layer.gpu_kv_cache = None;
+        }
+        self.graph_manager.reset();
+        self.masks.clear();
+    }
+
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
 

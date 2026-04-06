@@ -17,6 +17,26 @@ pub struct CatalogEntry {
 pub const CATALOG: &[CatalogEntry] = &[
     CatalogEntry {
         name: "qwen2",
+        tag: "0.5b",
+        display: "Qwen2.5 0.5B Instruct",
+        hf_repo: "bartowski/Qwen2.5-0.5B-Instruct-GGUF",
+        filename: "Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: "Qwen/Qwen2.5-0.5B-Instruct",
+        size_gb: 0.4,
+        arch: "qwen2",
+    },
+    CatalogEntry {
+        name: "qwen2",
+        tag: "1.5b",
+        display: "Qwen2.5 1.5B Instruct",
+        hf_repo: "bartowski/Qwen2.5-1.5B-Instruct-GGUF",
+        filename: "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+        tokenizer_repo: "Qwen/Qwen2.5-1.5B-Instruct",
+        size_gb: 1.0,
+        arch: "qwen2",
+    },
+    CatalogEntry {
+        name: "qwen2",
         tag: "7b",
         display: "Qwen2.5 7B Instruct",
         hf_repo: "bartowski/Qwen2.5-7B-Instruct-GGUF",

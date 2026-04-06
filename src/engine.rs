@@ -17,7 +17,7 @@ use crate::models::turbo_generic;
 /// Unified model backend — GenericTurboModel handles all GGUF architectures
 /// with CUDA-compatible ops (RmsNorm, RoPE, softmax). When TQ is disabled,
 /// all layers use uncompressed fp16 KV cache through the same code path.
-struct ModelWeights(turbo_generic::GenericTurboModel);
+pub struct ModelWeights(pub turbo_generic::GenericTurboModel);
 
 impl ModelWeights {
     fn forward(&mut self, x: &Tensor, pos: usize) -> crate::cuda::Result<Tensor> {
@@ -111,8 +111,8 @@ impl QualityGate {
 
 /// Unified inference engine.
 pub struct Engine {
-    model: ModelWeights,
-    tokenizer: Tokenizer,
+    pub model: ModelWeights,
+    pub tokenizer: Tokenizer,
     device: Device,
     position: usize,
     eos_token_ids: Vec<u32>,
@@ -461,6 +461,162 @@ impl Engine {
             print!("{}", token);
             let _ = std::io::stdout().flush();
         })
+    }
+
+    /// Speculative decoding: draft model proposes K tokens, target model verifies in one pass.
+    /// Returns accepted tokens per step on average.
+    pub fn speculative_generate<F>(
+        target: &mut Engine,
+        draft: &mut Engine,
+        prompt: &str,
+        params: &GenerationParams,
+        spec_k: usize,  // number of draft tokens per speculation step
+        mut on_token: F,
+    ) -> Result<(String, f64)>  // (output, avg_accepted_per_step)
+    where
+        F: FnMut(&str),
+    {
+        let encoding = target.tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow::anyhow!("Tokenize error: {}", e))?;
+        let prompt_tokens = encoding.get_ids().to_vec();
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("Empty prompt");
+        }
+
+        eprintln!("Speculative decoding: K={}, prompt tokens: {}", spec_k, prompt_tokens.len());
+
+        let mut sampler = Sampler::new(SamplingMode::ArgMax, params.seed);
+
+        // Prefill both models with prompt
+        target.position = 0;
+        draft.position = 0;
+
+        let input = target.make_input(&prompt_tokens).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let target_logits = target.model.forward(&input, 0).map_err(|e| anyhow::anyhow!("{}", e))?;
+        target.position = prompt_tokens.len();
+
+        let draft_input = draft.make_input(&prompt_tokens).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let _ = draft.model.forward(&draft_input, 0).map_err(|e| anyhow::anyhow!("{}", e))?;
+        draft.position = prompt_tokens.len();
+
+        let target_logits = extract_last_logits(&target_logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut next_token = sampler.sample(&target_logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let mut output = String::new();
+        let mut all_tokens: Vec<u32> = Vec::new();
+        let mut prev_decoded_len = 0;
+        let mut n_generated = 0u32;
+        let mut total_accepted = 0usize;
+        let mut total_steps = 0usize;
+
+        while n_generated < params.max_tokens {
+            if target.eos_token_ids.contains(&next_token) { break; }
+
+            // ── Draft phase: generate K candidate tokens with draft model ──
+            let mut draft_tokens = Vec::with_capacity(spec_k);
+            let mut draft_token = next_token;
+
+            for _ in 0..spec_k {
+                let d_input = draft.make_input(&[draft_token]).map_err(|e| anyhow::anyhow!("{}", e))?;
+                let d_logits = draft.model.forward(&d_input, draft.position).map_err(|e| anyhow::anyhow!("{}", e))?;
+                draft.position += 1;
+
+                let d_logits = extract_last_logits(&d_logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+                draft_token = sampler.sample(&d_logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+                draft_tokens.push(draft_token);
+
+                if target.eos_token_ids.contains(&draft_token) { break; }
+            }
+
+            // ── Verify phase: run target model on [next_token, draft_tokens...] ──
+            let mut verify_tokens = vec![next_token];
+            verify_tokens.extend_from_slice(&draft_tokens);
+
+            let v_input = target.make_input(&verify_tokens).map_err(|e| anyhow::anyhow!("{}", e))?;
+            let v_logits = target.model.forward(&v_input, target.position).map_err(|e| anyhow::anyhow!("{}", e))?;
+            // v_logits shape: [1, n_verify, vocab_size]
+            let v_logits_flat = v_logits.to_vec1().map_err(|e| anyhow::anyhow!("{}", e))?;
+            let vocab_size = target.tokenizer.get_vocab_size(false);
+            let n_verify = verify_tokens.len();
+
+            // ── Accept phase: find longest matching prefix ──
+            // Position i in v_logits predicts token at position i+1.
+            // v_logits[0] predicts what comes after next_token → should match draft_tokens[0]
+            let mut n_accepted = 0;
+            for i in 0..draft_tokens.len().min(n_verify - 1) {
+                let logit_offset = i * vocab_size;
+                let logit_slice = &v_logits_flat[logit_offset..logit_offset + vocab_size];
+                let target_pred = logit_slice.iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .map(|(idx, _)| idx as u32)
+                    .unwrap_or(0);
+
+                if target_pred == draft_tokens[i] {
+                    n_accepted += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Accept: next_token + n_accepted draft tokens
+            // Emit next_token (already known)
+            all_tokens.push(next_token);
+            for i in 0..n_accepted {
+                all_tokens.push(draft_tokens[i]);
+            }
+
+            // Decode and stream new text
+            let full_text = target.tokenizer.decode(&all_tokens, true).unwrap_or_default();
+            if full_text.len() > prev_decoded_len {
+                let new_text = &full_text[prev_decoded_len..];
+                on_token(new_text);
+                output.push_str(new_text);
+            }
+            prev_decoded_len = full_text.len();
+
+            n_generated += 1 + n_accepted as u32;
+            total_accepted += 1 + n_accepted; // 1 for next_token + n_accepted drafts
+            total_steps += 1;
+
+            // Update target position (accepted next_token + n_accepted drafts)
+            target.position += 1 + n_accepted;
+
+            // Roll back draft model to match target position
+            // (draft generated spec_k tokens but only n_accepted were accepted)
+            // For simplicity: reset draft KV cache and re-feed accepted tokens
+            // TODO: optimize by truncating draft KV cache
+            if n_accepted < draft_tokens.len() {
+                // Draft diverged — its KV cache is wrong after acceptance point.
+                // Roll back draft position to match target.
+                draft.position = target.position;
+                draft.model.0.clear_kv_cache();
+                // Re-prefill draft with all accepted tokens so far
+                let all_so_far: Vec<u32> = prompt_tokens.iter().chain(all_tokens.iter()).copied().collect();
+                let d_input = draft.make_input(&all_so_far).map_err(|e| anyhow::anyhow!("{}", e))?;
+                let _ = draft.model.forward(&d_input, 0).map_err(|e| anyhow::anyhow!("{}", e))?;
+                draft.position = all_so_far.len();
+            }
+
+            // Next token: sample from last position's target logits
+            let last_logit_offset = n_accepted * vocab_size;
+            if last_logit_offset + vocab_size <= v_logits_flat.len() {
+                let last_logits = &v_logits_flat[last_logit_offset..last_logit_offset + vocab_size];
+                let last_logits_t = Tensor::from_vec(
+                    last_logits.to_vec(), vec![vocab_size], &Device::Cpu,
+                ).map_err(|e| anyhow::anyhow!("{}", e))?;
+                next_token = sampler.sample(&last_logits_t).map_err(|e| anyhow::anyhow!("{}", e))?;
+            } else {
+                break;
+            }
+        }
+
+        let avg_accepted = if total_steps > 0 { total_accepted as f64 / total_steps as f64 } else { 0.0 };
+        eprintln!("Speculative decode: {:.1} tokens/step avg ({} accepted / {} steps)",
+            avg_accepted, total_accepted, total_steps);
+
+        Ok((output, avg_accepted))
     }
 
     /// Compute perplexity on a text.
