@@ -63,7 +63,7 @@ impl CudaGraphManager {
             supported_batch_sizes: supported,
             status: GraphStatus::NotCaptured,
             enabled,
-            warmup_runs: 1,
+            warmup_runs: 2,
             eager_count: 0,
             #[cfg(feature = "cuda")]
             capture_stream: None,

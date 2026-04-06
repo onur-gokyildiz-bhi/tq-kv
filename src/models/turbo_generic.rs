@@ -2976,68 +2976,56 @@ impl GenericTurboModel {
             self.arena_decode_count = 0;
         }
 
-        // ── CUDA Graph replay ──
+        // ── CUDA Graph replay (layer loop only — norm+lm_head run eagerly after) ──
+        #[cfg(feature = "cuda")]
+        let mut graph_replayed = false;
         #[cfg(feature = "cuda")]
         if seq_len == 1 && self.graph_manager.is_ready(1) {
             let reg = crate::cuda::kernels::global_registry().unwrap();
 
-            // Update input embedding: compute new token's embedding, memcpy to graph's input buffer.
+            // Update embedding into dedicated buffer (same GPU address as capture)
             if let Some(ref mut input_buf) = self.graph_input_buffer {
                 let new_emb = self.tok_embeddings.forward(x)?;
                 let emb_data = new_emb.as_slice();
                 let _ = reg.stream.context().check_err();
-                let buf_mut = std::sync::Arc::make_mut(input_buf);
-                if let Err(e) = reg.stream.memcpy_htod(emb_data, buf_mut) {
-                    eprintln!("[graph-replay] input update failed: {}", e);
-                }
+                let buf_mut = std::sync::Arc::get_mut(input_buf)
+                    .expect("graph_input_buffer refcount > 1");
+                let _ = reg.stream.memcpy_htod(emb_data, buf_mut);
             }
 
             // Update RoPE position GPU scalar
             if let Some(ref mut rope_buf) = self.rope_pos_gpu {
-                let pos_val = index_pos as i32;
-                let _ = reg.stream.memcpy_htod(&[pos_val], rope_buf);
+                let _ = reg.stream.memcpy_htod(&[index_pos as i32], rope_buf);
             }
 
-            // Update KV cache: set valid_len_gpu to CURRENT seq_len (pre-append position).
-            // The graph's kv_cache_append kernel reads this to know WHERE to write.
-            // After graph replay, seq_len is incremented.
+            // Update KV cache valid_len (pre-append position)
             for layer in &mut self.layers {
                 if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
-                    // Set pre-append position (where new token goes)
-                    let pre_pos = gpu_kv.seq_len as i32;
-                    let _ = reg.stream.memcpy_htod(&[pre_pos], &mut gpu_kv.valid_len_gpu);
+                    let _ = reg.stream.memcpy_htod(&[gpu_kv.seq_len as i32], &mut gpu_kv.valid_len_gpu);
                 }
             }
 
             let _ = reg.stream.synchronize();
-            let _ = reg.stream.context().check_err();
-            self.graph_manager.replay(&reg.stream, 1)
-                .map_err(|e| TqError::Msg(format!("graph replay: {}", e)))?;
-            reg.stream.synchronize()
-                .map_err(|e| TqError::Msg(format!("graph sync: {}", e)))?;
-            let _ = reg.stream.context().check_err();
-
-            // Post-replay: increment seq_len (graph appended 1 token to each layer's KV cache)
-            for layer in &mut self.layers {
-                if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
-                    gpu_kv.seq_len += 1;
+            if let Ok(()) = self.graph_manager.replay(&reg.stream, 1) {
+                let _ = reg.stream.synchronize();
+                // Post-replay: increment seq_len
+                for layer in &mut self.layers {
+                    if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
+                        gpu_kv.seq_len += 1;
+                    }
                 }
-            }
-
-            if let Some(ref out) = self.graph_output {
-                return Ok(out.clone());
+                graph_replayed = true;
+                // DON'T return — fall through to norm + lm_head
             }
         }
 
-        // ── CUDA Graph capture ──
+        // ── CUDA Graph capture (scratch-based, no pool recording) ──
         #[cfg(feature = "cuda")]
         let capturing = seq_len == 1 && self.graph_manager.should_capture(1);
-        // Recording pass: last warm-up before capture → pre-allocate pool buffers.
-        // should_capture already incremented eager_count; check if this was the recording pass.
         #[cfg(feature = "cuda")]
-        let recording = !capturing && self.graph_manager.is_recording_pass();
+        let recording = false; // recording pass disabled for scratch-based graph
         #[cfg(feature = "cuda")]
-        if recording || capturing {
+        if capturing {
             if let Some(reg) = crate::cuda::kernels::global_registry() {
                 let pos_val = index_pos as i32;
                 let _ = reg.stream.context().check_err();
@@ -3048,15 +3036,10 @@ impl GenericTurboModel {
                 } else if let Some(ref mut existing) = self.rope_pos_gpu {
                     let _ = reg.stream.memcpy_htod(&[pos_val], existing);
                 }
-                // Set thread-local raw pointer for apply_rotary_emb to read
                 if let Some(ref buf) = self.rope_pos_gpu {
                     ROPE_POS_GPU_PTR.with(|p| p.set(buf as *const _ as u64));
                 }
             }
-        }
-        #[cfg(feature = "cuda")]
-        if recording {
-            crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Recording);
         }
 
         // ── Size-based buffer pool for decode (replaces broken cursor-based arena) ──
@@ -3115,16 +3098,31 @@ impl GenericTurboModel {
             }
         }
 
-        // Save input buffer address for graph replay (allows updating embedding before replay).
+        // Save input buffer for graph replay. Must be a SEPARATE allocation
+        // (not Arc::clone of layer_in) so graph_input_buffer always has refcount=1
+        // and Arc::get_mut succeeds on replay without cloning to a new address.
         #[cfg(feature = "cuda")]
         if capturing || recording {
             if layer_in.is_cuda() {
-                self.graph_input_buffer = Some(std::sync::Arc::clone(
-                    match &layer_in.storage() {
-                        crate::cuda::TqStorage::Cuda { data, .. } => data,
-                        _ => unreachable!(),
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    let src = layer_in.cuda_data();
+                    let n = layer_in.elem_count();
+                    // Allocate dedicated buffer (refcount=1, never shared)
+                    if self.graph_input_buffer.is_none() {
+                        if let Ok(buf) = crate::cuda::gpu_alloc_zeros_pub(&reg.stream, n) {
+                            self.graph_input_buffer = Some(std::sync::Arc::new(buf));
+                        }
                     }
-                ));
+                    // Copy embedding data into the dedicated buffer
+                    if let Some(ref mut buf) = self.graph_input_buffer {
+                        let dst = std::sync::Arc::get_mut(buf).expect("graph_input_buffer shared");
+                        let _ = reg.stream.memcpy_dtod(src, dst);
+                        // Replace layer_in with tensor backed by graph_input_buffer
+                        layer_in = Tensor::from_cuda_arc(
+                            buf.clone(), layer_in.shape().to_vec(), reg.stream.clone(),
+                        );
+                    }
+                }
             }
         }
 
@@ -3133,18 +3131,11 @@ impl GenericTurboModel {
         if capturing {
             // Restore pool buffers and set Pooled mode: kernel launches use
             // pre-allocated (Recording-pass) pointers that persist across graph replay.
-            crate::cuda::decode_pool_restore(std::mem::take(&mut self.graph_pool_buffers));
-            crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Pooled);
-            crate::cuda::decode_pool_reset_cursor();
+            // Scratch-based capture: no pool needed, all pointers stable.
             if let Some(reg) = crate::cuda::kernels::global_registry() {
-                if let Err(e) = self.graph_manager.begin_capture(&reg.stream) {
-                    eprintln!("[cuda-graph] begin_capture failed: {}", e);
-                } else {
-                    // Verify capture is active
-                    match reg.stream.capture_status() {
-                        Ok(s) => eprintln!("[cuda-graph] capture started, status={:?}", s),
-                        Err(e) => eprintln!("[cuda-graph] capture_status error: {}", e),
-                    }
+                match self.graph_manager.begin_capture(&reg.stream) {
+                    Ok(()) => eprintln!("[cuda-graph] capture started (scratch-based)"),
+                    Err(e) => eprintln!("[cuda-graph] begin_capture failed: {}", e),
                 }
             }
         }
@@ -3176,10 +3167,24 @@ impl GenericTurboModel {
         }
 
         // Take scratch out of self to avoid borrow conflicts with self.layers.iter_mut().
-        // Put it back after the loop completes.
         #[cfg(feature = "cuda")]
         let mut decode_scratch = self.decode_scratch.take();
 
+        // Graph replayed: skip layer loop, set layer_in from scratch combined buffer.
+        #[cfg(feature = "cuda")]
+        if graph_replayed {
+            if let Some(ref scratch) = decode_scratch {
+                let last_ci = (self.layers.len() - 1) & 1;
+                layer_in = Tensor::from_cuda_arc(
+                    Arc::clone(&scratch.combined_bufs[last_ci]),
+                    vec![1, 1, scratch.hidden_dim], scratch.stream.clone(),
+                );
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let graph_replayed = false;
+
+        if !graph_replayed {
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let x = layer_in;
             // prof_sync macro defined before loop
@@ -3328,7 +3333,7 @@ impl GenericTurboModel {
                     let attn = if qkv_in_scratch
                         && layer.gpu_kv_cache.is_some()
                         && layer.attention_wo.q4k_gpu_data().is_some()
-                        && !capturing && !recording
+                        // (capturing allowed — scratch pointers are stable for graph)
                     {
                         let scratch = decode_scratch.as_mut().unwrap();
                         let reg = crate::cuda::kernels::global_registry().unwrap();
@@ -3344,25 +3349,29 @@ impl GenericTurboModel {
                             }};
                         }
 
-                        // 1. RoPE in-place on scratch Q and K (zero alloc)
+                        // 1. RoPE in-place (graph-safe: uses rope_pos_gpu when available)
+                        let rope_gpu_pos = ROPE_POS_GPU_PTR.with(|p| p.get());
+                        let rope_gpu_ref = if rope_gpu_pos != 0 {
+                            Some(unsafe { &*(rope_gpu_pos as *const cudarc::driver::CudaSlice<i32>) })
+                        } else { None };
                         ptime!("rope_q", {
                             let q_mut = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
                             let rope_fn = match layer.rope_style {
-                                RopeStyle::Halved => crate::cuda::kernels::rope_halved,
-                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved,
+                                RopeStyle::Halved => crate::cuda::kernels::rope_halved_with_gpu_pos,
+                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_with_gpu_pos,
                             };
                             rope_fn(reg, q_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
-                                1, scratch.n_head, scratch.head_dim, layer.rope_dim, index_pos,
+                                1, scratch.n_head, scratch.head_dim, layer.rope_dim, index_pos, rope_gpu_ref,
                             ).map_err(|e| TqError::Msg(format!("scratch RoPE Q: {}", e)))
                         })?;
                         ptime!("rope_k", {
                             let k_mut = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
                             let rope_fn = match layer.rope_style {
-                                RopeStyle::Halved => crate::cuda::kernels::rope_halved,
-                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved,
+                                RopeStyle::Halved => crate::cuda::kernels::rope_halved_with_gpu_pos,
+                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_with_gpu_pos,
                             };
                             rope_fn(reg, k_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
-                                1, scratch.n_kv_head, scratch.head_dim, layer.rope_dim, index_pos,
+                                1, scratch.n_kv_head, scratch.head_dim, layer.rope_dim, index_pos, rope_gpu_ref,
                             ).map_err(|e| TqError::Msg(format!("scratch RoPE K: {}", e)))
                         })?;
 
@@ -3721,10 +3730,54 @@ impl GenericTurboModel {
                 }
             }
         }
+        } // if !graph_replayed
 
         // Restore scratch buffers back into self after layer loop.
         #[cfg(feature = "cuda")]
         { self.decode_scratch = decode_scratch; }
+
+        // End graph capture BEFORE norm/lm_head (they allocate → can't be in graph).
+        // Graph captures layer loop only. Norm + lm_head run eagerly after replay.
+        #[cfg(feature = "cuda")]
+        if capturing && matches!(self.graph_manager.status, crate::cuda::graph::GraphStatus::Capturing) {
+            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                match self.graph_manager.end_capture(&reg.stream, 1) {
+                    Ok(()) => {
+                        eprintln!("[cuda-graph] captured layer loop (scratch-based)");
+                        // Immediate replay — capture only RECORDS, doesn't execute.
+                        let _ = reg.stream.context().check_err();
+                        match self.graph_manager.replay(&reg.stream, 1) {
+                            Ok(()) => {
+                                let _ = reg.stream.synchronize();
+                                eprintln!("[cuda-graph] initial replay OK");
+                                // Post-replay: increment seq_len
+                                for layer in &mut self.layers {
+                                    if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
+                                        gpu_kv.seq_len += 1;
+                                    }
+                                }
+                                // Update layer_in from scratch combined buffer
+                                if let Some(ref scratch) = self.decode_scratch {
+                                    let last_ci = (self.layers.len() - 1) & 1;
+                                    layer_in = Tensor::from_cuda_arc(
+                                        Arc::clone(&scratch.combined_bufs[last_ci]),
+                                        vec![1, 1, scratch.hidden_dim], scratch.stream.clone(),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[cuda-graph] initial replay FAILED: {}", e);
+                                self.graph_manager.reset();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[cuda-graph] end_capture failed: {}", e);
+                        self.graph_manager.reset();
+                    }
+                }
+            }
+        }
 
         let x = self.norm.forward(&layer_in, backend)?;
         let x = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
@@ -3756,55 +3809,7 @@ impl GenericTurboModel {
             }
         }
 
-        // End graph capture
-        #[cfg(feature = "cuda")]
-        if capturing && matches!(self.graph_manager.status, crate::cuda::graph::GraphStatus::Capturing) {
-            if let Some(reg) = crate::cuda::kernels::global_registry() {
-                match self.graph_manager.end_capture(&reg.stream, 1) {
-                    Ok(()) => {
-                        self.graph_output = Some(output.clone());
-                        // Drain retained buffers — keeps GPU memory alive for graph replay.
-                        self.graph_retained_buffers = crate::cuda::graph_retention_drain();
-                        eprintln!("[cuda-graph] retained {} GPU buffers for replay", self.graph_retained_buffers.len());
-                        // IMPORTANT: During capture, operations are RECORDED but NOT EXECUTED.
-                        // The output buffer has invalid data (virtual memory, not computed).
-                        // Do an immediate graph replay to produce valid output.
-                        let _ = reg.stream.context().check_err();
-                        match self.graph_manager.replay(&reg.stream, 1) {
-                            Ok(()) => {
-                                let _ = reg.stream.synchronize();
-                                let _ = reg.stream.context().check_err();
-                                eprintln!("[cuda-graph] initial replay OK — output buffer now valid");
-                            }
-                            Err(e) => {
-                                eprintln!("[cuda-graph] initial replay FAILED: {}", e);
-                                self.graph_manager.reset();
-                                self.graph_retained_buffers.clear();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[cuda-graph] end_capture failed: {}", e);
-                        self.graph_manager.reset();
-                        // Drain and discard on failure
-                        let _ = crate::cuda::graph_retention_drain();
-                    }
-                }
-            }
-        }
-
-        // After forward pass: handle pool mode transitions
-        #[cfg(feature = "cuda")]
-        if recording {
-            // Drain pool from warm-up pass → store for capture pass
-            self.graph_pool_buffers = crate::cuda::decode_pool_drain();
-            crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
-            eprintln!("[cuda-graph] recording pass done: {} pool buffers saved", self.graph_pool_buffers.len());
-        }
-        #[cfg(feature = "cuda")]
-        if capturing {
-            crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
-        }
+        // (End graph capture now handled before norm — see above)
 
         // After forward pass: deactivate size pool + track decode count
         #[cfg(feature = "cuda")]
