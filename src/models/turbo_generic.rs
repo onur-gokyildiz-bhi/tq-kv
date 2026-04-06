@@ -1686,12 +1686,12 @@ impl LayerWeights {
             let tokens_to_compress = seq_len.saturating_sub(compress_start);
 
             // Check GPU compress eligibility once (used by both compress and skip logic)
+            // GPU compress: per-vector sigma (ignores group_size, slight quality diff, massive speed gain)
             #[cfg(feature = "cuda")]
             let gpu_compress_ok = tokens_to_compress > 0 && seq_len == 1
                 && k.is_cuda()
                 && !pre_rope_mode
                 && layer_tq_config.calibrated_codebook.is_none()
-                && layer_tq_config.group_size == 0  // grouped needs per-group sigma, GPU kernel uses per-vector
                 && layer_tq_config.residual_bits == 0
                 && layer_tq_config.outlier_k == 0
                 && per_head_bits.is_none()
@@ -1764,12 +1764,17 @@ impl LayerWeights {
                         let gpu_tq = self.gpu_tq_cache.as_mut().unwrap();
                         gpu_tq.append_gpu(&packed_gpu, &norms_gpu, v_gpu)?;
 
-                        // Also append to CPU cache for CPU fallback paths
-                        // (skip for now — CPU cache stays out of sync)
-                        cache.cached_len += 1;
+                        // Don't increment cache.cached_len here — it's incremented
+                        // after the compress section at line ~1917.
 
-                        // Skip CPU compress below
-                        // Jump to attention
+                        // V raw: store on CPU for sink V extraction (small overhead)
+                        if cache.value_bits == 0 {
+                            let v_cpu = v.to_dtype(DType::F32)?;
+                            cache.v_raw = Some(match &cache.v_raw {
+                                Some(prev) => Tensor::cat(&[prev, &v_cpu], 2)?,
+                                None => v_cpu,
+                            });
+                        }
                     }
                 }
             }
@@ -1887,21 +1892,23 @@ impl LayerWeights {
                         }
                     }
 
-                    // Append the newly compressed token(s)
-                    if let Some(ref mut gpu) = self.gpu_tq_cache {
-                        let count = cache.k_per_head[0].count;
-                        let bpk = gpu.bytes_per_key;
-                        // The last token is at index count-1
-                        let pos = count - 1;
-                        let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
-                        let mut norms_all = Vec::with_capacity(self.n_kv_head);
-                        for h in 0..self.n_kv_head {
-                            let start = pos * bpk;
-                            packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
-                            norms_all.push(cache.k_per_head[h].norms[pos]);
+                    // Append the newly CPU-compressed token(s) to GPU cache.
+                    // Skip if GPU compress already appended directly.
+                    if !gpu_compress_ok {
+                        if let Some(ref mut gpu) = self.gpu_tq_cache {
+                            let count = cache.k_per_head[0].count;
+                            let bpk = gpu.bytes_per_key;
+                            let pos = count - 1;
+                            let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
+                            let mut norms_all = Vec::with_capacity(self.n_kv_head);
+                            for h in 0..self.n_kv_head {
+                                let start = pos * bpk;
+                                packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
+                                norms_all.push(cache.k_per_head[h].norms[pos]);
+                            }
+                            let v_zeros = vec![0.0f32; self.n_kv_head * self.head_dim];
+                            let _ = gpu.append(&packed_all, &norms_all, &v_zeros);
                         }
-                        let v_zeros = vec![0.0f32; self.n_kv_head * self.head_dim];
-                        let _ = gpu.append(&packed_all, &norms_all, &v_zeros);
                     }
                 }
             }
@@ -2074,6 +2081,12 @@ impl LayerWeights {
                 let has_compacted = cache.compacted.is_some();
                 let use_fused = get_use_fused() && q.is_cpu()
                     && !cache.pre_rope && !has_compacted;
+                // Use GPU TQ cache count when available (GPU compress doesn't update CPU cache)
+                #[cfg(feature = "cuda")]
+                let n_compressed = self.gpu_tq_cache.as_ref()
+                    .map(|g| g.count)
+                    .unwrap_or(cache.k_per_head[0].count);
+                #[cfg(not(feature = "cuda"))]
                 let n_compressed = cache.k_per_head[0].count;
                 let n_past_compressed = if n_compressed > 0 { n_compressed - 1 } else { 0 };
                 let compacted_t = cache.compacted.as_ref()
