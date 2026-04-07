@@ -533,7 +533,9 @@ impl GpuCompressedKv {
         v_flat: &[f32],
     ) -> std::result::Result<(), crate::cuda::TqError> {
         if self.count >= self.max_seq {
-            return Err(crate::cuda::TqError::Msg("GpuCompressedKv overflow".into()));
+            static WARN_CPU: std::sync::Once = std::sync::Once::new();
+            WARN_CPU.call_once(|| eprintln!("[WARN] GpuCompressedKv: max_seq={} reached, TQ context truncated", self.max_seq));
+            return Ok(());
         }
         let bpk = self.bytes_per_key;
         let pos = self.count;
@@ -576,7 +578,9 @@ impl GpuCompressedKv {
         use cudarc::driver::sys;
 
         if self.count >= self.max_seq {
-            return Err(crate::cuda::TqError::Msg("GpuCompressedKv overflow".into()));
+            static WARN_GPU: std::sync::Once = std::sync::Once::new();
+            WARN_GPU.call_once(|| eprintln!("[WARN] GpuCompressedKv: max_seq={} reached, TQ context truncated (D2D)", self.max_seq));
+            return Ok(());
         }
         let bpk = self.bytes_per_key;
         let pos = self.count;
@@ -1274,7 +1278,9 @@ impl GpuKvCache {
     /// Append new K/V tokens. Input shape: [1, n_kv_head, n_new, head_dim].
     fn append(&mut self, new_k: &Tensor, new_v: &Tensor, n_new: usize) -> Result<()> {
         if self.seq_len + n_new > self.max_seq {
-            bail!("GpuKvCache: overflow {} + {} > {}", self.seq_len, n_new, self.max_seq);
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| eprintln!("[WARN] GpuKvCache: max_seq={} reached, context truncated", self.max_seq));
+            return Ok(());
         }
         let reg = crate::cuda::kernels::global_registry()
             .ok_or_else(|| TqError::Msg("no GPU registry".into()))?;
