@@ -134,6 +134,8 @@ extern "C" __global__ void tq_fused_attention_f32(
 // Note: This outputs keys in the Hadamard-rotated domain (pre-RoPE).
 // The caller must handle RoPE separately if needed.
 
+// DEPRECATED: fused centroid+WHT version had subtle bug (max_diff=1.23 vs CPU).
+// Use tq_centroid_lookup_f32 + hadamard_inverse_batch_f32 two-step instead.
 extern "C" __global__ void tq_decompress_keys_f32(
     const uint8_t* __restrict__ packed_indices,  // [n_kv_heads, max_seq * bytes_per_key]
     const float* __restrict__ norms,             // [n_kv_heads, max_seq]
@@ -204,6 +206,86 @@ extern "C" __global__ void tq_decompress_keys_f32(
     float* out_ptr = keys_out + kv_head * n_keys * head_dim + key_idx * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
         out_ptr[d] = s_key[d] * inv_sqrt_dim * signs[d];
+    }
+}
+
+// ─── Centroid Lookup Only (Step 1 of two-step decompress) ───
+// Unpacks indices, looks up centroids, scales by sigma.
+// Output is in the Hadamard-rotated domain (before inverse WHT).
+// Caller must run hadamard_inverse_batch_f32 on the output.
+//
+// Grid: (n_kv_heads, n_keys), Block: (min(head_dim, 256))
+//
+// key_offset: start reading from this position in packed/norms (for incremental)
+// out_stride: output per-head stride in vectors (max_seq for cache, n_keys for contiguous)
+//
+// Output: out[(kv_head * out_stride + key_idx) * head_dim]
+// For contiguous output: set out_stride = n_keys
+// For strided cache:     set out_stride = max_seq, write at out_offset positions
+
+extern "C" __global__ void tq_centroid_lookup_f32(
+    const uint8_t* __restrict__ packed_indices,  // [n_kv_heads, max_seq * bytes_per_key]
+    const float* __restrict__ norms,             // [n_kv_heads, max_seq]
+    const float* __restrict__ centroids,         // [n_centroids]
+    float* __restrict__ out,                     // output buffer
+    const int n_kv_heads,
+    const int n_keys,
+    const int head_dim,
+    const int bits,
+    const int max_seq,                           // buffer stride for packed/norms
+    const int key_offset,                        // read keys starting at this position
+    const int out_stride                         // per-head stride in output (vectors, not bytes)
+) {
+    const int kv_head = blockIdx.x;
+    const int key_idx = blockIdx.y;
+    if (kv_head >= n_kv_heads || key_idx >= n_keys) return;
+
+    const int tid = threadIdx.x;
+    const int bytes_per_key = (head_dim * bits + 7) / 8;
+
+    // Load centroids to shared memory
+    __shared__ float s_centroids[MAX_CENTROIDS];
+    const int n_centroids = 1 << bits;
+    if (tid < n_centroids) s_centroids[tid] = centroids[tid];
+    __syncthreads();
+
+    // Read from key_offset + key_idx in the packed buffer
+    const int src_pos = key_offset + key_idx;
+    float norm = norms[kv_head * max_seq + src_pos];
+    float sigma = (norm > 1e-10f) ? norm / sqrtf((float)head_dim) : 0.0f;
+
+    const uint8_t* key_packed = packed_indices + kv_head * max_seq * bytes_per_key + src_pos * bytes_per_key;
+    // Output row with configurable stride
+    float* out_row = out + (kv_head * out_stride + key_idx) * head_dim;
+
+    if (bits == 4) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            uint8_t byte = key_packed[d / 2];
+            float c = (d & 1) ? s_centroids[byte >> 4] : s_centroids[byte & 0xF];
+            out_row[d] = c * sigma;
+        }
+    } else if (bits == 2) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            uint8_t byte = key_packed[d / 4];
+            int shift = (d & 3) * 2;
+            float c = s_centroids[(byte >> shift) & 3];
+            out_row[d] = c * sigma;
+        }
+    } else if (bits == 3) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            int bit_offset = d * 3;
+            int byte_idx = bit_offset / 8;
+            int bit_pos  = bit_offset % 8;
+            uint8_t idx;
+            if (bit_pos <= 5) {
+                idx = (key_packed[byte_idx] >> bit_pos) & 7;
+            } else {
+                idx = (key_packed[byte_idx] >> bit_pos) |
+                      ((key_packed[byte_idx + 1] << (8 - bit_pos)) & 7);
+                idx &= 7;
+            }
+            out_row[d] = s_centroids[idx] * sigma;
+        }
     }
 }
 

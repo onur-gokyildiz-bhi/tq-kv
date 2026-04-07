@@ -789,6 +789,118 @@ pub fn tq_decompress_keys(
     Ok(())
 }
 
+/// Two-step GPU key decompression: centroid lookup → hadamard inverse.
+/// Replaces the fused tq_decompress_keys which had a subtle WHT bug.
+///
+/// Step 1: tq_centroid_lookup_f32 — unpack indices, lookup centroids, scale by sigma
+/// Step 2: hadamard_inverse_batch_f32 — proven-correct inverse WHT + sign flip
+///
+/// Output layout: [n_kv_heads, n_keys, head_dim] (same as tq_decompress_keys)
+pub fn tq_decompress_keys_v2(
+    reg: &KernelRegistry,
+    packed_indices: &CudaSlice<u8>,
+    norms: &CudaSlice<f32>,
+    centroids: &CudaSlice<f32>,
+    signs: &CudaSlice<f32>,
+    keys_out: &mut CudaSlice<f32>,
+    n_kv_heads: usize,
+    n_keys: usize,
+    head_dim: usize,
+    bits: usize,
+    max_seq: usize,
+) -> Result<(), DriverError> {
+    // Contiguous output: key_offset=0, out_stride=n_keys
+    tq_decompress_keys_range(
+        reg, packed_indices, norms, centroids, signs, keys_out,
+        n_kv_heads, n_keys, head_dim, bits, max_seq, 0, n_keys,
+    )
+}
+
+/// Decompress a range of keys with configurable source offset and output stride.
+///
+/// key_offset: start reading from this position in packed_indices/norms
+/// out_stride: per-head stride in output buffer (in vectors, not bytes)
+///   - For contiguous output: out_stride = n_keys
+///   - For strided cache:     out_stride = max_seq (or cache stride)
+///
+/// Writes n_kv_heads × n_keys vectors of head_dim floats.
+/// Output position for head h, key i: keys_out[(h * out_stride + i) * head_dim]
+pub fn tq_decompress_keys_range(
+    reg: &KernelRegistry,
+    packed_indices: &CudaSlice<u8>,
+    norms: &CudaSlice<f32>,
+    centroids: &CudaSlice<f32>,
+    signs: &CudaSlice<f32>,
+    keys_out: &mut CudaSlice<f32>,
+    n_kv_heads: usize,
+    n_keys: usize,
+    head_dim: usize,
+    bits: usize,
+    max_seq: usize,
+    key_offset: usize,
+    out_stride: usize,
+) -> Result<(), DriverError> {
+    if n_keys == 0 { return Ok(()); }
+
+    // Step 1: Centroid lookup → temp buffer (contiguous)
+    // We need contiguous vectors for hadamard_inverse_batch, so always write
+    // to a contiguous region first, then scatter to strided output if needed.
+    let contiguous = out_stride == n_keys && key_offset == 0;
+
+    if contiguous {
+        // Fast path: output is already contiguous
+        let f = reg.get_fn("fused_attention", "tq_centroid_lookup_f32")?;
+        let block = head_dim.min(256) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_kv_heads as u32, n_keys as u32, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (nkv, nk, hd, b, ms) = (n_kv_heads as i32, n_keys as i32, head_dim as i32, bits as i32, max_seq as i32);
+        let ko = 0i32;
+        let os = n_keys as i32;
+        unsafe {
+            reg.stream.launch_builder(&f)
+                .arg(packed_indices).arg(norms).arg(centroids)
+                .arg(&mut *keys_out)
+                .arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&ms).arg(&ko).arg(&os)
+                .launch(cfg)?;
+        }
+        hadamard_inverse_batch(reg, keys_out, signs, n_kv_heads * n_keys, head_dim)?;
+    } else {
+        // Strided path: centroid lookup to temp, hadamard, then scatter
+        let total = n_kv_heads * n_keys * head_dim;
+        let mut temp = reg.stream.alloc_zeros::<f32>(total)?;
+        let f = reg.get_fn("fused_attention", "tq_centroid_lookup_f32")?;
+        let block = head_dim.min(256) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_kv_heads as u32, n_keys as u32, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (nkv, nk, hd, b, ms) = (n_kv_heads as i32, n_keys as i32, head_dim as i32, bits as i32, max_seq as i32);
+        let ko = key_offset as i32;
+        let os = n_keys as i32; // temp is contiguous
+        unsafe {
+            reg.stream.launch_builder(&f)
+                .arg(packed_indices).arg(norms).arg(centroids)
+                .arg(&mut temp)
+                .arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&ms).arg(&ko).arg(&os)
+                .launch(cfg)?;
+        }
+        hadamard_inverse_batch(reg, &mut temp, signs, n_kv_heads * n_keys, head_dim)?;
+
+        // Scatter from contiguous temp to strided output
+        for h in 0..n_kv_heads {
+            let src_off = h * n_keys * head_dim;
+            let dst_off = h * out_stride * head_dim;
+            copy_with_offsets(reg, &temp, keys_out, n_keys * head_dim, src_off, dst_off)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Full fused TQ decode attention: compressed score + online softmax + V accumulation.
 /// Single kernel replaces: decompress → matmul → softmax → matmul chain.
 pub fn tq_fused_decode_attention(

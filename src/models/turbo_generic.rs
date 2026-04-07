@@ -443,6 +443,11 @@ struct GpuCompressedKv {
     /// Scratch buffers (reused across calls)
     rotated_q: cudarc::driver::CudaSlice<f32>,  // [n_heads, head_dim]
     output_buf: cudarc::driver::CudaSlice<f32>,  // [n_heads, head_dim]
+    /// Decompressed key cache: [n_kv_head, max_seq, head_dim] (strided)
+    /// Incrementally updated — only new keys decompressed each step.
+    decomp_cache: cudarc::driver::CudaSlice<f32>,
+    /// How many keys in decomp_cache are valid (matches count after initial fill)
+    decomp_count: usize,
     /// Current count of compressed keys per head
     count: usize,
     max_seq: usize,
@@ -495,14 +500,16 @@ impl GpuCompressedKv {
             .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv rq: {}", e)))?;
         let output_buf = stream.alloc_zeros::<f32>(n_heads * head_dim)
             .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv out: {}", e)))?;
-
-        eprintln!("[gpu-tq] pre-allocated {}×{}×{} = {:.1}MB compressed KV",
+        let decomp_cache = stream.alloc_zeros::<f32>(total_v)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv decomp: {}", e)))?;
+        eprintln!("[gpu-tq] pre-allocated {}×{}×{} = {:.1}MB compressed + {:.1}MB decomp cache",
             n_kv_head, max_seq, bytes_per_key,
-            (total_indices + total_norms * 4 + total_v * 4) as f64 / 1e6);
+            (total_indices + total_norms * 4 + total_v * 4) as f64 / 1e6,
+            (total_v * 4) as f64 / 1e6);
 
         Ok(Self {
             packed_indices, norms, centroids: gpu_centroids, v_data,
-            rotated_q, output_buf,
+            rotated_q, output_buf, decomp_cache, decomp_count: 0,
             count: 0, max_seq, n_kv_head, n_heads, head_dim, bytes_per_key, bits,
             stream,
         })
@@ -2222,6 +2229,116 @@ impl LayerWeights {
                         let y = Tensor::from_vec(attn_out, vec![1, self.n_head, 1, self.head_dim], q.device())?;
                         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
                         return self.attention_wo.forward(&y, backend);
+                    }
+                }
+
+                // ─── ALL-GPU TQ DECOMPRESS ATTENTION ──────────────────
+                // GPU decompress keys + GPU matmul + GPU softmax + GPU V matmul.
+                // No CPU round-trip. Uses proven two-step decompress (centroid lookup + hadamard inverse).
+                // Falls through to CPU paths when conditions aren't met.
+                #[cfg(feature = "cuda")]
+                if seq_len == 1
+                    && !cache.pre_rope && !has_compacted
+                    && cache.cold_len == 0
+                    && n_past_compressed > 0
+                    && self.padded_head_dim == self.head_dim
+                    && cache.k_per_head[0].qjl_corrections.is_none()
+                    && layer_tq_config.channel_scales.is_none()
+                    && layer_tq_config.key_channel_bias.is_none()
+                    && cache.value_bits == 0
+                {
+                    if let (Some(reg), Some(ref mut gpu), Some(ref signs)) = (
+                        crate::cuda::kernels::global_registry(),
+                        &mut self.gpu_tq_cache,
+                        &self.signs_gpu,
+                    ) {
+                        let gpu_result: Result<Tensor> = (|| {
+                            let hdim = self.head_dim;
+                            let scale = 1.0 / (hdim as f64).sqrt();
+                            let stream = reg.stream.clone();
+
+                            // Helper: upload CPU tensor to GPU
+                            let upload = |t: &Tensor| -> Result<Tensor> {
+                                if t.is_cuda() { return Ok(t.clone()); }
+                                let data: Vec<f32> = t.to_vec1()?;
+                                let gpu_data = stream.clone_htod(&data)
+                                    .map_err(|e| TqError::Msg(format!("htod: {e}")))?;
+                                Ok(Tensor::from_cuda(gpu_data, t.shape().to_vec(), stream.clone()))
+                            };
+
+                            // Step 1: Incremental GPU decompress
+                            // decomp_cache is [n_kv_head, max_seq, head_dim] with max_seq stride.
+                            // Only decompress keys that haven't been decompressed yet.
+                            let ms = gpu.max_seq;
+                            if gpu.decomp_count < n_past_compressed {
+                                let new_start = gpu.decomp_count;
+                                let new_count = n_past_compressed - new_start;
+                                crate::cuda::kernels::tq_decompress_keys_range(
+                                    reg, &gpu.packed_indices, &gpu.norms,
+                                    &gpu.centroids, signs, &mut gpu.decomp_cache,
+                                    self.n_kv_head, new_count, hdim,
+                                    gpu.bits as usize, ms,
+                                    new_start, ms, // key_offset, out_stride
+                                ).map_err(|e| TqError::Msg(format!("decompress_range: {e}")))?;
+                                gpu.decomp_count = n_past_compressed;
+                            }
+
+                            // Gather contiguous K from strided decomp_cache
+                            let total_k = self.n_kv_head * n_past_compressed * hdim;
+                            let mut k_contig: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(total_k)
+                                .map_err(|e| TqError::Msg(format!("k_contig: {e}")))?;
+                            for h in 0..self.n_kv_head {
+                                let src_off = h * ms * hdim;
+                                let dst_off = h * n_past_compressed * hdim;
+                                crate::cuda::kernels::copy_with_offsets(
+                                    reg, &gpu.decomp_cache, &k_contig,
+                                    n_past_compressed * hdim, src_off, dst_off,
+                                ).map_err(|e| TqError::Msg(format!("k gather: {e}")))?;
+                            }
+                            let k_hot = Tensor::from_cuda(
+                                k_contig,
+                                vec![1, self.n_kv_head, n_past_compressed, hdim],
+                                stream.clone(),
+                            );
+
+                            // Step 2: Build K on GPU [sink | hot | current]
+                            let mut k_parts_gpu: Vec<Tensor> = Vec::new();
+                            if let Some(ref sink) = cache.sink_k {
+                                k_parts_gpu.push(upload(&sink.to_dtype(DType::F32)?)?);
+                            }
+                            k_parts_gpu.push(k_hot);
+                            if n_compressed > 0 {
+                                k_parts_gpu.push(upload(&k.to_dtype(DType::F32)?)?);
+                            }
+
+                            let k_full = if k_parts_gpu.len() == 1 {
+                                k_parts_gpu.remove(0)
+                            } else {
+                                let k_refs: Vec<&Tensor> = k_parts_gpu.iter().collect();
+                                Tensor::cat(&k_refs, 2)?
+                            };
+                            let k_full = repeat_kv(k_full, n_rep)?;
+
+                            // Step 3: Q @ K^T on GPU
+                            let q_gpu = upload(&q_f32)?;
+                            let att = (q_gpu.matmul(&k_full.t()?)? / scale)?;
+                            let att = softmax_last_dim(&att, backend)?;
+
+                            // Step 4: att @ V on GPU
+                            let total_len = cache.sink_len + n_past_compressed
+                                + if n_compressed > 0 { 1 } else { 0 };
+                            let v_f32 = cache.v_raw.as_ref().unwrap()
+                                .narrow(2, 0, total_len)?
+                                .to_dtype(DType::F32)?;
+                            let v_f32 = upload(&v_f32)?;
+                            let v_f32 = repeat_kv(v_f32, n_rep)?;
+                            att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)
+                        })();
+
+                        if let Ok(y) = gpu_result {
+                            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+                            return self.attention_wo.forward(&y, backend);
+                        }
                     }
                 }
 
