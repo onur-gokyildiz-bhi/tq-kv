@@ -2257,18 +2257,7 @@ impl LayerWeights {
                             let scale = 1.0 / (hdim as f64).sqrt();
                             let stream = reg.stream.clone();
 
-                            // Helper: upload CPU tensor to GPU
-                            let upload = |t: &Tensor| -> Result<Tensor> {
-                                if t.is_cuda() { return Ok(t.clone()); }
-                                let data: Vec<f32> = t.to_vec1()?;
-                                let gpu_data = stream.clone_htod(&data)
-                                    .map_err(|e| TqError::Msg(format!("htod: {e}")))?;
-                                Ok(Tensor::from_cuda(gpu_data, t.shape().to_vec(), stream.clone()))
-                            };
-
                             // Step 1: Incremental GPU decompress
-                            // decomp_cache is [n_kv_head, max_seq, head_dim] with max_seq stride.
-                            // Only decompress keys that haven't been decompressed yet.
                             let ms = gpu.max_seq;
                             if gpu.decomp_count < n_past_compressed {
                                 let new_start = gpu.decomp_count;
@@ -2278,45 +2267,32 @@ impl LayerWeights {
                                     &gpu.centroids, signs, &mut gpu.decomp_cache,
                                     self.n_kv_head, new_count, hdim,
                                     gpu.bits as usize, ms,
-                                    new_start, ms, // key_offset, out_stride
+                                    new_start, ms,
                                 ).map_err(|e| TqError::Msg(format!("decompress_range: {e}")))?;
                                 gpu.decomp_count = n_past_compressed;
                             }
 
-                            // Gather contiguous K from strided decomp_cache
-                            let total_k = self.n_kv_head * n_past_compressed * hdim;
-                            let mut k_contig: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(total_k)
-                                .map_err(|e| TqError::Msg(format!("k_contig: {e}")))?;
-                            for h in 0..self.n_kv_head {
-                                let src_off = h * ms * hdim;
-                                let dst_off = h * n_past_compressed * hdim;
-                                crate::cuda::kernels::copy_with_offsets(
-                                    reg, &gpu.decomp_cache, &k_contig,
-                                    n_past_compressed * hdim, src_off, dst_off,
-                                ).map_err(|e| TqError::Msg(format!("k gather: {e}")))?;
-                            }
-                            let k_hot = Tensor::from_cuda(
-                                k_contig,
-                                vec![1, self.n_kv_head, n_past_compressed, hdim],
+                            // K hot: GPU narrow on strided decomp_cache (single strided_copy kernel)
+                            let k_hot = Tensor::from_cuda_arc(
+                                std::sync::Arc::new(gpu.decomp_cache.clone()),
+                                vec![self.n_kv_head, ms, hdim],
                                 stream.clone(),
-                            );
+                            ).narrow(1, 0, n_past_compressed)?
+                             .reshape(vec![1, self.n_kv_head, n_past_compressed, hdim])?;
 
-                            // Cache sink K/V on GPU (upload once, reuse)
+                            // Cache sink K/V on GPU (upload once)
                             let sink_len = cache.sink_len;
                             if sink_len > 0 && self.sink_k_gpu.is_none() {
                                 if let Some(ref sink_k) = cache.sink_k {
-                                    let sk = sink_k.to_dtype(DType::F32)?;
-                                    let data: Vec<f32> = sk.to_vec1()?;
-                                    if let Ok(gpu_buf) = stream.clone_htod(&data) {
-                                        self.sink_k_gpu = Some(gpu_buf);
+                                    let data: Vec<f32> = sink_k.to_dtype(DType::F32)?.to_vec1()?;
+                                    if let Ok(buf) = stream.clone_htod(&data) {
+                                        self.sink_k_gpu = Some(buf);
                                     }
                                 }
                                 if let Some(ref v_raw) = cache.v_raw {
-                                    if let Ok(sv) = v_raw.narrow(2, 0, sink_len)?.to_dtype(DType::F32) {
-                                        let data: Vec<f32> = sv.to_vec1()?;
-                                        if let Ok(gpu_buf) = stream.clone_htod(&data) {
-                                            self.sink_v_gpu = Some(gpu_buf);
-                                        }
+                                    let data: Vec<f32> = v_raw.narrow(2, 0, sink_len)?.to_dtype(DType::F32)?.to_vec1()?;
+                                    if let Ok(buf) = stream.clone_htod(&data) {
+                                        self.sink_v_gpu = Some(buf);
                                     }
                                 }
                             }
@@ -2329,12 +2305,12 @@ impl LayerWeights {
                                     vec![1, self.n_kv_head, sink_len, hdim],
                                     stream.clone(),
                                 ));
-                            } else if let Some(ref sink) = cache.sink_k {
-                                k_parts_gpu.push(upload(&sink.to_dtype(DType::F32)?)?);
                             }
                             k_parts_gpu.push(k_hot);
                             if n_compressed > 0 {
-                                k_parts_gpu.push(upload(&k.to_dtype(DType::F32)?)?);
+                                let k_cur = k.to_dtype(DType::F32)?;
+                                debug_assert!(k_cur.is_cuda(), "current K should be GPU");
+                                k_parts_gpu.push(k_cur);
                             }
 
                             let k_full = if k_parts_gpu.len() == 1 {
@@ -2345,51 +2321,33 @@ impl LayerWeights {
                             };
                             let k_full = repeat_kv(k_full, n_rep)?;
 
-                            // Step 3: Q @ K^T on GPU
-                            let q_gpu = upload(&q_f32)?;
-                            let att = (q_gpu.matmul(&k_full.t()?)? / scale)?;
+                            // Step 3: Q @ K^T on GPU (q_f32 already CUDA from attention_wo)
+                            debug_assert!(q_f32.is_cuda(), "Q should be GPU in all-GPU path");
+                            let att = (q_f32.matmul(&k_full.t()?)? / scale)?;
                             let att = softmax_last_dim(&att, backend)?;
 
-                            // Step 4: Build V on GPU [sink | hot | current]
+                            // Step 4: V hot from strided gpu.v_data (single strided_copy kernel)
                             let mut v_parts_gpu: Vec<Tensor> = Vec::new();
-
-                            // Sink V (cached on GPU)
                             if let Some(ref sv) = self.sink_v_gpu {
                                 v_parts_gpu.push(Tensor::from_cuda_arc(
                                     std::sync::Arc::new(sv.clone()),
                                     vec![1, self.n_kv_head, sink_len, hdim],
                                     stream.clone(),
                                 ));
-                            } else if sink_len > 0 {
-                                if let Some(ref v_raw) = cache.v_raw {
-                                    let sv = v_raw.narrow(2, 0, sink_len)?.to_dtype(DType::F32)?;
-                                    v_parts_gpu.push(upload(&sv)?);
-                                }
                             }
-
-                            // Hot V: gather from strided gpu.v_data
                             if n_past_compressed > 0 {
-                                let v_total = self.n_kv_head * n_past_compressed * hdim;
-                                let mut v_contig: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(v_total)
-                                    .map_err(|e| TqError::Msg(format!("v_contig: {e}")))?;
-                                for h in 0..self.n_kv_head {
-                                    let src_off = h * ms * hdim;
-                                    let dst_off = h * n_past_compressed * hdim;
-                                    crate::cuda::kernels::copy_with_offsets(
-                                        reg, &gpu.v_data, &v_contig,
-                                        n_past_compressed * hdim, src_off, dst_off,
-                                    ).map_err(|e| TqError::Msg(format!("v gather: {e}")))?;
-                                }
-                                v_parts_gpu.push(Tensor::from_cuda(
-                                    v_contig,
-                                    vec![1, self.n_kv_head, n_past_compressed, hdim],
+                                let v_hot = Tensor::from_cuda_arc(
+                                    std::sync::Arc::new(gpu.v_data.clone()),
+                                    vec![self.n_kv_head, ms, hdim],
                                     stream.clone(),
-                                ));
+                                ).narrow(1, 0, n_past_compressed)?
+                                 .reshape(vec![1, self.n_kv_head, n_past_compressed, hdim])?;
+                                v_parts_gpu.push(v_hot);
                             }
-
-                            // Current V (already on GPU from QKV)
                             if n_compressed > 0 {
-                                v_parts_gpu.push(upload(&v.to_dtype(DType::F32)?)?);
+                                let v_cur = v.to_dtype(DType::F32)?;
+                                debug_assert!(v_cur.is_cuda(), "current V should be GPU");
+                                v_parts_gpu.push(v_cur);
                             }
 
                             let v_full = if v_parts_gpu.len() == 1 {
