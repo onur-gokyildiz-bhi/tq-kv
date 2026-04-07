@@ -2102,7 +2102,7 @@ impl LayerWeights {
 
                 // Fused attention incompatible with pre-RoPE and compaction
                 let has_compacted = cache.compacted.is_some();
-                let use_fused = get_use_fused() && q.is_cpu()
+                let use_fused = get_use_fused()
                     && !cache.pre_rope && !has_compacted;
                 let n_compressed = cache.k_per_head[0].count;
                 let n_past_compressed = if n_compressed > 0 { n_compressed - 1 } else { 0 };
@@ -2114,18 +2114,12 @@ impl LayerWeights {
                 // Requirements: no pre-rope, no compacted, no cold, no sink, has past keys.
                 // GPU fused TQ attention: compressed keys + optional sink tokens.
                 // Requirements: no pre-rope, no compacted, no cold tier, has past keys.
-                // GPU-accelerated TQ scores: TQ_GPU_FUSED=0 disables
                 #[cfg(feature = "cuda")]
-                let gpu_fused_ok = std::env::var("TQ_GPU_FUSED").ok().map(|v| v != "0").unwrap_or(true)
-                    && crate::cuda::kernels::global_registry().is_some()
-                    && !cache.pre_rope && !has_compacted
-                    && cache.cold_len == 0
-                    && n_past_compressed > 0 && seq_len == 1;
+                let gpu_fused_ok = false;
                 #[cfg(not(feature = "cuda"))]
                 let gpu_fused_ok = false;
 
-                // GPU-accelerated TQ score computation + CPU softmax/V accumulation
-                // Uses scores-only GPU kernel (no online softmax = no compounding error)
+                // Dead code — kept for future GPU fused attention work
                 #[cfg(feature = "cuda")]
                 if gpu_fused_ok && n_past_compressed > 0 {
                     if let (Some(reg), Some(ref gpu)) = (crate::cuda::kernels::global_registry(), &self.gpu_tq_cache) {
@@ -2239,6 +2233,42 @@ impl LayerWeights {
                         .as_ref().map(|cb| cb.centroids.clone());
                     // Note: cold centroids looked up per-head inside the loop (mixed bits)
 
+                    // GPU-accelerated compressed score computation (if available)
+                    #[cfg(feature = "cuda")]
+                    let gpu_comp_scores: Option<Vec<f32>> = if n_past_compressed > 0 {
+                        if let (Some(reg), Some(ref gpu)) = (crate::cuda::kernels::global_registry(), &self.gpu_tq_cache) {
+                            // Upload rotated query
+                            let mut rotated_q_all = Vec::with_capacity(self.n_head * self.head_dim);
+                            for qh in 0..self.n_head {
+                                let qstart = qh * self.head_dim;
+                                let q_vec = &q_flat[qstart..qstart + self.head_dim];
+                                let rq = if let Some(ref matrix) = self.tq_config.rotation_matrix {
+                                    tq_kv::pre_rotate_query_with_matrix(q_vec, matrix)
+                                } else {
+                                    tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs)
+                                };
+                                rotated_q_all.extend_from_slice(&rq);
+                            }
+                            let rq_gpu = reg.stream.clone_htod(&rotated_q_all).ok();
+                            if let Some(ref rq) = rq_gpu {
+                                let mut scores_gpu = reg.stream.alloc_zeros::<f32>(self.n_head * n_past_compressed).ok();
+                                if let Some(ref mut sg) = scores_gpu {
+                                    let ok = crate::cuda::kernels::tq_fused_attention(
+                                        reg, rq, &gpu.packed_indices, &gpu.norms,
+                                        &gpu.centroids, sg,
+                                        self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
+                                        gpu.bits as usize, scale, gpu.max_seq,
+                                    );
+                                    if ok.is_ok() {
+                                        reg.stream.clone_dtoh(sg).ok()
+                                    } else { None }
+                                } else { None }
+                            } else { None }
+                        } else { None }
+                    } else { None };
+                    #[cfg(not(feature = "cuda"))]
+                    let gpu_comp_scores: Option<Vec<f32>> = None;
+
                     use rayon::prelude::*;
                     let head_scores: Vec<Vec<f32>> = (0..self.n_head)
                         .into_par_iter()
@@ -2275,33 +2305,39 @@ impl LayerWeights {
                                 scores.extend_from_slice(&cold_scores);
                             }
 
-                            // Segment 3: Hot compressed keys (excluding last = current)
+                            // Segment 3: Hot compressed keys — GPU-accelerated when available
                             if n_past_compressed > 0 {
-                                // Use calibrated centroids only if they match the head's bit width
-                                let head_bits = cache.k_per_head[kv_h].bits;
-                                let hot_cb: &[f32] = match cal_centroids_owned.as_deref() {
-                                    Some(cal) if head_bits == layer_tq_config.bits => cal,
-                                    _ => tq_kv::codebook::get_centroids(head_bits),
-                                };
-                                let hot = &cache.k_per_head[kv_h];
-                                let dim = hot.dim;
-                                let bpv = hot.bytes_per_vector();
-                                let mut idx_buf = vec![0u8; dim];
-                                for pos in 0..n_past_compressed {
-                                    let norm = hot.norms[pos];
-                                    if norm < 1e-10 {
-                                        scores.push(0.0);
-                                        continue;
+                                if let Some(ref gpu_scores) = gpu_comp_scores {
+                                    // Use pre-computed GPU scores
+                                    let start = qh * n_past_compressed;
+                                    scores.extend_from_slice(&gpu_scores[start..start + n_past_compressed]);
+                                } else {
+                                    // CPU fallback
+                                    let head_bits = cache.k_per_head[kv_h].bits;
+                                    let hot_cb: &[f32] = match cal_centroids_owned.as_deref() {
+                                        Some(cal) if head_bits == layer_tq_config.bits => cal,
+                                        _ => tq_kv::codebook::get_centroids(head_bits),
+                                    };
+                                    let hot = &cache.k_per_head[kv_h];
+                                    let dim = hot.dim;
+                                    let bpv = hot.bytes_per_vector();
+                                    let mut idx_buf = vec![0u8; dim];
+                                    for pos in 0..n_past_compressed {
+                                        let norm = hot.norms[pos];
+                                        if norm < 1e-10 {
+                                            scores.push(0.0);
+                                            continue;
+                                        }
+                                        let start = pos * bpv;
+                                        let end = start + bpv;
+                                        tq_kv::codebook::unpack_indices_into(
+                                            &hot.packed_indices[start..end], &mut idx_buf, hot.bits,
+                                        );
+                                        let score = tq_kv::fused_dot_product_with_centroids(
+                                            &rotated_q, &idx_buf, norm, hot_cb, dim,
+                                        ) * scale;
+                                        scores.push(score);
                                     }
-                                    let start = pos * bpv;
-                                    let end = start + bpv;
-                                    tq_kv::codebook::unpack_indices_into(
-                                        &hot.packed_indices[start..end], &mut idx_buf, hot.bits,
-                                    );
-                                    let score = tq_kv::fused_dot_product_with_centroids(
-                                        &rotated_q, &idx_buf, norm, hot_cb, dim,
-                                    ) * scale;
-                                    scores.push(score);
                                 }
                             }
 
