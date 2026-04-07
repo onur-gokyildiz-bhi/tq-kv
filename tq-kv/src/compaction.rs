@@ -9,6 +9,22 @@
 //! - TurboQuant reduces BITS per token (16 → 4)
 //! - Combined: 50x token × 8x bits = 400x total compression
 
+use crate::triattention::TriAttentionConfig;
+
+/// Key selection method for compaction.
+#[derive(Clone, Debug)]
+pub enum PruningMethod {
+    /// Original: score by mean attention weight across reference queries.
+    MeanAttention,
+    /// TriAttention: score by trigonometric series approximation.
+    TriAttention {
+        config: TriAttentionConfig,
+        current_pos: usize,
+        key_positions: Vec<usize>,
+        kv_head: usize,
+    },
+}
+
 /// Result of KV cache compaction for a single attention head.
 #[derive(Clone, Debug)]
 pub struct CompactedHead {

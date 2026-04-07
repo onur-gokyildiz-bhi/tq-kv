@@ -712,6 +712,12 @@ struct CompressedKvCache {
     /// At decode time, keys must be decompressed and RoPE applied dynamically.
     pre_rope: bool,
     // GPU fused attention is triggered dynamically (no persistent state needed).
+
+    // -- TriAttention eviction state --
+    tri_config: Option<tq_kv::triattention::TriAttentionConfig>,
+    tri_keys_pre_rope: Option<Vec<Vec<f32>>>,
+    tri_key_positions: Vec<usize>,
+    tri_tokens_since_eviction: usize,
 }
 
 /// Decompress compressed keys to tensor. Only decompresses the compressed portion.
@@ -1054,6 +1060,21 @@ fn get_compact_threshold() -> usize {
 fn get_compact_ratio() -> usize {
     static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *C.get_or_init(|| std::env::var("TQ_COMPACT_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(5))
+}
+
+fn get_triattention_enabled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_TRIATTN").ok().map(|v| v == "1").unwrap_or(false))
+}
+
+fn get_triattention_budget() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_TRIATTN_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2048))
+}
+
+fn get_triattention_interval() -> usize {
+    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_TRIATTN_INTERVAL").ok().and_then(|v| v.parse().ok()).unwrap_or(128))
 }
 
 const TQ_VBITS_DEFAULT: u8 = 0;
@@ -1732,6 +1753,12 @@ impl LayerWeights {
                     cached_len: 0,
                     dtype: cache_dtype,
                     pre_rope: pre_rope_mode,
+                    tri_config: None,
+                    tri_keys_pre_rope: if get_triattention_enabled() {
+                        Some(vec![Vec::new(); self.n_kv_head])
+                    } else { None },
+                    tri_key_positions: Vec::new(),
+                    tri_tokens_since_eviction: 0,
                 });
             }
 
@@ -3615,8 +3642,10 @@ impl GenericTurboModel {
     pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
             layer.kv_cache = None;
-            layer.gpu_kv_cache = None;
+            #[cfg(feature = "cuda")]
+            { layer.gpu_kv_cache = None; }
         }
+        #[cfg(feature = "cuda")]
         self.graph_manager.reset();
         self.masks.clear();
     }

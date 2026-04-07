@@ -67,6 +67,32 @@ pub struct CalibrationData {
     /// Effective dimension at 95% variance threshold.
     #[serde(default)]
     pub d_eff: Option<usize>,
+
+    // -- TriAttention fields (arXiv:2604.04921) --
+
+    /// Pre-RoPE query centers per head: E[q_f] in frequency-pair space.
+    /// Shape: [n_heads][head_dim]. Stable across positions and contexts.
+    #[serde(default)]
+    pub tri_q_centers: Option<Vec<Vec<f32>>>,
+    /// Pre-RoPE key centers per head: E[k_f] in frequency-pair space.
+    #[serde(default)]
+    pub tri_k_centers: Option<Vec<Vec<f32>>>,
+    /// Mean Resultant Length per head: R_f = ||E[q_f/||q_f||]||.
+    /// R→1 means high concentration (trig series accurate), R→0 means dispersed.
+    #[serde(default)]
+    pub tri_mrl: Option<Vec<f32>>,
+    /// Pre-RoPE query norm means per head: E[||q_f||].
+    #[serde(default)]
+    pub tri_q_norm_means: Option<Vec<f32>>,
+    /// RoPE frequencies per frequency pair: omega_f = 1/theta^(2f/d).
+    #[serde(default)]
+    pub tri_rope_freqs: Option<Vec<f32>>,
+    /// Number of query heads (for GQA head mapping).
+    #[serde(default)]
+    pub tri_n_heads: Option<usize>,
+    /// Number of KV heads.
+    #[serde(default)]
+    pub tri_n_kv_heads: Option<usize>,
 }
 
 impl CalibrationData {
@@ -144,6 +170,14 @@ pub struct CalibrationCollector {
     pub head_norm_sq_sums: Vec<f64>,
     pub head_sample_counts: Vec<usize>,
     pub n_kv_heads: usize,
+    // -- TriAttention accumulators --
+    pub tri_q_sums: Vec<Vec<f64>>,
+    pub tri_k_sums: Vec<Vec<f64>>,
+    pub tri_q_norm_sums: Vec<f64>,
+    pub tri_q_unit_sums: Vec<Vec<f64>>,
+    pub tri_q_counts: Vec<usize>,
+    pub tri_k_counts: Vec<usize>,
+    pub n_heads: usize,
 }
 
 impl CalibrationCollector {
@@ -157,6 +191,13 @@ impl CalibrationCollector {
             head_norm_sq_sums: Vec::new(),
             head_sample_counts: Vec::new(),
             n_kv_heads: 0,
+            tri_q_sums: Vec::new(),
+            tri_k_sums: Vec::new(),
+            tri_q_norm_sums: Vec::new(),
+            tri_q_unit_sums: Vec::new(),
+            tri_q_counts: Vec::new(),
+            tri_k_counts: Vec::new(),
+            n_heads: 0,
         }
     }
 
@@ -207,6 +248,53 @@ impl CalibrationCollector {
     pub fn is_full(&self) -> bool {
         self.count >= self.max_samples
     }
+
+    /// Collect pre-RoPE Q and K vectors for TriAttention calibration.
+    pub fn collect_pre_rope(&mut self, q_flat: &[f32], k_flat: &[f32],
+                            n_heads: usize, n_kv_heads: usize,
+                            seq_len: usize, head_dim: usize) {
+        if self.n_heads == 0 && n_heads > 0 {
+            self.n_heads = n_heads;
+            self.tri_q_sums = vec![vec![0.0f64; head_dim]; n_heads];
+            self.tri_q_norm_sums = vec![0.0f64; n_heads];
+            self.tri_q_unit_sums = vec![vec![0.0f64; head_dim]; n_heads];
+            self.tri_q_counts = vec![0; n_heads];
+        }
+        if self.tri_k_sums.is_empty() && n_kv_heads > 0 {
+            self.tri_k_sums = vec![vec![0.0f64; head_dim]; n_kv_heads];
+            self.tri_k_counts = vec![0; n_kv_heads];
+        }
+        for h in 0..n_heads.min(self.n_heads) {
+            for s in 0..seq_len {
+                let offset = (h * seq_len + s) * head_dim;
+                if offset + head_dim > q_flat.len() { continue; }
+                let q_vec = &q_flat[offset..offset + head_dim];
+                for (i, &v) in q_vec.iter().enumerate() {
+                    self.tri_q_sums[h][i] += v as f64;
+                }
+                let norm: f64 = q_vec.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>().sqrt();
+                self.tri_q_norm_sums[h] += norm;
+                if norm > 1e-12 {
+                    let inv_norm = 1.0 / norm;
+                    for (i, &v) in q_vec.iter().enumerate() {
+                        self.tri_q_unit_sums[h][i] += (v as f64) * inv_norm;
+                    }
+                }
+                self.tri_q_counts[h] += 1;
+            }
+        }
+        for h in 0..n_kv_heads.min(self.tri_k_sums.len()) {
+            for s in 0..seq_len {
+                let offset = (h * seq_len + s) * head_dim;
+                if offset + head_dim > k_flat.len() { continue; }
+                let k_vec = &k_flat[offset..offset + head_dim];
+                for (i, &v) in k_vec.iter().enumerate() {
+                    self.tri_k_sums[h][i] += v as f64;
+                }
+                self.tri_k_counts[h] += 1;
+            }
+        }
+    }
 }
 
 /// Global calibration collector, set during `tq calibrate` runs.
@@ -233,12 +321,80 @@ pub fn maybe_collect(k_flat: &[f32], n_kv_heads: usize, seq_len: usize, head_dim
     }
 }
 
-/// Stub for TriAttention pre-RoPE calibration (full impl on feature/triattention-mix).
+/// Collect pre-RoPE Q and K vectors for TriAttention calibration.
 #[inline]
 pub fn maybe_collect_pre_rope(
-    _q_flat: &[f32], _k_flat: &[f32],
-    _n_heads: usize, _n_kv_heads: usize, _seq_len: usize, _head_dim: usize,
-) {}
+    q_flat: &[f32], k_flat: &[f32],
+    n_heads: usize, n_kv_heads: usize,
+    seq_len: usize, head_dim: usize,
+) {
+    if let Some(collector) = CALIBRATION_COLLECTOR.get() {
+        if let Ok(mut c) = collector.lock() {
+            c.collect_pre_rope(q_flat, k_flat, n_heads, n_kv_heads, seq_len, head_dim);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TriAttention statistics — pre-RoPE Q/K center extraction
+// ---------------------------------------------------------------------------
+
+/// Compute TriAttention calibration statistics from collected pre-RoPE samples.
+pub fn compute_triattention_stats(collector: &CalibrationCollector)
+    -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>, Vec<f32>)
+{
+    let head_dim = collector.head_dim;
+    let n_heads = collector.n_heads;
+    let n_kv_heads = collector.tri_k_sums.len();
+
+    let mut q_centers = Vec::with_capacity(n_heads);
+    let mut mrl = Vec::with_capacity(n_heads);
+    let mut q_norm_means = Vec::with_capacity(n_heads);
+
+    for h in 0..n_heads {
+        let count = collector.tri_q_counts[h] as f64;
+        if count < 1.0 {
+            q_centers.push(vec![0.0f32; head_dim]);
+            mrl.push(0.0);
+            q_norm_means.push(1.0);
+            continue;
+        }
+        let center: Vec<f32> = collector.tri_q_sums[h].iter()
+            .map(|&s| (s / count) as f32).collect();
+        let mean_norm = collector.tri_q_norm_sums[h] / count;
+        let unit_mean_norm: f64 = collector.tri_q_unit_sums[h].iter()
+            .map(|s| (s / count) * (s / count)).sum::<f64>().sqrt();
+        q_centers.push(center);
+        mrl.push(unit_mean_norm.min(1.0) as f32);
+        q_norm_means.push(mean_norm as f32);
+    }
+
+    let mut k_centers = Vec::with_capacity(n_kv_heads);
+    for h in 0..n_kv_heads {
+        let count = collector.tri_k_counts[h] as f64;
+        if count < 1.0 {
+            k_centers.push(vec![0.0f32; head_dim]);
+            continue;
+        }
+        let center: Vec<f32> = collector.tri_k_sums[h].iter()
+            .map(|&s| (s / count) as f32).collect();
+        k_centers.push(center);
+    }
+
+    if !mrl.is_empty() {
+        let mean_mrl: f32 = mrl.iter().sum::<f32>() / mrl.len() as f32;
+        eprintln!("  TriAttention MRL: mean={:.4} (higher = better trig approx)", mean_mrl);
+    }
+
+    (q_centers, k_centers, mrl, q_norm_means)
+}
+
+/// Compute RoPE frequency table.
+pub fn compute_rope_freqs(head_dim: usize, theta: f32) -> Vec<f32> {
+    let n_pairs = head_dim / 2;
+    (0..n_pairs).map(|f| 1.0 / theta.powf(2.0 * f as f32 / head_dim as f32)).collect()
+}
+>>>>>>> 5d79b08 (TriAttention × TurboQuant mix: scoring engine + calibration + eviction infra)
 
 // ---------------------------------------------------------------------------
 // Per-head importance scoring
@@ -398,6 +554,16 @@ pub fn compute_calibration(
         (None, None)
     };
 
+    // 6. TriAttention pre-RoPE statistics
+    let (tri_q_centers, tri_k_centers, tri_mrl, tri_q_norm_means) =
+        if collector.n_heads > 0 && !collector.tri_q_sums.is_empty() {
+            eprintln!("  TriAttention pre-RoPE statistics...");
+            compute_triattention_stats(collector)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+    let rope_freqs = compute_rope_freqs(head_dim, 10000.0);
+
     CalibrationData {
         model: model_name.to_string(),
         head_dim,
@@ -412,6 +578,13 @@ pub fn compute_calibration(
         key_channel_bias: Some(key_channel_bias),
         eigenvalues: if eigenvalues.is_empty() { None } else { Some(eigenvalues) },
         d_eff: Some(d_eff_95),
+        tri_q_centers: if tri_q_centers.is_empty() { None } else { Some(tri_q_centers) },
+        tri_k_centers: if tri_k_centers.is_empty() { None } else { Some(tri_k_centers) },
+        tri_mrl: if tri_mrl.is_empty() { None } else { Some(tri_mrl) },
+        tri_q_norm_means: if tri_q_norm_means.is_empty() { None } else { Some(tri_q_norm_means) },
+        tri_rope_freqs: Some(rope_freqs),
+        tri_n_heads: if collector.n_heads > 0 { Some(collector.n_heads) } else { None },
+        tri_n_kv_heads: if collector.tri_k_sums.is_empty() { None } else { Some(collector.tri_k_sums.len()) },
     }
 }
 

@@ -44,6 +44,8 @@
 pub mod codebook;
 /// KV cache compaction — reduce token count via attention matching.
 pub mod compaction;
+/// TriAttention — trigonometric KV cache scoring & eviction (arXiv:2604.04921).
+pub mod triattention;
 /// Fast Walsh-Hadamard Transform for decorrelation.
 pub mod hadamard;
 
