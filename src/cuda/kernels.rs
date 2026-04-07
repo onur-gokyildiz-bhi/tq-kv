@@ -83,6 +83,7 @@ impl KernelRegistry {
             ("softmax", PTX_SOFTMAX),
             ("sparse_v", PTX_SPARSE_V),
             ("tq_compress", PTX_TQ_COMPRESS),
+            ("trig_score", PTX_TRIG_SCORE),
         ];
         let mut loaded = 0;
         for &(name, ptx_src) in ptx_sources {
@@ -560,6 +561,46 @@ pub fn tq_compress_key(
             .arg(key_vectors).arg(signs).arg(boundaries).arg(centroids)
             .arg(packed_out).arg(norms_out)
             .arg(&hd).arg(&nc).arg(&bpk)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// TriAttention: score all keys for all KV heads using trigonometric series.
+/// Grid: (n_kv_heads, 1, 1), Block: 256 threads.
+/// Scores pre-RoPE keys without full attention computation.
+pub fn trig_score_keys_batched(
+    reg: &KernelRegistry,
+    q_centers: &CudaSlice<f32>,       // [n_kv_heads, head_dim]
+    keys_pre_rope: &CudaSlice<f32>,   // [n_kv_heads, n_keys, head_dim]
+    rope_freqs: &CudaSlice<f32>,      // [n_pairs]
+    key_positions: &CudaSlice<i32>,   // [n_keys]
+    scores_out: &mut CudaSlice<f32>,  // [n_kv_heads, n_keys]
+    mrl_per_head: &CudaSlice<f32>,    // [n_kv_heads]
+    q_norm_per_head: &CudaSlice<f32>, // [n_kv_heads]
+    current_pos: usize,
+    n_keys: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    offsets: &CudaSlice<i32>,         // [n_offsets]
+    n_offsets: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("trig_score", "trig_score_keys_batched_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_heads as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0, // shared memory statically allocated in kernel
+    };
+    let cp = current_pos as i32;
+    let nk = n_keys as i32;
+    let hd = head_dim as i32;
+    let no = n_offsets as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q_centers).arg(keys_pre_rope).arg(rope_freqs)
+            .arg(key_positions).arg(scores_out)
+            .arg(mrl_per_head).arg(q_norm_per_head)
+            .arg(&cp).arg(&nk).arg(&hd).arg(&no).arg(offsets)
             .launch(cfg)?;
     }
     Ok(())
