@@ -448,6 +448,10 @@ struct GpuCompressedKv {
     decomp_cache: cudarc::driver::CudaSlice<f32>,
     /// How many keys in decomp_cache are valid (matches count after initial fill)
     decomp_count: usize,
+    /// Pre-allocated contiguous K gather buffer: avoids per-token alloc in narrow()
+    k_contig: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    /// Pre-allocated contiguous V gather buffer: avoids per-token alloc in narrow()
+    v_contig: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
     /// Current count of compressed keys per head
     count: usize,
     max_seq: usize,
@@ -502,6 +506,10 @@ impl GpuCompressedKv {
             .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv out: {}", e)))?;
         let decomp_cache = stream.alloc_zeros::<f32>(total_v)
             .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv decomp: {}", e)))?;
+        let k_contig = std::sync::Arc::new(stream.alloc_zeros::<f32>(total_v)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv k_contig: {}", e)))?);
+        let v_contig = std::sync::Arc::new(stream.alloc_zeros::<f32>(total_v)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv v_contig: {}", e)))?);
         eprintln!("[gpu-tq] pre-allocated {}×{}×{} = {:.1}MB compressed + {:.1}MB decomp cache",
             n_kv_head, max_seq, bytes_per_key,
             (total_indices + total_norms * 4 + total_v * 4) as f64 / 1e6,
@@ -510,6 +518,7 @@ impl GpuCompressedKv {
         Ok(Self {
             packed_indices, norms, centroids: gpu_centroids, v_data,
             rotated_q, output_buf, decomp_cache, decomp_count: 0,
+            k_contig, v_contig,
             count: 0, max_seq, n_kv_head, n_heads, head_dim, bytes_per_key, bits,
             stream,
         })
@@ -555,7 +564,7 @@ impl GpuCompressedKv {
     }
 
     /// Append one token's compressed K and raw V directly from GPU buffers.
-    /// No CPU round-trip — GPU compress kernel output goes straight to cache.
+    /// Pure D2D scatter — no CPU round-trip. Uses cuMemcpyDtoDAsync per head.
     /// packed_gpu: [n_kv_head * bytes_per_key], norms_gpu: [n_kv_head], v_gpu: [n_kv_head * head_dim]
     fn append_gpu(
         &mut self,
@@ -563,25 +572,69 @@ impl GpuCompressedKv {
         norms_gpu: &cudarc::driver::CudaSlice<f32>,
         v_gpu: &cudarc::driver::CudaSlice<f32>,
     ) -> std::result::Result<(), crate::cuda::TqError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use cudarc::driver::sys;
+
         if self.count >= self.max_seq {
             return Err(crate::cuda::TqError::Msg("GpuCompressedKv overflow".into()));
         }
         let bpk = self.bytes_per_key;
         let pos = self.count;
         let hd = self.head_dim;
+        let ms = self.max_seq;
+        let n_kv = self.n_kv_head;
+        let raw_stream = self.stream.cu_stream();
 
-        // Download small GPU buffers → CPU → upload to correct offsets.
-        // Total data: n_kv_head × (bpk + 4 + hd×4) ≈ 4 × 580 = 2.3 KB.
-        // The download is negligible (was ~2KB vs old approach downloading 2048B K vectors).
-        // True zero-copy D2D requires a dedicated scatter kernel (future optimization).
-        let packed_cpu = self.stream.clone_dtoh(packed_gpu)
-            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu packed dtoh: {}", e)))?;
-        let norms_cpu = self.stream.clone_dtoh(norms_gpu)
-            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu norms dtoh: {}", e)))?;
-        let v_cpu = self.stream.clone_dtoh(v_gpu)
-            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu v dtoh: {}", e)))?;
+        // D2D scatter: packed indices (u8) per head
+        {
+            let (src_base, _g1) = packed_gpu.device_ptr(self.stream.as_ref());
+            let (dst_base, _g2) = self.packed_indices.device_ptr_mut(self.stream.as_ref());
+            for h in 0..n_kv {
+                let src_off = (h * bpk) as u64;
+                let dst_off = ((h * ms + pos) * bpk) as u64;
+                let res = unsafe {
+                    sys::cuMemcpyDtoDAsync_v2(dst_base + dst_off, src_base + src_off, bpk as usize, raw_stream)
+                };
+                if res != sys::cudaError_enum::CUDA_SUCCESS {
+                    return Err(crate::cuda::TqError::Msg(format!("d2d packed h={}: {:?}", h, res)));
+                }
+            }
+        }
 
-        self.append(&packed_cpu, &norms_cpu, &v_cpu)
+        // D2D scatter: norms (f32) per head
+        {
+            let (src_base, _g1) = norms_gpu.device_ptr(self.stream.as_ref());
+            let (dst_base, _g2) = self.norms.device_ptr_mut(self.stream.as_ref());
+            for h in 0..n_kv {
+                let src_off = (h * 4) as u64;
+                let dst_off = ((h * ms + pos) * 4) as u64;
+                let res = unsafe {
+                    sys::cuMemcpyDtoDAsync_v2(dst_base + dst_off, src_base + src_off, 4, raw_stream)
+                };
+                if res != sys::cudaError_enum::CUDA_SUCCESS {
+                    return Err(crate::cuda::TqError::Msg(format!("d2d norms h={}: {:?}", h, res)));
+                }
+            }
+        }
+
+        // D2D scatter: V data (f32) per head
+        {
+            let (src_base, _g1) = v_gpu.device_ptr(self.stream.as_ref());
+            let (dst_base, _g2) = self.v_data.device_ptr_mut(self.stream.as_ref());
+            for h in 0..n_kv {
+                let src_off = (h * hd * 4) as u64;
+                let dst_off = ((h * ms + pos) * hd * 4) as u64;
+                let res = unsafe {
+                    sys::cuMemcpyDtoDAsync_v2(dst_base + dst_off, src_base + src_off, hd * 4, raw_stream)
+                };
+                if res != sys::cudaError_enum::CUDA_SUCCESS {
+                    return Err(crate::cuda::TqError::Msg(format!("d2d v h={}: {:?}", h, res)));
+                }
+            }
+        }
+
+        self.count += 1;
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -2272,13 +2325,26 @@ impl LayerWeights {
                                 gpu.decomp_count = n_past_compressed;
                             }
 
-                            // K hot: GPU narrow on strided decomp_cache (single strided_copy kernel)
+                            // K hot: gather from strided decomp_cache → pre-allocated k_contig (0 allocs)
+                            {
+                                let n_kv = self.n_kv_head;
+                                let count = n_past_compressed;
+                                let dst = std::sync::Arc::get_mut(&mut gpu.k_contig)
+                                    .expect("k_contig aliased");
+                                crate::cuda::kernels::strided_copy_args(
+                                    reg, &gpu.decomp_cache, dst,
+                                    n_kv * count * hdim, 3,
+                                    &[(n_kv as i32), (count as i32), (hdim as i32)],
+                                    &[((count * hdim) as i32), (hdim as i32), 1],
+                                    &[((ms * hdim) as i32), (hdim as i32), 1],
+                                    0,
+                                ).map_err(|e| TqError::Msg(format!("k_hot gather: {e}")))?;
+                            }
                             let k_hot = Tensor::from_cuda_arc(
-                                std::sync::Arc::new(gpu.decomp_cache.clone()),
-                                vec![self.n_kv_head, ms, hdim],
+                                std::sync::Arc::clone(&gpu.k_contig),
+                                vec![1, self.n_kv_head, n_past_compressed, hdim],
                                 stream.clone(),
-                            ).narrow(1, 0, n_past_compressed)?
-                             .reshape(vec![1, self.n_kv_head, n_past_compressed, hdim])?;
+                            );
 
                             // Cache sink K/V on GPU (upload once)
                             let sink_len = cache.sink_len;
@@ -2336,12 +2402,26 @@ impl LayerWeights {
                                 ));
                             }
                             if n_past_compressed > 0 {
+                                // V hot: gather from strided v_data → pre-allocated v_contig (0 allocs)
+                                {
+                                    let n_kv = self.n_kv_head;
+                                    let count = n_past_compressed;
+                                    let dst = std::sync::Arc::get_mut(&mut gpu.v_contig)
+                                        .expect("v_contig aliased");
+                                    crate::cuda::kernels::strided_copy_args(
+                                        reg, &gpu.v_data, dst,
+                                        n_kv * count * hdim, 3,
+                                        &[(n_kv as i32), (count as i32), (hdim as i32)],
+                                        &[((count * hdim) as i32), (hdim as i32), 1],
+                                        &[((ms * hdim) as i32), (hdim as i32), 1],
+                                        0,
+                                    ).map_err(|e| TqError::Msg(format!("v_hot gather: {e}")))?;
+                                }
                                 let v_hot = Tensor::from_cuda_arc(
-                                    std::sync::Arc::new(gpu.v_data.clone()),
-                                    vec![self.n_kv_head, ms, hdim],
+                                    std::sync::Arc::clone(&gpu.v_contig),
+                                    vec![1, self.n_kv_head, n_past_compressed, hdim],
                                     stream.clone(),
-                                ).narrow(1, 0, n_past_compressed)?
-                                 .reshape(vec![1, self.n_kv_head, n_past_compressed, hdim])?;
+                                );
                                 v_parts_gpu.push(v_hot);
                             }
                             if n_compressed > 0 {
@@ -3446,9 +3526,9 @@ impl GenericTurboModel {
                 }
             }
 
-            let _ = reg.stream.synchronize();
+            // No sync needed: memcpy_htod + graph launch are stream-ordered.
             if let Ok(()) = self.graph_manager.replay(&reg.stream, 1) {
-                let _ = reg.stream.synchronize();
+                // No post-replay sync: TQ layers launch on same stream after graph.
                 // Post-replay: increment seq_len
                 for layer in &mut self.layers {
                     if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
@@ -3462,7 +3542,7 @@ impl GenericTurboModel {
 
         // ── CUDA Graph capture (scratch-based, no pool recording) ──
         #[cfg(feature = "cuda")]
-        let capturing = seq_len == 1 && self.graph_manager.should_capture(1);
+        let mut capturing = seq_len == 1 && self.graph_manager.should_capture(1);
         #[cfg(feature = "cuda")]
         let recording = false; // recording pass disabled for scratch-based graph
         #[cfg(feature = "cuda")]
@@ -3611,13 +3691,18 @@ impl GenericTurboModel {
         #[cfg(feature = "cuda")]
         let mut decode_scratch = self.decode_scratch.take();
 
-        // Graph replayed: skip layer loop, set layer_in from scratch combined buffer.
+        // Hybrid graph replayed: layer_in from last non-TQ layer's scratch slot.
+        // TQ layers will run eagerly after the graph-replayed non-TQ portion.
         #[cfg(feature = "cuda")]
         if graph_replayed {
             if let Some(ref scratch) = decode_scratch {
-                let last_ci = (self.layers.len() - 1) & 1;
+                let skip_first = get_skip_layers(&self.layers[0].tq_config);
+                let n_layers = self.layers.len();
+                // Full graph (no TQ layers): last layer output. Hybrid: last non-TQ layer.
+                let graph_last = if skip_first >= n_layers { n_layers - 1 } else { skip_first.saturating_sub(1) };
+                let ci = graph_last & 1;
                 layer_in = Tensor::from_cuda_arc(
-                    Arc::clone(&scratch.combined_bufs[last_ci]),
+                    Arc::clone(&scratch.combined_bufs[ci]),
                     vec![1, 1, scratch.hidden_dim], scratch.stream.clone(),
                 );
             }
@@ -3625,8 +3710,16 @@ impl GenericTurboModel {
         #[cfg(not(feature = "cuda"))]
         let graph_replayed = false;
 
-        if !graph_replayed {
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // Hybrid graph replay: skip non-TQ layers (already executed by graph)
+            #[cfg(feature = "cuda")]
+            if graph_replayed {
+                let this_is_tq = get_layer_bits(layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers).is_some();
+                if !this_is_tq {
+                    continue;
+                }
+            }
+
             let x = layer_in;
             // prof_sync macro defined before loop
 
@@ -3662,6 +3755,40 @@ impl GenericTurboModel {
             // Phases are scoped to avoid borrow conflicts with &mut self in forward_attn.
             #[cfg(feature = "cuda")]
             let layer_uses_compression = get_layer_bits(layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers).is_some();
+
+            // ── Hybrid graph: end capture at TQ boundary ──
+            // Non-TQ layers are captured in the graph. When we hit the first TQ layer,
+            // end capture and replay immediately. TQ layers run eagerly after.
+            #[cfg(feature = "cuda")]
+            if capturing && layer_uses_compression
+                && matches!(self.graph_manager.status, crate::cuda::graph::GraphStatus::Capturing)
+            {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    match self.graph_manager.end_capture(&reg.stream, 1) {
+                        Ok(()) => {
+                            eprintln!("[cuda-graph] hybrid: captured {} non-TQ layers", layer_idx);
+                            // Capture only records — replay to actually execute
+                            let _ = reg.stream.context().check_err();
+                            match self.graph_manager.replay(&reg.stream, 1) {
+                                Ok(()) => {
+                                    let _ = reg.stream.synchronize();
+                                    eprintln!("[cuda-graph] hybrid: initial replay OK");
+                                }
+                                Err(e) => {
+                                    eprintln!("[cuda-graph] hybrid: replay FAILED: {}", e);
+                                    self.graph_manager.reset();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[cuda-graph] hybrid: end_capture failed: {}", e);
+                            self.graph_manager.reset();
+                        }
+                    }
+                }
+                capturing = false;
+            }
+
             #[cfg(feature = "cuda")]
             let fused_disabled = {
                 static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4212,7 +4339,6 @@ impl GenericTurboModel {
                 }
             }
         }
-        } // if !graph_replayed
 
         // Restore scratch buffers back into self after layer loop.
         #[cfg(feature = "cuda")]
