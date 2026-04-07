@@ -1971,10 +1971,10 @@ impl LayerWeights {
                             Err(e) => eprintln!("[gpu-tq] init failed: {}", e),
                         }
                     }
-
                     // Append the newly CPU-compressed token(s) to GPU cache.
                     // Skip if GPU compress already appended directly.
-                    if !gpu_compress_ok {
+                    // `else if`: skip when GPU cache was just initialized (seed already includes all tokens).
+                    else if !gpu_compress_ok {
                         if let Some(ref mut gpu) = self.gpu_tq_cache {
                             let count = cache.k_per_head[0].count;
                             let bpk = gpu.bytes_per_key;
@@ -1997,6 +1997,15 @@ impl LayerWeights {
                                 vec![0.0f32; self.n_kv_head * self.head_dim]
                             };
                             let _ = gpu.append(&packed_all, &norms_all, &v_data);
+                        }
+                    }
+
+                    // Ensure signs are on GPU for all-GPU decompress attention path.
+                    // Uploaded here (not in GPU compress block) because GPU compress
+                    // may not run on the first compression (gpu_tq_cache was None).
+                    if self.signs_gpu.is_none() {
+                        if let Ok(buf) = reg.stream.clone_htod(&self.signs) {
+                            self.signs_gpu = Some(buf);
                         }
                     }
                 }
@@ -2170,7 +2179,14 @@ impl LayerWeights {
                 let has_compacted = cache.compacted.is_some();
                 let use_fused = get_use_fused() && q.is_cpu()
                     && !cache.pre_rope && !has_compacted;
-                let n_compressed = cache.k_per_head[0].count;
+                // Use GPU TQ cache count when available (GPU compress path
+                // doesn't update CPU cache.k_per_head[h].count).
+                let n_compressed_cpu = cache.k_per_head[0].count;
+                #[cfg(feature = "cuda")]
+                let n_compressed = self.gpu_tq_cache.as_ref()
+                    .map(|g| g.count).unwrap_or(n_compressed_cpu);
+                #[cfg(not(feature = "cuda"))]
+                let n_compressed = n_compressed_cpu;
                 let n_past_compressed = if n_compressed > 0 { n_compressed - 1 } else { 0 };
                 let compacted_t = cache.compacted.as_ref()
                     .map(|c| c[0].t).unwrap_or(0);
@@ -2299,7 +2315,7 @@ impl LayerWeights {
                 if seq_len == 1
                     && !cache.pre_rope && !has_compacted
                     && cache.cold_len == 0
-                    && n_past_compressed > 0
+                    && n_compressed > 0
                     && self.padded_head_dim == self.head_dim
                     && cache.k_per_head[0].qjl_corrections.is_none()
                     && layer_tq_config.channel_scales.is_none()
@@ -2316,41 +2332,42 @@ impl LayerWeights {
                             let scale = 1.0 / (hdim as f64).sqrt();
                             let stream = reg.stream.clone();
 
-                            // Step 1: Incremental GPU decompress
+                            // Step 1: Incremental GPU decompress + K hot gather
                             let ms = gpu.max_seq;
-                            if gpu.decomp_count < n_past_compressed {
-                                let new_start = gpu.decomp_count;
-                                let new_count = n_past_compressed - new_start;
-                                crate::cuda::kernels::tq_decompress_keys_range(
-                                    reg, &gpu.packed_indices, &gpu.norms,
-                                    &gpu.centroids, signs, &mut gpu.decomp_cache,
-                                    self.n_kv_head, new_count, hdim,
-                                    gpu.bits as usize, ms,
-                                    new_start, ms,
-                                ).map_err(|e| TqError::Msg(format!("decompress_range: {e}")))?;
-                                gpu.decomp_count = n_past_compressed;
-                            }
-
-                            // K hot: gather from strided decomp_cache → pre-allocated k_contig (0 allocs)
-                            {
-                                let n_kv = self.n_kv_head;
-                                let count = n_past_compressed;
-                                let dst = std::sync::Arc::get_mut(&mut gpu.k_contig)
-                                    .expect("k_contig aliased");
-                                crate::cuda::kernels::strided_copy_args(
-                                    reg, &gpu.decomp_cache, dst,
-                                    n_kv * count * hdim, 3,
-                                    &[(n_kv as i32), (count as i32), (hdim as i32)],
-                                    &[((count * hdim) as i32), (hdim as i32), 1],
-                                    &[((ms * hdim) as i32), (hdim as i32), 1],
-                                    0,
-                                ).map_err(|e| TqError::Msg(format!("k_hot gather: {e}")))?;
-                            }
-                            let k_hot = Tensor::from_cuda_arc(
-                                std::sync::Arc::clone(&gpu.k_contig),
-                                vec![1, self.n_kv_head, n_past_compressed, hdim],
-                                stream.clone(),
-                            );
+                            let k_hot = if n_past_compressed > 0 {
+                                if gpu.decomp_count < n_past_compressed {
+                                    let new_start = gpu.decomp_count;
+                                    let new_count = n_past_compressed - new_start;
+                                    crate::cuda::kernels::tq_decompress_keys_range(
+                                        reg, &gpu.packed_indices, &gpu.norms,
+                                        &gpu.centroids, signs, &mut gpu.decomp_cache,
+                                        self.n_kv_head, new_count, hdim,
+                                        gpu.bits as usize, ms,
+                                        new_start, ms,
+                                    ).map_err(|e| TqError::Msg(format!("decompress_range: {e}")))?;
+                                    gpu.decomp_count = n_past_compressed;
+                                }
+                                // K hot: gather from strided decomp_cache → pre-allocated k_contig
+                                {
+                                    let n_kv = self.n_kv_head;
+                                    let count = n_past_compressed;
+                                    let dst = std::sync::Arc::get_mut(&mut gpu.k_contig)
+                                        .expect("k_contig aliased");
+                                    crate::cuda::kernels::strided_copy_args(
+                                        reg, &gpu.decomp_cache, dst,
+                                        n_kv * count * hdim, 3,
+                                        &[(n_kv as i32), (count as i32), (hdim as i32)],
+                                        &[((count * hdim) as i32), (hdim as i32), 1],
+                                        &[((ms * hdim) as i32), (hdim as i32), 1],
+                                        0,
+                                    ).map_err(|e| TqError::Msg(format!("k_hot gather: {e}")))?;
+                                }
+                                Some(Tensor::from_cuda_arc(
+                                    std::sync::Arc::clone(&gpu.k_contig),
+                                    vec![1, self.n_kv_head, n_past_compressed, hdim],
+                                    stream.clone(),
+                                ))
+                            } else { None };
 
                             // Cache sink K/V on GPU (upload once)
                             let sink_len = cache.sink_len;
@@ -2378,7 +2395,7 @@ impl LayerWeights {
                                     stream.clone(),
                                 ));
                             }
-                            k_parts_gpu.push(k_hot);
+                            if let Some(kh) = k_hot { k_parts_gpu.push(kh); }
                             if n_compressed > 0 {
                                 let k_cur = k.to_dtype(DType::F32)?;
                                 debug_assert!(k_cur.is_cuda(), "current K should be GPU");
@@ -2446,9 +2463,18 @@ impl LayerWeights {
                             att.matmul(&v_full.contiguous()?)?.to_dtype(cache.dtype)
                         })();
 
-                        if let Ok(y) = gpu_result {
-                            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
-                            return self.attention_wo.forward(&y, backend);
+                        match gpu_result {
+                            Ok(y) => {
+                                let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+                                return self.attention_wo.forward(&y, backend);
+                            }
+                            Err(ref e) if n_compressed > n_compressed_cpu => {
+                                // GPU compress active but all-GPU attention failed.
+                                // CPU fallback has incomplete data — propagate error.
+                                eprintln!("[gpu-tq-attn] FAILED (GPU compress active): {e}");
+                                return Err(TqError::Msg(format!("all-GPU TQ attn: {e}")));
+                            }
+                            _ => {} // Fall through to CPU paths
                         }
                     }
                 }
