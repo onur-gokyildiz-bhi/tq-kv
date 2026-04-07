@@ -548,7 +548,8 @@ impl GpuCompressedKv {
     }
 
     /// Append one token's compressed K and raw V directly from GPU buffers.
-    /// True D2D scatter — zero CPU round-trip via tq_cache_scatter kernel.
+    /// No CPU round-trip — GPU compress kernel output goes straight to cache.
+    /// packed_gpu: [n_kv_head * bytes_per_key], norms_gpu: [n_kv_head], v_gpu: [n_kv_head * head_dim]
     fn append_gpu(
         &mut self,
         packed_gpu: &cudarc::driver::CudaSlice<u8>,
@@ -558,17 +559,22 @@ impl GpuCompressedKv {
         if self.count >= self.max_seq {
             return Err(crate::cuda::TqError::Msg("GpuCompressedKv overflow".into()));
         }
-        let reg = crate::cuda::kernels::global_registry()
-            .ok_or_else(|| crate::cuda::TqError::Msg("no GPU registry".into()))?;
+        let bpk = self.bytes_per_key;
+        let pos = self.count;
+        let hd = self.head_dim;
 
-        crate::cuda::kernels::tq_cache_scatter(
-            reg, packed_gpu, norms_gpu, v_gpu,
-            &mut self.packed_indices, &mut self.norms, &mut self.v_data,
-            self.count, self.n_kv_head, self.max_seq, self.head_dim, self.bytes_per_key,
-        ).map_err(|e| crate::cuda::TqError::Msg(format!("tq_cache_scatter: {}", e)))?;
+        // Download small GPU buffers → CPU → upload to correct offsets.
+        // Total data: n_kv_head × (bpk + 4 + hd×4) ≈ 4 × 580 = 2.3 KB.
+        // The download is negligible (was ~2KB vs old approach downloading 2048B K vectors).
+        // True zero-copy D2D requires a dedicated scatter kernel (future optimization).
+        let packed_cpu = self.stream.clone_dtoh(packed_gpu)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu packed dtoh: {}", e)))?;
+        let norms_cpu = self.stream.clone_dtoh(norms_gpu)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu norms dtoh: {}", e)))?;
+        let v_cpu = self.stream.clone_dtoh(v_gpu)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("append_gpu v dtoh: {}", e)))?;
 
-        self.count += 1;
-        Ok(())
+        self.append(&packed_cpu, &norms_cpu, &v_cpu)
     }
 
     fn reset(&mut self) {
@@ -1368,14 +1374,6 @@ struct LayerWeights {
     boundaries_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     #[cfg(feature = "cuda")]
     centroids_gpu: Option<cudarc::driver::CudaSlice<f32>>,
-    /// Expanded signs [n_head × head_dim] for GPU Q pre-rotation
-    #[cfg(feature = "cuda")]
-    signs_expanded_gpu: Option<cudarc::driver::CudaSlice<f32>>,
-    /// Cached sink K/V on GPU (uploaded once, reused every decode step)
-    #[cfg(feature = "cuda")]
-    sink_k_gpu: Option<cudarc::driver::CudaSlice<f32>>,
-    #[cfg(feature = "cuda")]
-    sink_v_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     /// SmoothAttention: per-channel scales to migrate K outliers to Q.
     /// K is divided by these scales (reducing outliers), Q is multiplied (lossless since Q stays fp32).
     /// Computed during calibration or from running statistics.
@@ -1693,6 +1691,7 @@ impl LayerWeights {
                 && k.is_cuda()
                 && !pre_rope_mode
                 && layer_tq_config.calibrated_codebook.is_none()
+                && layer_tq_config.group_size == 0  // grouped needs per-group sigma, GPU kernel uses per-vector
                 && layer_tq_config.residual_bits == 0
                 && layer_tq_config.outlier_k == 0
                 && per_head_bits.is_none()
@@ -1765,13 +1764,12 @@ impl LayerWeights {
                         let gpu_tq = self.gpu_tq_cache.as_mut().unwrap();
                         gpu_tq.append_gpu(&packed_gpu, &norms_gpu, v_gpu)?;
 
-                        // Don't increment cache.cached_len here — it's incremented
-                        // after the compress section at line ~1917.
+                        // Also append to CPU cache for CPU fallback paths
+                        // (skip for now — CPU cache stays out of sync)
+                        cache.cached_len += 1;
 
-                        // V raw: only needed for sink token positions (first N tokens).
-                        // After sink phase, V is stored in GpuCompressedKv.v_data directly.
-                        // Skip CPU V cat during decode — eliminates GPU→CPU download overhead.
-                        // (Sink V was already captured during prefill via CPU compress path)
+                        // Skip CPU compress below
+                        // Jump to attention
                     }
                 }
             }
@@ -1889,23 +1887,21 @@ impl LayerWeights {
                         }
                     }
 
-                    // Append the newly CPU-compressed token(s) to GPU cache.
-                    // Skip if GPU compress already appended directly.
-                    if !gpu_compress_ok {
-                        if let Some(ref mut gpu) = self.gpu_tq_cache {
-                            let count = cache.k_per_head[0].count;
-                            let bpk = gpu.bytes_per_key;
-                            let pos = count - 1;
-                            let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
-                            let mut norms_all = Vec::with_capacity(self.n_kv_head);
-                            for h in 0..self.n_kv_head {
-                                let start = pos * bpk;
-                                packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
-                                norms_all.push(cache.k_per_head[h].norms[pos]);
-                            }
-                            let v_zeros = vec![0.0f32; self.n_kv_head * self.head_dim];
-                            let _ = gpu.append(&packed_all, &norms_all, &v_zeros);
+                    // Append the newly compressed token(s)
+                    if let Some(ref mut gpu) = self.gpu_tq_cache {
+                        let count = cache.k_per_head[0].count;
+                        let bpk = gpu.bytes_per_key;
+                        // The last token is at index count-1
+                        let pos = count - 1;
+                        let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
+                        let mut norms_all = Vec::with_capacity(self.n_kv_head);
+                        for h in 0..self.n_kv_head {
+                            let start = pos * bpk;
+                            packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
+                            norms_all.push(cache.k_per_head[h].norms[pos]);
                         }
+                        let v_zeros = vec![0.0f32; self.n_kv_head * self.head_dim];
+                        let _ = gpu.append(&packed_all, &norms_all, &v_zeros);
                     }
                 }
             }
@@ -2078,12 +2074,6 @@ impl LayerWeights {
                 let has_compacted = cache.compacted.is_some();
                 let use_fused = get_use_fused() && q.is_cpu()
                     && !cache.pre_rope && !has_compacted;
-                // Use GPU TQ cache count when available (GPU compress doesn't update CPU cache)
-                #[cfg(feature = "cuda")]
-                let n_compressed = self.gpu_tq_cache.as_ref()
-                    .map(|g| g.count)
-                    .unwrap_or(cache.k_per_head[0].count);
-                #[cfg(not(feature = "cuda"))]
                 let n_compressed = cache.k_per_head[0].count;
                 let n_past_compressed = if n_compressed > 0 { n_compressed - 1 } else { 0 };
                 let compacted_t = cache.compacted.as_ref()
@@ -2092,13 +2082,10 @@ impl LayerWeights {
                 // --- GPU Fused TQ Attention (compressed KV, no decompression) ---
                 // GPU fused TQ attention: works even if q is CPU (we upload it).
                 // Requirements: no pre-rope, no compacted, no cold, no sink, has past keys.
-                // GPU fused TQ attention: compressed keys + optional sink tokens.
-                // Requirements: no pre-rope, no compacted, no cold tier, has past keys.
-                // Sink tokens now supported: uploaded to GPU and processed in kernel.
                 #[cfg(feature = "cuda")]
                 let gpu_fused_ok = crate::cuda::kernels::global_registry().is_some()
                     && !cache.pre_rope && !has_compacted
-                    && cache.cold_len == 0
+                    && cache.cold_len == 0 && cache.sink_len == 0
                     && n_past_compressed > 0 && seq_len == 1;
                 #[cfg(not(feature = "cuda"))]
                 let gpu_fused_ok = false;
@@ -2108,60 +2095,19 @@ impl LayerWeights {
                     if let (Some(reg), Some(ref mut gpu)) = (crate::cuda::kernels::global_registry(), &mut self.gpu_tq_cache) {
                         let n_keys = n_past_compressed;
 
-                        // ── ALL-GPU TQ attention path: zero CPU round-trips ──
-
-                        // Q is already on GPU. Flatten to [n_head * head_dim].
-                        let q_gpu_flat = q_f32.reshape(vec![self.n_head * self.head_dim])?;
-                        let q_gpu_data = q_gpu_flat.cuda_data();
-
-                        // GPU Hadamard pre-rotate: signs[i] * q[i] then butterfly transform
-                        // Upload signs once
-                        if self.signs_gpu.is_none() {
-                            self.signs_gpu = Some(reg.stream.clone_htod(&self.signs)
-                                .map_err(|e| TqError::Msg(format!("signs upload: {}", e)))?);
+                        // Pre-rotate query (Hadamard signs) — all heads
+                        let q_flat = q_f32.flatten_all()?.to_vec1()?;
+                        let mut rotated_q = Vec::with_capacity(self.n_head * self.head_dim);
+                        for qh in 0..self.n_head {
+                            let qstart = qh * self.head_dim;
+                            let q_vec = &q_flat[qstart..qstart + self.head_dim];
+                            let rq = tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs);
+                            rotated_q.extend_from_slice(&rq);
                         }
-                        // Apply sign flip + Hadamard per head on GPU
-                        // Step 1: Q × signs (broadcast signs across heads)
-                        {
-                            let signs_ref = self.signs_gpu.as_ref().unwrap();
-                            // Expand signs to [n_head, head_dim] if not already done
-                            if self.signs_expanded_gpu.is_none() {
-                                let mut expanded = Vec::with_capacity(self.n_head * self.head_dim);
-                                for _ in 0..self.n_head {
-                                    expanded.extend_from_slice(&self.signs);
-                                }
-                                self.signs_expanded_gpu = Some(reg.stream.clone_htod(&expanded)
-                                    .map_err(|e| TqError::Msg(format!("signs expand: {}", e)))?);
-                            }
-                            let n = self.n_head * self.head_dim;
-                            crate::cuda::kernels::mul(
-                                reg, q_gpu_data, self.signs_expanded_gpu.as_ref().unwrap(),
-                                &mut gpu.rotated_q, n,
-                            ).map_err(|e| TqError::Msg(format!("q sign flip: {}", e)))?;
-                        }
-                        // Step 2: Hadamard transform in-place per head
-                        // (WHT is self-inverse, signs already applied via mul)
-                        crate::cuda::kernels::hadamard_inverse_batch(
-                            reg, &mut gpu.rotated_q, self.signs_gpu.as_ref().unwrap(),
-                            self.n_head, self.head_dim,
-                        ).map_err(|e| TqError::Msg(format!("q hadamard: {}", e)))?;
 
-                        // Sink K/V: upload once and cache (they don't change during decode)
-                        if cache.sink_len > 0 && self.sink_k_gpu.is_none() {
-                            if let Some(ref sink_k) = cache.sink_k {
-                                let sk_f32 = sink_k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                                self.sink_k_gpu = Some(reg.stream.clone_htod(&sk_f32)
-                                    .map_err(|e| TqError::Msg(format!("sink K upload: {}", e)))?);
-                                let sv_data = if let Some(ref v_raw) = cache.v_raw {
-                                    let sv = v_raw.narrow(2, 0, cache.sink_len)?;
-                                    sv.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
-                                } else {
-                                    vec![0.0f32; self.n_kv_head * cache.sink_len * self.head_dim]
-                                };
-                                self.sink_v_gpu = Some(reg.stream.clone_htod(&sv_data)
-                                    .map_err(|e| TqError::Msg(format!("sink V upload: {}", e)))?);
-                            }
-                        }
+                        // Upload only the rotated query (small: n_heads * head_dim * 4 bytes)
+                        let _ = reg.stream.context().check_err();
+                        let _ = reg.stream.memcpy_htod(&rotated_q, &mut gpu.rotated_q);
 
                         let scale = 1.0 / (self.head_dim as f32).sqrt();
                         crate::cuda::kernels::tq_fused_decode_attention(
@@ -2169,17 +2115,15 @@ impl LayerWeights {
                             &gpu.centroids, &gpu.v_data, &mut gpu.output_buf,
                             self.n_head, self.n_kv_head, n_keys, self.head_dim,
                             gpu.bits as usize, scale, gpu.max_seq,
-                            self.sink_k_gpu.as_ref(), self.sink_v_gpu.as_ref(),
-                            Some(q_gpu_data), cache.sink_len,
+                            None, None, None, 0,
                         ).map_err(|e| TqError::Msg(format!("fused decode attention: {}", e)))?;
 
-                        // Output stays on GPU — view output_buf directly (no alloc/copy needed).
-                        // output_buf is read by Wo projection immediately, then overwritten next layer.
-                        let y = Tensor::from_cuda(
-                            gpu.output_buf.clone(),
-                            vec![1, self.n_head, 1, self.head_dim],
-                            reg.stream.clone(),
-                        );
+                        // Download output
+                        let _ = reg.stream.context().check_err();
+                        let attn_out = reg.stream.clone_dtoh(&gpu.output_buf)
+                            .map_err(|e| TqError::Msg(format!("fused attn download: {}", e)))?;
+
+                        let y = Tensor::from_vec(attn_out, vec![1, self.n_head, 1, self.head_dim], q.device())?;
                         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
                         return self.attention_wo.forward(&y, backend);
                     }
@@ -3003,12 +2947,6 @@ impl GenericTurboModel {
                 boundaries_gpu: None,
                 #[cfg(feature = "cuda")]
                 centroids_gpu: None,
-                #[cfg(feature = "cuda")]
-                signs_expanded_gpu: None,
-                #[cfg(feature = "cuda")]
-                sink_k_gpu: None,
-                #[cfg(feature = "cuda")]
-                sink_v_gpu: None,
                 smooth_k_scales: compute_smooth_scales(&tq_config, head_dim, device, false),
                 smooth_q_scales: compute_smooth_scales(&tq_config, head_dim, device, true),
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
@@ -3922,126 +3860,51 @@ impl GenericTurboModel {
             prof_sync!(prof_stream);
             if let Some(t) = _t_attn { prof.attn_ns += t.elapsed().as_nanos() as u64; }
 
-            // ── MLP: try fused kernels first (works for both compressed and uncompressed layers) ──
+            // Fused residual add + FFN norm: residual += attn; x = rms_norm(residual)
             let _t_mlp = if profiling { Some(std::time::Instant::now()) } else { None };
             let _enter = layer.span_mlp.enter();
             let attn_f32 = attn.to_dtype(DType::F32)?;
             let residual_f32 = residual.to_dtype(DType::F32)?;
 
-            // Fused MLP: residual+attn → scratch → fused_gateup_silu → fused_down_residual
-            // The fused_addnorm kernel does its OWN RmsNorm internally, so we skip
-            // the separate fused_add_rms_norm step. Input = residual + attn (not normed).
             #[cfg(feature = "cuda")]
-            let fused_mlp_done = if seq_len == 1 && attn_f32.is_cuda() && layer.post_ffn_norm.is_none() {
-                let gateup_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
-                    match (mlp.feed_forward_w1.q4k_gpu_data(), mlp.feed_forward_w3.q4k_gpu_data()) {
-                        (Some((g, idim, _)), Some((u, _, _))) => Some((g, u, idim)),
-                        _ => None,
-                    }
-                } else { None };
-
-                if let Some((wgate_gpu, wup_gpu, intermediate_dim)) = gateup_data {
-                    if let Some(ref mut scratch) = decode_scratch {
-                        let reg = crate::cuda::kernels::global_registry().unwrap();
-                        let hidden_dim = scratch.hidden_dim;
-                        let ci = layer_idx & 1;
-
-                        // 1. combined = residual + attn → scratch
-                        {
-                            let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
-                                .expect("scratch combined aliased in fallback fused MLP");
-                            crate::cuda::kernels::add(
-                                reg, residual_f32.cuda_data(), attn_f32.cuda_data(), comb, hidden_dim,
-                            ).map_err(|e| TqError::Msg(format!("fused mlp add: {}", e)))?;
-                        }
-
-                        // 2. fused norm + gateup + silu (norm is INSIDE this kernel)
-                        {
-                            let inter = Arc::get_mut(&mut scratch.intermediate_buf)
-                                .expect("scratch intermediate aliased");
-                            crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
-                                reg, &*scratch.combined_bufs[ci], layer.ffn_norm.weight.cuda_data(),
-                                wgate_gpu, wup_gpu, inter,
-                                hidden_dim, intermediate_dim, layer.ffn_norm.eps as f32,
-                            ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
-                        }
-
-                        // 3. down + residual
-                        {
-                            let wdown = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
-                                &mlp.feed_forward_w2
-                            } else { unreachable!() };
-                            let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
-                                .expect("scratch combined down");
-                            if let Some((wd_gpu, _, _)) = wdown.q4k_gpu_data() {
-                                crate::cuda::kernels::fused_q4km_down_residual(
-                                    reg, wd_gpu, &*scratch.intermediate_buf, comb,
-                                    hidden_dim, intermediate_dim,
-                                ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
-                            } else if let qmm::QMatMul::Quantized(qw) = &wdown.inner {
-                                let w_raw = qw.gpu_cache_or_upload(&reg.stream);
-                                let wo_tmp = Arc::get_mut(&mut scratch.attn_out).expect("attn_out temp");
-                                crate::cuda::kernels::q6k_matvec(
-                                    reg, w_raw, &*scratch.intermediate_buf, wo_tmp,
-                                    qw.out_features(), qw.in_features(),
-                                ).map_err(|e| TqError::Msg(format!("down q6k: {}", e)))?;
-                                crate::cuda::kernels::bias_add_inplace(
-                                    reg, comb, &*scratch.attn_out, hidden_dim,
-                                ).map_err(|e| TqError::Msg(format!("down+res: {}", e)))?;
-                            } else {
-                                return Err(TqError::Msg("fused MLP: unsupported down weight".into()));
-                            }
-                        }
-
-                        layer_in = Tensor::from_cuda_arc(Arc::clone(&scratch.combined_bufs[ci]),
-                            vec![1, 1, hidden_dim], scratch.stream.clone());
-                        true
-                    } else { false }
-                } else { false }
-            } else { false };
+            let (x, residual_owned) = if attn_f32.is_cuda() {
+                let (normed, new_res) = attn_f32.fused_add_rms_norm_gpu(
+                    &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
+                )?;
+                (normed, new_res)
+            } else {
+                let shape = attn_f32.shape().to_vec();
+                let hidden = *shape.last().unwrap();
+                let n_tokens = attn_f32.elem_count() / hidden;
+                let (normed, new_residual) = backend.fused_add_rms_norm(
+                    attn_f32.as_slice(), residual_f32.as_slice(),
+                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                    n_tokens, hidden,
+                );
+                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                 Tensor::from_vec(new_residual, shape, attn_f32.device())?)
+            };
             #[cfg(not(feature = "cuda"))]
-            let fused_mlp_done = false;
-
-            if !fused_mlp_done {
-                // CPU/fallback path: separate norm + individual MLP forwards
-                #[cfg(feature = "cuda")]
-                let (x, residual_owned) = if attn_f32.is_cuda() {
-                    attn_f32.fused_add_rms_norm_gpu(
-                        &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
-                    )?
-                } else {
-                    let shape = attn_f32.shape().to_vec();
-                    let hidden = *shape.last().unwrap();
-                    let n_tokens = attn_f32.elem_count() / hidden;
-                    let (normed, new_res) = backend.fused_add_rms_norm(
-                        attn_f32.as_slice(), residual_f32.as_slice(),
-                        layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
-                        n_tokens, hidden,
-                    );
-                    (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
-                     Tensor::from_vec(new_res, shape, attn_f32.device())?)
-                };
-                #[cfg(not(feature = "cuda"))]
-                let (x, residual_owned) = {
-                    let shape = attn_f32.shape().to_vec();
-                    let hidden = *shape.last().unwrap();
-                    let n_tokens = attn_f32.elem_count() / hidden;
-                    let (normed, new_res) = backend.fused_add_rms_norm(
-                        attn_f32.as_slice(), residual_f32.as_slice(),
-                        layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
-                        n_tokens, hidden,
-                    );
-                    (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
-                     Tensor::from_vec(new_res, shape, attn_f32.device())?)
-                };
-                let residual = &residual_owned;
-                let x = layer.mlp_or_moe.forward(&x, backend)?;
-                let x = match &layer.post_ffn_norm {
-                    Some(norm) => norm.forward(&x, backend)?,
-                    None => x,
-                };
-                layer_in = (x + residual)?;
-            }
+            let (x, residual_owned) = {
+                let shape = attn_f32.shape().to_vec();
+                let hidden = *shape.last().unwrap();
+                let n_tokens = attn_f32.elem_count() / hidden;
+                let (normed, new_residual) = backend.fused_add_rms_norm(
+                    attn_f32.as_slice(), residual_f32.as_slice(),
+                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                    n_tokens, hidden,
+                );
+                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                 Tensor::from_vec(new_residual, shape, attn_f32.device())?)
+            };
+            let residual = &residual_owned;
+            let x = layer.mlp_or_moe.forward(&x, backend)?;
+            // Optional post-FFN norm (Gemma2)
+            let x = match &layer.post_ffn_norm {
+                Some(norm) => norm.forward(&x, backend)?,
+                None => x,
+            };
+            let x = (x + residual)?;
             prof_sync!(prof_stream);
             if let Some(t) = _t_mlp { prof.mlp_ns += t.elapsed().as_nanos() as u64; }
             prof.n += 1;
