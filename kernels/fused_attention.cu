@@ -123,6 +123,90 @@ extern "C" __global__ void tq_fused_attention_f32(
     }
 }
 
+// ─── GPU Key Decompression: packed indices → full FP32 keys ──
+// Decompresses TQ-compressed keys directly on GPU for standard Q@K matmul.
+// Each block handles one key position for one KV head.
+// Grid: (n_kv_heads, n_keys), Block: (head_dim)
+//
+// Output: keys_out[kv_head * n_keys * head_dim + key * head_dim + d]
+// = sigma * inverse_hadamard(centroids[indices[d]]) for each dimension d
+//
+// Note: This outputs keys in the Hadamard-rotated domain (pre-RoPE).
+// The caller must handle RoPE separately if needed.
+
+extern "C" __global__ void tq_decompress_keys_f32(
+    const uint8_t* __restrict__ packed_indices,  // [n_kv_heads, max_seq * bytes_per_key]
+    const float* __restrict__ norms,             // [n_kv_heads, max_seq]
+    const float* __restrict__ centroids,         // [n_centroids]
+    const float* __restrict__ signs,             // [head_dim] — Hadamard sign flips
+    float* __restrict__ keys_out,                // [n_kv_heads, n_keys, head_dim]
+    const int n_kv_heads,
+    const int n_keys,
+    const int head_dim,
+    const int bits,
+    const int max_seq                            // buffer stride
+) {
+    const int kv_head = blockIdx.x;
+    const int key_idx = blockIdx.y;
+    if (kv_head >= n_kv_heads || key_idx >= n_keys) return;
+
+    const int tid = threadIdx.x;
+    const int bytes_per_key = (head_dim * bits + 7) / 8;
+
+    // Load centroids to shared memory
+    __shared__ float s_centroids[MAX_CENTROIDS];
+    const int n_centroids = 1 << bits;
+    if (tid < n_centroids) s_centroids[tid] = centroids[tid];
+    __syncthreads();
+
+    // Get norm/sigma for this key
+    float norm = norms[kv_head * max_seq + key_idx];
+    float sigma = (norm > 1e-10f) ? norm / sqrtf((float)head_dim) : 0.0f;
+
+    // Decompress: lookup centroid for each dimension, scale by sigma
+    const uint8_t* key_packed = packed_indices + kv_head * max_seq * bytes_per_key + key_idx * bytes_per_key;
+
+    __shared__ float s_key[MAX_HEAD_DIM];
+
+    if (bits == 4) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            uint8_t byte = key_packed[d / 2];
+            float c = (d & 1) ? s_centroids[byte >> 4] : s_centroids[byte & 0xF];
+            s_key[d] = c * sigma;
+        }
+    } else if (bits == 2) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            uint8_t byte = key_packed[d / 4];
+            int shift = (d & 3) * 2;
+            float c = s_centroids[(byte >> shift) & 3];
+            s_key[d] = c * sigma;
+        }
+    }
+    __syncthreads();
+
+    // Inverse Hadamard: WHT then sign flip
+    // WHT butterfly stages
+    for (int h = 1; h < head_dim; h <<= 1) {
+        for (int i = tid; i < head_dim / 2; i += blockDim.x) {
+            int block_idx = i / h;
+            int offset = i % h;
+            int j = block_idx * (2 * h) + offset;
+            float a = s_key[j];
+            float b = s_key[j + h];
+            s_key[j] = a + b;
+            s_key[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Normalize and apply sign flips (inverse Hadamard = WHT * 1/sqrt(d) * D)
+    float inv_sqrt_dim = rsqrtf((float)head_dim);
+    float* out_ptr = keys_out + kv_head * n_keys * head_dim + key_idx * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        out_ptr[d] = s_key[d] * inv_sqrt_dim * signs[d];
+    }
+}
+
 // ─── Fused TQ Attention with Per-Group Norms ─────────────────
 // When using grouped quantization (TQ_GROUP=32), each group of 32
 // dimensions has its own norm/sigma. More accurate but slightly slower.

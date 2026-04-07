@@ -2102,7 +2102,7 @@ impl LayerWeights {
 
                 // Fused attention incompatible with pre-RoPE and compaction
                 let has_compacted = cache.compacted.is_some();
-                let use_fused = get_use_fused()
+                let use_fused = get_use_fused() && q.is_cpu()
                     && !cache.pre_rope && !has_compacted;
                 let n_compressed = cache.k_per_head[0].count;
                 let n_past_compressed = if n_compressed > 0 { n_compressed - 1 } else { 0 };
@@ -2114,14 +2114,19 @@ impl LayerWeights {
                 // Requirements: no pre-rope, no compacted, no cold, no sink, has past keys.
                 // GPU fused TQ attention: compressed keys + optional sink tokens.
                 // Requirements: no pre-rope, no compacted, no cold tier, has past keys.
+                // GPU full fused TQ attention — enabled with TQ_GPU_FUSED=1
                 #[cfg(feature = "cuda")]
-                let gpu_fused_ok = false;
+                let gpu_fused_ok = std::env::var("TQ_GPU_FUSED").ok().map(|v| v == "1").unwrap_or(false)
+                    && crate::cuda::kernels::global_registry().is_some()
+                    && !cache.pre_rope && !has_compacted
+                    && cache.cold_len == 0
+                    && n_past_compressed > 0 && seq_len == 1;
                 #[cfg(not(feature = "cuda"))]
                 let gpu_fused_ok = false;
 
-                // Dead code — kept for future GPU fused attention work
+                // GPU fused attention with CPU V multiply (no online softmax in kernel)
                 #[cfg(feature = "cuda")]
-                if gpu_fused_ok && n_past_compressed > 0 {
+                if gpu_fused_ok {
                     if let (Some(reg), Some(ref gpu)) = (crate::cuda::kernels::global_registry(), &self.gpu_tq_cache) {
                         // Pre-rotate query for compressed scores
                         let q_flat = q_f32.flatten_all()?.to_vec1()?;
@@ -2234,8 +2239,10 @@ impl LayerWeights {
                     // Note: cold centroids looked up per-head inside the loop (mixed bits)
 
                     // GPU-accelerated compressed score computation (if available)
+                    // GPU-accelerated score computation disabled — overhead too high for benefit
+                    // TODO: pre-allocate GPU buffers and batch across layers
                     #[cfg(feature = "cuda")]
-                    let gpu_comp_scores: Option<Vec<f32>> = if n_past_compressed > 0 {
+                    let gpu_comp_scores: Option<Vec<f32>> = if false && n_past_compressed >= 8 {
                         if let (Some(reg), Some(ref gpu)) = (crate::cuda::kernels::global_registry(), &self.gpu_tq_cache) {
                             // Upload rotated query
                             let mut rotated_q_all = Vec::with_capacity(self.n_head * self.head_dim);

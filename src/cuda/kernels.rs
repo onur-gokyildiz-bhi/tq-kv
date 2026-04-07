@@ -751,6 +751,44 @@ pub fn tq_fused_attention(
     Ok(())
 }
 
+/// GPU key decompression: packed indices → full FP32 keys.
+/// Decompresses TQ-compressed keys directly on GPU for standard Q@K matmul.
+/// Grid: (n_kv_heads, n_keys), Block: (head_dim or 128)
+pub fn tq_decompress_keys(
+    reg: &KernelRegistry,
+    packed_indices: &CudaSlice<u8>,
+    norms: &CudaSlice<f32>,
+    centroids: &CudaSlice<f32>,
+    signs: &CudaSlice<f32>,
+    keys_out: &mut CudaSlice<f32>,
+    n_kv_heads: usize,
+    n_keys: usize,
+    head_dim: usize,
+    bits: usize,
+    max_seq: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_attention", "tq_decompress_keys_f32")?;
+    let block = head_dim.min(256) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_heads as u32, n_keys as u32, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nkv = n_kv_heads as i32;
+    let nk = n_keys as i32;
+    let hd = head_dim as i32;
+    let b = bits as i32;
+    let ms = max_seq as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(packed_indices).arg(norms).arg(centroids).arg(signs)
+            .arg(keys_out)
+            .arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&ms)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Full fused TQ decode attention: compressed score + online softmax + V accumulation.
 /// Single kernel replaces: decompress → matmul → softmax → matmul chain.
 pub fn tq_fused_decode_attention(
