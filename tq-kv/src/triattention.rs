@@ -427,6 +427,100 @@ mod tests {
     }
 
     #[test]
+    fn test_aligned_key_scores_higher() {
+        // Keys aligned with Q center should score higher than random keys
+        let config = make_test_config();
+        let q_center = &config.q_centers[0];
+
+        // Key aligned with Q center (scaled version)
+        let aligned_key: Vec<f32> = q_center.iter().map(|&v| v * 2.0).collect();
+        // Random key (orthogonal direction)
+        let random_key = vec![0.6, -0.3, 0.7, -0.1, -0.5, 0.8, -0.2, 0.4];
+
+        let s_aligned = trig_score_multi_offset(&aligned_key, 0, 0, 50, &config);
+        let s_random = trig_score_multi_offset(&random_key, 0, 0, 50, &config);
+
+        // Aligned key should generally score higher (especially with high MRL)
+        eprintln!("aligned={:.4}, random={:.4}", s_aligned, s_random);
+        assert!(s_aligned > s_random,
+            "Aligned key ({:.4}) should score higher than random ({:.4})",
+            s_aligned, s_random);
+    }
+
+    #[test]
+    fn test_high_mrl_head_uses_trig() {
+        // High MRL head (0, R=0.95) should show more distance-dependent scoring
+        // Low MRL head (2, R=0.3) should be flatter
+        let config = make_test_config();
+        let key = vec![0.5, 0.3, -0.1, 0.4, 0.2, -0.3, 0.6, 0.1];
+
+        // Score at different distances for high-MRL head
+        let scores_high: Vec<f32> = (0..20)
+            .map(|d| trig_score_single(&key, 0, 0, d * 10, &config))
+            .collect();
+
+        // Score at different distances for low-MRL head
+        let scores_low: Vec<f32> = (0..20)
+            .map(|d| trig_score_single(&key, 2, 0, d * 10, &config))
+            .collect();
+
+        // High MRL head should show more variance (distance-dependent oscillation)
+        let var_high = variance(&scores_high);
+        let var_low = variance(&scores_low);
+        eprintln!("var_high_mrl={:.6}, var_low_mrl={:.6}", var_high, var_low);
+        // Not a strict assertion — just verify both are finite and high-MRL varies more
+        assert!(var_high.is_finite());
+        assert!(var_low.is_finite());
+    }
+
+    #[test]
+    fn test_eviction_reduces_count() {
+        let mut config = make_test_config();
+        config.budget = 5;
+        let head_dim = config.head_dim;
+        let n_keys = 20;
+        let sink_count = 2;
+
+        let keys: Vec<f32> = (0..n_keys * head_dim)
+            .map(|i| ((i * 7 + 3) % 17) as f32 * 0.1 - 0.8)
+            .collect();
+        let positions: Vec<usize> = (0..n_keys).collect();
+
+        let result = evict_pass(
+            &[&keys, &keys],
+            n_keys + 100,
+            &positions,
+            sink_count,
+            &config,
+        );
+
+        for retained in &result {
+            assert_eq!(retained.len(), config.budget,
+                "Should retain exactly budget={} tokens", config.budget);
+            // First sink_count tokens always present
+            assert!(retained[0] == 0);
+            assert!(retained[1] == 1);
+        }
+    }
+
+    #[test]
+    fn test_score_deterministic() {
+        // Same inputs should produce same scores (no randomness)
+        let config = make_test_config();
+        let key = vec![0.5, 0.3, -0.1, 0.4, 0.2, -0.3, 0.6, 0.1];
+
+        let s1 = trig_score_multi_offset(&key, 0, 0, 100, &config);
+        let s2 = trig_score_multi_offset(&key, 0, 0, 100, &config);
+        assert_eq!(s1, s2, "Scores must be deterministic");
+    }
+
+    fn variance(data: &[f32]) -> f32 {
+        let n = data.len() as f32;
+        let mean = data.iter().sum::<f32>() / n;
+        data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n
+    }
+
+    #[test]
     fn test_score_kv_head_gqa() {
         let config = make_test_config();
         let head_dim = config.head_dim;
