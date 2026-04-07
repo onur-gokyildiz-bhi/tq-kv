@@ -2301,9 +2301,35 @@ impl LayerWeights {
                                 stream.clone(),
                             );
 
+                            // Cache sink K/V on GPU (upload once, reuse)
+                            let sink_len = cache.sink_len;
+                            if sink_len > 0 && self.sink_k_gpu.is_none() {
+                                if let Some(ref sink_k) = cache.sink_k {
+                                    let sk = sink_k.to_dtype(DType::F32)?;
+                                    let data: Vec<f32> = sk.to_vec1()?;
+                                    if let Ok(gpu_buf) = stream.clone_htod(&data) {
+                                        self.sink_k_gpu = Some(gpu_buf);
+                                    }
+                                }
+                                if let Some(ref v_raw) = cache.v_raw {
+                                    if let Ok(sv) = v_raw.narrow(2, 0, sink_len)?.to_dtype(DType::F32) {
+                                        let data: Vec<f32> = sv.to_vec1()?;
+                                        if let Ok(gpu_buf) = stream.clone_htod(&data) {
+                                            self.sink_v_gpu = Some(gpu_buf);
+                                        }
+                                    }
+                                }
+                            }
+
                             // Step 2: Build K on GPU [sink | hot | current]
                             let mut k_parts_gpu: Vec<Tensor> = Vec::new();
-                            if let Some(ref sink) = cache.sink_k {
+                            if let Some(ref sk) = self.sink_k_gpu {
+                                k_parts_gpu.push(Tensor::from_cuda_arc(
+                                    std::sync::Arc::new(sk.clone()),
+                                    vec![1, self.n_kv_head, sink_len, hdim],
+                                    stream.clone(),
+                                ));
+                            } else if let Some(ref sink) = cache.sink_k {
                                 k_parts_gpu.push(upload(&sink.to_dtype(DType::F32)?)?);
                             }
                             k_parts_gpu.push(k_hot);
@@ -2324,15 +2350,56 @@ impl LayerWeights {
                             let att = (q_gpu.matmul(&k_full.t()?)? / scale)?;
                             let att = softmax_last_dim(&att, backend)?;
 
-                            // Step 4: att @ V on GPU
-                            let total_len = cache.sink_len + n_past_compressed
-                                + if n_compressed > 0 { 1 } else { 0 };
-                            let v_f32 = cache.v_raw.as_ref().unwrap()
-                                .narrow(2, 0, total_len)?
-                                .to_dtype(DType::F32)?;
-                            let v_f32 = upload(&v_f32)?;
-                            let v_f32 = repeat_kv(v_f32, n_rep)?;
-                            att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)
+                            // Step 4: Build V on GPU [sink | hot | current]
+                            let mut v_parts_gpu: Vec<Tensor> = Vec::new();
+
+                            // Sink V (cached on GPU)
+                            if let Some(ref sv) = self.sink_v_gpu {
+                                v_parts_gpu.push(Tensor::from_cuda_arc(
+                                    std::sync::Arc::new(sv.clone()),
+                                    vec![1, self.n_kv_head, sink_len, hdim],
+                                    stream.clone(),
+                                ));
+                            } else if sink_len > 0 {
+                                if let Some(ref v_raw) = cache.v_raw {
+                                    let sv = v_raw.narrow(2, 0, sink_len)?.to_dtype(DType::F32)?;
+                                    v_parts_gpu.push(upload(&sv)?);
+                                }
+                            }
+
+                            // Hot V: gather from strided gpu.v_data
+                            if n_past_compressed > 0 {
+                                let v_total = self.n_kv_head * n_past_compressed * hdim;
+                                let mut v_contig: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(v_total)
+                                    .map_err(|e| TqError::Msg(format!("v_contig: {e}")))?;
+                                for h in 0..self.n_kv_head {
+                                    let src_off = h * ms * hdim;
+                                    let dst_off = h * n_past_compressed * hdim;
+                                    crate::cuda::kernels::copy_with_offsets(
+                                        reg, &gpu.v_data, &v_contig,
+                                        n_past_compressed * hdim, src_off, dst_off,
+                                    ).map_err(|e| TqError::Msg(format!("v gather: {e}")))?;
+                                }
+                                v_parts_gpu.push(Tensor::from_cuda(
+                                    v_contig,
+                                    vec![1, self.n_kv_head, n_past_compressed, hdim],
+                                    stream.clone(),
+                                ));
+                            }
+
+                            // Current V (already on GPU from QKV)
+                            if n_compressed > 0 {
+                                v_parts_gpu.push(upload(&v.to_dtype(DType::F32)?)?);
+                            }
+
+                            let v_full = if v_parts_gpu.len() == 1 {
+                                v_parts_gpu.remove(0)
+                            } else {
+                                let v_refs: Vec<&Tensor> = v_parts_gpu.iter().collect();
+                                Tensor::cat(&v_refs, 2)?
+                            };
+                            let v_full = repeat_kv(v_full, n_rep)?;
+                            att.matmul(&v_full.contiguous()?)?.to_dtype(cache.dtype)
                         })();
 
                         if let Ok(y) = gpu_result {
