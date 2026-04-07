@@ -1374,6 +1374,14 @@ struct LayerWeights {
     boundaries_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     #[cfg(feature = "cuda")]
     centroids_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    /// Expanded signs [n_head × head_dim] for GPU Q pre-rotation
+    #[cfg(feature = "cuda")]
+    signs_expanded_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    /// Cached sink K/V on GPU (uploaded once, reused every decode step)
+    #[cfg(feature = "cuda")]
+    sink_k_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    #[cfg(feature = "cuda")]
+    sink_v_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     /// SmoothAttention: per-channel scales to migrate K outliers to Q.
     /// K is divided by these scales (reducing outliers), Q is multiplied (lossless since Q stays fp32).
     /// Computed during calibration or from running statistics.
@@ -1691,7 +1699,6 @@ impl LayerWeights {
                 && k.is_cuda()
                 && !pre_rope_mode
                 && layer_tq_config.calibrated_codebook.is_none()
-                && layer_tq_config.group_size == 0  // grouped needs per-group sigma, GPU kernel uses per-vector
                 && layer_tq_config.residual_bits == 0
                 && layer_tq_config.outlier_k == 0
                 && per_head_bits.is_none()
@@ -1764,12 +1771,13 @@ impl LayerWeights {
                         let gpu_tq = self.gpu_tq_cache.as_mut().unwrap();
                         gpu_tq.append_gpu(&packed_gpu, &norms_gpu, v_gpu)?;
 
-                        // Also append to CPU cache for CPU fallback paths
-                        // (skip for now — CPU cache stays out of sync)
-                        cache.cached_len += 1;
+                        // Don't increment cache.cached_len here — it's incremented
+                        // after the compress section at line ~1917.
 
-                        // Skip CPU compress below
-                        // Jump to attention
+                        // V raw: only needed for sink token positions (first N tokens).
+                        // After sink phase, V is stored in GpuCompressedKv.v_data directly.
+                        // Skip CPU V cat during decode — eliminates GPU→CPU download overhead.
+                        // (Sink V was already captured during prefill via CPU compress path)
                     }
                 }
             }
@@ -1866,8 +1874,9 @@ impl LayerWeights {
                             self.head_dim, head_bits, max_seq, cb,
                         ) {
                             Ok(mut gpu) => {
-                                // Seed with all existing compressed keys
+                                // Seed with all existing compressed keys + actual V data.
                                 let existing = cache.k_per_head[0].count;
+                                let v_offset = cache.sink_len;
                                 let bpk = gpu.bytes_per_key;
                                 for pos in 0..existing {
                                     let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
@@ -1877,9 +1886,19 @@ impl LayerWeights {
                                         packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
                                         norms_all.push(cache.k_per_head[h].norms[pos]);
                                     }
-                                    // V data placeholder (zeros for now — V is handled separately)
-                                    let v_zeros = vec![0.0f32; self.n_kv_head * self.head_dim];
-                                    let _ = gpu.append(&packed_all, &norms_all, &v_zeros);
+                                    let v_data = if let Some(ref v_raw) = cache.v_raw {
+                                        let v_pos = v_raw.narrow(2, v_offset + pos, 1)
+                                            .and_then(|t| t.to_dtype(DType::F32))
+                                            .and_then(|t| t.flatten_all())
+                                            .and_then(|t| t.to_vec1());
+                                        match v_pos {
+                                            Ok(d) => d,
+                                            Err(_) => vec![0.0f32; self.n_kv_head * self.head_dim],
+                                        }
+                                    } else {
+                                        vec![0.0f32; self.n_kv_head * self.head_dim]
+                                    };
+                                    let _ = gpu.append(&packed_all, &norms_all, &v_data);
                                 }
                                 self.gpu_tq_cache = Some(gpu);
                             }
@@ -1887,21 +1906,32 @@ impl LayerWeights {
                         }
                     }
 
-                    // Append the newly compressed token(s)
-                    if let Some(ref mut gpu) = self.gpu_tq_cache {
-                        let count = cache.k_per_head[0].count;
-                        let bpk = gpu.bytes_per_key;
-                        // The last token is at index count-1
-                        let pos = count - 1;
-                        let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
-                        let mut norms_all = Vec::with_capacity(self.n_kv_head);
-                        for h in 0..self.n_kv_head {
-                            let start = pos * bpk;
-                            packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
-                            norms_all.push(cache.k_per_head[h].norms[pos]);
+                    // Append the newly CPU-compressed token(s) to GPU cache.
+                    // Skip if GPU compress already appended directly.
+                    if !gpu_compress_ok {
+                        if let Some(ref mut gpu) = self.gpu_tq_cache {
+                            let count = cache.k_per_head[0].count;
+                            let bpk = gpu.bytes_per_key;
+                            let pos = count - 1;
+                            let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
+                            let mut norms_all = Vec::with_capacity(self.n_kv_head);
+                            for h in 0..self.n_kv_head {
+                                let start = pos * bpk;
+                                packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
+                                norms_all.push(cache.k_per_head[h].norms[pos]);
+                            }
+                            // Extract actual V data for this token from v_raw cache
+                            let v_data = if let Some(ref v_raw) = cache.v_raw {
+                                // v_raw: [1, n_kv_head, cached_len, head_dim]
+                                // Extract last position along dim 2
+                                let vlen = v_raw.dim(2)?;
+                                let last_v = v_raw.narrow(2, vlen - 1, 1)?;
+                                last_v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
+                            } else {
+                                vec![0.0f32; self.n_kv_head * self.head_dim]
+                            };
+                            let _ = gpu.append(&packed_all, &norms_all, &v_data);
                         }
-                        let v_zeros = vec![0.0f32; self.n_kv_head * self.head_dim];
-                        let _ = gpu.append(&packed_all, &norms_all, &v_zeros);
                     }
                 }
             }
@@ -2082,20 +2112,24 @@ impl LayerWeights {
                 // --- GPU Fused TQ Attention (compressed KV, no decompression) ---
                 // GPU fused TQ attention: works even if q is CPU (we upload it).
                 // Requirements: no pre-rope, no compacted, no cold, no sink, has past keys.
+                // GPU fused TQ attention: compressed keys + optional sink tokens.
+                // Requirements: no pre-rope, no compacted, no cold tier, has past keys.
+                // GPU-accelerated TQ scores: TQ_GPU_FUSED=0 disables
                 #[cfg(feature = "cuda")]
-                let gpu_fused_ok = crate::cuda::kernels::global_registry().is_some()
+                let gpu_fused_ok = std::env::var("TQ_GPU_FUSED").ok().map(|v| v != "0").unwrap_or(true)
+                    && crate::cuda::kernels::global_registry().is_some()
                     && !cache.pre_rope && !has_compacted
-                    && cache.cold_len == 0 && cache.sink_len == 0
+                    && cache.cold_len == 0
                     && n_past_compressed > 0 && seq_len == 1;
                 #[cfg(not(feature = "cuda"))]
                 let gpu_fused_ok = false;
 
+                // GPU-accelerated TQ score computation + CPU softmax/V accumulation
+                // Uses scores-only GPU kernel (no online softmax = no compounding error)
                 #[cfg(feature = "cuda")]
-                if gpu_fused_ok {
-                    if let (Some(reg), Some(ref mut gpu)) = (crate::cuda::kernels::global_registry(), &mut self.gpu_tq_cache) {
-                        let n_keys = n_past_compressed;
-
-                        // Pre-rotate query (Hadamard signs) — all heads
+                if gpu_fused_ok && n_past_compressed > 0 {
+                    if let (Some(reg), Some(ref gpu)) = (crate::cuda::kernels::global_registry(), &self.gpu_tq_cache) {
+                        // Pre-rotate query for compressed scores
                         let q_flat = q_f32.flatten_all()?.to_vec1()?;
                         let mut rotated_q = Vec::with_capacity(self.n_head * self.head_dim);
                         for qh in 0..self.n_head {
@@ -2105,24 +2139,87 @@ impl LayerWeights {
                             rotated_q.extend_from_slice(&rq);
                         }
 
-                        // Upload only the rotated query (small: n_heads * head_dim * 4 bytes)
-                        let _ = reg.stream.context().check_err();
-                        let _ = reg.stream.memcpy_htod(&rotated_q, &mut gpu.rotated_q);
+                        // Upload rotated query to temp buffer
+                        let rq_gpu = reg.stream.clone_htod(&rotated_q)
+                            .map_err(|e| TqError::Msg(format!("rq upload: {}", e)))?;
 
+                        // GPU: compute compressed scores [n_heads, n_past_compressed]
+                        let mut scores_gpu = reg.stream.alloc_zeros::<f32>(self.n_head * n_past_compressed)
+                            .map_err(|e| TqError::Msg(format!("scores alloc: {}", e)))?;
                         let scale = 1.0 / (self.head_dim as f32).sqrt();
-                        crate::cuda::kernels::tq_fused_decode_attention(
-                            reg, &gpu.rotated_q, &gpu.packed_indices, &gpu.norms,
-                            &gpu.centroids, &gpu.v_data, &mut gpu.output_buf,
-                            self.n_head, self.n_kv_head, n_keys, self.head_dim,
+                        crate::cuda::kernels::tq_fused_attention(
+                            reg, &rq_gpu, &gpu.packed_indices, &gpu.norms,
+                            &gpu.centroids, &mut scores_gpu,
+                            self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
                             gpu.bits as usize, scale, gpu.max_seq,
-                            None, None, None, 0,
-                        ).map_err(|e| TqError::Msg(format!("fused decode attention: {}", e)))?;
+                        ).map_err(|e| TqError::Msg(format!("tq_fused_attention: {}", e)))?;
 
-                        // Download output
-                        let _ = reg.stream.context().check_err();
-                        let attn_out = reg.stream.clone_dtoh(&gpu.output_buf)
-                            .map_err(|e| TqError::Msg(format!("fused attn download: {}", e)))?;
+                        // Download compressed scores
+                        let comp_scores: Vec<f32> = reg.stream.clone_dtoh(&scores_gpu)
+                            .map_err(|e| TqError::Msg(format!("scores download: {}", e)))?;
 
+                        // Download V data for compressed keys
+                        let v_gpu_data: Vec<f32> = reg.stream.clone_dtoh(&gpu.v_data)
+                            .map_err(|e| TqError::Msg(format!("v download: {}", e)))?;
+
+                        // CPU: build full scores and compute attention (using GPU scores for compressed keys)
+                        let sink_k_flat: Vec<f32> = cache.sink_k.as_ref()
+                            .map(|sk| sk.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
+                            .unwrap_or_default();
+                        let sink_v_flat: Vec<f32> = cache.v_raw.as_ref()
+                            .and_then(|vr| vr.narrow(2, 0, cache.sink_len).ok())
+                            .map(|sv| sv.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
+                            .unwrap_or_default();
+                        let k_flat: Vec<f32> = k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                        let v_flat_cur: Vec<f32> = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+
+                        // Use v_raw directly for V data (avoids GPU cache V issues)
+                        let v_raw_flat: Vec<f32> = cache.v_raw.as_ref()
+                            .map(|vr| vr.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
+                            .unwrap_or_default();
+                        let v_raw_len = cache.v_raw.as_ref().map(|vr| vr.dim(2).unwrap_or(0)).unwrap_or(0);
+
+                        let mut attn_out = Vec::with_capacity(self.n_head * self.head_dim);
+                        for qh in 0..self.n_head {
+                            let kv_h = qh / n_rep;
+                            let q_vec = &q_flat[qh * self.head_dim..(qh + 1) * self.head_dim];
+                            let mut scores = Vec::with_capacity(total_len);
+
+                            // Sink scores
+                            for s in 0..cache.sink_len {
+                                let k_off = kv_h * cache.sink_len * self.head_dim + s * self.head_dim;
+                                let k_vec = &sink_k_flat[k_off..k_off + self.head_dim];
+                                let dot: f32 = q_vec.iter().zip(k_vec).map(|(a,b)| a * b).sum();
+                                scores.push(dot * scale);
+                            }
+                            // Compressed scores from GPU
+                            for i in 0..n_past_compressed {
+                                scores.push(comp_scores[qh * n_past_compressed + i]);
+                            }
+                            // Current token (POQ lossless)
+                            if n_compressed > 0 {
+                                let k_vec = &k_flat[kv_h * self.head_dim..(kv_h + 1) * self.head_dim];
+                                let dot: f32 = q_vec.iter().zip(k_vec).map(|(a,b)| a * b).sum();
+                                scores.push(dot * scale);
+                            }
+
+                            // Softmax + V weighted sum using v_raw directly
+                            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            let exp_s: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+                            let sum_exp: f32 = exp_s.iter().sum();
+
+                            let mut out = vec![0.0f32; self.head_dim];
+                            for (si, &w_exp) in exp_s.iter().enumerate() {
+                                let w = w_exp / sum_exp;
+                                // V position in v_raw: 0..total_len
+                                let v_pos = si; // direct position mapping
+                                let v_off = kv_h * v_raw_len * self.head_dim + v_pos * self.head_dim;
+                                if v_off + self.head_dim <= v_raw_flat.len() {
+                                    for d in 0..self.head_dim { out[d] += w * v_raw_flat[v_off + d]; }
+                                }
+                            }
+                            attn_out.extend_from_slice(&out);
+                        }
                         let y = Tensor::from_vec(attn_out, vec![1, self.n_head, 1, self.head_dim], q.device())?;
                         let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
                         return self.attention_wo.forward(&y, backend);
@@ -2947,6 +3044,12 @@ impl GenericTurboModel {
                 boundaries_gpu: None,
                 #[cfg(feature = "cuda")]
                 centroids_gpu: None,
+                #[cfg(feature = "cuda")]
+                signs_expanded_gpu: None,
+                #[cfg(feature = "cuda")]
+                sink_k_gpu: None,
+                #[cfg(feature = "cuda")]
+                sink_v_gpu: None,
                 smooth_k_scales: compute_smooth_scales(&tq_config, head_dim, device, false),
                 smooth_q_scales: compute_smooth_scales(&tq_config, head_dim, device, true),
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),

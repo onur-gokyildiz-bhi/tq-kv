@@ -31,8 +31,8 @@
 
 extern "C" __global__ void tq_fused_attention_f32(
     const float* __restrict__ rotated_query,   // [n_heads, head_dim]
-    const uint8_t* __restrict__ packed_indices, // [n_kv_heads, n_keys * bytes_per_key]
-    const float* __restrict__ norms,            // [n_kv_heads, n_keys]
+    const uint8_t* __restrict__ packed_indices, // [n_kv_heads, max_seq * bytes_per_key]
+    const float* __restrict__ norms,            // [n_kv_heads, max_seq]
     const float* __restrict__ centroids,        // [n_centroids]
     float* __restrict__ scores_out,             // [n_heads, n_keys]
     const int n_heads,
@@ -40,7 +40,8 @@ extern "C" __global__ void tq_fused_attention_f32(
     const int n_keys,
     const int head_dim,
     const int bits,                             // 2, 3, or 4
-    const float scale                           // 1/sqrt(head_dim)
+    const float scale,                          // 1/sqrt(head_dim)
+    const int max_seq                           // buffer stride (pre-allocated size per head)
 ) {
     const int head_idx = blockIdx.x;
     const int tid = threadIdx.x;
@@ -62,8 +63,8 @@ extern "C" __global__ void tq_fused_attention_f32(
 
     // Compute bytes per key
     const int bytes_per_key = (head_dim * bits + 7) / 8;
-    const uint8_t* kv_packed = packed_indices + kv_head * n_keys * bytes_per_key;
-    const float* kv_norms = norms + kv_head * n_keys;
+    const uint8_t* kv_packed = packed_indices + kv_head * max_seq * bytes_per_key;
+    const float* kv_norms = norms + kv_head * max_seq;
 
     // Each thread handles a subset of key positions
     for (int k = tid; k < n_keys; k += blockDim.x) {
@@ -207,6 +208,7 @@ extern "C" __global__ void tq_fused_attention_grouped_f32(
 // Parallelism: threads split the head_dim for V accumulation.
 // Sequential over KV tokens (online softmax requires serial scan).
 
+// v2: rescale broadcast fix
 extern "C" __global__ void tq_fused_decode_attention_f32(
     const float* __restrict__ rotated_query,   // [n_heads, head_dim] (pre-rotated with Hadamard)
     const uint8_t* __restrict__ packed_indices, // [n_kv_heads, n_keys * bytes_per_key]
@@ -237,8 +239,9 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
     __shared__ float s_centroids[MAX_CENTROIDS];
     __shared__ float s_q[MAX_HEAD_DIM];     // rotated query (for compressed keys)
     __shared__ float s_q_raw[MAX_HEAD_DIM]; // raw query (for sink keys)
-    __shared__ float s_max;     // running max score
-    __shared__ float s_sum_exp; // running sum of exp(score - max)
+    __shared__ float s_max;       // running max score
+    __shared__ float s_sum_exp;   // running sum of exp(score - max)
+    __shared__ float s_rescale;   // broadcast rescale factor for V accumulator
 
     const int n_centroids = 1 << bits;
     if (tid < n_centroids) s_centroids[tid] = centroids[tid];
@@ -276,21 +279,21 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
 
             if (tid == 0) {
                 float new_max = fmaxf(running_max, score);
-                float rescale = expf(running_max - new_max);
-                running_sum = running_sum * rescale + expf(score - new_max);
+                float r = expf(running_max - new_max);
+                running_sum = running_sum * r + expf(score - new_max);
                 running_max = new_max;
                 s_max = running_max;
                 s_sum_exp = running_sum;
+                s_rescale = r;
             }
             __syncthreads();
 
             float w = expf(score - s_max);
-            float rescale = expf(running_max - s_max);
             const float* v_row = sink_v_head + k * head_dim;
             for (int i = 0; i < 4; ++i) {
                 int d = tid + i * blockDim.x;
                 if (d < head_dim) {
-                    acc[i] = acc[i] * rescale + w * v_row[d];
+                    acc[i] = acc[i] * s_rescale + w * v_row[d];
                 }
             }
             running_max = s_max;
@@ -338,32 +341,32 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
         __syncthreads();
         float score = s_score_comp;
 
-        // --- Online softmax update (all threads see the same score via shared mem) ---
+        // --- Online softmax update ---
+        // Thread 0 computes new max/sum. Rescale factor broadcast via shared memory
+        // so ALL threads (including tid==0) use the same correct rescale value.
+        // Without this broadcast, tid==0's running_max is updated before the rescale
+        // computation, giving rescale=1.0 instead of exp(old_max - new_max).
         if (tid == 0) {
             float new_max = fmaxf(running_max, score);
-            float rescale = expf(running_max - new_max);
-            running_sum = running_sum * rescale + expf(score - new_max);
+            float r = expf(running_max - new_max);
+            running_sum = running_sum * r + expf(score - new_max);
             running_max = new_max;
             s_max = running_max;
             s_sum_exp = running_sum;
+            s_rescale = r;
         }
         __syncthreads();
 
-        float w = expf(score - s_max); // unnormalized softmax weight
-        float rescale = expf(running_max - s_max); // handle max update for old accumulators
+        float w = expf(score - s_max);
 
-        // Rescale previous accumulator (max changed) + add new contribution
         const float* v_row = kv_v + k * head_dim;
         for (int i = 0; i < 4; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
-                // When max increases, previous acc was too large by exp(old_max - new_max)
-                // We track this: acc already has the rescale from the last iteration
-                acc[i] = acc[i] * rescale + w * v_row[d];
+                acc[i] = acc[i] * s_rescale + w * v_row[d];
             }
         }
 
-        // Update running max for rescale tracking
         running_max = s_max;
     }
 

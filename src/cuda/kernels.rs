@@ -728,6 +728,7 @@ pub fn tq_fused_attention(
     head_dim: usize,
     bits: usize,
     scale: f32,
+    max_seq: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("fused_attention", "tq_fused_attention_f32")?;
     let cfg = LaunchConfig {
@@ -740,10 +741,11 @@ pub fn tq_fused_attention(
     let nk = n_keys as i32;
     let hd = head_dim as i32;
     let b = bits as i32;
+    let ms = max_seq as i32;
     unsafe {
         reg.stream.launch_builder(&f)
             .arg(query).arg(packed_indices).arg(norms).arg(centroids).arg(scores_out)
-            .arg(&nh).arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&scale)
+            .arg(&nh).arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&scale).arg(&ms)
             .launch(cfg)?;
     }
     Ok(())
@@ -886,6 +888,34 @@ pub fn hadamard_inverse_batch(
     dim: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("hadamard", "hadamard_inverse_batch_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_vectors as u32, 1, 1),
+        block_dim: (dim as u32, 1, 1),
+        shared_mem_bytes: (dim * 4) as u32,
+    };
+    let nv = n_vectors as i32;
+    let d = dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(data).arg(signs)
+            .arg(&nv).arg(&d)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch hadamard_forward_batch_f32: forward randomized Hadamard for query pre-rotation.
+/// y = (1/√d) * H * D * x where D = diag(signs).
+/// Input `data` is [n_vectors × dim], modified in-place.
+/// Signs are applied internally (no separate mul step needed).
+pub fn hadamard_forward_batch(
+    reg: &KernelRegistry,
+    data: &mut CudaSlice<f32>,
+    signs: &CudaSlice<f32>,
+    n_vectors: usize,
+    dim: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("hadamard", "hadamard_forward_batch_f32")?;
     let cfg = LaunchConfig {
         grid_dim: (n_vectors as u32, 1, 1),
         block_dim: (dim as u32, 1, 1),
