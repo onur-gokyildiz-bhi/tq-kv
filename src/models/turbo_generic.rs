@@ -85,6 +85,8 @@ impl Embedding {
 struct RmsNorm {
     weight: Tensor,
     eps: f64,
+    /// Gemma: use (1 + weight) instead of weight
+    add_unit: bool,
     span: tracing::Span,
 }
 
@@ -93,7 +95,7 @@ impl RmsNorm {
         let data = crate::quant::dequantize(raw, dtype, n_elements);
         let weight = Tensor::from_vec(data, vec![n_elements], device)?;
         let span = tracing::span!(tracing::Level::TRACE, "rms-norm");
-        Ok(Self { weight, eps, span })
+        Ok(Self { weight, eps, add_unit: false, span })
     }
 
     /// Create from QWeight (candle API compat: `RmsNorm::from_qtensor(qt, eps, device)?`).
@@ -102,13 +104,33 @@ impl RmsNorm {
         Self::from_qweight(&qw.raw_data, qw.dtype, n_elements, eps, device)
     }
 
+    /// Set Gemma-style weight offset: (1 + w) instead of w
+    fn with_add_unit(mut self) -> Self {
+        self.add_unit = true;
+        self
+    }
+
     fn forward(&self, x: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
         let _enter = self.span.enter();
         let x_f32 = x.to_dtype(DType::F32)?;
 
+        // Gemma: effective weight = 1 + w (learned offset from unit)
+        let effective_weight = if self.add_unit {
+            let w = self.weight.as_slice();
+            let w_plus_one: Vec<f32> = w.iter().map(|&v| 1.0 + v).collect();
+            std::borrow::Cow::Owned(w_plus_one)
+        } else {
+            std::borrow::Cow::Borrowed(self.weight.as_slice())
+        };
+
         // GPU-resident path: use TqTensor::rms_norm_gpu directly
         #[cfg(feature = "cuda")]
         if x_f32.is_cuda() {
+            if self.add_unit {
+                // Upload modified weights for GPU path
+                let w_tensor = Tensor::from_vec(effective_weight.to_vec(), self.weight.shape().to_vec(), x.device())?;
+                return x_f32.rms_norm_gpu(&w_tensor, self.eps as f32);
+            }
             return x_f32.rms_norm_gpu(&self.weight, self.eps as f32);
         }
 
@@ -116,7 +138,7 @@ impl RmsNorm {
         let shape = x_f32.shape().to_vec();
         let hidden = *shape.last().unwrap();
         let n_tokens = x_f32.elem_count() / hidden;
-        let result = backend.rms_norm(x_f32.as_slice(), self.weight.as_slice(), self.eps as f32, n_tokens, hidden);
+        let result = backend.rms_norm(x_f32.as_slice(), &effective_weight, self.eps as f32, n_tokens, hidden);
         Tensor::from_vec(result, shape, x.device())
     }
 }
@@ -134,6 +156,15 @@ fn softmax_last_dim(x: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> 
     let rows = x.elem_count() / cols;
     let result = backend.softmax(x.as_slice(), rows, cols);
     Tensor::from_vec(result, shape, x.device())
+}
+
+/// Logit soft-capping: cap * tanh(logits / cap). Used by Gemma2.
+fn apply_softcap(x: &Tensor, cap: f32) -> Result<Tensor> {
+    let inv_cap = 1.0 / cap;
+    // x / cap → tanh → * cap
+    let data = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let capped: Vec<f32> = data.iter().map(|&v| cap * (v * inv_cap).tanh()).collect();
+    Tensor::from_vec(capped, x.shape().to_vec(), x.device())
 }
 
 /// Fused SiLU gate × up: silu(gate) * up — single pass, no intermediate tensor.
@@ -1424,6 +1455,8 @@ struct LayerWeights {
     cos: Tensor,
     sin: Tensor,
     neg_inf: Tensor,
+    /// Gemma2 attention logit soft-capping: cap * tanh(logits / cap)
+    attn_logit_softcap: Option<f32>,
     /// Layer index (0-based) — used for selective compression
     layer_idx: usize,
     /// Total number of layers — needed for boundary protection (TQ_PROTECT_LAST)
@@ -2445,7 +2478,10 @@ impl LayerWeights {
 
                             // Step 3: Q @ K^T on GPU (q_f32 already CUDA from attention_wo)
                             debug_assert!(q_f32.is_cuda(), "Q should be GPU in all-GPU path");
-                            let att = (q_f32.matmul(&k_full.t()?)? / scale)?;
+                            let mut att = (q_f32.matmul(&k_full.t()?)? / scale)?;
+                            if let Some(cap) = self.attn_logit_softcap {
+                                att = apply_softcap(&att, cap)?;
+                            }
                             let att = softmax_last_dim(&att, backend)?;
 
                             // Step 4: V hot from strided gpu.v_data (single strided_copy kernel)
@@ -2751,6 +2787,9 @@ impl LayerWeights {
 
                     let k_full = repeat_kv(k_full, n_rep)?;
                     let mut att = (q_f32.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+                    if let Some(cap) = self.attn_logit_softcap {
+                        att = apply_softcap(&att, cap)?;
+                    }
 
                     // Apply compaction beta biases to compacted segment logits
                     if let Some(ref comp) = cache.compacted {
@@ -2970,6 +3009,9 @@ impl LayerWeights {
                     let v_full = repeat_kv(v_full, n_rep)?;
 
                     let att = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+                    let att = if let Some(cap) = self.attn_logit_softcap {
+                        apply_softcap(&att, cap)?
+                    } else { att };
                     let kv_mask = kv_mask.broadcast_as(att.shape())?;
                     let att = (att + kv_mask)?;
 
@@ -3058,6 +3100,10 @@ pub struct GenericTurboModel {
     norm: RmsNorm,
     output: QMatMul,
     masks: HashMap<usize, Tensor>,
+    /// Gemma: scale embeddings by sqrt(hidden_dim)
+    embed_scale: Option<f32>,
+    /// Gemma2 final logit soft-capping: cap * tanh(logits / cap)
+    final_logit_softcap: Option<f32>,
     backend: Arc<dyn ComputeBackend>,
     span: tracing::Span,
     span_output: tracing::Span,
@@ -3178,6 +3224,15 @@ impl GenericTurboModel {
             );
         }
 
+        // Gemma2 logit soft-capping: cap * tanh(logits / cap)
+        let attn_logit_softcap = md_get(&format!("{arch}.attn_logit_softcapping"))
+            .and_then(|m| m.to_f32()).ok();
+        let final_logit_softcap = md_get(&format!("{arch}.final_logit_softcapping"))
+            .and_then(|m| m.to_f32()).ok();
+        if attn_logit_softcap.is_some() || final_logit_softcap.is_some() {
+            eprintln!("  Logit soft-capping: attn={:?} final={:?}", attn_logit_softcap, final_logit_softcap);
+        }
+
         // RoPE dimension: some models (llama) specify it explicitly, others use head_dim
         let rope_dim = md_get(&format!("{arch}.rope.dimension_count"))
             .and_then(|m| m.to_u32())
@@ -3233,9 +3288,12 @@ impl GenericTurboModel {
         // Embeddings + output
         let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
         let tok_embeddings = tok_embeddings_q.dequantize_to_device(device)?;
-        let norm = RmsNorm::from_qtensor(
-            ct.tensor(reader, "output_norm.weight", device)?, rms_norm_eps, device,
-        )?;
+        let norm = {
+            let n = RmsNorm::from_qtensor(
+                ct.tensor(reader, "output_norm.weight", device)?, rms_norm_eps, device,
+            )?;
+            if arch.contains("gemma") { n.with_add_unit() } else { n }
+        };
         // Detect tie_word_embeddings: if output.weight is missing, reuse token embeddings
         let output = match ct.tensor(reader, "output.weight", device) {
             Ok(tensor) => tensor,
@@ -3344,11 +3402,21 @@ impl GenericTurboModel {
                 attention_bq,
                 attention_bk,
                 attention_bv,
-                attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps, device)?,
-                post_attention_norm,
+                attention_norm: {
+                    let n = RmsNorm::from_qtensor(attention_norm, rms_norm_eps, device)?;
+                    if arch.contains("gemma") { n.with_add_unit() } else { n }
+                },
+                post_attention_norm: post_attention_norm.map(|n| {
+                    if arch.contains("gemma") { n.with_add_unit() } else { n }
+                }),
                 mlp_or_moe,
-                ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps, device)?,
-                post_ffn_norm,
+                ffn_norm: {
+                    let n = RmsNorm::from_qtensor(ffn_norm, rms_norm_eps, device)?;
+                    if arch.contains("gemma") { n.with_add_unit() } else { n }
+                },
+                post_ffn_norm: post_ffn_norm.map(|n| {
+                    if arch.contains("gemma") { n.with_add_unit() } else { n }
+                }),
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
@@ -3358,6 +3426,7 @@ impl GenericTurboModel {
                 cos: cos.clone(),
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
+                attn_logit_softcap,
                 layer_idx,
                 n_layers: block_count,
                 kv_cache: None,
@@ -3396,6 +3465,10 @@ impl GenericTurboModel {
             norm,
             output: QMatMul::from_qtensor(output)?,
             masks: HashMap::new(),
+            embed_scale: if arch.contains("gemma") {
+                Some((embedding_length as f32).sqrt())
+            } else { None },
+            final_logit_softcap,
             backend,
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
@@ -3674,6 +3747,12 @@ impl GenericTurboModel {
         let backend = self.backend.clone();
         let backend = backend.as_ref();
         let mut layer_in = self.tok_embeddings.forward(x)?;
+        // Gemma: scale embeddings by sqrt(hidden_dim)
+        if let Some(scale) = self.embed_scale {
+            let data = layer_in.as_slice();
+            let scaled: Vec<f32> = data.iter().map(|&v| v * scale).collect();
+            layer_in = Tensor::from_vec(scaled, layer_in.shape().to_vec(), layer_in.device())?;
+        }
 
         // Phase 3: Upload embedding to GPU for GPU-resident forward pass.
         // All subsequent ops auto-dispatch to GPU when tensor is CUDA.
@@ -4461,6 +4540,9 @@ impl GenericTurboModel {
         #[cfg(not(feature = "cuda"))]
         let _t_lm: Option<std::time::Instant> = None;
         let output = self.output.forward(&x, backend)?;
+        let output = if let Some(cap) = self.final_logit_softcap {
+            apply_softcap(&output, cap)?
+        } else { output };
         #[cfg(feature = "cuda")]
         if let Some(t) = _t_lm {
             if let Some(ref s) = prof_stream { let _ = s.synchronize(); }
