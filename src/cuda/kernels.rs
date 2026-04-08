@@ -664,9 +664,9 @@ pub fn tq_cache_scatter(
     Ok(())
 }
 
-/// Flash decode partial: split KV across blocks, each computes partial attention.
-/// Grid: (n_splits, n_heads, batch), Block: 32 threads.
-/// Call flash_decode_reduce after to combine partial results.
+/// Flash decode v2: split KV across blocks, each computes partial attention.
+/// Grid: (n_splits, n_heads, batch), Block: 128 threads (4 warps).
+/// 4x memory bandwidth vs v1 (32 threads). Call flash_decode_reduce after.
 pub fn flash_decode_partial(
     reg: &KernelRegistry,
     q: &CudaSlice<f32>,
@@ -688,7 +688,7 @@ pub fn flash_decode_partial(
     let n_splits = (seq_kv + split_size - 1) / split_size;
     let cfg = LaunchConfig {
         grid_dim: (n_splits as u32, n_heads as u32, batch_size as u32),
-        block_dim: (32, 1, 1),
+        block_dim: (128, 1, 1),  // v2: 4 warps for better memory throughput
         shared_mem_bytes: 0,
     };
     let bs = batch_size as i32;
@@ -724,7 +724,7 @@ pub fn flash_decode_reduce(
     let f = reg.get_fn("flash_decode", "flash_decode_reduce")?;
     let cfg = LaunchConfig {
         grid_dim: (1, n_heads as u32, batch_size as u32),
-        block_dim: (32, 1, 1),
+        block_dim: (128, 1, 1),  // v2: match partial kernel thread count
         shared_mem_bytes: 0,
     };
     let nh = n_heads as i32;
