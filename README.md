@@ -4,13 +4,13 @@
 
 [![Crates.io](https://img.shields.io/crates/v/tq-kv)](https://crates.io/crates/tq-kv)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
-[![Tests](https://img.shields.io/badge/tests-86%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-96%20passing-brightgreen)]()
 [![CUDA](https://img.shields.io/badge/CUDA-13.2-76B900)](https://developer.nvidia.com/cuda-toolkit)
 [![no\_std](https://img.shields.io/badge/no__std-compatible-blue)]()
 
 Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) with the **3-Fix framework** that enables aggressive key compression (4-bit, 7.5x) on GGUF quantized models -- where symmetric K compression produces catastrophic output.
 
-Now with **Pre-RoPE key quantization** (34-59% less PPL gap) and **KV Compaction** (up to 25x token reduction).
+Now with **Pre-RoPE key quantization** (34-59% less PPL gap), **KV Compaction** (up to 25x token reduction), and **TriAttention** eviction for constant-memory KV cache at any context length.
 
 <p align="center">
   <img src="docs/tq-demo.gif" alt="tq-engine Web UI demo — Qwen2.5 7B with TurboQuant 4-bit KV compression" width="720">
@@ -189,7 +189,7 @@ Fix 2: Current token = lossless (POQ)       -> highest-impact position protected
 Fix 3: Cache reset per conversation         -> prevents cross-contamination
 ```
 
-### 5-Segment Attention
+### 6-Segment Attention
 
 ```
 [sink FP16] [cold decayed] [compacted + beta] [hot compressed] [current FP16]
@@ -197,7 +197,47 @@ Fix 3: Cache reset per conversation         -> prevents cross-contamination
   Always       Temporal        Attention-           Per-head          POQ
   lossless     decay           matching             adaptive         lossless
   (Fix 1)                      reduction            bitwidth         (Fix 2)
+                                    ^
+                              TriAttention eviction scores all segments,
+                              keeps top-B tokens, maintains fixed budget
 ```
+
+### TriAttention: Constant-Memory KV Cache
+
+Based on [TriAttention](https://arxiv.org/abs/2604.04921) (Mao et al., 2026). Pre-RoPE Q/K vectors concentrate around fixed centers, enabling cheap trigonometric importance scoring without full attention computation.
+
+**Orthogonal to TurboQuant**: TriAttention decides *which* tokens to keep (eviction), TurboQuant decides *how* to compress them (quantization). Combined: fixed-size KV cache at any context length.
+
+```bash
+# Enable TriAttention (requires calibration: tq calibrate <model>)
+TQ_TRIATTN=1 TQ_TRIATTN_BUDGET=256 tq chat qwen2:7b --turbo-quant
+```
+
+#### Memory Projection (Qwen2.5-7B, TQ 4-bit + TriAttention, budget=128)
+
+| Context Length | FP16 KV | TQ 4-bit | TQ + TriAttn | Total Compression |
+|:---------------|--------:|---------:|-------------:|------------------:|
+| 4K tokens | 235 MB | 154 MB | **4.8 MB** | **49x** |
+| 32K tokens | 1,879 MB | 1,233 MB | **4.8 MB** | **390x** |
+| 128K tokens | 7,516 MB | 4,933 MB | **4.8 MB** | **1,560x** |
+
+#### Speed vs Budget (RTX 3080, Qwen2.5-7B, 100 tokens)
+
+| Budget | tok/s | vs TQ only | Fixed KV Memory |
+|:------:|------:|:----------:|:---------------:|
+| 512 | 15.3 | -6% | 19.3 MB |
+| 256 | 15.3 | -6% | 9.6 MB |
+| 128 | 13.8 | -15% | 4.8 MB |
+| 64 | 7.9 | -46% | 2.4 MB |
+| (none) | 16.2 | -- | grows linearly |
+
+#### What Fits in 10GB VRAM (5GB available for KV cache)
+
+| Method | Max Context Length |
+|:-------|:------------------:|
+| FP16 KV | ~87,000 tokens |
+| TQ 4-bit | ~133,000 tokens |
+| **TQ + TriAttention** | **unlimited** |
 
 ---
 
@@ -212,6 +252,7 @@ Fix 3: Cache reset per conversation         -> prevents cross-contamination
 | **Maximum savings** | `TQ_PRE_ROPE=1 TQ_VBITS=4` | +5.0% | ~24x |
 | **Long context** | `TQ_PRE_ROPE=1 TQ_COMPACT=1000 TQ_COMPACT_RATIO=30` | +30% | ~50x |
 | **Extreme** | Pre-RoPE + V4 + Compact | +56% | ~100x |
+| **Unlimited context** | `TQ_TRIATTN=1 TQ_TRIATTN_BUDGET=256` | TBD | **constant 10 MB** |
 
 ### Environment Variables
 
@@ -232,6 +273,9 @@ Fix 3: Cache reset per conversation         -> prevents cross-contamination
 | `TQ_GROUP` | 32 | Group size for per-group sigma |
 | `TQ_BIAS_CORRECT` | 0 | Softmax bias correction (experimental) |
 | `TQ_NO_CAL` | 0 | Disable calibration auto-loading |
+| `TQ_TRIATTN` | 0 | TriAttention eviction (1=enabled, requires calibration) |
+| `TQ_TRIATTN_BUDGET` | 2048 | Max KV tokens to retain (fixed memory ceiling) |
+| `TQ_TRIATTN_INTERVAL` | 128 | Eviction check interval in tokens |
 
 ---
 
@@ -244,6 +288,7 @@ Fix 3: Cache reset per conversation         -> prevents cross-contamination
 | Llama 3.1 70B | 32K | 20 GB | 2.7 GB | 1.4 GB | 7.5-14.2x |
 
 With KV Compaction: effective compression reaches 100-400x.
+With TriAttention: **constant-memory KV cache** -- up to 1,560x at 128K context.
 
 ---
 
@@ -303,6 +348,7 @@ Web UI at localhost:11435. Works with ChatBox and Open WebUI.
 | DecodeScratch + fused | 10.1 | 4.8s | Zero-alloc decode, fused kernels |
 | **GPU prefill pipeline** | **11.0** | **1.05s** | GPU dequant + SGEMM, GPU causal mask |
 | **+ CUDA Graph** | **17.8** | **0.33s** | Graph replay, Q6K matvec for lm_head |
+| **+ TriAttention (b=256)** | **15.3** | **0.24s** | Constant-memory KV, zero overhead |
 
 ---
 
@@ -322,6 +368,7 @@ Full results: [BENCHMARK.md](BENCHMARK.md)
 
 **Original:**
 - Zandieh, Daliri, Hadian, Mirrokni. "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate." ICLR 2026. [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
+- Mao, Lin, Huang et al. "TriAttention: Efficient Long Reasoning with Trigonometric KV Compression." 2026. [arXiv:2604.04921](https://arxiv.org/abs/2604.04921)
 
 ## License
 
