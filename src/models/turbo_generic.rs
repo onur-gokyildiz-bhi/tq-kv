@@ -44,35 +44,72 @@ trait Module {
 /// Embedding lookup — replaces candle_nn::Embedding.
 #[derive(Debug, Clone)]
 struct Embedding {
-    weight: Tensor,
+    /// Full f32 weight (when dequantized at load) or None (lazy mode)
+    weight: Option<Tensor>,
+    /// Quantized raw data + dtype for lazy per-row dequant (saves ~2 GB)
+    raw_data: Option<Vec<u8>>,
+    raw_dtype: Option<crate::gguf::GgmlDType>,
     hidden_size: usize,
 }
 
 impl Embedding {
     fn new(weight: Tensor, hidden_size: usize) -> Self {
-        Self { weight, hidden_size }
+        Self { weight: Some(weight), raw_data: None, raw_dtype: None, hidden_size }
+    }
+
+    /// Lazy embedding: keep quantized data, dequant only needed rows on lookup.
+    /// Saves ~2 GB for Qwen2 7B (151K vocab × 3584 dim × 4 bytes = 2.1 GB).
+    fn new_lazy(raw_data: Vec<u8>, dtype: crate::gguf::GgmlDType, hidden_size: usize) -> Self {
+        Self { weight: None, raw_data: Some(raw_data), raw_dtype: Some(dtype), hidden_size }
     }
 
     fn forward(&self, ids: &Tensor) -> Result<Tensor> {
         let shape = ids.shape().to_vec();
         let ids_flat = ids.to_vec1()?;
-        let w = self.weight.as_slice();
         let n_tokens = ids_flat.len();
-        let mut output = Vec::with_capacity(n_tokens * self.hidden_size);
-        for &id in &ids_flat {
-            let idx = id as usize;
-            let start = idx * self.hidden_size;
-            let end = start + self.hidden_size;
-            if end <= w.len() {
-                output.extend_from_slice(&w[start..end]);
-            } else {
-                output.extend(std::iter::repeat(0.0f32).take(self.hidden_size));
+
+        if let Some(ref w_tensor) = self.weight {
+            // Full f32 path (original)
+            let w = w_tensor.as_slice();
+            let mut output = Vec::with_capacity(n_tokens * self.hidden_size);
+            for &id in &ids_flat {
+                let idx = id as usize;
+                let start = idx * self.hidden_size;
+                let end = start + self.hidden_size;
+                if end <= w.len() {
+                    output.extend_from_slice(&w[start..end]);
+                } else {
+                    output.extend(std::iter::repeat(0.0f32).take(self.hidden_size));
+                }
             }
+            let mut out_shape = shape;
+            out_shape.push(self.hidden_size);
+            Tensor::from_vec(output, out_shape, ids.device())
+        } else if let (Some(ref raw), Some(dtype)) = (&self.raw_data, self.raw_dtype) {
+            // Lazy dequant: only dequant requested rows
+            let block_numel = dtype.block_numel();
+            let block_bytes = dtype.block_size_bytes();
+            let blocks_per_row = (self.hidden_size + block_numel - 1) / block_numel;
+            let bytes_per_row = blocks_per_row * block_bytes;
+
+            let mut output = Vec::with_capacity(n_tokens * self.hidden_size);
+            for &id in &ids_flat {
+                let idx = id as usize;
+                let row_start = idx * bytes_per_row;
+                let row_end = row_start + bytes_per_row;
+                if row_end <= raw.len() {
+                    let row_f32 = crate::quant::dequantize(&raw[row_start..row_end], dtype, self.hidden_size);
+                    output.extend_from_slice(&row_f32);
+                } else {
+                    output.extend(std::iter::repeat(0.0f32).take(self.hidden_size));
+                }
+            }
+            let mut out_shape = shape;
+            out_shape.push(self.hidden_size);
+            Tensor::from_vec(output, out_shape, &Device::Cpu)
+        } else {
+            bail!("Embedding: no weight data")
         }
-        // Preserve input shape: [batch, seq_len] → [batch, seq_len, hidden_size]
-        let mut out_shape = shape;
-        out_shape.push(self.hidden_size);
-        Tensor::from_vec(output, out_shape, ids.device())
     }
 }
 
@@ -3687,9 +3724,24 @@ impl GenericTurboModel {
         let (cos, sin) = precompute_freqs_cis(rope_dim, rope_freq_base, context_length, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
-        // Embeddings + output
+        // Embeddings: lazy dequant on GPU (saves ~2 GB), full dequant on CPU
         let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
-        let tok_embeddings = tok_embeddings_q.dequantize_to_device(device)?;
+        let emb_dtype = tok_embeddings_q.dtype;
+        let emb_shape = tok_embeddings_q.shape;
+        #[cfg(feature = "cuda")]
+        let tok_embeddings_lazy = crate::cuda::kernels::global_registry().is_some();
+        #[cfg(not(feature = "cuda"))]
+        let tok_embeddings_lazy = false;
+        // Clone raw_data since tok_embeddings_q may be reused for tie_word_embeddings
+        let emb_raw_data = tok_embeddings_q.raw_data.clone();
+        let (emb_raw, emb_full) = if tok_embeddings_lazy {
+            (Some(emb_raw_data), None)
+        } else {
+            let dequant = crate::quant::dequantize(&emb_raw_data, emb_dtype,
+                emb_shape.0 * emb_shape.1);
+            let tensor = Tensor::from_vec(dequant, vec![emb_shape.0, emb_shape.1], device)?;
+            (None, Some(tensor))
+        };
         let norm = {
             let n = RmsNorm::from_qtensor(
                 ct.tensor(reader, "output_norm.weight", device)?, rms_norm_eps, device,
@@ -3864,7 +3916,11 @@ impl GenericTurboModel {
         let backend = crate::backend::create_backend();
 
         let mut model = Self {
-            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            tok_embeddings: if let Some(raw) = emb_raw {
+                Embedding::new_lazy(raw, emb_dtype, embedding_length)
+            } else {
+                Embedding::new(emb_full.unwrap(), embedding_length)
+            },
             layers,
             norm,
             output: QMatMul::from_qtensor(output)?,
@@ -3990,6 +4046,11 @@ impl GenericTurboModel {
         }
 
         eprintln!("  Weight caches warmed.");
+
+        // Note: A.2 (raw_data release after GPU upload) was attempted but caused
+        // crashes in CPU fallback paths (e.g. Q6K prefill dequant). Deferred until
+        // all forward paths are fully GPU-resident with no CPU fallback.
+
         } // end if do_warmup
 
         Ok(model)

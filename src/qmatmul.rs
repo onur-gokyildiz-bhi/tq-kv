@@ -151,6 +151,23 @@ impl QWeight {
     /// Returns the cached slice, or uploads on first call. Panics on OOM are
     /// avoided by returning a fallback empty slice on upload failure.
     #[cfg(feature = "cuda")]
+    /// Release CPU raw_data after GPU upload. Saves ~4 GB for 7B model.
+    pub fn release_cpu_after_gpu(&mut self) {
+        #[cfg(feature = "cuda")]
+        if self.gpu_cache.get().is_some() {
+            let freed = self.raw_data.len();
+            self.raw_data = Vec::new();
+            self.cpu_cache = OnceLock::new(); // also drop f32 cache if any
+            if freed > 0 {
+                static TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let total = TOTAL.fetch_add(freed, std::sync::atomic::Ordering::Relaxed) + freed;
+                if total > 1_000_000 && (total - freed) / 100_000_000 != total / 100_000_000 {
+                    eprintln!("  Released {:.1} MB CPU weight data (GPU cached)", total as f64 / 1e6);
+                }
+            }
+        }
+    }
+
     pub fn gpu_cache_or_upload(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> &CudaSlice<u8> {
         self.gpu_cache.get_or_init(|| {
             match stream.clone_htod(&self.raw_data) {
