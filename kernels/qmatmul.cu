@@ -36,10 +36,10 @@ __device__ __forceinline__ void get_scale_min_k4(
 // Threads cooperatively dequantize super-blocks and accumulate.
 //
 // W layout: [out_features, in_features] packed as Q4_K_M blocks.
-// in_features must be divisible by QK_K (256).
+// Supports non-256-aligned in_features (e.g. 896 for Qwen2 0.5B).
 
-// Multi-row Q4K_M matvec: 2 output rows per block, shared memory x cache.
-// x loaded ONCE per superblock, reused for both rows → halves x bandwidth.
+// Multi-row Q4K_M matvec: 4 output rows per block, shared memory x cache.
+// x loaded ONCE per superblock, reused for all rows → halves x bandwidth.
 // 256 threads map 1:1 to the 256 values per superblock.
 #define MATVEC_ROWS_PER_BLOCK 4
 
@@ -53,7 +53,7 @@ extern "C" __global__ void q4km_matvec_f32(
     const int base_row = blockIdx.x * MATVEC_ROWS_PER_BLOCK;
     const int tid = threadIdx.x;
 
-    const int n_superblocks = in_features / QK_K;
+    const int n_superblocks = (in_features + QK_K - 1) / QK_K;  // ceiling division
     const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
 
     __shared__ float s_x[QK_K];
@@ -68,7 +68,9 @@ extern "C" __global__ void q4km_matvec_f32(
 
     for (int sb = 0; sb < n_superblocks; ++sb) {
         // Cooperative x load: 256 threads load 256 floats (ONCE for all rows)
-        s_x[tid] = x[sb * QK_K + tid];
+        // Bounds check for last superblock when in_features % 256 != 0
+        const int x_pos = sb * QK_K + tid;
+        s_x[tid] = (x_pos < in_features) ? x[x_pos] : 0.0f;
         __syncthreads();
 
         float x_val = s_x[x_idx];
@@ -138,7 +140,7 @@ extern "C" __global__ void q6k_matvec_f32(
     const int base_row = blockIdx.x * MATVEC_ROWS_PER_BLOCK;
     const int tid = threadIdx.x;
 
-    const int n_superblocks = in_features / QK_K;
+    const int n_superblocks = (in_features + QK_K - 1) / QK_K;
     const int bytes_per_row = n_superblocks * Q6K_BLOCK_SIZE;
 
     __shared__ float s_x[QK_K];
@@ -153,7 +155,8 @@ extern "C" __global__ void q6k_matvec_f32(
     float sums[MATVEC_ROWS_PER_BLOCK] = {0.0f};
 
     for (int sb = 0; sb < n_superblocks; ++sb) {
-        s_x[tid] = x[sb * QK_K + tid];
+        const int x_pos = sb * QK_K + tid;
+        s_x[tid] = (x_pos < in_features) ? x[x_pos] : 0.0f;
         __syncthreads();
 
         // x position: grp*128 + sub*32 + l
@@ -261,7 +264,7 @@ extern "C" __global__ void q4km_dequant_f32(
     const int tid = threadIdx.x;
 
     if (row >= n_rows) return;
-    const int n_sb = in_features / QK_K;
+    const int n_sb = (in_features + QK_K - 1) / QK_K;
     if (sb >= n_sb) return;
 
     const uint8_t* block = W_packed + (row * n_sb + sb) * Q4K_BLOCK_SIZE;
@@ -290,8 +293,12 @@ extern "C" __global__ void q4km_dequant_f32(
 
         uint8_t byte = qs[grp * 32 + l];
         int base = grp * 64;
-        out[base + l]      = d_lo * (float)(byte & 0xF) - dm_lo;
-        out[base + 32 + l] = d_hi * (float)(byte >> 4)  - dm_hi;
+        int abs_lo = sb * QK_K + base + l;
+        int abs_hi = sb * QK_K + base + 32 + l;
+        if (abs_lo < in_features)
+            out[base + l]      = d_lo * (float)(byte & 0xF) - dm_lo;
+        if (abs_hi < in_features)
+            out[base + 32 + l] = d_hi * (float)(byte >> 4)  - dm_hi;
     }
 }
 
@@ -311,7 +318,7 @@ extern "C" __global__ void q6k_dequant_f32(
     const int tid = threadIdx.x; // 0..255 = position within superblock
 
     if (row >= n_rows) return;
-    const int n_sb = in_features / QK_K;
+    const int n_sb = (in_features + QK_K - 1) / QK_K;
     if (sb >= n_sb) return;
 
     const uint8_t* block = W_packed + (row * n_sb + sb) * Q6K_BLOCK_SIZE;
@@ -342,7 +349,9 @@ extern "C" __global__ void q6k_dequant_f32(
     int q = q_lo | (qh_bits << 4);
     float sc = (float)scales[sc_off + sub * 2 + is];
 
-    out[grp * 128 + sub * 32 + l] = d * sc * (float)(q - 32);
+    int abs_pos = sb * QK_K + grp * 128 + sub * 32 + l;
+    if (abs_pos < in_features)
+        out[grp * 128 + sub * 32 + l] = d * sc * (float)(q - 32);
 }
 
 // ─── Q4_K_M Batch Dequantize to FP16 (for HGEMM prefill) ───
@@ -360,7 +369,7 @@ extern "C" __global__ void q4km_dequant_f16(
     const int tid = threadIdx.x;
 
     if (row >= n_rows) return;
-    const int n_sb = in_features / QK_K;
+    const int n_sb = (in_features + QK_K - 1) / QK_K;
     if (sb >= n_sb) return;
 
     const uint8_t* block = W_packed + (row * n_sb + sb) * Q4K_BLOCK_SIZE;
@@ -385,7 +394,11 @@ extern "C" __global__ void q4km_dequant_f16(
 
         uint8_t byte = qs[grp * 32 + l];
         int base = grp * 64;
-        out[base + l]      = __float2half(d_lo * (float)(byte & 0xF) - dm_lo);
-        out[base + 32 + l] = __float2half(d_hi * (float)(byte >> 4)  - dm_hi);
+        int abs_lo = sb * QK_K + base + l;
+        int abs_hi = sb * QK_K + base + 32 + l;
+        if (abs_lo < in_features)
+            out[base + l]      = __float2half(d_lo * (float)(byte & 0xF) - dm_lo);
+        if (abs_hi < in_features)
+            out[base + 32 + l] = __float2half(d_hi * (float)(byte >> 4)  - dm_hi);
     }
 }

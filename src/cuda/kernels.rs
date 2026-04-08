@@ -1463,7 +1463,7 @@ pub fn q4km_dequant_f32(
     in_features: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("qmatmul", "q4km_dequant_f32")?;
-    let n_sb = in_features / 256; // QK_K = 256
+    let n_sb = (in_features + 255) / 256; // QK_K = 256, ceiling division
     let cfg = LaunchConfig {
         grid_dim: (n_sb as u32, n_rows as u32, 1),
         block_dim: (128, 1, 1),
@@ -1493,7 +1493,7 @@ pub fn q4km_dequant_f16(
     in_features: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("qmatmul", "q4km_dequant_f16")?;
-    let n_sb = in_features / 256; // QK_K = 256
+    let n_sb = (in_features + 255) / 256; // QK_K = 256, ceiling division
     let cfg = LaunchConfig {
         grid_dim: (n_sb as u32, n_rows as u32, 1),
         block_dim: (128, 1, 1),
@@ -1522,7 +1522,7 @@ pub fn q6k_dequant_f32(
     in_features: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("qmatmul", "q6k_dequant_f32")?;
-    let n_sb = in_features / 256; // QK_K = 256
+    let n_sb = (in_features + 255) / 256; // QK_K = 256, ceiling division
     let cfg = LaunchConfig {
         grid_dim: (n_sb as u32, n_rows as u32, 1),
         block_dim: (256, 1, 1),
