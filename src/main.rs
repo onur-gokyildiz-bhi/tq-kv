@@ -1038,8 +1038,18 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
         if tq_only { eprintln!("[1/1] Loading model (TQ 4-bit)..."); }
         else { eprintln!("[2/2] Loading model (TQ 4-bit)..."); }
     }
-    let tq_config = resolve_tq_config_for_model(true, cli.tq_bits, Some(model_name))
-        .unwrap_or_else(|| tq_kv::TurboQuantConfig::balanced());
+    let mut tq_config = tq_kv::TurboQuantConfig::balanced(); // 4-bit, no calibration overhead
+    // Apply env var overrides (TQ_GROUP, TQ_SINK, etc.)
+    if let Ok(val) = std::env::var("TQ_GROUP") {
+        if let Ok(gs) = val.parse::<usize>() { tq_config.group_size = gs; }
+    }
+    // Load TriAttention config from calibration (if TQ_TRIATTN=1) without
+    // applying calibrated codebook/rotation to TQ config — those slow down GPU fused path.
+    if std::env::var("TQ_TRIATTN").ok().map_or(false, |v| v == "1") {
+        if let Some(cal_data) = calibrate::load_calibration_for_model(model_name) {
+            calibrate::init_triattention(&cal_data, cal_data.head_dim);
+        }
+    }
     let mut engine_tq = load_engine(Some(tq_config))?;
 
     let tq_result = bench_run(&mut engine_tq, &formatted_prompt, &gen_params)?;
