@@ -674,6 +674,72 @@ impl GpuCompressedKv {
 
     fn reset(&mut self) {
         self.count = 0;
+        self.decomp_count = 0;
+    }
+
+    /// Compact GPU cache in-place: keep only `retained` indices (sorted ascending).
+    /// Uses D2D copies to gather retained positions to buffer start.
+    /// Much faster than full re-seed (copies only retained tokens, not all).
+    fn compact(&mut self, retained: &[usize]) -> std::result::Result<(), crate::cuda::TqError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use cudarc::driver::sys;
+
+        let n_retain = retained.len();
+        if n_retain == 0 || n_retain >= self.count {
+            return Ok(()); // nothing to do
+        }
+
+        let raw_stream = self.stream.cu_stream();
+        let bpk = self.bytes_per_key;
+        let hd = self.head_dim;
+        let ms = self.max_seq;
+
+        // For each head, gather retained positions to the front of the buffer.
+        // We iterate in order (new_pos < old_pos for moved elements), so D2D
+        // copies don't overlap destructively.
+        // Use raw device_ptr for in-place D2D (same buffer src and dst).
+
+        let packed_base = self.packed_indices.device_ptr(self.stream.as_ref()).0;
+        let norms_base = self.norms.device_ptr(self.stream.as_ref()).0;
+        let v_base = self.v_data.device_ptr(self.stream.as_ref()).0;
+
+        for h in 0..self.n_kv_head {
+            for (new_pos, &old_pos) in retained.iter().enumerate() {
+                if new_pos == old_pos { continue; }
+                // Packed indices
+                let src = packed_base + ((h * ms + old_pos) * bpk) as u64;
+                let dst = packed_base + ((h * ms + new_pos) * bpk) as u64;
+                unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, bpk, raw_stream); }
+
+                // Norms
+                let src = norms_base + ((h * ms + old_pos) as u64) * 4;
+                let dst = norms_base + ((h * ms + new_pos) as u64) * 4;
+                unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, 4, raw_stream); }
+
+                // V data
+                let src = v_base + ((h * ms + old_pos) * hd) as u64 * 4;
+                let dst = v_base + ((h * ms + new_pos) * hd) as u64 * 4;
+                unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, hd * 4, raw_stream); }
+            }
+        }
+
+        // Also compact decomp_cache if populated
+        if self.decomp_count > 0 {
+            let dc_base = self.decomp_cache.device_ptr(self.stream.as_ref()).0;
+            for h in 0..self.n_kv_head {
+                for (new_pos, &old_pos) in retained.iter().enumerate() {
+                    if new_pos == old_pos || old_pos >= self.decomp_count { continue; }
+                    let src = dc_base + ((h * ms + old_pos) * hd) as u64 * 4;
+                    let dst = dc_base + ((h * ms + new_pos) * hd) as u64 * 4;
+                    unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, hd * 4, raw_stream); }
+                }
+            }
+            self.decomp_count = n_retain.min(self.decomp_count);
+        }
+
+        let _ = self.stream.synchronize();
+        self.count = n_retain;
+        Ok(())
     }
 }
 
@@ -2215,9 +2281,11 @@ impl LayerWeights {
                                         }
                                     }
                                 }
-                                // Invalidate GPU TQ cache (will be re-seeded)
+                                // Compact GPU TQ cache in-place (D2D gather, no re-seed)
                                 #[cfg(feature = "cuda")]
-                                { self.gpu_tq_cache = None; }
+                                if let Some(ref mut gpu) = self.gpu_tq_cache {
+                                    let _ = gpu.compact(&compressed_retain);
+                                }
                             }
 
                             cache.tri_key_positions = new_positions;
