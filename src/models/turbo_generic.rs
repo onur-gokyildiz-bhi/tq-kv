@@ -302,19 +302,46 @@ impl QMatMul {
 // MLP / MoE
 // ============================================================
 
-/// Standard 3-gate MLP: gate (w1) + up (w3) → silu(gate) * up → down (w2)
+/// Activation type for gated MLP.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GateActivation {
+    SiLU,  // Llama, Qwen, Mistral
+    GELU,  // Gemma 2
+}
+
+/// Standard 3-gate MLP: gate (w1) + up (w3) → act(gate) * up → down (w2)
 #[derive(Debug, Clone)]
 struct Mlp {
     feed_forward_w1: QMatMul,
     feed_forward_w2: QMatMul,
     feed_forward_w3: QMatMul,
+    activation: GateActivation,
 }
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
         let w1 = self.feed_forward_w1.forward(xs, backend)?;
         let w3 = self.feed_forward_w3.forward(xs, backend)?;
-        let activated = fused_silu_mul(&w1, &w3, backend)?;
+        let activated = match self.activation {
+            GateActivation::SiLU => fused_silu_mul(&w1, &w3, backend)?,
+            GateActivation::GELU => {
+                // GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+                let w1_f32 = w1.to_dtype(DType::F32)?;
+                let data = w1_f32.flatten_all()?.to_vec1()?;
+                let sqrt_2_over_pi: f32 = 0.7978845608;
+                let gelu: Vec<f32> = data.iter().map(|&x| {
+                    0.5 * x * (1.0 + (sqrt_2_over_pi * (x + 0.044715 * x * x * x)).tanh())
+                }).collect();
+                let mut g = Tensor::from_vec(gelu, w1.shape().to_vec(), w1.device())?;
+                // Ensure g is on same device as w3
+                #[cfg(feature = "cuda")]
+                if w3.is_cuda() && !g.is_cuda() {
+                    g = g.to_device_auto()?;
+                }
+                let w3_f32 = w3.to_dtype(DType::F32)?;
+                (g * w3_f32)?
+            }
+        };
         self.feed_forward_w2.forward(&activated, backend)
     }
 }
@@ -3633,6 +3660,9 @@ impl GenericTurboModel {
         );
         let protect_last = get_protect_last_layers(&tq_config);
         let skip_first = get_skip_layers(&tq_config);
+        // Note: Gemma 2 HF config says gelu_pytorch_tanh, but GGUF Q4K weights
+        // seem to work better with SiLU. TODO: investigate further.
+        let mlp_activation = GateActivation::SiLU;
         eprintln!(
             "  qkv={}, mlp={}, post_attn_norm={}, post_ffn_norm={}",
             qkv_style, mlp_style, has_post_attn_norm, has_post_ffn_norm,
@@ -3717,6 +3747,7 @@ impl GenericTurboModel {
                         feed_forward_w1: QMatMul::from_qtensor(w1)?,
                         feed_forward_w2: QMatMul::from_qtensor(w2)?,
                         feed_forward_w3: QMatMul::from_qtensor(w3)?,
+                        activation: mlp_activation,
                     });
                 }
                 MlpOrMoe::MoE {
@@ -3732,6 +3763,7 @@ impl GenericTurboModel {
                     feed_forward_w1: QMatMul::from_qtensor(w1)?,
                     feed_forward_w2: QMatMul::from_qtensor(w2)?,
                     feed_forward_w3: QMatMul::from_qtensor(w3)?,
+                    activation: mlp_activation,
                 })
             } else {
                 // Phi-style: only ffn_up and ffn_down (no ffn_gate)
