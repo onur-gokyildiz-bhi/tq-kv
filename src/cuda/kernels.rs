@@ -660,6 +660,7 @@ pub fn flash_decode_partial(
     head_dim: usize,
     scale: f32,
     split_size: usize,
+    max_seq: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("flash_decode", "flash_decode_partial")?;
     let n_splits = (seq_kv + split_size - 1) / split_size;
@@ -674,11 +675,12 @@ pub fn flash_decode_partial(
     let skv = seq_kv as i32;
     let hd = head_dim as i32;
     let ss = split_size as i32;
+    let ms = max_seq as i32;
     unsafe {
         reg.stream.launch_builder(&f)
             .arg(q).arg(k).arg(v)
             .arg(partial_o).arg(partial_max).arg(partial_sum)
-            .arg(&bs).arg(&nh).arg(&nkv).arg(&skv).arg(&hd).arg(&scale).arg(&ss)
+            .arg(&bs).arg(&nh).arg(&nkv).arg(&skv).arg(&hd).arg(&scale).arg(&ss).arg(&ms)
             .launch(cfg)?;
     }
     Ok(())

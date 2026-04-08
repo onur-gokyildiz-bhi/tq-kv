@@ -21,8 +21,8 @@
 
 extern "C" __global__ void flash_decode_partial(
     const float* __restrict__ Q,          // [B, H, 1, D]
-    const float* __restrict__ K,          // [B, Hkv, Skv, D]
-    const float* __restrict__ V,          // [B, Hkv, Skv, D]
+    const float* __restrict__ K,          // [B, Hkv, max_seq, D]
+    const float* __restrict__ V,          // [B, Hkv, max_seq, D]
     float* __restrict__ partial_O,        // [B, H, n_splits, D]
     float* __restrict__ partial_max,      // [B, H, n_splits]
     float* __restrict__ partial_sum,      // [B, H, n_splits]
@@ -32,7 +32,8 @@ extern "C" __global__ void flash_decode_partial(
     const int seq_kv,
     const int head_dim,
     const float scale,
-    const int split_size                  // KV tokens per split
+    const int split_size,                 // KV tokens per split
+    const int max_seq                     // stride for KV buffer (may be > seq_kv)
 ) {
     const int batch_idx = blockIdx.z;
     const int head_idx  = blockIdx.y;
@@ -61,8 +62,8 @@ extern "C" __global__ void flash_decode_partial(
         local_o[d] = 0.0f;
     }
 
-    const float* k_base = K + ((batch_idx * n_kv_heads + kv_head) * seq_kv + kv_start) * head_dim;
-    const float* v_base = V + ((batch_idx * n_kv_heads + kv_head) * seq_kv + kv_start) * head_dim;
+    const float* k_base = K + ((batch_idx * n_kv_heads + kv_head) * max_seq + kv_start) * head_dim;
+    const float* v_base = V + ((batch_idx * n_kv_heads + kv_head) * max_seq + kv_start) * head_dim;
 
     for (int ki = 0; ki < kv_len; ++ki) {
         // Dot product Q·K[ki]

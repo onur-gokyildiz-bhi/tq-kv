@@ -4454,10 +4454,8 @@ impl GenericTurboModel {
                         ptime!("gqa_attn", {
                             let gpu_kv = layer.gpu_kv_cache.as_ref().unwrap();
                             let attn_mut = Arc::get_mut(&mut scratch.attn_out).expect("attn_out aliased");
-                            // Flash decode DISABLED: kernel has a correctness bug
-                            // (PPL degrades catastrophically at seq_len > 256).
-                            // TODO: debug flash_decode_partial/reduce kernels
-                            let use_flash = false;
+                            let use_flash = !capturing && !graph_replayed
+                                && gpu_kv.seq_len > 256;
 
                             if use_flash {
                                 // Flash decode: split KV across blocks for parallelism
@@ -4481,6 +4479,7 @@ impl GenericTurboModel {
                                     &mut partial_o, &mut partial_max, &mut partial_sum,
                                     1, scratch.n_head, scratch.n_kv_head,
                                     actual_seq, scratch.head_dim, scale, split_size,
+                                    gpu_kv.max_seq,
                                 ).map_err(|e| TqError::Msg(format!("flash_decode_partial: {}", e)))?;
 
                                 crate::cuda::kernels::flash_decode_reduce(
