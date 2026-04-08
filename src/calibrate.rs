@@ -233,6 +233,13 @@ pub fn maybe_collect(k_flat: &[f32], n_kv_heads: usize, seq_len: usize, head_dim
     }
 }
 
+/// Stub for TriAttention pre-RoPE calibration (full impl on feature/triattention-mix).
+#[inline]
+pub fn maybe_collect_pre_rope(
+    _q_flat: &[f32], _k_flat: &[f32],
+    _n_heads: usize, _n_kv_heads: usize, _seq_len: usize, _head_dim: usize,
+) {}
+
 // ---------------------------------------------------------------------------
 // Per-head importance scoring
 // ---------------------------------------------------------------------------

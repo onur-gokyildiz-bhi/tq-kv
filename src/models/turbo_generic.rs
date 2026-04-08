@@ -994,6 +994,12 @@ fn get_sparse_v_threshold() -> f32 {
 /// Fused attention: compute attention scores directly from compressed indices
 /// instead of decompressing keys first. Saves memory bandwidth on CPU.
 /// Set TQ_FUSED=1 to enable. Default: off (decompress path).
+/// TriAttention enabled (stub — full implementation on feature/triattention-mix)
+fn get_triattention_enabled() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_TRIATTN").ok().map(|v| v == "1").unwrap_or(false))
+}
+
 fn get_use_fused() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| std::env::var("TQ_FUSED").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false))
@@ -1585,10 +1591,24 @@ impl LayerWeights {
             (q, k)
         };
 
+        // TriAttention calibration: collect pre-RoPE Q and K for center statistics.
+        // Must happen BEFORE RoPE — pre-RoPE vectors have position-independent stats.
+        if crate::calibrate::CALIBRATION_COLLECTOR.get().is_some() {
+            if let (Ok(q_f32), Ok(k_f32)) = (
+                q.to_dtype(DType::F32).and_then(|t| t.flatten_all()?.to_vec1()),
+                k.to_dtype(DType::F32).and_then(|t| t.flatten_all()?.to_vec1()),
+            ) {
+                crate::calibrate::maybe_collect_pre_rope(
+                    &q_f32, &k_f32, self.n_head, self.n_kv_head, seq_len, self.head_dim,
+                );
+            }
+        }
+
         // Pre-RoPE quantization: save k BEFORE RoPE for compression.
         // Pre-RoPE keys have position-independent per-channel stats → better quantization.
         let pre_rope_mode = self.tq_config.pre_rope || get_pre_rope();
-        let k_pre_rope = if pre_rope_mode { Some(k.clone()) } else { None };
+        let tri_enabled = get_triattention_enabled();
+        let k_pre_rope = if pre_rope_mode || tri_enabled { Some(k.clone()) } else { None };
 
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
@@ -1943,13 +1963,19 @@ impl LayerWeights {
                                 // Seed with all existing compressed keys + actual V data.
                                 let existing = cache.k_per_head[0].count;
                                 let v_offset = cache.sink_len;
-                                let bpk = gpu.bytes_per_key;
+                                let gpu_bpk = gpu.bytes_per_key;
                                 for pos in 0..existing {
-                                    let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
+                                    let mut packed_all = Vec::with_capacity(self.n_kv_head * gpu_bpk);
                                     let mut norms_all = Vec::with_capacity(self.n_kv_head);
                                     for h in 0..self.n_kv_head {
-                                        let start = pos * bpk;
-                                        packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
+                                        let h_bpk = cache.k_per_head[h].packed_indices.len() / existing.max(1);
+                                        let start = pos * h_bpk;
+                                        let end = (start + h_bpk).min(cache.k_per_head[h].packed_indices.len());
+                                        let chunk = &cache.k_per_head[h].packed_indices[start..end];
+                                        packed_all.extend_from_slice(chunk);
+                                        if chunk.len() < gpu_bpk {
+                                            packed_all.extend(std::iter::repeat(0u8).take(gpu_bpk - chunk.len()));
+                                        }
                                         norms_all.push(cache.k_per_head[h].norms[pos]);
                                     }
                                     let v_data = if let Some(ref v_raw) = cache.v_raw {
@@ -1977,13 +2003,20 @@ impl LayerWeights {
                     else if !gpu_compress_ok {
                         if let Some(ref mut gpu) = self.gpu_tq_cache {
                             let count = cache.k_per_head[0].count;
-                            let bpk = gpu.bytes_per_key;
+                            let gpu_bpk = gpu.bytes_per_key;
                             let pos = count - 1;
-                            let mut packed_all = Vec::with_capacity(self.n_kv_head * bpk);
+                            let mut packed_all = Vec::with_capacity(self.n_kv_head * gpu_bpk);
                             let mut norms_all = Vec::with_capacity(self.n_kv_head);
                             for h in 0..self.n_kv_head {
-                                let start = pos * bpk;
-                                packed_all.extend_from_slice(&cache.k_per_head[h].packed_indices[start..start + bpk]);
+                                let h_bpk = cache.k_per_head[h].packed_indices.len() / count.max(1);
+                                let start = pos * h_bpk;
+                                let end = (start + h_bpk).min(cache.k_per_head[h].packed_indices.len());
+                                let chunk = &cache.k_per_head[h].packed_indices[start..end];
+                                packed_all.extend_from_slice(chunk);
+                                // Pad to GPU layout size if grouped format is smaller
+                                if chunk.len() < gpu_bpk {
+                                    packed_all.extend(std::iter::repeat(0u8).take(gpu_bpk - chunk.len()));
+                                }
                                 norms_all.push(cache.k_per_head[h].norms[pos]);
                             }
                             // Extract actual V data for this token from v_raw cache
