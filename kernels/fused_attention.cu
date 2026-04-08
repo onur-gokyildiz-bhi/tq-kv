@@ -569,7 +569,8 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
     const int max_seq,
     const int head_dim,
     const float scale,
-    const int extra  // added after kv_append (typically 1 for decode)
+    const int extra,       // added after kv_append (typically 1 for decode)
+    const int window_size  // sliding window: 0 = global (attend all), >0 = attend last N tokens
 ) {
     const int seq_len = *seq_len_ptr + extra;  // post-append length
     const int head_idx = blockIdx.x;
@@ -593,7 +594,10 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
     const float* kv_k = K + kv_head * max_seq * head_dim;
     const float* kv_v = V + kv_head * max_seq * head_dim;
 
-    for (int k = 0; k < seq_len; ++k) {
+    // Sliding window: only attend to last window_size tokens (0 = global)
+    const int k_start = (window_size > 0 && seq_len > window_size) ? (seq_len - window_size) : 0;
+
+    for (int k = k_start; k < seq_len; ++k) {
         const float* k_row = kv_k + k * head_dim;
         float partial_dot = 0.0f;
         for (int d = tid; d < head_dim; d += blockDim.x) {

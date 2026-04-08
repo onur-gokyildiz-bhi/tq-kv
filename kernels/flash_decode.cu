@@ -36,7 +36,8 @@ extern "C" __global__ void flash_decode_partial(
     const int head_dim,
     const float scale,
     const int split_size,
-    const int max_seq                     // stride for KV buffer
+    const int max_seq,                    // stride for KV buffer
+    const int window_size                 // sliding window: 0 = global, >0 = attend last N
 ) {
     const int batch_idx = blockIdx.z;
     const int head_idx  = blockIdx.y;
@@ -44,8 +45,12 @@ extern "C" __global__ void flash_decode_partial(
     const int n_rep     = n_heads / n_kv_heads;
     const int kv_head   = head_idx / n_rep;
 
+    // Apply sliding window: restrict to last window_size tokens
+    const int global_start = (window_size > 0 && seq_kv > window_size) ? (seq_kv - window_size) : 0;
     const int kv_start = split_idx * split_size;
-    const int kv_len   = min(split_size, seq_kv - kv_start);
+    const int effective_start = max(kv_start, global_start);
+    const int effective_end = min(kv_start + split_size, seq_kv);
+    const int kv_len = effective_end - effective_start;
     if (kv_len <= 0) return;
 
     const int tid = threadIdx.x;
@@ -66,8 +71,8 @@ extern "C" __global__ void flash_decode_partial(
     float local_o[HEAD_DIM_MAX / BLOCK_SIZE + 1];
     for (int i = 0; i < n_d_per_thread; ++i) local_o[i] = 0.0f;
 
-    const float* k_base = K + ((batch_idx * n_kv_heads + kv_head) * max_seq + kv_start) * head_dim;
-    const float* v_base = V + ((batch_idx * n_kv_heads + kv_head) * max_seq + kv_start) * head_dim;
+    const float* k_base = K + ((batch_idx * n_kv_heads + kv_head) * max_seq + effective_start) * head_dim;
+    const float* v_base = V + ((batch_idx * n_kv_heads + kv_head) * max_seq + effective_start) * head_dim;
 
     // Shared memory for dot product broadcast
     __shared__ float s_dot;

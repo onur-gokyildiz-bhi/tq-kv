@@ -4526,6 +4526,7 @@ impl GenericTurboModel {
                                     1, scratch.n_head, scratch.n_kv_head,
                                     actual_seq, scratch.head_dim, scale, split_size,
                                     gpu_kv.max_seq,
+                                    0, // window_size: 0 = global (TODO: per-layer for Gemma 2)
                                 ).map_err(|e| TqError::Msg(format!("flash_decode_partial: {}", e)))?;
 
                                 crate::cuda::kernels::flash_decode_reduce(
@@ -4544,6 +4545,7 @@ impl GenericTurboModel {
                                     gpu_kv.max_seq, scratch.head_dim,
                                     1.0 / (scratch.head_dim as f32).sqrt(),
                                     attn_extra,
+                                    0, // window_size: 0 = global (TODO: per-layer sliding window for Gemma 2)
                                 ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))?;
                                 Ok(())
                             }

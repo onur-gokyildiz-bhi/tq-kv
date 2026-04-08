@@ -683,6 +683,7 @@ pub fn flash_decode_partial(
     scale: f32,
     split_size: usize,
     max_seq: usize,
+    window_size: i32,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("flash_decode", "flash_decode_partial")?;
     let n_splits = (seq_kv + split_size - 1) / split_size;
@@ -702,7 +703,7 @@ pub fn flash_decode_partial(
         reg.stream.launch_builder(&f)
             .arg(q).arg(k).arg(v)
             .arg(partial_o).arg(partial_max).arg(partial_sum)
-            .arg(&bs).arg(&nh).arg(&nkv).arg(&skv).arg(&hd).arg(&scale).arg(&ss).arg(&ms)
+            .arg(&bs).arg(&nh).arg(&nkv).arg(&skv).arg(&hd).arg(&scale).arg(&ss).arg(&ms).arg(&window_size)
             .launch(cfg)?;
     }
     Ok(())
@@ -1036,6 +1037,7 @@ pub fn gqa_decode_attention_graph(
     head_dim: usize,
     scale: f32,
     extra: i32,  // tokens appended after valid_len was set (typically 1)
+    window_size: i32,  // sliding window: 0 = global, >0 = attend last N tokens
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("fused_attention", "gqa_decode_attention_graph_f32")?;
     let block_dim = 32u32.min(head_dim as u32);
@@ -1051,7 +1053,7 @@ pub fn gqa_decode_attention_graph(
     unsafe {
         reg.stream.launch_builder(&f)
             .arg(q).arg(k).arg(v).arg(output).arg(seq_len_ptr)
-            .arg(&nh).arg(&nkv).arg(&ms).arg(&hd).arg(&scale).arg(&extra)
+            .arg(&nh).arg(&nkv).arg(&ms).arg(&hd).arg(&scale).arg(&extra).arg(&window_size)
             .launch(cfg)?;
     }
     Ok(())
