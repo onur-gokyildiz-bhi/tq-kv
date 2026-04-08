@@ -420,7 +420,9 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
     __syncthreads();
 
     // Per-thread V accumulator (each thread handles a subset of head_dim)
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // unrolled for dims tid, tid+blockDim, ...
+    const int n_acc = (head_dim + blockDim.x - 1) / blockDim.x;
+    float acc[9]; // MAX_HEAD_DIM(256)/32+1; unrolled for dims tid, tid+blockDim, ...
+    for (int i = 0; i < n_acc; ++i) acc[i] = 0.0f;
     float running_max = -1e10f;
     float running_sum = 0.0f;
 
@@ -456,7 +458,7 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
 
             float w = expf(score - s_max);
             const float* v_row = sink_v_head + k * head_dim;
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < n_acc; ++i) {
                 int d = tid + i * blockDim.x;
                 if (d < head_dim) {
                     acc[i] = acc[i] * s_rescale + w * v_row[d];
@@ -526,7 +528,7 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
         float w = expf(score - s_max);
 
         const float* v_row = kv_v + k * head_dim;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < n_acc; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
                 acc[i] = acc[i] * s_rescale + w * v_row[d];
@@ -538,7 +540,7 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
 
     // --- Final output: acc / sum_exp ---
     float inv_sum = (s_sum_exp > 0.0f) ? 1.0f / s_sum_exp : 0.0f;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < n_acc; ++i) {
         int d = tid + i * blockDim.x;
         if (d < head_dim) {
             output[head_idx * head_dim + d] = acc[i] * inv_sum;
@@ -587,7 +589,9 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
     }
     __syncthreads();
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int n_acc = (head_dim + blockDim.x - 1) / blockDim.x;
+    float acc[9];  // MAX_HEAD_DIM(256) / min_blockDim(32) + 1
+    for (int i = 0; i < n_acc; ++i) acc[i] = 0.0f;
     float running_max = -1e10f;
     float running_sum = 0.0f;
 
@@ -624,7 +628,7 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
 
         float w = expf(score - s_max);
         const float* v_row = kv_v + k * head_dim;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < n_acc; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
                 acc[i] = acc[i] * s_rescale + w * v_row[d];
@@ -634,7 +638,7 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
     }
 
     float inv_sum = (s_sum_exp > 0.0f) ? 1.0f / s_sum_exp : 0.0f;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < n_acc; ++i) {
         int d = tid + i * blockDim.x;
         if (d < head_dim) {
             output[head_idx * head_dim + d] = acc[i] * inv_sum;
@@ -671,7 +675,9 @@ extern "C" __global__ void gqa_decode_attention_f32(
     __syncthreads();
 
     // Per-thread V accumulator
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const int n_acc = (head_dim + blockDim.x - 1) / blockDim.x;
+    float acc[9];  // MAX_HEAD_DIM(256) / min_blockDim(32) + 1
+    for (int i = 0; i < n_acc; ++i) acc[i] = 0.0f;
     float running_max = -1e10f;
     float running_sum = 0.0f;
 
@@ -710,7 +716,7 @@ extern "C" __global__ void gqa_decode_attention_f32(
 
         float w = expf(score - s_max);
         const float* v_row = kv_v + k * head_dim;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < n_acc; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
                 acc[i] = acc[i] * s_rescale + w * v_row[d];
@@ -721,7 +727,7 @@ extern "C" __global__ void gqa_decode_attention_f32(
 
     // Final output: acc / sum_exp
     float inv_sum = (s_sum_exp > 0.0f) ? 1.0f / s_sum_exp : 0.0f;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < n_acc; ++i) {
         int d = tid + i * blockDim.x;
         if (d < head_dim) {
             output[head_idx * head_dim + d] = acc[i] * inv_sum;
