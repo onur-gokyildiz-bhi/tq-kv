@@ -206,11 +206,19 @@ impl QMatMul {
         Self { inner, span }
     }
 
-    /// Pre-warm weight cache: dequant on CPU + upload to GPU via backend.
-    /// Call during model load to eliminate first-forward latency.
+    /// Pre-warm weight cache: upload to GPU if available, CPU dequant only as fallback.
+    /// GPU fused kernels (q4km_matvec etc.) work directly on quantized bytes —
+    /// CPU dequant to f32 wastes ~28 GB RAM and is never used on GPU path.
     fn warmup(&self, backend: &dyn ComputeBackend) {
         match &self.inner {
             qmm::QMatMul::Quantized(qw) => {
+                #[cfg(feature = "cuda")]
+                if crate::cuda::kernels::global_registry().is_some() {
+                    // GPU available: upload raw quantized bytes, skip CPU f32 dequant
+                    backend.warmup_qweight(qw);
+                    return;
+                }
+                // CPU-only: dequant to f32 for SGEMM fallback
                 qw.warmup_cpu();
                 backend.warmup_qweight(qw);
             }

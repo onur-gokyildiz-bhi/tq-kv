@@ -117,6 +117,7 @@
 | Phase 2 | +2K | 6.3K | %85 |
 | Phase 3 | +1.5K | 7.8K | %90 |
 | Phase 4 | +3K | 10.8K | %95+ |
+| Phase 7 | +2.5K | 13.3K | %100+ (llama.cpp'de yok) |
 
 ---
 
@@ -247,6 +248,71 @@ Tom'un Avantajı (Phase 6 ile kapatılacak):
 
 ---
 
+## Phase 7: Speculative Decoding — Block Diffusion (4-8 hafta)
+
+> **İlham:** z-lab/dflash — diffusion drafter ile 6x lossless speedup iddiası.
+> Onların kodu Python/HuggingFace, biz kendi CUDA kernel'larımızı yazacağız.
+> TQ KV compression + speculative decoding stacklenirse multiplicative gain potansiyeli var.
+
+### 7.1 Draft Model Altyapısı
+- **Neden:** Speculative decoding 2 model gerektirir (target + draft). Mevcut runtime tek model.
+- **Plan:**
+  - Dual-model memory layout: target (Q4K) + draft (Q8/FP16, ~0.5B param) aynı GPU'da
+  - VRAM bütçeleme: RTX 3080 10GB'da 7B target Q4K (~4GB) + 0.5B draft FP16 (~1GB) + KV cache (~2GB) = sığar
+  - Draft model loader: ayrı GGUF veya safetensors'tan küçük model yükle
+  - Shared KV cache: target model'in KV cache'ini draft model okuyabilsin (read-only view)
+- **Dosya:** `src/models/draft_model.rs`, `src/speculative.rs`
+
+### 7.2 Autoregressive Draft + Verify Kernels
+- **Neden:** Klasik speculative decoding (Leviathan et al. 2023) baseline olarak lazım
+- **Plan:**
+  - Draft kernel: küçük model N token üretir (N=4-8), tek CUDA stream
+  - Verify kernel: target model N+1 token'ı batch forward pass ile doğrular
+  - Acceptance sampling: GPU'da rejection sampling (draft vs target logit karşılaştırma)
+  - **Dosya:** Yeni `kernels/spec_verify.cu` — batch logit compare + accept/reject
+- **Hedef:** Klasik speculative decode ile 2-3x decode hızlanma
+
+### 7.3 Block Diffusion Drafter (DFlash-style)
+- **Neden:** DFlash'ın core insight'ı — diffusion model autoregressive'den hızlı draft üretir
+- **Plan:**
+  - Mini diffusion model: 2-4 layer transformer + noise schedule
+  - Block generation: tek forward pass'te 8-16 token paralel üret
+  - Target model conditioning: target hidden states'ten feature extraction → draft model KV injection
+  - Feature fusion kernel: `kernels/feature_fuse.cu` — multi-layer hidden state projection + concat
+  - **Avantaj:** Draft latency token sayısından bağımsız (flat), autoregressive'de linear
+- **Dosya:** `kernels/diffusion_step.cu`, `src/models/diffusion_drafter.rs`
+
+### 7.4 TQ × Speculative Decode Fusion
+- **Neden:** Bizim moat — TQ compressed KV cache üzerinde speculative decode yapan başka proje yok
+- **Plan:**
+  - Draft model TQ-compressed KV'den okuyan attention kernel (mevcut `fused_attention.cu` genişlet)
+  - Verify step'te TQ decompress bypass: draft accept edilen token'ların KV'si zaten compressed
+  - TriAttention entegrasyonu: eviction + speculative decode birlikte çalışsın
+    - Evict edilen token'lar speculative draft'ta da skip edilsin
+    - Accept edilen yeni token'lar otomatik TQ compress + append
+  - **Hedef:** TQ 4-bit KV + speculative decode = 2x mem savings × 3x speed = 6x effective gain
+- **Dosya:** `kernels/tq_spec_attention.cu`
+
+### 7.5 Token Tree Attention
+- **Neden:** Medusa/EAGLE tarzı tree-based verification daha yüksek acceptance rate verir
+- **Plan:**
+  - Tree attention mask kernel: `kernels/tree_attention.cu`
+  - Draft model birden fazla branch üretir (top-k sampling at each position)
+  - Tree verify: target model tek batch'te tüm branch'leri verify eder
+  - Tree pruning GPU'da: accepted path selection + KV cache update
+- **Etki:** Acceptance rate %60 → %80+, effective speedup 3x → 4-5x
+
+### 7.6 Self-Speculative Decode (Draft Model-Free)
+- **Neden:** İkinci model yüklenmeden, target model kendi early layer'ları ile draft yapabilir
+- **Plan:**
+  - Early-exit head: target model'in N. layer'ından (N=8) küçük LM head ile token üret
+  - Skip-layer draft: sadece ilk K layer çalıştır, kalan layer'lar verify'da çalışır
+  - **Avantaj:** Ekstra VRAM = ~0, sadece küçük bir LM head (~10MB)
+  - **Trade-off:** Acceptance rate target-aware draft'tan düşük olabilir
+- **Dosya:** `src/models/self_speculative.rs`, `kernels/early_exit.cu`
+
+---
+
 ## Öncelik Özeti
 
 ```
@@ -256,4 +322,41 @@ Orta:     Sliding window + MoE → yeni model ailesi desteği
 Uzun:     FP8 + Multi-GPU → production serving
 Paralel:  Dashboard + HF compat + safetensors → DX & görünürlük
 Rekabet:  Metal + Vulkan + 70B validation → turboquant_plus parity
+Gelecek:  Speculative decode → TQ×spec fusion = multiplicative gain
 ```
+
+---
+
+## Integration Validation Backlog
+
+> Kernel altyapısı hazır ama henüz production'da aktif test edilmemiş özellikler.
+> Her biri blocker fix + model indirme + PPL/speed validation gerektiriyor.
+
+### V.1 Speculative Decode Validation
+- **Durum:** engine.rs'de tam impl (draft+verify+rollback+streaming)
+- **Blocker:** Draft model (Qwen2 0.5B) bozuk — Q5_0 dequant + head_dim=64 base inference bug
+- **Fix:** Q5_0 dequant implementasyonu + head_dim=64 inference fix
+- **Test:** `tq bench qwen2:7b -n 100 --draft qwen2:0.5b --speculate 5`
+- **Beklenen:** ~1.5-2x speedup (K=5, acceptance rate ~60%)
+
+### V.2 MoE Dispatch Validation
+- **Durum:** turbo_generic.rs'de tam impl (CPU routing + GPU expert MLPs)
+- **Blocker:** Katalogda MoE model yok
+- **Fix:** Mixtral 8x7B Q4_K_M kataloga ekle + pull + test
+- **Test:** `tq perplexity --model mixtral:8x7b /tmp/ppl_short.txt`
+- **Beklenen:** PPL ~5-6, 2-of-8 expert dispatch çalışır
+
+### V.3 Sliding Window Activation
+- **Durum:** Kernel window_size param hazır, caller'lar hep 0 geçiyor
+- **Blocker:** Gemma 2 fallback path kullanıyor (post_attention_norm yüzünden fused path skip)
+- **Fix:** Per-layer window_size config (layer_idx % 2 == 0 → 4096, else → 0) + Gemma 2 fused path unlock
+- **Test:** `tq perplexity --model gemma:9b` PPL < 20 olmalı
+- **Beklenen:** Gemma 2 PPL fix'in son parçası
+
+### V.4 head_dim > 128 Fused Path
+- **Durum:** acc[] overflow fixed, kernel supports head_dim 256
+- **Blocker:** Gemma 2 post_attention_norm → fused path skipped
+- **Fix:** Fused path'i post_attention_norm destekleyecek şekilde genişlet (norm çağrısı ekle)
+- **Test:** Gemma 2 fused path aktif iken PPL + speed
+- **Beklenen:** Gemma 2 decode 2-3x hızlanır (CPU fallback → GPU fused)
+
