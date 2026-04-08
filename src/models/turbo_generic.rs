@@ -151,9 +151,23 @@ fn softmax_last_dim(x: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> 
 
 /// Logit soft-capping: cap * tanh(logits / cap). Used by Gemma2.
 fn apply_softcap(x: &Tensor, cap: f32) -> Result<Tensor> {
-    let inv_cap = 1.0 / cap;
-    // x / cap → tanh → * cap
+    // GPU path: in-place softcap kernel
+    #[cfg(feature = "cuda")]
+    if x.is_cuda() {
+        if let Some(reg) = crate::cuda::kernels::global_registry() {
+            let n = x.elem_count();
+            let mut out = crate::cuda::gpu_alloc_zeros_pub(&reg.stream, n)
+                .map_err(|e| TqError::Msg(format!("softcap alloc: {e}")))?;
+            // Copy x → out, then softcap in-place
+            let _ = reg.stream.memcpy_dtod(x.cuda_data(), &mut out);
+            crate::cuda::kernels::softcap_inplace(reg, &mut out, cap, n)
+                .map_err(|e| TqError::Msg(format!("softcap kernel: {e}")))?;
+            return Ok(Tensor::from_cuda(out, x.shape().to_vec(), reg.stream.clone()));
+        }
+    }
+    // CPU fallback
     let data = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let inv_cap = 1.0 / cap;
     let capped: Vec<f32> = data.iter().map(|&v| cap * (v * inv_cap).tanh()).collect();
     Tensor::from_vec(capped, x.shape().to_vec(), x.device())
 }

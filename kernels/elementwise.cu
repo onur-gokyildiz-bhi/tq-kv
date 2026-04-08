@@ -205,3 +205,17 @@ extern "C" __global__ void argmax_f32(
         *out_idx = (unsigned int)s_idx[0];
     }
 }
+
+// ─── Softcap: cap * tanh(x / cap) ─────────────────────────────
+// Gemma 2 attention + final logit soft-capping. In-place.
+extern "C" __global__ void softcap_inplace_f32(
+    float* __restrict__ data,
+    const float inv_cap,   // 1.0 / cap
+    const float cap,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        data[idx] = cap * tanhf(data[idx] * inv_cap);
+    }
+}

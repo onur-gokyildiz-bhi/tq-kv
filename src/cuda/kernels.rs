@@ -490,6 +490,28 @@ pub fn silu(
     Ok(())
 }
 
+/// Softcap in-place: data = cap * tanh(data / cap). Gemma 2 attention/final logit capping.
+pub fn softcap_inplace(
+    reg: &KernelRegistry,
+    data: &mut CudaSlice<f32>,
+    cap: f32,
+    n: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("elementwise", "softcap_inplace_f32")?;
+    let cfg = launch_1d(n);
+    let inv_cap = 1.0f32 / cap;
+    let ni = n as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(data)
+            .arg(&inv_cap)
+            .arg(&cap)
+            .arg(&ni)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Convert f32 → f16 on GPU.
 pub fn f32_to_f16(
     reg: &KernelRegistry,
