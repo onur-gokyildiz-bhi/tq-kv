@@ -106,6 +106,22 @@ impl CalibrationData {
         }
     }
 
+    /// Build a TriAttentionConfig from calibration data, if tri_* fields are present.
+    pub fn build_triattention_config(&self, head_dim: usize) -> Option<tq_kv::triattention::TriAttentionConfig> {
+        let qc = self.tri_q_centers.as_ref()?;
+        let kc = self.tri_k_centers.as_ref()?;
+        let mrl = self.tri_mrl.as_ref()?;
+        let qnm = self.tri_q_norm_means.as_ref()?;
+        let rf = self.tri_rope_freqs.as_ref()?;
+        let n_h = self.tri_n_heads.unwrap_or(0);
+        let n_kvh = self.tri_n_kv_heads.unwrap_or(0);
+        if n_h == 0 || n_kvh == 0 { return None; }
+        Some(tq_kv::triattention::TriAttentionConfig::from_calibration(
+            qc.clone(), kc.clone(), mrl.clone(), qnm.clone(), rf.clone(),
+            n_h, n_kvh, head_dim,
+        ))
+    }
+
     /// Apply calibration data to a TurboQuantConfig.
     ///
     /// Calibration features are currently experimental. Channel_scales enables
@@ -295,6 +311,33 @@ impl CalibrationCollector {
             }
         }
     }
+}
+
+/// Global TriAttention config, set at startup from calibration data.
+/// Read by turbo_generic.rs cache init when TQ_TRIATTN=1.
+pub static TRIATTENTION_CONFIG: std::sync::OnceLock<tq_kv::triattention::TriAttentionConfig> =
+    std::sync::OnceLock::new();
+
+/// Initialize the global TriAttention config from calibration data.
+/// Called from main.rs after loading calibration.
+pub fn init_triattention(cal: &CalibrationData, head_dim: usize) -> bool {
+    if let Some(mut cfg) = cal.build_triattention_config(head_dim) {
+        cfg.budget = std::env::var("TQ_TRIATTN_BUDGET")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+        cfg.eviction_interval = std::env::var("TQ_TRIATTN_INTERVAL")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+        let n_h = cfg.n_heads;
+        let n_kvh = cfg.n_kv_heads;
+        let mrl_mean: f32 = cfg.mrl.iter().sum::<f32>() / cfg.mrl.len().max(1) as f32;
+        if TRIATTENTION_CONFIG.set(cfg).is_ok() {
+            eprintln!("  TriAttention enabled: {} Q heads, {} KV heads, MRL={:.3}, budget={}, interval={}",
+                n_h, n_kvh, mrl_mean,
+                std::env::var("TQ_TRIATTN_BUDGET").unwrap_or("2048".into()),
+                std::env::var("TQ_TRIATTN_INTERVAL").unwrap_or("128".into()));
+            return true;
+        }
+    }
+    false
 }
 
 /// Global calibration collector, set during `tq calibrate` runs.

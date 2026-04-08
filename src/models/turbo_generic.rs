@@ -1753,7 +1753,9 @@ impl LayerWeights {
                     cached_len: 0,
                     dtype: cache_dtype,
                     pre_rope: pre_rope_mode,
-                    tri_config: None,
+                    tri_config: if get_triattention_enabled() {
+                        crate::calibrate::TRIATTENTION_CONFIG.get().cloned()
+                    } else { None },
                     tri_keys_pre_rope: if get_triattention_enabled() {
                         Some(vec![Vec::new(); self.n_kv_head])
                     } else { None },
@@ -2106,6 +2108,136 @@ impl LayerWeights {
 
             cache.cached_len += seq_len;
             cache.tokens_since_decay += seq_len;
+
+            // --- TriAttention: accumulate pre-RoPE keys + periodic eviction ---
+            if cache.tri_config.is_some() {
+                // #2: Store pre-RoPE keys for scoring
+                if let Some(ref k_pr) = k_pre_rope {
+                    if let Ok(k_pr_flat) = k_pr.to_dtype(DType::F32)
+                        .and_then(|t| t.flatten_all())
+                        .and_then(|t| t.to_vec1())
+                    {
+                        let hdim = self.head_dim;
+                        let tri_keys = cache.tri_keys_pre_rope.as_mut().unwrap();
+                        for h in 0..self.n_kv_head {
+                            for s in 0..seq_len {
+                                let offset = (h * seq_len + s) * hdim;
+                                if offset + hdim <= k_pr_flat.len() {
+                                    tri_keys[h].extend_from_slice(&k_pr_flat[offset..offset + hdim]);
+                                }
+                            }
+                        }
+                        for s in 0..seq_len {
+                            cache.tri_key_positions.push(index_pos + s);
+                        }
+                    }
+                }
+                cache.tri_tokens_since_eviction += seq_len;
+
+                // #3: Periodic eviction — score and remove low-importance tokens
+                let tri_cfg = cache.tri_config.clone().unwrap();
+                let n_tri_keys = cache.tri_key_positions.len();
+                if cache.tri_tokens_since_eviction >= tri_cfg.eviction_interval
+                    && seq_len == 1
+                    && n_tri_keys > tri_cfg.budget
+                {
+                    let current_pos = index_pos + seq_len;
+                    let tri_keys_ref = cache.tri_keys_pre_rope.as_ref().unwrap();
+                    let key_refs: Vec<&[f32]> = tri_keys_ref.iter().map(|v| v.as_slice()).collect();
+
+                    let retain_per_head = tq_kv::triattention::evict_pass(
+                        &key_refs, current_pos, &cache.tri_key_positions,
+                        cache.sink_len, &tri_cfg,
+                    );
+
+                    // #4: Apply eviction — splice tri_keys + compressed cache
+                    if let Some(retained) = retain_per_head.first() {
+                        if retained.len() < n_tri_keys {
+                            let evicted = n_tri_keys - retained.len();
+
+                            // Rebuild tri_key_positions (shared)
+                            let new_positions: Vec<usize> = retained.iter()
+                                .map(|&i| cache.tri_key_positions[i]).collect();
+
+                            // Rebuild per-head pre-RoPE keys
+                            let hdim = self.head_dim;
+                            let tri_keys = cache.tri_keys_pre_rope.as_mut().unwrap();
+                            for (h, head_retain) in retain_per_head.iter().enumerate() {
+                                if h >= tri_keys.len() { break; }
+                                let old = tri_keys[h].clone();
+                                let mut new_k = Vec::with_capacity(head_retain.len() * hdim);
+                                for &idx in head_retain {
+                                    let start = idx * hdim;
+                                    if start + hdim <= old.len() {
+                                        new_k.extend_from_slice(&old[start..start + hdim]);
+                                    }
+                                }
+                                tri_keys[h] = new_k;
+                            }
+
+                            // Splice compressed cache: keep only retained indices in k_per_head
+                            // Map tri indices to compressed cache indices:
+                            // tri positions [0..sink_len) are sink (not in k_per_head)
+                            // tri positions [sink_len..] map to k_per_head positions [0..]
+                            let sink_n = cache.sink_len;
+                            let compressed_retain: Vec<usize> = retained.iter()
+                                .filter(|&&i| i >= sink_n)
+                                .map(|&i| i - sink_n)
+                                .collect();
+                            let compressed_count = cache.k_per_head[0].count;
+                            if !compressed_retain.is_empty() && compressed_retain.len() < compressed_count {
+                                for h in 0..self.n_kv_head {
+                                    cache.k_per_head[h] = cache.k_per_head[h].select_indices(&compressed_retain);
+                                }
+                                // Splice v_raw if present
+                                // v_raw: [1, n_kv_head, total_len, head_dim]
+                                // Rebuild by selecting sink + retained compressed positions
+                                if let Some(ref v_tensor) = cache.v_raw {
+                                    let total_v_len = v_tensor.dim(2).unwrap_or(0);
+                                    if total_v_len > 0 && !compressed_retain.is_empty() {
+                                        let mut slices = Vec::new();
+                                        // Keep all sink tokens
+                                        if sink_n > 0 {
+                                            if let Ok(s) = v_tensor.narrow(2, 0, sink_n) {
+                                                slices.push(s);
+                                            }
+                                        }
+                                        // Keep retained compressed tokens
+                                        for &ci in &compressed_retain {
+                                            let vi = ci + sink_n;
+                                            if vi < total_v_len {
+                                                if let Ok(s) = v_tensor.narrow(2, vi, 1) {
+                                                    slices.push(s);
+                                                }
+                                            }
+                                        }
+                                        if slices.len() > 1 {
+                                            let slice_refs: Vec<&Tensor> = slices.iter().collect();
+                                            if let Ok(new_v) = Tensor::cat(&slice_refs, 2) {
+                                                cache.v_raw = Some(new_v);
+                                            }
+                                        } else if slices.len() == 1 {
+                                            cache.v_raw = Some(slices.into_iter().next().unwrap());
+                                        }
+                                    }
+                                }
+                                // Invalidate GPU TQ cache (will be re-seeded)
+                                #[cfg(feature = "cuda")]
+                                { self.gpu_tq_cache = None; }
+                            }
+
+                            cache.tri_key_positions = new_positions;
+
+                            if self.layer_idx == 0 {
+                                eprintln!("[tri-evict] {}/{} retained (evicted {})",
+                                    retained.len(), n_tri_keys, evicted);
+                            }
+                        }
+                    }
+                    cache.tri_tokens_since_eviction = 0;
+                }
+            }
+
             let total_len = cache.cached_len;
 
             // --- Temporal decay: demote old hot tokens to lower bit width ---

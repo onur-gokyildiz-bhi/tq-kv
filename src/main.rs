@@ -283,6 +283,10 @@ fn resolve_tq_config_for_model(turbo_quant: bool, tq_bits: u8, model_name: Optio
                 if let Some(cal_data) = calibrate::load_calibration_for_model(name) {
                     eprintln!("Using calibrated codebook + rotation + channel scales");
                     cal_data.apply_to_config(&mut config);
+                    // TriAttention: load config from calibration if TQ_TRIATTN=1
+                    if std::env::var("TQ_TRIATTN").ok().map_or(false, |v| v == "1") {
+                        calibrate::init_triattention(&cal_data, cal_data.head_dim);
+                    }
                 }
             }
         }
@@ -304,7 +308,7 @@ fn resolve_tq_config_with_auto(
 ) -> Option<tq_kv::TurboQuantConfig> {
     // If user explicitly enabled TQ, use that
     if turbo_quant {
-        return resolve_tq_config(true, tq_bits);
+        return resolve_tq_config_for_model(true, tq_bits, Some(model_name));
     }
 
     // If user explicitly disabled auto-TQ, return None
