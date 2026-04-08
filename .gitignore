@@ -20,3 +20,4 @@ build_test_ffi.bat
 # Codescope (graph-rag)
 .mcp.json
 .graph-rag/
+.fastembed_cache/

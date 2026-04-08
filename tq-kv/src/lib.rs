@@ -44,6 +44,8 @@
 pub mod codebook;
 /// KV cache compaction — reduce token count via attention matching.
 pub mod compaction;
+/// TriAttention — trigonometric KV cache scoring & eviction (arXiv:2604.04921).
+pub mod triattention;
 /// Fast Walsh-Hadamard Transform for decorrelation.
 pub mod hadamard;
 
@@ -577,6 +579,49 @@ impl CompressedKeys {
             count: self.count,
             rotation_seed: self.rotation_seed,
             group_size: self.group_size,
+            residual_indices: None,
+            residual_norms: None,
+            residual_bits: 0,
+            outlier_indices: None,
+            outlier_values: None,
+            outlier_k: 0,
+        }
+    }
+
+    /// Select a subset of vectors by index, returning a new CompressedKeys.
+    /// Indices must be sorted ascending and within [0, count).
+    /// Used by TriAttention eviction to splice the cache.
+    pub fn select_indices(&self, indices: &[usize]) -> CompressedKeys {
+        let bpk = if self.count > 0 { self.packed_indices.len() / self.count } else { 0 };
+        // Grouped format: norms_per_vector = dim / group_size (or 1 if non-grouped)
+        let npv = if self.group_size > 0 && self.dim > 0 {
+            self.dim / self.group_size
+        } else {
+            1
+        };
+        let mut packed = Vec::with_capacity(indices.len() * bpk);
+        let mut norms = Vec::with_capacity(indices.len() * npv);
+        for &idx in indices {
+            if idx < self.count {
+                let start = idx * bpk;
+                let end = start + bpk;
+                if end <= self.packed_indices.len() {
+                    packed.extend_from_slice(&self.packed_indices[start..end]);
+                }
+                let norm_start = idx * npv;
+                let norm_end = (norm_start + npv).min(self.norms.len());
+                norms.extend_from_slice(&self.norms[norm_start..norm_end]);
+            }
+        }
+        CompressedKeys {
+            packed_indices: packed,
+            norms,
+            count: indices.len(),
+            bits: self.bits,
+            dim: self.dim,
+            rotation_seed: self.rotation_seed,
+            group_size: self.group_size,
+            qjl_corrections: None, // QJL corrections not preserved (re-compute if needed)
             residual_indices: None,
             residual_norms: None,
             residual_bits: 0,
