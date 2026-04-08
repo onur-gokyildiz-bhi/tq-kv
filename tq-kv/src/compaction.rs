@@ -206,6 +206,137 @@ pub fn compact_head(
     }
 }
 
+/// Compact with configurable pruning method.
+///
+/// When `method` is `MeanAttention`, delegates to `compact_head`.
+/// When `method` is `TriAttention`, uses trigonometric scoring for key selection,
+/// then runs the same beta fitting and value synthesis.
+pub fn compact_head_with_method(
+    keys: &[f32],
+    values: &[f32],
+    queries: &[f32],
+    seq_len: usize,
+    n_queries: usize,
+    head_dim: usize,
+    target_size: usize,
+    method: &PruningMethod,
+) -> CompactedHead {
+    match method {
+        PruningMethod::MeanAttention => {
+            compact_head(keys, values, queries, seq_len, n_queries, head_dim, target_size)
+        }
+        PruningMethod::TriAttention { config, current_pos, key_positions, kv_head } => {
+            // Phase 1: TriAttention key selection (no full attention needed)
+            let scores = crate::triattention::score_kv_head(
+                keys, *kv_head, *current_pos, key_positions, config,
+            );
+            let selected = crate::triattention::select_top_keys(&scores, target_size.min(seq_len));
+            let t = selected.len();
+
+            // Phase 2-4: Use compact_head's beta/value fitting on selected keys
+            // Extract selected keys, then run compact_head with pre-selected indices
+            let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
+
+            // Extract selected keys
+            let mut c1 = vec![0.0f32; t * head_dim];
+            for (j, &idx) in selected.iter().enumerate() {
+                c1[j * head_dim..(j + 1) * head_dim]
+                    .copy_from_slice(&keys[idx * head_dim..(idx + 1) * head_dim]);
+            }
+
+            // Compute full attention scores for beta fitting (needed for partition function)
+            let mut scores_full = vec![0.0f32; n_queries * seq_len];
+            for qi in 0..n_queries {
+                for ki in 0..seq_len {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += queries[qi * head_dim + d] * keys[ki * head_dim + d];
+                    }
+                    scores_full[qi * seq_len + ki] = dot * inv_sqrt_d;
+                }
+            }
+
+            let mut exp_raw = vec![0.0f32; n_queries * seq_len];
+            let mut exp_norm = vec![0.0f32; n_queries * seq_len];
+            let mut targets = vec![0.0f32; n_queries];
+            for qi in 0..n_queries {
+                let row = &scores_full[qi * seq_len..(qi + 1) * seq_len];
+                let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f32;
+                for ki in 0..seq_len {
+                    let e = (row[ki] - max_val).exp();
+                    exp_raw[qi * seq_len + ki] = e;
+                    sum_exp += e;
+                }
+                targets[qi] = sum_exp;
+                for ki in 0..seq_len {
+                    exp_norm[qi * seq_len + ki] = exp_raw[qi * seq_len + ki] / sum_exp;
+                }
+            }
+
+            // Beta fitting (NNLS)
+            let mut m_mat = vec![0.0f32; n_queries * t];
+            for qi in 0..n_queries {
+                for (j, &idx) in selected.iter().enumerate() {
+                    m_mat[qi * t + j] = exp_raw[qi * seq_len + idx];
+                }
+            }
+            let beta_weights = solve_nnls(&m_mat, &targets, n_queries, t);
+            let beta: Vec<f32> = beta_weights.iter().map(|&b| b.max(1e-12).ln()).collect();
+
+            // Value fitting (ridge regression)
+            let mut compact_scores = vec![0.0f32; n_queries * t];
+            for qi in 0..n_queries {
+                for j in 0..t {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += queries[qi * head_dim + d] * c1[j * head_dim + d];
+                    }
+                    compact_scores[qi * t + j] = dot * inv_sqrt_d + beta[j];
+                }
+            }
+
+            let mut x_mat = vec![0.0f32; n_queries * t];
+            for qi in 0..n_queries {
+                let row = &compact_scores[qi * t..(qi + 1) * t];
+                let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f32;
+                for j in 0..t {
+                    let e = (row[j] - max_val).exp();
+                    x_mat[qi * t + j] = e;
+                    sum_exp += e;
+                }
+                for j in 0..t {
+                    x_mat[qi * t + j] /= sum_exp;
+                }
+            }
+
+            let mut y_mat = vec![0.0f32; n_queries * head_dim];
+            for qi in 0..n_queries {
+                for d in 0..head_dim {
+                    let mut val = 0.0f32;
+                    for ki in 0..seq_len {
+                        val += exp_norm[qi * seq_len + ki] * values[ki * head_dim + d];
+                    }
+                    y_mat[qi * head_dim + d] = val;
+                }
+            }
+
+            let lambda = if n_queries > 1 { 1e-4 / (n_queries as f32) } else { 1e-3 };
+            let c2 = solve_ridge(&x_mat, &y_mat, n_queries, t, head_dim, lambda);
+
+            CompactedHead {
+                keys: c1,
+                beta,
+                values: c2,
+                indices: selected,
+                t,
+                head_dim,
+            }
+        }
+    }
+}
+
 /// Solve M @ x ≈ b, x >= 0 (clamped least squares).
 fn solve_nnls(m: &[f32], b: &[f32], n: usize, t: usize) -> Vec<f32> {
     // M^T M [t, t]

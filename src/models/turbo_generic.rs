@@ -104,8 +104,12 @@ impl RmsNorm {
         Self::from_qweight(&qw.raw_data, qw.dtype, n_elements, eps, device)
     }
 
-    /// Set Gemma-style weight offset: (1 + w) instead of w
+    /// Set Gemma-style weight offset: bake (1 + w) into stored weight
     fn with_add_unit(mut self) -> Self {
+        let w = self.weight.as_slice();
+        let w_plus_one: Vec<f32> = w.iter().map(|&v| 1.0 + v).collect();
+        self.weight = Tensor::from_vec(w_plus_one, self.weight.shape().to_vec(), self.weight.device())
+            .expect("add_unit weight creation");
         self.add_unit = true;
         self
     }
@@ -114,23 +118,10 @@ impl RmsNorm {
         let _enter = self.span.enter();
         let x_f32 = x.to_dtype(DType::F32)?;
 
-        // Gemma: effective weight = 1 + w (learned offset from unit)
-        let effective_weight = if self.add_unit {
-            let w = self.weight.as_slice();
-            let w_plus_one: Vec<f32> = w.iter().map(|&v| 1.0 + v).collect();
-            std::borrow::Cow::Owned(w_plus_one)
-        } else {
-            std::borrow::Cow::Borrowed(self.weight.as_slice())
-        };
-
         // GPU-resident path: use TqTensor::rms_norm_gpu directly
+        // (add_unit already baked into self.weight at construction time)
         #[cfg(feature = "cuda")]
         if x_f32.is_cuda() {
-            if self.add_unit {
-                // Upload modified weights for GPU path
-                let w_tensor = Tensor::from_vec(effective_weight.to_vec(), self.weight.shape().to_vec(), x.device())?;
-                return x_f32.rms_norm_gpu(&w_tensor, self.eps as f32);
-            }
             return x_f32.rms_norm_gpu(&self.weight, self.eps as f32);
         }
 
@@ -138,7 +129,7 @@ impl RmsNorm {
         let shape = x_f32.shape().to_vec();
         let hidden = *shape.last().unwrap();
         let n_tokens = x_f32.elem_count() / hidden;
-        let result = backend.rms_norm(x_f32.as_slice(), &effective_weight, self.eps as f32, n_tokens, hidden);
+        let result = backend.rms_norm(x_f32.as_slice(), self.weight.as_slice(), self.eps as f32, n_tokens, hidden);
         Tensor::from_vec(result, shape, x.device())
     }
 }
@@ -741,6 +732,105 @@ impl GpuCompressedKv {
         self.count = n_retain;
         Ok(())
     }
+}
+
+/// GPU-accelerated TriAttention scoring + selection.
+/// Uploads pre-RoPE keys to GPU, runs trig_score_keys_batched kernel,
+/// downloads scores, selects top-B on CPU.
+#[cfg(feature = "cuda")]
+fn gpu_tri_score_and_select(
+    reg: &crate::cuda::kernels::KernelRegistry,
+    tri_keys: &[Vec<f32>],      // per KV head: [n_keys * head_dim]
+    key_positions: &[usize],
+    current_pos: usize,
+    sink_count: usize,
+    config: &tq_kv::triattention::TriAttentionConfig,
+) -> std::result::Result<Vec<Vec<usize>>, crate::cuda::TqError> {
+    let n_kv_heads = tri_keys.len();
+    let n_keys = key_positions.len();
+    let head_dim = config.head_dim;
+    let budget = config.budget;
+    if n_keys == 0 || n_kv_heads == 0 {
+        return Ok(vec![(0..n_keys).collect(); n_kv_heads]);
+    }
+
+    // Map Q centers to KV heads: for each KV head, use first mapped Q head's center
+    let n_rep = config.n_heads / config.n_kv_heads;
+    let mut q_centers_mapped: Vec<f32> = Vec::with_capacity(n_kv_heads * head_dim);
+    let mut mrl_mapped: Vec<f32> = Vec::with_capacity(n_kv_heads);
+    let mut qnorm_mapped: Vec<f32> = Vec::with_capacity(n_kv_heads);
+    for kv_h in 0..n_kv_heads {
+        let q_h = kv_h * n_rep; // first Q head for this KV head
+        q_centers_mapped.extend_from_slice(&config.q_centers[q_h]);
+        mrl_mapped.push(config.mrl[q_h]);
+        qnorm_mapped.push(config.q_norm_means[q_h]);
+    }
+
+    // Flatten keys: [n_kv_heads, n_keys, head_dim]
+    // Only score non-sink keys
+    let non_sink_n = n_keys.saturating_sub(sink_count);
+    let mut keys_flat: Vec<f32> = Vec::with_capacity(n_kv_heads * non_sink_n * head_dim);
+    for h in 0..n_kv_heads {
+        let start = sink_count * head_dim;
+        if start < tri_keys[h].len() {
+            keys_flat.extend_from_slice(&tri_keys[h][start..]);
+        }
+        // Pad if needed
+        let expected = non_sink_n * head_dim;
+        let actual = keys_flat.len() - h * expected;
+        if actual < expected {
+            keys_flat.extend(std::iter::repeat(0.0f32).take(expected - actual));
+        }
+    }
+
+    let positions_i32: Vec<i32> = key_positions[sink_count..].iter()
+        .map(|&p| p as i32).collect();
+    let offsets_i32: Vec<i32> = config.offsets.iter().map(|&o| o as i32).collect();
+
+    // Upload to GPU
+    let gpu_q_centers = reg.stream.clone_htod(&q_centers_mapped)
+        .map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu q_centers: {}", e)))?;
+    let gpu_keys = reg.stream.clone_htod(&keys_flat)
+        .map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu keys: {}", e)))?;
+    let gpu_freqs = reg.stream.clone_htod(&config.rope_freqs)
+        .map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu freqs: {}", e)))?;
+    let gpu_positions = reg.stream.clone_htod(&positions_i32)
+        .map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu positions: {}", e)))?;
+    let gpu_mrl = reg.stream.clone_htod(&mrl_mapped)
+        .map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu mrl: {}", e)))?;
+    let gpu_qnorm = reg.stream.clone_htod(&qnorm_mapped)
+        .map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu qnorm: {}", e)))?;
+    let gpu_offsets = reg.stream.clone_htod(&offsets_i32)
+        .map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu offsets: {}", e)))?;
+    let mut gpu_scores = reg.stream.alloc_zeros::<f32>(n_kv_heads * non_sink_n)
+        .map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu scores: {}", e)))?;
+
+    // Launch kernel
+    crate::cuda::kernels::trig_score_keys_batched(
+        reg,
+        &gpu_q_centers, &gpu_keys, &gpu_freqs, &gpu_positions,
+        &mut gpu_scores, &gpu_mrl, &gpu_qnorm,
+        current_pos, non_sink_n, n_kv_heads, head_dim,
+        &gpu_offsets, config.offsets.len(),
+    ).map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu kernel: {:?}", e)))?;
+
+    // Download scores
+    let scores_flat: Vec<f32> = reg.stream.clone_dtoh(&gpu_scores)
+        .map_err(|e| crate::cuda::TqError::Msg(format!("tri-gpu dtoh: {}", e)))?;
+
+    // Select top-B per head (on CPU)
+    let non_sink_budget = budget.saturating_sub(sink_count);
+    let mut result = Vec::with_capacity(n_kv_heads);
+    for kv_h in 0..n_kv_heads {
+        let head_scores = &scores_flat[kv_h * non_sink_n..(kv_h + 1) * non_sink_n];
+        let selected = tq_kv::triattention::select_top_keys(head_scores, non_sink_budget);
+        // Shift back to global indices + prepend sinks
+        let mut full: Vec<usize> = (0..sink_count).collect();
+        full.extend(selected.iter().map(|&i| i + sink_count));
+        result.push(full);
+    }
+
+    Ok(result)
 }
 
 #[derive(Clone, Debug)]
@@ -2203,12 +2293,25 @@ impl LayerWeights {
                 {
                     let current_pos = index_pos + seq_len;
                     let tri_keys_ref = cache.tri_keys_pre_rope.as_ref().unwrap();
-                    let key_refs: Vec<&[f32]> = tri_keys_ref.iter().map(|v| v.as_slice()).collect();
 
-                    let retain_per_head = tq_kv::triattention::evict_pass(
-                        &key_refs, current_pos, &cache.tri_key_positions,
-                        cache.sink_len, &tri_cfg,
-                    );
+                    // Try GPU scoring path, fall back to CPU
+                    let retain_per_head = 'scoring: {
+                        #[cfg(feature = "cuda")]
+                        if let Some(reg) = crate::cuda::kernels::global_registry() {
+                            if let Ok(retain) = gpu_tri_score_and_select(
+                                reg, tri_keys_ref, &cache.tri_key_positions,
+                                current_pos, cache.sink_len, &tri_cfg,
+                            ) {
+                                break 'scoring retain;
+                            }
+                        }
+                        // CPU fallback
+                        let key_refs: Vec<&[f32]> = tri_keys_ref.iter().map(|v| v.as_slice()).collect();
+                        tq_kv::triattention::evict_pass(
+                            &key_refs, current_pos, &cache.tri_key_positions,
+                            cache.sink_len, &tri_cfg,
+                        )
+                    };
 
                     // #4: Apply eviction — splice tri_keys + compressed cache
                     if let Some(retained) = retain_per_head.first() {
@@ -2427,9 +2530,24 @@ impl LayerWeights {
                         let v_head_offset = v_head_base + v_start * hdim;
                         let v_head = &v_for_compact[v_head_offset..v_head_offset + to_compact * hdim];
 
-                        let compacted = tq_kv::compaction::compact_head(
+                        // Use TriAttention scoring for key selection if available,
+                        // otherwise fall back to mean-attention scoring.
+                        let pruning_method = if let Some(ref tri_cfg) = cache.tri_config {
+                            let hot_start = cache.sink_len + cache.cold_len + cache.compacted_original_len;
+                            let key_positions: Vec<usize> = (0..to_compact).map(|i| hot_start + i).collect();
+                            tq_kv::compaction::PruningMethod::TriAttention {
+                                config: tri_cfg.clone(),
+                                current_pos: index_pos + seq_len,
+                                key_positions,
+                                kv_head: h,
+                            }
+                        } else {
+                            tq_kv::compaction::PruningMethod::MeanAttention
+                        };
+                        let compacted = tq_kv::compaction::compact_head_with_method(
                             &k_trimmed, v_head, &q_refs,
                             to_compact, n_ref_queries, hdim, target_size,
+                            &pruning_method,
                         );
                         compacted_heads.push(CompactedCacheHead {
                             keys: compacted.keys,
@@ -3461,6 +3579,17 @@ impl GenericTurboModel {
             .unwrap_or(head_dim);
 
         let rope_style = detect_rope_style(&arch);
+
+        // Dump Gemma-relevant metadata
+        if arch.contains("gemma") {
+            for key in ["attention.value_length", "attention.sliding_window",
+                        "attention.query_pre_attn_scalar"] {
+                let full_key = format!("{arch}.{key}");
+                if let Some(val) = ct.get(&full_key) {
+                    eprintln!("  [gguf] {full_key} = {val:?}");
+                }
+            }
+        }
 
         // Auto-detect features from GGUF tensors
         let has_bias = ct.tensor(reader, "blk.0.attn_q.bias", device).is_ok();
