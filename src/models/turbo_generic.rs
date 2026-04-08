@@ -1031,12 +1031,6 @@ fn get_sparse_v_threshold() -> f32 {
 /// Fused attention: compute attention scores directly from compressed indices
 /// instead of decompressing keys first. Saves memory bandwidth on CPU.
 /// Set TQ_FUSED=1 to enable. Default: off (decompress path).
-/// TriAttention enabled (stub — full implementation on feature/triattention-mix)
-fn get_triattention_enabled() -> bool {
-    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *C.get_or_init(|| std::env::var("TQ_TRIATTN").ok().map(|v| v == "1").unwrap_or(false))
-}
-
 fn get_use_fused() -> bool {
     static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| std::env::var("TQ_FUSED").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false))

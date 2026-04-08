@@ -437,7 +437,6 @@ pub fn compute_rope_freqs(head_dim: usize, theta: f32) -> Vec<f32> {
     let n_pairs = head_dim / 2;
     (0..n_pairs).map(|f| 1.0 / theta.powf(2.0 * f as f32 / head_dim as f32)).collect()
 }
->>>>>>> 5d79b08 (TriAttention × TurboQuant mix: scoring engine + calibration + eviction infra)
 
 // ---------------------------------------------------------------------------
 // Per-head importance scoring
