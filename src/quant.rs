@@ -226,11 +226,120 @@ pub fn dequantize_bf16(data: &[u8], n_elements: usize) -> Vec<f32> {
 // ─── Dispatch ─────────────────────────────────────────────────
 
 /// Dequantize raw tensor data to f32 based on GGML dtype.
+// ─── Q4_0: 18 bytes → 32 f32 values ─────────────────────────
+// Block: [f16 d][u8 qs × 16] — each byte holds 2 nibbles (4-bit unsigned, offset by 8)
+
+pub fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 18; // 2 (f16 d) + 16 (4-bit × 32 / 2)
+    const BLOCK_NUMEL: usize = 32;
+    let n_blocks = n_elements / BLOCK_NUMEL;
+    let mut output = Vec::with_capacity(n_elements);
+
+    for b in 0..n_blocks {
+        let block = &data[b * BLOCK_SIZE..];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for j in 0..BLOCK_NUMEL / 2 {
+            let byte = block[2 + j];
+            let lo = (byte & 0x0F) as i32 - 8;
+            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
+            output.push(lo as f32 * d);
+            output.push(hi as f32 * d);
+        }
+    }
+    output
+}
+
+// ─── Q4_1: 20 bytes → 32 f32 values ─────────────────────────
+// Block: [f16 d][f16 m][u8 qs × 16] — 4-bit unsigned + min offset
+
+pub fn dequantize_q4_1(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 20; // 2 (f16 d) + 2 (f16 m) + 16
+    const BLOCK_NUMEL: usize = 32;
+    let n_blocks = n_elements / BLOCK_NUMEL;
+    let mut output = Vec::with_capacity(n_elements);
+
+    for b in 0..n_blocks {
+        let block = &data[b * BLOCK_SIZE..];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let m = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        for j in 0..BLOCK_NUMEL / 2 {
+            let byte = block[4 + j];
+            let lo = (byte & 0x0F) as f32;
+            let hi = ((byte >> 4) & 0x0F) as f32;
+            output.push(lo * d + m);
+            output.push(hi * d + m);
+        }
+    }
+    output
+}
+
+// ─── Q5_0: 22 bytes → 32 f32 values ─────────────────────────
+// Block: [f16 d][u32 qh][u8 qs × 16] — 4-bit nibbles + 1 high bit from qh
+
+pub fn dequantize_q5_0(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 22; // 2 (f16 d) + 4 (qh) + 16 (qs)
+    const BLOCK_NUMEL: usize = 32;
+    let n_blocks = n_elements / BLOCK_NUMEL;
+    let mut output = Vec::with_capacity(n_elements);
+
+    for b in 0..n_blocks {
+        let block = &data[b * BLOCK_SIZE..];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        for j in 0..BLOCK_NUMEL / 2 {
+            let byte = block[6 + j];
+            let lo4 = (byte & 0x0F) as i32;
+            let hi4 = ((byte >> 4) & 0x0F) as i32;
+            // 5th bit from qh bitmask
+            let lo5 = ((qh >> (j * 2)) & 1) as i32;
+            let hi5 = ((qh >> (j * 2 + 1)) & 1) as i32;
+            let lo = lo4 | (lo5 << 4);
+            let hi = hi4 | (hi5 << 4);
+            output.push((lo as f32 - 16.0) * d);
+            output.push((hi as f32 - 16.0) * d);
+        }
+    }
+    output
+}
+
+// ─── Q5_1: 24 bytes → 32 f32 values ─────────────────────────
+// Block: [f16 d][f16 m][u32 qh][u8 qs × 16] — 5-bit unsigned + min offset
+
+pub fn dequantize_q5_1(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 24; // 2 (d) + 2 (m) + 4 (qh) + 16 (qs)
+    const BLOCK_NUMEL: usize = 32;
+    let n_blocks = n_elements / BLOCK_NUMEL;
+    let mut output = Vec::with_capacity(n_elements);
+
+    for b in 0..n_blocks {
+        let block = &data[b * BLOCK_SIZE..];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let m = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        for j in 0..BLOCK_NUMEL / 2 {
+            let byte = block[8 + j];
+            let lo4 = (byte & 0x0F) as f32;
+            let hi4 = ((byte >> 4) & 0x0F) as f32;
+            let lo5 = ((qh >> (j * 2)) & 1) as f32;
+            let hi5 = ((qh >> (j * 2 + 1)) & 1) as f32;
+            let lo = lo4 + lo5 * 16.0;
+            let hi = hi4 + hi5 * 16.0;
+            output.push(lo * d + m);
+            output.push(hi * d + m);
+        }
+    }
+    output
+}
+
 pub fn dequantize(data: &[u8], dtype: GgmlDType, n_elements: usize) -> Vec<f32> {
     match dtype {
         GgmlDType::F32 => dequantize_f32(data, n_elements),
         GgmlDType::F16 => dequantize_f16(data, n_elements),
         GgmlDType::BF16 => dequantize_bf16(data, n_elements),
+        GgmlDType::Q4_0 => dequantize_q4_0(data, n_elements),
+        GgmlDType::Q4_1 => dequantize_q4_1(data, n_elements),
+        GgmlDType::Q5_0 => dequantize_q5_0(data, n_elements),
+        GgmlDType::Q5_1 => dequantize_q5_1(data, n_elements),
         GgmlDType::Q8_0 => dequantize_q8_0(data, n_elements),
         GgmlDType::Q4K => dequantize_q4k(data, n_elements),
         GgmlDType::Q5K => dequantize_q5k(data, n_elements),
