@@ -645,10 +645,18 @@ impl GenericTurboModel {
         }
 
         // ── CUDA Graph replay (layer loop only — norm+lm_head run eagerly after) ──
+        // Skip graph replay when seq_len > 256: fall through to eager mode
+        // so flash_decode can be used (split-KV parallelism for long context).
+        // Graph captures gqa_decode which is single-block — too slow past 256 tokens.
         #[cfg(feature = "cuda")]
         let mut graph_replayed = false;
         #[cfg(feature = "cuda")]
-        if seq_len == 1 && self.graph_manager.is_ready(1) {
+        let kv_len_for_graph = self.layers.first()
+            .and_then(|l| l.gpu_kv_cache.as_ref())
+            .map(|kv| kv.seq_len)
+            .unwrap_or(0);
+        #[cfg(feature = "cuda")]
+        if seq_len == 1 && self.graph_manager.is_ready(1) && kv_len_for_graph <= 256 {
             let reg = crate::cuda::kernels::global_registry().unwrap();
 
             // Update embedding into dedicated buffer (same GPU address as capture)

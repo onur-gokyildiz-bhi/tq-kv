@@ -916,11 +916,11 @@ pub(crate) fn compute_smooth_scales(
 
 /// Maximum sequence length for pre-allocated KV cache.
 /// Maximum pre-allocated KV cache sequence length (for graph-compatible padded attention).
-/// Configurable via TQ_MAX_SEQ env var. Default 128 is efficient for benchmarks.
+/// Configurable via TQ_MAX_SEQ env var. Default 2048 for practical inference.
 /// For production: set higher (e.g., 2048 or 4096).
 pub(crate) fn get_max_kv_seq() -> usize {
     pub(crate) static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *C.get_or_init(|| std::env::var("TQ_MAX_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(128))
+    *C.get_or_init(|| std::env::var("TQ_MAX_SEQ").ok().and_then(|v| v.parse().ok()).unwrap_or(2048))
 }
 
 /// Pre-allocated scratch buffers for zero-alloc decode (seq_len=1).
