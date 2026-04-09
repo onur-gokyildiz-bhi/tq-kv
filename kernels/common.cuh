@@ -36,6 +36,37 @@
   #define TQ_SMEM_MAX_KB 48       // Turing default (opt-in up to 96 KB)
 #endif
 
+// ─── Async copy helpers (sm_80+ / Ampere+) ────────────────────
+// cp.async bypasses registers: global → shared directly.
+// Frees register file for compute, enables load/compute overlap.
+#if TQ_HAS_CP_ASYNC
+
+// Async copy 4 bytes (one float) from global to shared memory
+__device__ __forceinline__ void tq_cp_async_f32(float* dst_shared, const float* src_global) {
+    uint32_t smem_addr = __cvta_generic_to_shared(dst_shared);
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :: "r"(smem_addr), "l"(src_global)
+    );
+}
+
+// Commit outstanding async copies as a pipeline group
+__device__ __forceinline__ void tq_cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// Wait for all committed groups to complete
+__device__ __forceinline__ void tq_cp_async_wait_all() {
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+// Wait until at most 1 group outstanding (for double-buffer overlap)
+__device__ __forceinline__ void tq_cp_async_wait_one() {
+    asm volatile("cp.async.wait_group 1;\n" ::);
+}
+
+#endif // TQ_HAS_CP_ASYNC
+
 // ─── Warp/block reduction helpers ─────────────────────────────
 
 // Warp-level reduce sum (warp shuffle)

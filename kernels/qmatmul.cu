@@ -56,8 +56,6 @@ extern "C" __global__ void q4km_matvec_f32(
     const int n_superblocks = (in_features + QK_K - 1) / QK_K;  // ceiling division
     const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
 
-    __shared__ float s_x[QK_K];
-
     const int grp = tid >> 6;
     const int pos = tid & 63;
     const int is_hi = pos >> 5;
@@ -66,16 +64,80 @@ extern "C" __global__ void q4km_matvec_f32(
 
     float sums[MATVEC_ROWS_PER_BLOCK] = {0.0f};
 
+#if TQ_HAS_CP_ASYNC
+    // ── Double-buffered x with async pipeline (sm_80+ / Ampere+) ──
+    // Prefetch next superblock's x while computing with current.
+    // cp.async bypasses registers: global → shared directly.
+    __shared__ float s_x[2][QK_K];
+    int cur_buf = 0;
+
+    // Pre-fetch first superblock
+    if (n_superblocks > 0) {
+        if (tid < in_features) {
+            tq_cp_async_f32(&s_x[0][tid], &x[tid]);
+        } else {
+            s_x[0][tid] = 0.0f;
+        }
+        tq_cp_async_commit();
+    }
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        // Wait for current buffer load to complete
+        tq_cp_async_wait_all();
+        __syncthreads();
+
+        // Start async prefetch of NEXT superblock into alternate buffer
+        if (sb + 1 < n_superblocks) {
+            const int next_pos = (sb + 1) * QK_K + tid;
+            if (next_pos < in_features) {
+                tq_cp_async_f32(&s_x[1 - cur_buf][tid], &x[next_pos]);
+            } else {
+                s_x[1 - cur_buf][tid] = 0.0f;
+            }
+            tq_cp_async_commit();
+        }
+
+        // Compute with current buffer (weight reads overlap with x prefetch)
+        float x_val = s_x[cur_buf][x_idx];
+
+        #pragma unroll
+        for (int r = 0; r < MATVEC_ROWS_PER_BLOCK; ++r) {
+            int row = base_row + r;
+            if (row >= out_features) break;
+
+            const uint8_t* block = W_packed + row * bytes_per_row + sb * Q4K_BLOCK_SIZE;
+
+            uint16_t d_bits  = block[0] | (block[1] << 8);
+            uint16_t dm_bits = block[2] | (block[3] << 8);
+            float d    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+            float dmin = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+            const uint8_t* scales = block + 4;
+            const uint8_t* qs = block + 16;
+
+            uint8_t sc_val, m_val;
+            get_scale_min_k4(2 * grp + is_hi, scales, &sc_val, &m_val);
+
+            uint8_t q_byte = qs[grp * 32 + l];
+            float nibble = is_hi ? (float)(q_byte >> 4) : (float)(q_byte & 0xF);
+            sums[r] += (d * (float)sc_val * nibble - dmin * (float)m_val) * x_val;
+        }
+
+        cur_buf = 1 - cur_buf;
+        __syncthreads();
+    }
+#else
+    // ── Synchronous x load (sm_75 / Turing fallback) ──
+    __shared__ float s_x[QK_K];
+
     for (int sb = 0; sb < n_superblocks; ++sb) {
         // Cooperative x load: 256 threads load 256 floats (ONCE for all rows)
-        // __ldg(): read-only cache — x is shared across all output rows
         const int x_pos = sb * QK_K + tid;
         s_x[tid] = (x_pos < in_features) ? __ldg(&x[x_pos]) : 0.0f;
         __syncthreads();
 
         float x_val = s_x[x_idx];
 
-        // Process each row: read weight, dequant, multiply with cached x
         #pragma unroll
         for (int r = 0; r < MATVEC_ROWS_PER_BLOCK; ++r) {
             int row = base_row + r;
@@ -101,6 +163,7 @@ extern "C" __global__ void q4km_matvec_f32(
 
         __syncthreads();
     }
+#endif
 
     // Reduce and write each row
     #pragma unroll
@@ -143,24 +206,45 @@ extern "C" __global__ void q6k_matvec_f32(
     const int n_superblocks = (in_features + QK_K - 1) / QK_K;
     const int bytes_per_row = n_superblocks * Q6K_BLOCK_SIZE;
 
-    __shared__ float s_x[QK_K];
-
     // Thread mapping: 256 threads → 256 positions in superblock
     const int grp = tid >> 7;        // 0 or 1 (which group of 128)
     const int pos = tid & 127;
     const int sub = pos >> 5;        // 0-3 (sub-block within group)
     const int l   = pos & 31;        // position within sub-block
     const int is  = l >> 4;          // 0 or 1 (scale pair index)
+    const int x_idx_q6 = grp * 128 + sub * 32 + l;
 
     float sums[MATVEC_ROWS_PER_BLOCK] = {0.0f};
 
+#if TQ_HAS_CP_ASYNC
+    // ── Double-buffered x with async pipeline (sm_80+) ──
+    __shared__ float s_x[2][QK_K];
+    int cur_buf = 0;
+
+    if (n_superblocks > 0) {
+        if (tid < in_features) {
+            tq_cp_async_f32(&s_x[0][tid], &x[tid]);
+        } else {
+            s_x[0][tid] = 0.0f;
+        }
+        tq_cp_async_commit();
+    }
+
     for (int sb = 0; sb < n_superblocks; ++sb) {
-        const int x_pos = sb * QK_K + tid;
-        s_x[tid] = (x_pos < in_features) ? __ldg(&x[x_pos]) : 0.0f;
+        tq_cp_async_wait_all();
         __syncthreads();
 
-        // x position: grp*128 + sub*32 + l
-        float x_val = s_x[grp * 128 + sub * 32 + l];
+        if (sb + 1 < n_superblocks) {
+            const int next_pos = (sb + 1) * QK_K + tid;
+            if (next_pos < in_features) {
+                tq_cp_async_f32(&s_x[1 - cur_buf][tid], &x[next_pos]);
+            } else {
+                s_x[1 - cur_buf][tid] = 0.0f;
+            }
+            tq_cp_async_commit();
+        }
+
+        float x_val = s_x[cur_buf][x_idx_q6];
 
         #pragma unroll
         for (int r = 0; r < MATVEC_ROWS_PER_BLOCK; ++r) {
@@ -177,15 +261,53 @@ extern "C" __global__ void q6k_matvec_f32(
             int qh_off = grp * 32;
             int sc_off = grp * 8;
 
-            // ql byte (sub 0,2 share one byte; sub 1,3 share another)
             uint8_t ql_byte = (sub & 1) ? ql[ql_off + l + 32] : ql[ql_off + l];
             int q_lo = (sub < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
 
-            // qh bits (all 4 subs share same qh byte, different bit pairs)
             uint8_t qh_byte = qh[qh_off + l];
             int qh_bits = (qh_byte >> (sub * 2)) & 3;
 
-            // 6-bit value + scale
+            int q = q_lo | (qh_bits << 4);
+            float sc = (float)scales[sc_off + sub * 2 + is];
+
+            sums[r] += d * sc * (float)(q - 32) * x_val;
+        }
+
+        cur_buf = 1 - cur_buf;
+        __syncthreads();
+    }
+#else
+    // ── Synchronous x load (sm_75 fallback) ──
+    __shared__ float s_x[QK_K];
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        const int x_pos = sb * QK_K + tid;
+        s_x[tid] = (x_pos < in_features) ? __ldg(&x[x_pos]) : 0.0f;
+        __syncthreads();
+
+        float x_val = s_x[x_idx_q6];
+
+        #pragma unroll
+        for (int r = 0; r < MATVEC_ROWS_PER_BLOCK; ++r) {
+            int row = base_row + r;
+            if (row >= out_features) break;
+
+            const uint8_t* block = W_packed + row * bytes_per_row + sb * Q6K_BLOCK_SIZE;
+            const uint8_t* ql = block;
+            const uint8_t* qh = block + 128;
+            const int8_t* scales = (const int8_t*)(block + 192);
+            float d = __half2float(*reinterpret_cast<const __half*>(block + 208));
+
+            int ql_off = grp * 64;
+            int qh_off = grp * 32;
+            int sc_off = grp * 8;
+
+            uint8_t ql_byte = (sub & 1) ? ql[ql_off + l + 32] : ql[ql_off + l];
+            int q_lo = (sub < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
+
+            uint8_t qh_byte = qh[qh_off + l];
+            int qh_bits = (qh_byte >> (sub * 2)) & 3;
+
             int q = q_lo | (qh_bits << 4);
             float sc = (float)scales[sc_off + sub * 2 + is];
 
@@ -194,6 +316,7 @@ extern "C" __global__ void q6k_matvec_f32(
 
         __syncthreads();
     }
+#endif
 
     #pragma unroll
     for (int r = 0; r < MATVEC_ROWS_PER_BLOCK; ++r) {
