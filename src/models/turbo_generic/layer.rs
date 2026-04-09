@@ -364,13 +364,27 @@ impl LayerWeights {
         let k = repeat_kv(k, n_rep)?;
         let v = repeat_kv(v, n_rep)?;
         let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-        let att = match mask {
-            None => att,
-            Some(mask) => {
-                let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
-                let mask4d = mask4d.broadcast_as(att.shape())?;
-                (att + mask4d)?
+        // Build causal mask from actual attention dimensions (handles batched verify
+        // where seq_len < total_kv_len due to existing KV cache).
+        let att = if seq_len > 1 {
+            let total_kv_len = att.dim(3)?;
+            let offset = total_kv_len - seq_len;
+            let mask_data: Vec<f32> = (0..seq_len)
+                .flat_map(|i| {
+                    let qpos = offset + i;
+                    (0..total_kv_len).map(move |j| if j <= qpos { 0.0f32 } else { -1e10f32 })
+                })
+                .collect();
+            let mut mask = Tensor::from_slice(&mask_data, vec![seq_len, total_kv_len], &Device::Cpu)?;
+            #[cfg(feature = "cuda")]
+            if att.is_cuda() {
+                if let Ok(gpu) = mask.to_device_auto() { mask = gpu; }
             }
+            let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
+            let mask4d = mask4d.broadcast_as(att.shape())?;
+            (att + mask4d)?
+        } else {
+            att
         };
         let att = softmax_last_dim(&att, backend)?;
         let y = att.matmul(&v.contiguous()?)?;
@@ -1840,21 +1854,26 @@ impl LayerWeights {
                 let k = repeat_kv(k, n_rep)?;
                 let v_for_attn = repeat_kv(v, n_rep)?;
 
-                // Standard attention for prefill (no candle flash attention dependency)
-                if false {
-                    // placeholder branch — flash attention will be re-added when custom CUDA kernels land
-                    unreachable!()
-                } else {
+                {
                     let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-                    let att = match mask {
-                        None => att,
-                        Some(mask) => {
-                            // Additive mask: 0 for valid, -1e10 for masked
-                            let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
-                            let mask4d = mask4d.broadcast_as(att.shape())?;
-                            (att + mask4d)?
+                    let att = if seq_len > 1 {
+                        let total_kv_len = att.dim(3)?;
+                        let offset = total_kv_len - seq_len;
+                        let mask_data: Vec<f32> = (0..seq_len)
+                            .flat_map(|i| {
+                                let qpos = offset + i;
+                                (0..total_kv_len).map(move |j| if j <= qpos { 0.0f32 } else { -1e10f32 })
+                            })
+                            .collect();
+                        let mut mask = Tensor::from_slice(&mask_data, vec![seq_len, total_kv_len], &Device::Cpu)?;
+                        #[cfg(feature = "cuda")]
+                        if att.is_cuda() {
+                            if let Ok(gpu) = mask.to_device_auto() { mask = gpu; }
                         }
-                    };
+                        let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
+                        let mask4d = mask4d.broadcast_as(att.shape())?;
+                        (att + mask4d)?
+                    } else { att };
                     let att = softmax_last_dim(&att, backend)?;
                     att.matmul(&v_for_attn.contiguous()?)?
                 }

@@ -530,8 +530,8 @@ impl Engine {
             }
 
             // ── Verify phase: run target model on [next_token, draft_tokens...] ──
-            // Sequential: one token at a time (batched verify needs non-square causal
-            // mask support which interacts poorly with per-layer KV cache lengths).
+            // Sequential verify: one token at a time. Batched verify needs the compressed
+            // attention path to support seq_len > 1 with existing cache (future work).
             let mut verify_tokens = vec![next_token];
             verify_tokens.extend_from_slice(&draft_tokens);
 
