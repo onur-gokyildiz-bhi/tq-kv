@@ -73,12 +73,33 @@ impl QMatMul {
                 if xs.is_cuda() {
                     let x_shape = xs.shape().to_vec();
                     let batch: usize = x_shape[..x_shape.len() - 1].iter().product();
-                    if batch == 1 && matches!(qw.dtype, crate::gguf::GgmlDType::Q4K | crate::gguf::GgmlDType::Q8_0) {
+                    if matches!(qw.dtype, crate::gguf::GgmlDType::Q4K | crate::gguf::GgmlDType::Q6K | crate::gguf::GgmlDType::Q8_0) {
                         let w_gpu = qw.gpu_cache_or_upload(
                             &crate::cuda::kernels::global_registry()
                                 .expect("no GPU registry").stream
                         );
-                        return xs.qmatmul_gpu(w_gpu, qw.dtype, qw.out_features(), qw.in_features());
+                        if batch == 1 {
+                            return xs.qmatmul_gpu(w_gpu, qw.dtype, qw.out_features(), qw.in_features());
+                        }
+                        // Small batch (spec decode verify): loop fused matvec per row.
+                        // Faster than streaming dequant + cuBLAS SGEMM for bandwidth-bound models.
+                        if batch <= 8 {
+                            let in_f = qw.in_features();
+                            let out_f = qw.out_features();
+                            // Flatten to [batch, in_f], matvec each row, reshape back
+                            let flat = xs.reshape(vec![batch, in_f])?;
+                            let mut rows = Vec::with_capacity(batch);
+                            for b in 0..batch {
+                                let row = flat.narrow(0, b, 1)?;
+                                let out = row.qmatmul_gpu(w_gpu, qw.dtype, out_f, in_f)?;
+                                rows.push(out);
+                            }
+                            let row_refs: Vec<&Tensor> = rows.iter().collect();
+                            let catted = Tensor::cat(&row_refs, 0)?; // [batch, out_f]
+                            let mut out_shape = x_shape[..x_shape.len() - 1].to_vec();
+                            out_shape.push(out_f);
+                            return catted.reshape(out_shape);
+                        }
                     }
                     return self.inner.forward(xs);
                 }

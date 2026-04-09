@@ -1763,6 +1763,10 @@ impl TqTensor {
                     super::kernels::q4km_matvec(reg, w_gpu, x, &mut out, out_features, in_features)
                         .map_err(|e| TqError::Msg(format!("q4km_matvec: {}", e)))?;
                 }
+                crate::gguf::GgmlDType::Q6K => {
+                    super::kernels::q6k_matvec(reg, w_gpu, x, &mut out, out_features, in_features)
+                        .map_err(|e| TqError::Msg(format!("q6k_matvec: {}", e)))?;
+                }
                 crate::gguf::GgmlDType::Q8_0 => {
                     super::kernels::q8_0_matvec(reg, w_gpu, x, &mut out, out_features, in_features)
                         .map_err(|e| TqError::Msg(format!("q8_0_matvec: {}", e)))?;

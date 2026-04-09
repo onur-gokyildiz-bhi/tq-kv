@@ -537,15 +537,12 @@ impl Engine {
 
             let vocab_size = target.tokenizer.get_vocab_size(false);
             let n_verify = verify_tokens.len();
-            let mut v_logits_flat = Vec::with_capacity(n_verify * vocab_size);
-            for (vi, &vt) in verify_tokens.iter().enumerate() {
-                let v_input = target.make_input(&[vt]).map_err(|e| anyhow::anyhow!("{}", e))?;
-                let v_logits = target.model.forward(&v_input, target.position + vi)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                let logits = extract_last_logits(&v_logits).map_err(|e| anyhow::anyhow!("{}", e))?;
-                let logit_vec = logits.to_vec1().map_err(|e| anyhow::anyhow!("{}", e))?;
-                v_logits_flat.extend_from_slice(&logit_vec);
-            }
+            // Batched verify: single forward pass for all K+1 tokens.
+            // Inline causal mask handles non-square attention (seq_len × cache+seq_len).
+            let v_input = target.make_input(&verify_tokens).map_err(|e| anyhow::anyhow!("{}", e))?;
+            let v_logits = target.model.forward(&v_input, target.position)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            let v_logits_flat = v_logits.to_vec1().map_err(|e| anyhow::anyhow!("{}", e))?;
 
             // ── Accept phase: find longest matching prefix ──
             // Position i in v_logits predicts token at position i+1.

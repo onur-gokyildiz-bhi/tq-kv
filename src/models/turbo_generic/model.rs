@@ -1540,7 +1540,13 @@ impl GenericTurboModel {
         }
 
         let x = self.norm.forward(&layer_in, backend)?;
-        let x = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?;
+        // For batched verify (seq_len > 1, index_pos > 0): keep ALL positions' logits.
+        // For normal prefill/decode: only last position (next-token prediction).
+        let x = if seq_len > 1 && index_pos > 0 {
+            x.reshape(vec![seq_len, x.shape()[2]])?  // [seq_len, hidden]
+        } else {
+            x.narrow(1, seq_len - 1, 1)?.squeeze(1)?  // [1, hidden]
+        };
         let _enter = self.span_output.enter();
         #[cfg(feature = "cuda")]
         let _t_lm = if profiling {
