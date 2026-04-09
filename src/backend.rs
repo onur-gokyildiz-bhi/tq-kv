@@ -81,6 +81,10 @@ pub trait ComputeBackend: Send + Sync {
     /// Backend name for diagnostics.
     fn name(&self) -> &'static str;
 
+    /// Whether this backend has GPU acceleration available.
+    /// Used by model code to choose GPU-resident tensor paths vs CPU fallback.
+    fn is_gpu(&self) -> bool { false }
+
     /// Pre-upload a quantized weight to GPU (if applicable). No-op on CPU.
     fn warmup_qweight(&self, _weight: &QWeight) {}
 
@@ -544,6 +548,8 @@ impl ComputeBackend for CudaBackend {
     fn name(&self) -> &'static str {
         "cuda"
     }
+
+    fn is_gpu(&self) -> bool { true }
 
     fn warmup_qweight(&self, weight: &QWeight) {
         // Upload raw quantized bytes to GPU cache

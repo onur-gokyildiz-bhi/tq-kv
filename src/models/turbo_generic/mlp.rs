@@ -35,11 +35,12 @@ impl QMatMul {
     pub(crate) fn warmup(&self, backend: &dyn ComputeBackend) {
         match &self.inner {
             qmm::QMatMul::Quantized(qw) => {
-                #[cfg(feature = "cuda")]
-                if crate::cuda::kernels::global_registry().is_some() {
+                if backend.is_gpu() {
+                    // GPU available: upload raw quantized bytes, skip CPU f32 dequant
                     backend.warmup_qweight(qw);
                     return;
                 }
+                // CPU-only: dequant to f32 for SGEMM fallback
                 qw.warmup_cpu();
                 backend.warmup_qweight(qw);
             }

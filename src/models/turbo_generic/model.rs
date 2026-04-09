@@ -532,7 +532,7 @@ impl GenericTurboModel {
         // Upload persistent tensors to GPU (norm weights, cos/sin, biases).
         // Full broadcast GPU support enables this (stride-based kernels).
         #[cfg(feature = "cuda")]
-        if crate::cuda::kernels::global_registry().is_some() {
+        if b.is_gpu() {
             if let Ok(gpu) = model.norm.weight.to_device_auto() { model.norm.weight = gpu; }
             for layer in &mut model.layers {
                 if let Ok(gpu) = layer.cos.to_device_auto() { layer.cos = gpu; }
@@ -729,7 +729,7 @@ impl GenericTurboModel {
         // Phase 3: Upload embedding to GPU for GPU-resident forward pass.
         // All subsequent ops auto-dispatch to GPU when tensor is CUDA.
         #[cfg(feature = "cuda")]
-        if crate::cuda::kernels::global_registry().is_some() {
+        if backend.is_gpu() {
             if let Ok(gpu_tensor) = layer_in.to_device_auto() {
                 layer_in = gpu_tensor;
             }
