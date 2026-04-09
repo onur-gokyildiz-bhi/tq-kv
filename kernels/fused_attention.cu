@@ -15,7 +15,7 @@
 //      c. Compute: score = sum(rotated_q[d] * centroid[idx[d]] * sigma)
 //   3. Output raw attention scores (softmax applied separately)
 
-#include "common_v2.cuh"
+#include "common.cuh"
 
 #define MAX_CENTROIDS 16  // 4-bit = 16 centroids
 #define MAX_HEAD_DIM 256

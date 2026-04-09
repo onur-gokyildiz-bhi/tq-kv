@@ -7,7 +7,7 @@
 // For single-request decode, CPU sampling is fine.
 // This kernel matters for batched serving (continuous batching).
 
-#include "common_v2.cuh"
+#include "common.cuh"
 
 // ─── Argmax (greedy) ─────────────────────────────────────────
 // Find the index of the maximum value. One block per row.

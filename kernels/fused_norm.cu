@@ -6,7 +6,7 @@
 // All use FP32 variance computation for numerical stability.
 // Reference: rvLLM achieves 5.1x with fused Add+RMSNorm+GEMV
 
-#include "common_v2.cuh"
+#include "common.cuh"
 
 // ─── RMSNorm Standalone ───────────────────────────────────────
 // output[i] = (x[i] / rms) * weight[i]

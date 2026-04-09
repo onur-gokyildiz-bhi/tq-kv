@@ -3,7 +3,7 @@
 // These enable tensors to stay on GPU between compute kernels,
 // eliminating the CPU↔GPU transfer bottleneck.
 
-#include "common_v2.cuh"
+#include "common.cuh"
 
 // ─── Strided Copy (Narrow, Transpose) ────────────────────────
 // Generic gather: output[i] = input[compute_src_offset(i)]

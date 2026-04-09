@@ -14,7 +14,7 @@
 // Block: 256 threads
 // Each thread scores ceil(n_keys / blockDim.x) keys.
 
-#include "common_v2.cuh"
+#include "common.cuh"
 
 #define MAX_HEAD_DIM 256
 #define MAX_OFFSETS 17  // {2^0, 2^1, ..., 2^16}

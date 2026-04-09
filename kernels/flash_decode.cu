@@ -12,7 +12,7 @@
 //
 // Reference: Dao et al. "Flash-Decoding for long-context inference" (2023)
 
-#include "common_v2.cuh"
+#include "common.cuh"
 
 #define HEAD_DIM_MAX 256
 #define WARP_SIZE 32

@@ -3,7 +3,7 @@
 // Standalone versions for when fusion is not applicable.
 // Vectorized float4 loads where possible for 4x fewer memory transactions.
 
-#include "common_v2.cuh"
+#include "common.cuh"
 #include <cuda_fp16.h>
 
 // ─── SiLU (x * sigmoid(x)) ──────────────────────────────────
