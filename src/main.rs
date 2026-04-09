@@ -251,6 +251,78 @@ fn resolve_tq_config(turbo_quant: bool, tq_bits: u8) -> Option<tq_kv::TurboQuant
     resolve_tq_config_for_model(turbo_quant, tq_bits, None)
 }
 
+/// Auto-calibrate a model on first TQ use. Runs a quick prefill (~10s) to collect
+/// key vector statistics, computes calibration data, and saves for future runs.
+fn auto_calibrate(model_name: &str, force_cpu: bool) -> Result<calibrate::CalibrationData> {
+    let t0 = std::time::Instant::now();
+
+    let (gguf_path, tokenizer_path) = hub::resolve(model_name)?;
+    let tok_path = tokenizer_path.ok_or_else(|| anyhow::anyhow!("No tokenizer for '{}'", model_name))?;
+    let mf = gguf_path.to_string_lossy().to_string();
+    let arch = config::detect_arch(&mf);
+
+    // Determine head_dim from GGUF
+    let head_dim = {
+        let mut file = std::fs::File::open(&gguf_path)?;
+        let content = crate::gguf::GgufContent::read(&mut file)
+            .map_err(|e| anyhow::anyhow!("GGUF read: {}", e))?;
+        // Find embedding_length key regardless of architecture prefix
+        let n_embd = content.metadata.iter()
+            .find(|(k, _)| k.ends_with(".embedding_length"))
+            .and_then(|(_, v)| v.to_u32().ok())
+            .unwrap_or(4096) as usize;
+        let n_head = content.metadata.iter()
+            .find(|(k, _)| k.ends_with(".attention.head_count"))
+            .and_then(|(_, v)| v.to_u32().ok())
+            .unwrap_or(32) as usize;
+        n_embd / n_head
+    };
+
+    // Initialize collector (256 samples for quick calibration)
+    let collector = calibrate::init_collector(head_dim, 256);
+
+    // Default calibration text (Eiffel Tower passage — diverse vocabulary)
+    let cal_text = "The tower is 324 metres tall, about the same height as an 81-storey building, \
+         and the tallest structure in Paris. Its base is square, measuring 125 metres on \
+         each side. During its construction, the Eiffel Tower surpassed the Washington \
+         Monument to become the tallest human-made structure in the world, a title it held \
+         for 41 years until the Chrysler Building in New York City was finished in 1930.";
+
+    // Load model without TQ (skip all compression)
+    std::env::set_var("TQ_SKIP", "999");
+    let tq_stub = tq_kv::TurboQuantConfig { bits: 4, ..Default::default() };
+    let mut engine = Engine::load_with_device(&gguf_path, &tok_path, arch, Some(tq_stub), force_cpu)?;
+    std::env::remove_var("TQ_SKIP");
+
+    // Run prefill
+    let params = engine::GenerationParams { max_tokens: 1, temperature: 0.0, ..Default::default() };
+    let _ = engine.generate_silent(cal_text, &params);
+    drop(engine); // free memory before loading again
+
+    // Compute calibration
+    let c = collector.lock().map_err(|e| anyhow::anyhow!("Collector lock: {}", e))?;
+    if c.count < 50 {
+        anyhow::bail!("Too few samples ({}) — auto-calibrate needs at least 50", c.count);
+    }
+    let cal_data = calibrate::compute_calibration(&c, model_name, tq_kv::TurboQuantConfig::default().rotation_seed);
+
+    // Save
+    let (name, tag) = if let Some(e) = crate::catalog::find(model_name) {
+        (e.name.to_string(), e.tag.to_string())
+    } else if let Some((n, t)) = model_name.split_once(':') {
+        (n.to_string(), t.to_string())
+    } else {
+        (model_name.to_string(), "default".to_string())
+    };
+    let path = calibrate::calibration_path(&name, &tag);
+    calibrate::save_calibration(&cal_data, &path)?;
+
+    eprintln!("  Auto-calibrate done: {} samples, {:.1}s → {}",
+        c.count, t0.elapsed().as_secs_f64(), path.display());
+
+    Ok(cal_data)
+}
+
 fn resolve_tq_config_for_model(turbo_quant: bool, tq_bits: u8, model_name: Option<&str>) -> Option<tq_kv::TurboQuantConfig> {
     if turbo_quant {
         let mut config = match tq_bits {
@@ -280,10 +352,23 @@ fn resolve_tq_config_for_model(turbo_quant: bool, tq_bits: u8, model_name: Optio
         let no_cal = std::env::var("TQ_NO_CAL").ok().map_or(false, |v| v == "1");
         if !no_cal {
             if let Some(name) = model_name {
-                if let Some(cal_data) = calibrate::load_calibration_for_model(name) {
-                    eprintln!("Using calibrated codebook + rotation + channel scales");
+                let cal_data = calibrate::load_calibration_for_model(name)
+                    .or_else(|| {
+                        // No calibration found — run auto-calibrate
+                        let no_auto = std::env::var("TQ_NO_AUTO_CAL").ok().map_or(false, |v| v == "1");
+                        if no_auto { return None; }
+                        eprintln!("No calibration found for '{}' — running auto-calibrate...", name);
+                        match auto_calibrate(name, false) {
+                            Ok(cal) => Some(cal),
+                            Err(e) => {
+                                eprintln!("  Auto-calibrate failed: {} — continuing without calibration", e);
+                                None
+                            }
+                        }
+                    });
+                if let Some(cal_data) = cal_data {
+                    eprintln!("Using calibrated channel bias + per-head bits");
                     cal_data.apply_to_config(&mut config);
-                    // TriAttention: load config from calibration if TQ_TRIATTN=1
                     if std::env::var("TQ_TRIATTN").ok().map_or(false, |v| v == "1") {
                         calibrate::init_triattention(&cal_data, cal_data.head_dim);
                     }
