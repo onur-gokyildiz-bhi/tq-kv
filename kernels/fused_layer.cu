@@ -8,7 +8,7 @@
 // Kernel 3: fused_addnorm_q4km_gateup_silu — residual add + RmsNorm + gate/up + SiLU*mul
 // Kernel 4: fused_q4km_down_residual — down projection + residual add
 
-#include "common.cuh"
+#include "common_v2.cuh"
 #include <cuda_fp16.h>
 
 // Q4_K_M constants (from qmatmul.cu)

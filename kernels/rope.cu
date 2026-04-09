@@ -7,7 +7,7 @@
 // Fused with QKV split when possible (saves one kernel launch).
 // Supports position offset for continuous batching.
 
-#include "common.cuh"
+#include "common_v2.cuh"
 #include <math.h>
 
 // ─── Halved RoPE ─────────────────────────────────────────────

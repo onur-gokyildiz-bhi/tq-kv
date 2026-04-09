@@ -7,7 +7,7 @@
 // Used in the decompress path when fused attention is not applicable
 // (Pre-RoPE mode, compaction active, GPU).
 
-#include "common.cuh"
+#include "common_v2.cuh"
 
 #define MAX_DIM 256
 

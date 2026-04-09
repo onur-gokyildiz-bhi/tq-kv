@@ -4,7 +4,7 @@
 //
 // SwiGLU = SiLU(gate) * up, used in Llama/Qwen/Mistral MLP blocks.
 
-#include "common.cuh"
+#include "common_v2.cuh"
 
 // ─── Fused SiLU × Mul (SwiGLU) ───────────────────────────────
 // output[i] = silu(gate[i]) * up[i]

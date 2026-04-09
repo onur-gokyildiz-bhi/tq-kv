@@ -8,7 +8,7 @@
 //   1. 4-bit compressed V (absmax quantized)
 //   2. 8-bit compressed V (absmax quantized)
 
-#include "common.cuh"
+#include "common_v2.cuh"
 
 // ─── Sparse V Accumulate from 4-bit Compressed ───────────────
 // output[d] = sum_i( attn[i] * decompress_4bit(v_packed, i, d) )

@@ -7,7 +7,7 @@
 // Uses Milakov & Gimelshein (2018) online algorithm:
 //   Single pass: maintain running max and sum-of-exp.
 
-#include "common.cuh"
+#include "common_v2.cuh"
 
 // ─── Softmax Last Dim ─────────────────────────────────────────
 // input:  [n_rows, n_cols]

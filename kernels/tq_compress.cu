@@ -9,7 +9,7 @@
 //   TurboQuant (ICLR 2026): Lloyd-Max codebook on Hadamard-rotated keys
 //   tq-kv 3-Fix: sink tokens + POQ + cache reset
 
-#include "common.cuh"
+#include "common_v2.cuh"
 
 #define MAX_DIM 256
 #define MAX_CENTROIDS 16  // 4-bit
