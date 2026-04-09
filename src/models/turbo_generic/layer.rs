@@ -146,39 +146,47 @@ impl LayerWeights {
         }
     }
 
-    pub(crate) fn forward_attn(
-        &mut self,
+    /// Compute QKV projections, apply biases, reshape to head layout, SmoothAttention,
+    /// calibration hooks, and RoPE. Returns all intermediates needed by attention paths.
+    #[allow(clippy::type_complexity)]
+    fn compute_qkv_and_rope(
+        &self,
         x: &Tensor,
         pre_qkv: Option<(Tensor, Tensor, Tensor)>,
-        mask: Option<&Tensor>,
         index_pos: usize,
         backend: &dyn ComputeBackend,
-    ) -> Result<Tensor> {
-        let _enter = self.span_attn.enter();
+    ) -> Result<(
+        Tensor, Tensor, Tensor,     // q, k, v (post-RoPE)
+        Option<Tensor>,             // k_pre_rope (for TQ/TriAttention)
+        bool,                       // pre_rope_mode
+        bool,                       // tri_enabled
+        Option<u8>,                 // layer_bits
+        usize,                      // n_rep
+        usize,                      // b_sz
+        usize,                      // seq_len
+    )> {
         let (b_sz, seq_len, _n_embd) = x.dims3()?;
         let used_fused_qkv = pre_qkv.is_some();
         let (mut q, mut k, mut v) = if let Some(qkv) = pre_qkv {
             qkv
         } else {
             match &self.qkv {
-            QkvWeights::Separate { wq, wk, wv } => {
-                (wq.forward(x, backend)?, wk.forward(x, backend)?, wv.forward(x, backend)?)
+                QkvWeights::Separate { wq, wk, wv } => {
+                    (wq.forward(x, backend)?, wk.forward(x, backend)?, wv.forward(x, backend)?)
+                }
+                QkvWeights::Merged { wqkv } => {
+                    let qkv = wqkv.forward(x, backend)?;
+                    let q_size = self.n_head * self.head_dim;
+                    let kv_size = self.n_kv_head * self.head_dim;
+                    let q = qkv.narrow(2, 0, q_size)?;
+                    let k = qkv.narrow(2, q_size, kv_size)?;
+                    let v = qkv.narrow(2, q_size + kv_size, kv_size)?;
+                    (q, k, v)
+                }
             }
-            QkvWeights::Merged { wqkv } => {
-                let qkv = wqkv.forward(x, backend)?;
-                let q_size = self.n_head * self.head_dim;
-                let kv_size = self.n_kv_head * self.head_dim;
-                let q = qkv.narrow(2, 0, q_size)?;
-                let k = qkv.narrow(2, q_size, kv_size)?;
-                let v = qkv.narrow(2, q_size + kv_size, kv_size)?;
-                (q, k, v)
-            }
-        }
-        }; // end if let Some(qkv) / else
+        };
 
         // Calibration hook: collect RAW key vectors (before attention bias, before RoPE).
-        // These have consistent per-channel statistics — no positional or bias contamination.
-        // Ideal for computing per-channel bias and scale calibration.
         if crate::calibrate::CALIBRATION_COLLECTOR.get().is_some() {
             let k_for_cal = k.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?
                 .transpose(1, 2)?.contiguous()?;
@@ -188,7 +196,6 @@ impl LayerWeights {
         }
 
         // Apply biases if present (Qwen2 has them, Llama/Phi/Gemma don't).
-        // Skip if pre_qkv was provided — fused kernel already includes bias.
         if !used_fused_qkv {
             if let Some(bq) = &self.attention_bq {
                 q = q.broadcast_add(bq)?;
@@ -205,7 +212,6 @@ impl LayerWeights {
         let v = v.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?.transpose(1, 2)?.contiguous()?;
 
         // SmoothAttention: migrate K outliers to Q BEFORE RoPE.
-        // K *= 1/sqrt(s), Q *= sqrt(s). Invariance: (Q*sqrt(s)) * (K/sqrt(s))^T = Q * K^T
         let (q, k) = if let (Some(ref q_scales), Some(ref k_scales)) = (&self.smooth_q_scales, &self.smooth_k_scales) {
             (q.broadcast_mul(q_scales)?, k.broadcast_mul(k_scales)?)
         } else {
@@ -213,7 +219,6 @@ impl LayerWeights {
         };
 
         // TriAttention calibration: collect pre-RoPE Q and K for center statistics.
-        // Must happen BEFORE RoPE — pre-RoPE vectors have position-independent stats.
         if crate::calibrate::CALIBRATION_COLLECTOR.get().is_some() {
             if let (Ok(q_f32), Ok(k_f32)) = (
                 q.to_dtype(DType::F32).and_then(|t| t.flatten_all()?.to_vec1()),
@@ -226,7 +231,6 @@ impl LayerWeights {
         }
 
         // Pre-RoPE quantization: save k BEFORE RoPE for compression.
-        // Pre-RoPE keys have position-independent per-channel stats → better quantization.
         let pre_rope_mode = self.tq_config.pre_rope || get_pre_rope();
         let tri_enabled = get_triattention_enabled();
         let k_pre_rope = if pre_rope_mode || tri_enabled { Some(k.clone()) } else { None };
@@ -234,11 +238,160 @@ impl LayerWeights {
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
-        // Selective compression: first TQ_SKIP_FIRST_LAYERS use standard fp16 KV cache,
-        // remaining layers use TurboQuant compression.
         let layer_bits = get_layer_bits(self.layer_idx, self.tq_config.bits, &self.tq_config, self.n_layers);
-        let use_compression = layer_bits.is_some();
         let n_rep = self.n_head / self.n_kv_head;
+
+        Ok((q, k, v, k_pre_rope, pre_rope_mode, tri_enabled, layer_bits, n_rep, b_sz, seq_len))
+    }
+
+    /// Uncompressed attention path: standard fp16 KV cache (first N layers).
+    /// GPU path uses pre-allocated GpuKvCache, CPU path uses Tensor::cat.
+    fn uncompressed_attention(
+        &mut self,
+        q: &Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+        n_rep: usize,
+        b_sz: usize,
+        seq_len: usize,
+        backend: &dyn ComputeBackend,
+    ) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        let gpu_kv_disabled = {
+            static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *C.get_or_init(|| std::env::var("TQ_NO_GPU_KV").map(|v| v == "1").unwrap_or(false))
+        };
+        #[cfg(feature = "cuda")]
+        if k.is_cuda() && seq_len == 1 && !gpu_kv_disabled {
+            // Initialize GPU KV cache on first decode step
+            if self.gpu_kv_cache.is_none() {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    match GpuKvCache::new(reg.stream.clone(), self.n_kv_head, self.head_dim, get_max_kv_seq()) {
+                        Ok(mut cache) => {
+                            if let Some((prev_k, prev_v)) = &self.kv_cache {
+                                let prefill_len = prev_k.shape()[2];
+                                let gk = if prev_k.is_cuda() { prev_k.clone() } else {
+                                    prev_k.to_device_auto().unwrap_or_else(|_| prev_k.clone())
+                                };
+                                let gv = if prev_v.is_cuda() { prev_v.clone() } else {
+                                    prev_v.to_device_auto().unwrap_or_else(|_| prev_v.clone())
+                                };
+                                if gk.is_cuda() && gv.is_cuda() {
+                                    if let Err(e) = cache.append(&gk, &gv, prefill_len) {
+                                        eprintln!("[gpu-kv] L{}: seed failed: {}", self.layer_idx, e);
+                                    }
+                                }
+                            }
+                            self.gpu_kv_cache = Some(cache);
+                        }
+                        Err(e) => eprintln!("[gpu-kv] L{}: alloc failed: {}", self.layer_idx, e),
+                    }
+                }
+            }
+            if let Some(ref mut gpu_kv) = self.gpu_kv_cache {
+                if index_pos == 0 {
+                    gpu_kv.reset();
+                }
+                gpu_kv.append(&k, &v, seq_len)?;
+
+                let k_full = gpu_kv.k_tensor();
+                let v_full = gpu_kv.v_tensor();
+                let kv_mask = gpu_kv.mask_tensor();
+
+                let k_full = repeat_kv(k_full, n_rep)?;
+                let v_full = repeat_kv(v_full, n_rep)?;
+
+                let att = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+                let att = if let Some(cap) = self.attn_logit_softcap {
+                    apply_softcap(&att, cap)?
+                } else { att };
+                let kv_mask = kv_mask.broadcast_as(att.shape())?;
+                let att = (att + kv_mask)?;
+
+                let gpu_debug = {
+                    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    *C.get_or_init(|| std::env::var("TQ_GPU_DEBUG").map(|v| v == "1").unwrap_or(false))
+                };
+                if gpu_debug && self.layer_idx < 2 {
+                    if let Ok(scores) = att.to_vec1() {
+                        let max_seq_show = gpu_kv.seq_len.min(10);
+                        let head0_scores: Vec<f32> = scores[..max_seq_show].to_vec();
+                        eprintln!("[gpu-debug] L{} GpuKV att-pre-softmax head0[..{}]: {:?}",
+                            self.layer_idx, max_seq_show, head0_scores);
+                        let n_pad = scores.len() / self.n_head;
+                        let n_masked = scores[gpu_kv.seq_len..n_pad].iter()
+                            .filter(|&&v| v < -1e9).count();
+                        eprintln!("[gpu-debug] L{} GpuKV valid={} max_seq={} masked_positions={}",
+                            self.layer_idx, gpu_kv.seq_len, gpu_kv.max_seq, n_masked);
+                    }
+                }
+
+                let att = softmax_last_dim(&att, backend)?;
+
+                if gpu_debug && self.layer_idx < 2 {
+                    if let Ok(weights) = att.to_vec1() {
+                        let max_seq_show = gpu_kv.seq_len.min(10);
+                        let head0_weights: Vec<f32> = weights[..max_seq_show].to_vec();
+                        let head0_sum: f32 = weights[..gpu_kv.max_seq].iter().sum();
+                        eprintln!("[gpu-debug] L{} GpuKV att-post-softmax head0[..{}]: {:?} sum={:.6}",
+                            self.layer_idx, max_seq_show, head0_weights, head0_sum);
+                    }
+                }
+
+                let y = att.matmul(&v_full.contiguous()?)?;
+                let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+                return self.attention_wo.forward(&y, backend);
+            }
+        }
+
+        // CPU fallback / prefill: original cat()-based KV cache
+        let (k, v) = match &self.kv_cache {
+            None => (k, v),
+            Some((prev_k, prev_v)) => {
+                if index_pos == 0 {
+                    (k, v)
+                } else {
+                    let k = Tensor::cat(&[prev_k, &k], 2)?;
+                    let v = Tensor::cat(&[prev_v, &v], 2)?;
+                    (k, v)
+                }
+            }
+        };
+        self.kv_cache = Some((k.clone(), v.clone()));
+
+        let k = repeat_kv(k, n_rep)?;
+        let v = repeat_kv(v, n_rep)?;
+        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+        let att = match mask {
+            None => att,
+            Some(mask) => {
+                let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
+                let mask4d = mask4d.broadcast_as(att.shape())?;
+                (att + mask4d)?
+            }
+        };
+        let att = softmax_last_dim(&att, backend)?;
+        let y = att.matmul(&v.contiguous()?)?;
+
+        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        self.attention_wo.forward(&y, backend)
+    }
+
+    pub(crate) fn forward_attn(
+        &mut self,
+        x: &Tensor,
+        pre_qkv: Option<(Tensor, Tensor, Tensor)>,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+        backend: &dyn ComputeBackend,
+    ) -> Result<Tensor> {
+        let span = self.span_attn.clone();
+        let _enter = span.enter();
+        let (q, k, v, k_pre_rope, pre_rope_mode, tri_enabled, layer_bits, n_rep, b_sz, seq_len) =
+            self.compute_qkv_and_rope(x, pre_qkv, index_pos, backend)?;
+        let use_compression = layer_bits.is_some();
 
         if use_compression {
             // Apply per-layer bit width if different from default
@@ -1710,138 +1863,8 @@ impl LayerWeights {
             let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
             self.attention_wo.forward(&y, backend)
         } else {
-            // UNCOMPRESSED PATH: standard fp16 KV cache (first N layers)
-            //
-            // GPU path: pre-allocated GpuKvCache with in-place append + narrow.
-            //   Eliminates Tensor::cat (which copies entire history per step).
-            //   Uses narrow() for exact-length attention (no padding waste).
-            // CPU path: Tensor::cat fallback.
-            #[cfg(feature = "cuda")]
-            let gpu_kv_disabled = {
-                static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *C.get_or_init(|| std::env::var("TQ_NO_GPU_KV").map(|v| v == "1").unwrap_or(false))
-            };
-            #[cfg(feature = "cuda")]
-            if k.is_cuda() && seq_len == 1 && !gpu_kv_disabled {
-                // Initialize GPU KV cache on first decode step
-                if self.gpu_kv_cache.is_none() {
-                    if let Some(reg) = crate::cuda::kernels::global_registry() {
-                        match GpuKvCache::new(reg.stream.clone(), self.n_kv_head, self.head_dim, get_max_kv_seq()) {
-                            Ok(mut cache) => {
-                                // Seed with prefill KV data from the CPU-path kv_cache
-                                if let Some((prev_k, prev_v)) = &self.kv_cache {
-                                    let prefill_len = prev_k.shape()[2];
-                                    let gk = if prev_k.is_cuda() { prev_k.clone() } else {
-                                        prev_k.to_device_auto().unwrap_or_else(|_| prev_k.clone())
-                                    };
-                                    let gv = if prev_v.is_cuda() { prev_v.clone() } else {
-                                        prev_v.to_device_auto().unwrap_or_else(|_| prev_v.clone())
-                                    };
-                                    if gk.is_cuda() && gv.is_cuda() {
-                                        if let Err(e) = cache.append(&gk, &gv, prefill_len) {
-                                            eprintln!("[gpu-kv] L{}: seed failed: {}", self.layer_idx, e);
-                                        }
-                                    }
-                                }
-                                self.gpu_kv_cache = Some(cache);
-                            }
-                            Err(e) => eprintln!("[gpu-kv] L{}: alloc failed: {}", self.layer_idx, e),
-                        }
-                    }
-                }
-                if let Some(ref mut gpu_kv) = self.gpu_kv_cache {
-                    if index_pos == 0 {
-                        gpu_kv.reset();
-                    }
-                    // Append new K/V to pre-allocated buffers (in-place, zero-copy)
-                    gpu_kv.append(&k, &v, seq_len)?;
-
-                    // Padded attention with mask (cuBLAS matmul is faster than custom kernel).
-                    let k_full = gpu_kv.k_tensor();
-                    let v_full = gpu_kv.v_tensor();
-                    let kv_mask = gpu_kv.mask_tensor();
-
-                    let k_full = repeat_kv(k_full, n_rep)?;
-                    let v_full = repeat_kv(v_full, n_rep)?;
-
-                    let att = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
-                    let att = if let Some(cap) = self.attn_logit_softcap {
-                        apply_softcap(&att, cap)?
-                    } else { att };
-                    let kv_mask = kv_mask.broadcast_as(att.shape())?;
-                    let att = (att + kv_mask)?;
-
-                    let gpu_debug = {
-                        static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        *C.get_or_init(|| std::env::var("TQ_GPU_DEBUG").map(|v| v == "1").unwrap_or(false))
-                    };
-                    if gpu_debug && self.layer_idx < 2 {
-                        if let Ok(scores) = att.to_vec1() {
-                            let max_seq_show = gpu_kv.seq_len.min(10);
-                            let head0_scores: Vec<f32> = scores[..max_seq_show].to_vec();
-                            eprintln!("[gpu-debug] L{} GpuKV att-pre-softmax head0[..{}]: {:?}",
-                                self.layer_idx, max_seq_show, head0_scores);
-                            // Show mask values too
-                            let n_pad = scores.len() / self.n_head; // max_seq
-                            let n_masked = scores[gpu_kv.seq_len..n_pad].iter()
-                                .filter(|&&v| v < -1e9).count();
-                            eprintln!("[gpu-debug] L{} GpuKV valid={} max_seq={} masked_positions={}",
-                                self.layer_idx, gpu_kv.seq_len, gpu_kv.max_seq, n_masked);
-                        }
-                    }
-
-                    let att = softmax_last_dim(&att, backend)?;
-
-                    // Debug: attention weights after softmax (head 0)
-                    if gpu_debug && self.layer_idx < 2 {
-                        if let Ok(weights) = att.to_vec1() {
-                            let max_seq_show = gpu_kv.seq_len.min(10);
-                            let head0_weights: Vec<f32> = weights[..max_seq_show].to_vec();
-                            let head0_sum: f32 = weights[..gpu_kv.max_seq].iter().sum();
-                            eprintln!("[gpu-debug] L{} GpuKV att-post-softmax head0[..{}]: {:?} sum={:.6}",
-                                self.layer_idx, max_seq_show, head0_weights, head0_sum);
-                        }
-                    }
-
-                    let y = att.matmul(&v_full.contiguous()?)?;
-
-                    let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
-                    return self.attention_wo.forward(&y, backend);
-                }
-            }
-
-            // CPU fallback / prefill: original cat()-based KV cache
-            let (k, v) = match &self.kv_cache {
-                None => (k, v),
-                Some((prev_k, prev_v)) => {
-                    if index_pos == 0 {
-                        (k, v)
-                    } else {
-                        let k = Tensor::cat(&[prev_k, &k], 2)?;
-                        let v = Tensor::cat(&[prev_v, &v], 2)?;
-                        (k, v)
-                    }
-                }
-            };
-            self.kv_cache = Some((k.clone(), v.clone()));
-
-            let k = repeat_kv(k, n_rep)?;
-            let v = repeat_kv(v, n_rep)?;
-            let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-            let att = match mask {
-                None => att,
-                Some(mask) => {
-                    // Additive mask: 0 for valid, -1e10 for masked
-                    let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
-                    let mask4d = mask4d.broadcast_as(att.shape())?;
-                    (att + mask4d)?
-                }
-            };
-            let att = softmax_last_dim(&att, backend)?;
-            let y = att.matmul(&v.contiguous()?)?;
-
-            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
-            self.attention_wo.forward(&y, backend)
+            // UNCOMPRESSED PATH: delegate to helper
+            self.uncompressed_attention(&q, k, v, mask, index_pos, n_rep, b_sz, seq_len, backend)
         }
     }
 }
