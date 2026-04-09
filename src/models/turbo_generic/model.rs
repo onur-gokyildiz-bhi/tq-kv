@@ -29,7 +29,8 @@ pub struct GenericTurboModel {
     pub(crate) layers: Vec<LayerWeights>,
     pub(crate) norm: RmsNorm,
     pub(crate) output: QMatMul,
-    pub(crate) masks: HashMap<usize, Tensor>,
+    pub(crate) masks: HashMap<usize, Tensor>,  // legacy (unused after rect migration)
+    pub(crate) masks_rect: HashMap<(usize, usize), Tensor>,
     /// Gemma: scale embeddings by sqrt(hidden_dim)
     pub(crate) embed_scale: Option<f32>,
     /// Gemma2 final logit soft-capping: cap * tanh(logits / cap)
@@ -436,6 +437,7 @@ impl GenericTurboModel {
             norm,
             output: QMatMul::from_qtensor(output)?,
             masks: HashMap::new(),
+            masks_rect: HashMap::new(),
             embed_scale: if arch.contains("gemma") {
                 Some((embedding_length as f32).sqrt())
             } else { None },
@@ -567,23 +569,51 @@ impl GenericTurboModel {
         Ok(model)
     }
 
-    fn mask(&mut self, t: usize, _device: &Device) -> Result<Tensor> {
-        if let Some(mask) = self.masks.get(&t) {
-            Ok(mask.clone())
-        } else {
-            // Additive causal mask: 0.0 for valid (j <= i), -1e10 for masked (j > i).
-            // Can be added directly to attention scores — no masked_fill needed.
-            let mask: Vec<f32> = (0..t)
-                .flat_map(|i| (0..t).map(move |j| if j > i { -1e10f32 } else { 0.0f32 }))
-                .collect();
-            let mut mask = Tensor::from_slice(&mask, vec![t, t], _device)?;
-            // Upload to GPU if available
-            #[cfg(feature = "cuda")]
-            if let Ok(gpu) = mask.to_device_auto() {
-                mask = gpu;
+    /// Causal attention mask.
+    /// - Prefill (offset=0): square [seq_len, seq_len]
+    /// - Continuation (offset>0): rectangular [seq_len, offset+seq_len]
+    ///   where past positions (0..offset) are always valid.
+    fn mask(&mut self, seq_len: usize, offset: usize, _device: &Device) -> Result<Tensor> {
+        let total_len = offset + seq_len;
+        let key = (seq_len, total_len);
+        if let Some(mask) = self.masks_rect.get(&key) {
+            return Ok(mask.clone());
+        }
+        // Row i (query at position offset+i) can attend to column j if j <= offset+i
+        let mask: Vec<f32> = (0..seq_len)
+            .flat_map(|i| {
+                let query_pos = offset + i;
+                (0..total_len).map(move |j| if j <= query_pos { 0.0f32 } else { -1e10f32 })
+            })
+            .collect();
+        let mut mask = Tensor::from_slice(&mask, vec![seq_len, total_len], _device)?;
+        #[cfg(feature = "cuda")]
+        if let Ok(gpu) = mask.to_device_auto() {
+            mask = gpu;
+        }
+        self.masks_rect.insert(key, mask.clone());
+        Ok(mask)
+    }
+
+    /// Truncate KV caches to `target_len` tokens. Used by speculative decode
+    /// to roll back draft model's KV cache on rejection without full re-prefill.
+    pub fn truncate_kv_cache(&mut self, target_len: usize) {
+        for layer in &mut self.layers {
+            if let Some((ref k, ref v)) = layer.kv_cache {
+                let current_len = k.shape()[2];
+                if target_len < current_len {
+                    layer.kv_cache = Some((
+                        k.narrow(2, 0, target_len).expect("kv truncate k"),
+                        v.narrow(2, 0, target_len).expect("kv truncate v"),
+                    ));
+                }
             }
-            self.masks.insert(t, mask.clone());
-            Ok(mask)
+            #[cfg(feature = "cuda")]
+            if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
+                if target_len < gpu_kv.seq_len {
+                    gpu_kv.seq_len = target_len;
+                }
+            }
         }
     }
 
@@ -597,6 +627,7 @@ impl GenericTurboModel {
         #[cfg(feature = "cuda")]
         self.graph_manager.reset();
         self.masks.clear();
+        self.masks_rect.clear();
     }
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
@@ -719,7 +750,7 @@ impl GenericTurboModel {
         let mask = if seq_len == 1 {
             None
         } else {
-            Some(self.mask(seq_len, x.device())?)
+            Some(self.mask(seq_len, index_pos, x.device())?)
         };
         let _enter = self.span.enter();
         let backend = self.backend.clone();

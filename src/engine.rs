@@ -530,8 +530,8 @@ impl Engine {
             }
 
             // ── Verify phase: run target model on [next_token, draft_tokens...] ──
-            // Process one token at a time to avoid causal mask shape mismatch
-            // with existing KV cache (batch verify requires non-square mask).
+            // Sequential: one token at a time (batched verify needs non-square causal
+            // mask support which interacts poorly with per-layer KV cache lengths).
             let mut verify_tokens = vec![next_token];
             verify_tokens.extend_from_slice(&draft_tokens);
 
@@ -590,20 +590,16 @@ impl Engine {
             // Update target position (accepted next_token + n_accepted drafts)
             target.position += 1 + n_accepted;
 
-            // Roll back draft model to match target position
-            // (draft generated spec_k tokens but only n_accepted were accepted)
-            // For simplicity: reset draft KV cache and re-feed accepted tokens
-            // TODO: optimize by truncating draft KV cache
+            // Roll back draft model to match target position.
+            // Truncate KV cache instead of full re-prefill (O(1) vs O(n)).
+            // Draft generated spec_k tokens but only n_accepted were accepted.
+            // The draft's KV cache has entries for rejected tokens — truncate them.
             if n_accepted < draft_tokens.len() {
-                // Draft diverged — its KV cache is wrong after acceptance point.
-                // Roll back draft position to match target.
+                // Draft KV has: prompt + [prev accepted] + next_token + n_accepted + (spec_k - n_accepted rejected)
+                // Target position is: prompt_len + all_accepted + 1 + n_accepted
+                // Truncate draft KV to target.position
+                draft.model.0.truncate_kv_cache(target.position);
                 draft.position = target.position;
-                draft.model.0.clear_kv_cache();
-                // Re-prefill draft with all accepted tokens so far
-                let all_so_far: Vec<u32> = prompt_tokens.iter().chain(all_tokens.iter()).copied().collect();
-                let d_input = draft.make_input(&all_so_far).map_err(|e| anyhow::anyhow!("{}", e))?;
-                let _ = draft.model.forward(&d_input, 0).map_err(|e| anyhow::anyhow!("{}", e))?;
-                draft.position = all_so_far.len();
             }
 
             // Next token: sample from last position's target logits

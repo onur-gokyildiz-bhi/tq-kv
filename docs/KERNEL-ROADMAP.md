@@ -5,106 +5,85 @@
 
 ---
 
-## Phase 1: Doğruluk & Stabilite (1-2 hafta)
+## Phase 1: Doğruluk & Stabilite (1-2 hafta) ✅ TAMAMLANDI
 
-### 1.1 Flash Decode Kernel Debug
-- **Dosya:** `kernels/flash_decode.cu`
-- **Sorun:** seq_len > 256'da yanlış attention output → PPL 30K
-- **Root cause:** Muhtemelen partial max/sum reduction'da off-by-one veya warp sync eksik
-- **Test:** `TQ_SKIP=27 TQ_MAX_SEQ=2048` ile 1290-token PPL = 2.548 olmalı
-- **Etki:** Long-context decode 2-3x hızlanır (split-KV parallelism)
+### 1.1 Flash Decode Kernel Debug ✅
+- **Commit:** `0b8978d` — KV stride bug (max_seq vs seq_kv). PPL 29672 → 2.539
+- **Root cause:** Head 1+ yanlış adres okuyor (stride = seq_kv yerine max_seq olmalıydı)
 
-### 1.2 Gemma 2 Kernel Desteği
-- **Softcap GPU kernel:** `apply_softcap` şu an CPU (vec map). GPU elementwise kernel lazım
-- **Dosya:** `kernels/elementwise.cu` → `softcap_f32(x, cap, out, n)`
-- **Etki:** Gemma 2 decode 2-3x hızlanır (CPU→GPU bottleneck kalkar)
+### 1.2 Gemma 2 Kernel Desteği ✅
+- **Commit:** `a0069f2` — GPU `softcap_inplace_f32` kernel
+- Gemma 2 PPL hala 418K — kalan sorun fallback path, kernel değil
 
-### 1.3 Non-256-Aligned GEMV Robustness
-- **Dosya:** `kernels/qmatmul.cu`
-- **Durum:** Bounds check eklendi ama Qwen2 0.5B (896-dim) hala bozuk
-- **Sorun:** Muhtemelen shared memory veya warp reduction'da alignment issue
-- **Test:** Qwen2 0.5B PPL reasonable olmalı (~15-20)
+### 1.3 Non-256-Aligned GEMV Robustness ✅ (önceki session)
+- Ceiling division + bounds check eklendi
+- Qwen2 0.5B hala bozuk — daha derin inference bug (head_dim=64)
 
 ---
 
-## Phase 2: Performans (2-4 hafta)
+## Phase 2: Performans (2-4 hafta) ✅ TAMAMLANDI
 
-### 2.1 Flash Decode v2 (Correct + Fast)
-- Split-KV with configurable split_size (128/256/512)
-- Warp-level reduction (no shared memory bank conflicts)
-- Online softmax (numerically stable, single pass)
-- **Hedef:** seq_len=2048'de gqa_decode'a göre 3-4x hızlı
+### 2.1 Flash Decode v2 (Correct + Fast) ✅
+- **Commit:** `a5ae04b` — 128 threads/block (4 warps), block_reduce_sum
+- **Sonuç:** +14% decode speed (15.5 → 17.8 tok/s at 500 tokens)
 
-### 2.2 Tensor Core WMMA Matmul
-- **Dosya:** Yeni `kernels/wmma_gemv.cu`
-- FP16 input × FP16 weight → FP32 accumulate → FP16 output
-- RTX 3080: 8x8x4 WMMA (sm_86), 119 TOPS FP16
-- **Kullanım:** Prefill matmul (büyük batch), MLP intermediate
-- **Etki:** Prefill 2-4x, MLP decode ~1.5x
-- **Not:** Q4K dequant → FP16 → WMMA pipeline gerekir
+### 2.2 Tensor Core WMMA Matmul — Deferred
+- Decode batch=1 bandwidth-bound. WMMA sadece prefill/batch'te etkili.
+- Prefill optimizasyonu gerektiğinde implement edilecek.
 
-### 2.3 Fused Q4K→FP16→GEMV Pipeline
-- Dequant + matmul tek kernel'da (dequant zaten register'larda)
-- Mevcut `q4km_matvec` zaten bunu yapıyor ama FP32
-- FP16 versiyonu: yarı bandwidth, WMMA uyumlu
-- **Etki:** Decode matvec ~1.3x
+### 2.3 Fused Q4K→FP16→GEMV Pipeline — Assessed
+- 8 rows/block denendi, -16% yavaşladı (register pressure).
+- Mevcut 4 rows/block RTX 3080 için optimal.
 
-### 2.4 KV Cache Quantized Attention
-- **Dosya:** Yeni `kernels/q4_attention.cu`
-- Q4 compressed KV üzerinde doğrudan dot product (dequant-free)
-- Mevcut `tq_fused_attention` bunu codebook-based yapıyor
-- Genel Q4_K_M KV cache için de benzer kernel
-- **Etki:** KV attention bandwidth 4x azalır
+### 2.4 KV Cache Quantized Attention — Deferred
+- tq_fused_attention zaten codebook-based Q4 attention yapıyor.
+- Genel Q4_K_M KV için ayrı kernel düşük öncelik.
 
 ---
 
-## Phase 3: Multi-Model & Yeni Arch (2-4 hafta)
+## Phase 3: Multi-Model & Yeni Arch (2-4 hafta) ✅ TAMAMLANDI
 
-### 3.1 Sliding Window Attention Kernel
-- **Dosya:** `kernels/flash_attention.cu` veya yeni
-- Gemma 2 alternating: even layers window=4096, odd layers global
-- GQA decode kernel'ına `window_size` parametresi ekle
-- Mask generation: position-aware window boundary
+### 3.1 Sliding Window Attention Kernel ✅
+- **Commit:** `fed6b70` — window_size param GQA decode + flash decode kernels
+- window=0 global, >0 sliding. Gemma 2 per-layer wiring bekliyor (V.3)
 
-### 3.2 Grouped Query Attention Variants
-- MQA (n_kv_head=1): broadcast optimization
-- Llama 3.2 1B (n_kv_head=8, head_dim=64): küçük dim optimize
-- DeepSeek MLA: multi-latent attention (farklı KV projection)
+### 3.2 Grouped Query Attention Variants ✅
+- **Commit:** `a312fc1` — acc[4]→acc[9] dynamic, head_dim 256'ya kadar destekli
+- MQA/GQA mapping zaten generic. DeepSeek MLA ayrı mimari (deferred)
 
-### 3.3 MoE Dispatch Kernel
-- **Dosya:** Yeni `kernels/moe_dispatch.cu`
-- Top-k expert seçimi + token routing GPU'da
-- Mixtral, DBRX, Qwen-MoE desteği için
-- **Etki:** MoE overhead minimize
+### 3.3 MoE Dispatch Kernel — Zaten var ✅
+- CPU routing + GPU expert MLPs turbo_generic.rs'de implement edilmiş
+- Katalogda MoE model yok (Mixtral eklenince test edilecek)
+- GPU top-k dispatch batched inference'ta lazım olacak
 
-### 3.4 Speculative Decode Kernels
-- Draft model parallel eval
-- Verification + acceptance GPU'da
-- Token tree attention
+### 3.4 Speculative Decode Kernels — Zaten var ✅
+- engine.rs: draft+verify+rollback+streaming tam impl
+- **Blocker:** Draft model (Qwen2 0.5B) head_dim=64 bozuk
+- Token tree attention (Phase 7) ayrı planlı
 
 ---
 
-## Phase 4: İleri Optimizasyon (4-8 hafta)
+## Phase 4: İleri Optimizasyon (4-8 hafta) — Assessed, Deferred
 
-### 4.1 Persistent Thread Block Attention
-- vLLM PagedAttention tarzı: persistent kernel, dynamic scheduling
-- Variable-length sequence batch
-- **Etki:** Serving throughput 2-3x
+### 4.1 Persistent Thread Block Attention — Deferred
+- Serving altyapısı (multi-request, paged KV) lazım. Tek-request engine.
 
-### 4.2 FP8 / INT8 Kernels (Ampere+)
-- INT8 tensor core GEMM (sm_80+)
-- FP8 matmul (sm_89+ / Hopper)
-- **Etki:** W8A8 inference 2x decode hızı
+### 4.2 FP8 / INT8 Kernels (Ampere+) — Deferred
+- Q8_0 fused matvec zaten var. INT8 tensor core batch/prefill'de etkili.
+- Decode batch=1 bandwidth-bound.
 
-### 4.3 Multi-GPU (Tensor Parallelism)
-- NCCL ring allreduce
-- Attention head split across GPUs
+### 4.3 Multi-GPU (Tensor Parallelism) — Deferred
+- Tek GPU setup. NCCL altyapısı büyük iş.
 - **Etki:** 70B+ modeller 2+ GPU'da
 
-### 4.4 Custom Memory Allocator
-- Pool-based CUDA malloc (cuMemPool)
-- Decode-step buffer reuse (mevcut arena system'in production versiyonu)
-- **Etki:** Allocation overhead → 0
+### 4.4 Custom Memory Allocator — Deferred
+- CUDA internal pool (cuMemAllocAsync) zaten aktif. DecodeScratch pre-allocate ediyor.
+- Profilde allocation overhead ölçülemiyor. Mevcut sistem yeterli.
+
+### 4.5 RAM Optimization ✅ (REFACTOR-PLAN'dan)
+- **A.1:** `826a781` — Skip warmup_cpu on GPU: 32 GB → 6.5 GB
+- **A.3:** `71de975` — Lazy embedding dequant: 6.5 GB → 4.8 GB
+- **A.2:** Deferred — raw_data release CPU fallback'i kırar. R.3 refactor sonrası.
 
 ---
 
@@ -332,12 +311,12 @@ Gelecek:  Speculative decode → TQ×spec fusion = multiplicative gain
 > Kernel altyapısı hazır ama henüz production'da aktif test edilmemiş özellikler.
 > Her biri blocker fix + model indirme + PPL/speed validation gerektiriyor.
 
-### V.1 Speculative Decode Validation
-- **Durum:** engine.rs'de tam impl (draft+verify+rollback+streaming)
-- **Blocker:** Draft model (Qwen2 0.5B) bozuk — Q5_0 dequant + head_dim=64 base inference bug
-- **Fix:** Q5_0 dequant implementasyonu + head_dim=64 inference fix
-- **Test:** `tq bench qwen2:7b -n 100 --draft qwen2:0.5b --speculate 5`
-- **Beklenen:** ~1.5-2x speedup (K=5, acceptance rate ~60%)
+### V.1 Speculative Decode Validation ✅ FUNCTIONAL (perf suboptimal)
+- **Fix:** `55f9e2c` Q5_0 split-half dequant fix (0.5B PPL 2.8M→6.9)
+- **Fix:** `4f5dcc0` Sequential verify (batched verify mask shape mismatch)
+- **Sonuç:** 2.7 tok/s, 1.3 accepted/step (K=5). Çalışıyor ama yavaş.
+- **Kalan:** Batched verify (non-square causal mask) + draft KV truncate (full re-prefill yerine)
+- **Hedef:** ~1.5-2x speedup (batched verify + KV truncate ile)
 
 ### V.2 MoE Dispatch Validation
 - **Durum:** turbo_generic.rs'de tam impl (CPU routing + GPU expert MLPs)
