@@ -15,7 +15,7 @@
 //      c. Compute: score = sum(rotated_q[d] * centroid[idx[d]] * sigma)
 //   3. Output raw attention scores (softmax applied separately)
 
-#include "common.cuh"
+#include "common_v2.cuh"
 
 #define MAX_CENTROIDS 16  // 4-bit = 16 centroids
 #define MAX_HEAD_DIM 256
@@ -405,9 +405,6 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
     __shared__ float s_centroids[MAX_CENTROIDS];
     __shared__ float s_q[MAX_HEAD_DIM];     // rotated query (for compressed keys)
     __shared__ float s_q_raw[MAX_HEAD_DIM]; // raw query (for sink keys)
-    __shared__ float s_max;       // running max score
-    __shared__ float s_sum_exp;   // running sum of exp(score - max)
-    __shared__ float s_rescale;   // broadcast rescale factor for V accumulator
 
     const int n_centroids = 1 << bits;
     if (tid < n_centroids) s_centroids[tid] = centroids[tid];
@@ -435,36 +432,26 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
             float partial_dot = 0.0f;
             const float* k_row = sink_k_head + k * head_dim;
             for (int d = tid; d < head_dim; d += blockDim.x) {
-                partial_dot += s_q_raw[d] * k_row[d];
+                partial_dot += s_q_raw[d] * ld_readonly(&k_row[d]);
             }
-            // block_reduce_sum only returns correct value to tid 0.
-            // Broadcast score to all threads via shared memory.
-            float score_local = block_reduce_sum(partial_dot) * scale;
-            __shared__ float s_score_sink;
-            if (tid == 0) s_score_sink = score_local;
-            __syncthreads();
-            float score = s_score_sink;
+            // v2: block_reduce_sum broadcasts to ALL threads
+            float score = block_reduce_sum(partial_dot) * scale;
 
-            if (tid == 0) {
-                float new_max = fmaxf(running_max, score);
-                float r = expf(running_max - new_max);
-                running_sum = running_sum * r + expf(score - new_max);
-                running_max = new_max;
-                s_max = running_max;
-                s_sum_exp = running_sum;
-                s_rescale = r;
-            }
-            __syncthreads();
+            // Online softmax — all threads have score
+            float old_max = running_max;
+            float new_max = fmaxf(old_max, score);
+            float r = expf(old_max - new_max);
+            running_sum = running_sum * r + expf(score - new_max);
+            running_max = new_max;
 
-            float w = expf(score - s_max);
+            float w = expf(score - new_max);
             const float* v_row = sink_v_head + k * head_dim;
             for (int i = 0; i < n_acc; ++i) {
                 int d = tid + i * blockDim.x;
                 if (d < head_dim) {
-                    acc[i] = acc[i] * s_rescale + w * v_row[d];
+                    acc[i] = acc[i] * r + w * ld_readonly(&v_row[d]);
                 }
             }
-            running_max = s_max;
         }
     }
 
@@ -501,45 +488,29 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
         }
 
         float sigma = (norm_k > 1e-10f) ? norm_k / sqrtf((float)head_dim) : 0.0f;
-        // block_reduce_sum only returns correct result to tid 0.
-        // Broadcast score to all threads via shared memory.
-        float score_local = block_reduce_sum(partial_dot) * sigma * scale;
-        __shared__ float s_score_comp;
-        if (tid == 0) s_score_comp = score_local;
-        __syncthreads();
-        float score = s_score_comp;
+        // v2: block_reduce_sum broadcasts to ALL threads
+        float score = block_reduce_sum(partial_dot) * sigma * scale;
 
-        // --- Online softmax update ---
-        // Thread 0 computes new max/sum. Rescale factor broadcast via shared memory
-        // so ALL threads (including tid==0) use the same correct rescale value.
-        // Without this broadcast, tid==0's running_max is updated before the rescale
-        // computation, giving rescale=1.0 instead of exp(old_max - new_max).
-        if (tid == 0) {
-            float new_max = fmaxf(running_max, score);
-            float r = expf(running_max - new_max);
-            running_sum = running_sum * r + expf(score - new_max);
-            running_max = new_max;
-            s_max = running_max;
-            s_sum_exp = running_sum;
-            s_rescale = r;
-        }
-        __syncthreads();
+        // Online softmax — all threads have score
+        float old_max = running_max;
+        float new_max = fmaxf(old_max, score);
+        float r = expf(old_max - new_max);
+        running_sum = running_sum * r + expf(score - new_max);
+        running_max = new_max;
 
-        float w = expf(score - s_max);
+        float w = expf(score - new_max);
 
         const float* v_row = kv_v + k * head_dim;
         for (int i = 0; i < n_acc; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
-                acc[i] = acc[i] * s_rescale + w * v_row[d];
+                acc[i] = acc[i] * r + w * ld_readonly(&v_row[d]);
             }
         }
-
-        running_max = s_max;
     }
 
     // --- Final output: acc / sum_exp ---
-    float inv_sum = (s_sum_exp > 0.0f) ? 1.0f / s_sum_exp : 0.0f;
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
     for (int i = 0; i < n_acc; ++i) {
         int d = tid + i * blockDim.x;
         if (d < head_dim) {
@@ -581,11 +552,9 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
     const int kv_head = head_idx / (n_heads / n_kv_heads);
 
     __shared__ float s_q[MAX_HEAD_DIM];
-    __shared__ float s_max;
-    __shared__ float s_sum_exp;
 
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        s_q[d] = __ldg(&Q[head_idx * head_dim + d]);
+        s_q[d] = ld_readonly(&Q[head_idx * head_dim + d]);
     }
     __syncthreads();
 
@@ -605,39 +574,29 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
         const float* k_row = kv_k + k * head_dim;
         float partial_dot = 0.0f;
         for (int d = tid; d < head_dim; d += blockDim.x) {
-            partial_dot += s_q[d] * __ldg(&k_row[d]);
+            partial_dot += s_q[d] * ld_readonly(&k_row[d]);
         }
-        float score_local = block_reduce_sum(partial_dot) * scale;
+        // v2: block_reduce_sum broadcasts to ALL threads
+        float score = block_reduce_sum(partial_dot) * scale;
 
-        __shared__ float s_score;
-        if (tid == 0) s_score = score_local;
-        __syncthreads();
-        float score = s_score;
+        // Online softmax — all threads have score
+        float old_max = running_max;
+        float new_max = fmaxf(old_max, score);
+        float rf = expf(old_max - new_max);
+        running_sum = running_sum * rf + expf(score - new_max);
+        running_max = new_max;
 
-        __shared__ float s_rescale;
-        if (tid == 0) {
-            float new_max = fmaxf(running_max, score);
-            float rf = expf(running_max - new_max);
-            running_sum = running_sum * rf + expf(score - new_max);
-            running_max = new_max;
-            s_max = new_max;
-            s_sum_exp = running_sum;
-            s_rescale = rf;
-        }
-        __syncthreads();
-
-        float w = expf(score - s_max);
+        float w = expf(score - new_max);
         const float* v_row = kv_v + k * head_dim;
         for (int i = 0; i < n_acc; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
-                acc[i] = acc[i] * s_rescale + w * __ldg(&v_row[d]);
+                acc[i] = acc[i] * rf + w * ld_readonly(&v_row[d]);
             }
         }
-        running_max = s_max;
     }
 
-    float inv_sum = (s_sum_exp > 0.0f) ? 1.0f / s_sum_exp : 0.0f;
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
     for (int i = 0; i < n_acc; ++i) {
         int d = tid + i * blockDim.x;
         if (d < head_dim) {
@@ -666,11 +625,9 @@ extern "C" __global__ void gqa_decode_attention_f32(
 
     // Load query into shared memory
     __shared__ float s_q[MAX_HEAD_DIM];
-    __shared__ float s_max;
-    __shared__ float s_sum_exp;
 
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        s_q[d] = __ldg(&Q[head_idx * head_dim + d]);
+        s_q[d] = ld_readonly(&Q[head_idx * head_dim + d]);
     }
     __syncthreads();
 
@@ -686,47 +643,34 @@ extern "C" __global__ void gqa_decode_attention_f32(
 
     // Stream over valid KV positions
     for (int k = 0; k < seq_len; ++k) {
-        // Cooperative dot product: Q[head] · K[kv_head, k] with __ldg() read-only cache
+        // Cooperative dot product: Q[head] · K[kv_head, k] with read-only cache
         const float* k_row = kv_k + k * head_dim;
         float partial_dot = 0.0f;
         for (int d = tid; d < head_dim; d += blockDim.x) {
-            partial_dot += s_q[d] * __ldg(&k_row[d]);
+            partial_dot += s_q[d] * ld_readonly(&k_row[d]);
         }
-        float score_local = block_reduce_sum(partial_dot) * scale;
+        // v2: block_reduce_sum broadcasts to ALL threads — no hack needed
+        float score = block_reduce_sum(partial_dot) * scale;
 
-        // Broadcast score to all threads via shared memory
-        __shared__ float s_score;
-        if (tid == 0) s_score = score_local;
-        __syncthreads();
-        float score = s_score;
+        // Online softmax — all threads have score, each tracks own state
+        float old_max = running_max;
+        float new_max = fmaxf(old_max, score);
+        float rf = expf(old_max - new_max);
+        running_sum = running_sum * rf + expf(score - new_max);
+        running_max = new_max;
 
-        // Online softmax — broadcast rescale factor via shared memory
-        // so all threads (including tid==0) apply the same correction.
-        __shared__ float s_rescale;
-        if (tid == 0) {
-            float new_max = fmaxf(running_max, score);
-            float rf = expf(running_max - new_max);
-            running_sum = running_sum * rf + expf(score - new_max);
-            running_max = new_max;
-            s_max = new_max;
-            s_sum_exp = running_sum;
-            s_rescale = rf;
-        }
-        __syncthreads();
-
-        float w = expf(score - s_max);
+        float w = expf(score - new_max);
         const float* v_row = kv_v + k * head_dim;
         for (int i = 0; i < n_acc; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
-                acc[i] = acc[i] * s_rescale + w * __ldg(&v_row[d]);
+                acc[i] = acc[i] * rf + w * ld_readonly(&v_row[d]);
             }
         }
-        running_max = s_max;
     }
 
     // Final output: acc / sum_exp
-    float inv_sum = (s_sum_exp > 0.0f) ? 1.0f / s_sum_exp : 0.0f;
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
     for (int i = 0; i < n_acc; ++i) {
         int d = tid + i * blockDim.x;
         if (d < head_dim) {

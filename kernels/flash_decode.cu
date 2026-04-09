@@ -12,7 +12,7 @@
 //
 // Reference: Dao et al. "Flash-Decoding for long-context inference" (2023)
 
-#include "common.cuh"
+#include "common_v2.cuh"
 
 #define HEAD_DIM_MAX 256
 #define WARP_SIZE 32
@@ -56,13 +56,13 @@ extern "C" __global__ void flash_decode_partial(
     const int tid = threadIdx.x;
     const int lane = tid & (WARP_SIZE - 1);
     const int warp_id = tid >> 5;
-    const int n_warps = BLOCK_SIZE >> 5;  // 4
+    const int n_warps = BLOCK_SIZE >> 5;
 
-    // Load query into shared memory via __ldg() (read-only texture cache)
+    // Load query into shared memory via read-only cache
     __shared__ float s_q[HEAD_DIM_MAX];
     const float* q_ptr = Q + (batch_idx * n_heads + head_idx) * head_dim;
     for (int d = tid; d < head_dim; d += BLOCK_SIZE) {
-        s_q[d] = __ldg(&q_ptr[d]);
+        s_q[d] = ld_readonly(&q_ptr[d]);
     }
     __syncthreads();
 
@@ -76,40 +76,37 @@ extern "C" __global__ void flash_decode_partial(
     const float* k_base = K + ((batch_idx * n_kv_heads + kv_head) * max_seq + effective_start) * head_dim;
     const float* v_base = V + ((batch_idx * n_kv_heads + kv_head) * max_seq + effective_start) * head_dim;
 
-    // Shared memory for warp-level dot product broadcast
-    // Pattern: warp reduce → shared write → __syncthreads → all threads read
-    // Saves 1 __syncthreads per KV token vs block_reduce_sum + separate broadcast
-    __shared__ float s_warp_dot[8];  // max 8 warps
+    // 1-sync warp-reduce broadcast: safe because V accumulate provides
+    // enough work between iterations before next shared write.
+    __shared__ float s_warp_dot[8];
 
     for (int ki = 0; ki < kv_len; ++ki) {
-        // ── Q·K[ki] dot product with __ldg() for K reads ──
+        // ── Q·K[ki] dot product ──
         float dot = 0.0f;
         const float* k_ptr = k_base + ki * head_dim;
         for (int d = tid; d < head_dim; d += BLOCK_SIZE) {
-            dot += s_q[d] * __ldg(&k_ptr[d]);
+            dot += s_q[d] * ld_readonly(&k_ptr[d]);
         }
 
-        // Warp-level reduce + cross-warp broadcast (1 sync total)
+        // Butterfly warp reduce + 1-sync cross-warp broadcast
         dot = warp_reduce_sum(dot);
         if (lane == 0) s_warp_dot[warp_id] = dot;
         __syncthreads();
-        // All threads compute total score (n_warps additions, no extra sync needed)
         float score = 0.0f;
         for (int w = 0; w < n_warps; ++w) score += s_warp_dot[w];
         score *= scale;
 
-        // ── Online softmax update ──
+        // ── Online softmax + V accumulate ──
         float old_max = local_max;
         float new_max = fmaxf(old_max, score);
         float rescale = expf(old_max - new_max);
         float p = expf(score - new_max);
 
-        // ── Accumulate V weighted by attention probability ──
         const float* v_ptr = v_base + ki * head_dim;
         for (int i = 0; i < n_d_per_thread; ++i) {
             int d = i * BLOCK_SIZE + tid;
             if (d < head_dim) {
-                local_o[i] = local_o[i] * rescale + p * __ldg(&v_ptr[d]);
+                local_o[i] = local_o[i] * rescale + p * ld_readonly(&v_ptr[d]);
             }
         }
         local_sum = local_sum * rescale + p;

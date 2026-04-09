@@ -7,8 +7,7 @@
 //   Dao (2023) FlashAttention-2: Faster Attention with Better Parallelism
 //   Dao et al. Flash-Decoding for long-context inference
 
-#include "common.cuh"
-#include <cuda_fp16.h>
+#include "common_v2.cuh"
 #include <mma.h>
 
 using namespace nvcuda;
