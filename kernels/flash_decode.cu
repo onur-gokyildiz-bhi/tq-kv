@@ -1,9 +1,9 @@
 // FlashDecoding v2: Split-KV decode for long-context inference.
 //
 // v2 improvements over v1:
-//   - 128 threads/block (4 warps) → 4x memory bandwidth utilization
-//   - float4 vectorized K/V loads → 4x fewer memory transactions
-//   - block_reduce_sum for Q·K dot product across 4 warps
+//   - 128 threads/block (4 warps) for memory bandwidth utilization
+//   - __ldg() read-only cache hints for all K/V/Q global reads
+//   - Warp-reduce + broadcast pattern: 1 __syncthreads per KV token (was 2)
 //   - Configurable split_size via kernel parameter
 //
 // Splits KV cache across multiple thread blocks for parallelism.
@@ -54,19 +54,21 @@ extern "C" __global__ void flash_decode_partial(
     if (kv_len <= 0) return;
 
     const int tid = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp_id = tid >> 5;
+    const int n_warps = BLOCK_SIZE >> 5;  // 4
 
-    // Load query into shared memory (all BLOCK_SIZE threads cooperate)
+    // Load query into shared memory via __ldg() (read-only texture cache)
     __shared__ float s_q[HEAD_DIM_MAX];
     const float* q_ptr = Q + (batch_idx * n_heads + head_idx) * head_dim;
     for (int d = tid; d < head_dim; d += BLOCK_SIZE) {
-        s_q[d] = q_ptr[d];
+        s_q[d] = __ldg(&q_ptr[d]);
     }
     __syncthreads();
 
     // Per-thread accumulators
     float local_max = -1e10f;
     float local_sum = 0.0f;
-    // Each thread handles ceil(head_dim / BLOCK_SIZE) output dimensions
     const int n_d_per_thread = (head_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
     float local_o[HEAD_DIM_MAX / BLOCK_SIZE + 1];
     for (int i = 0; i < n_d_per_thread; ++i) local_o[i] = 0.0f;
@@ -74,35 +76,40 @@ extern "C" __global__ void flash_decode_partial(
     const float* k_base = K + ((batch_idx * n_kv_heads + kv_head) * max_seq + effective_start) * head_dim;
     const float* v_base = V + ((batch_idx * n_kv_heads + kv_head) * max_seq + effective_start) * head_dim;
 
-    // Shared memory for dot product broadcast
-    __shared__ float s_dot;
+    // Shared memory for warp-level dot product broadcast
+    // Pattern: warp reduce → shared write → __syncthreads → all threads read
+    // Saves 1 __syncthreads per KV token vs block_reduce_sum + separate broadcast
+    __shared__ float s_warp_dot[8];  // max 8 warps
 
     for (int ki = 0; ki < kv_len; ++ki) {
-        // Q·K[ki] dot product — distributed across BLOCK_SIZE threads
+        // ── Q·K[ki] dot product with __ldg() for K reads ──
         float dot = 0.0f;
         const float* k_ptr = k_base + ki * head_dim;
         for (int d = tid; d < head_dim; d += BLOCK_SIZE) {
-            dot += s_q[d] * k_ptr[d];
+            dot += s_q[d] * __ldg(&k_ptr[d]);
         }
-        // Block-level reduction (4 warps → single value)
-        dot = block_reduce_sum(dot);
-        // Broadcast scaled score to all threads
-        if (tid == 0) s_dot = dot * scale;
+
+        // Warp-level reduce + cross-warp broadcast (1 sync total)
+        dot = warp_reduce_sum(dot);
+        if (lane == 0) s_warp_dot[warp_id] = dot;
         __syncthreads();
-        dot = s_dot;
+        // All threads compute total score (n_warps additions, no extra sync needed)
+        float score = 0.0f;
+        for (int w = 0; w < n_warps; ++w) score += s_warp_dot[w];
+        score *= scale;
 
-        // Online softmax update
+        // ── Online softmax update ──
         float old_max = local_max;
-        float new_max = fmaxf(old_max, dot);
+        float new_max = fmaxf(old_max, score);
         float rescale = expf(old_max - new_max);
-        float p = expf(dot - new_max);
+        float p = expf(score - new_max);
 
-        // Accumulate V weighted by attention probability
+        // ── Accumulate V weighted by attention probability ──
         const float* v_ptr = v_base + ki * head_dim;
         for (int i = 0; i < n_d_per_thread; ++i) {
             int d = i * BLOCK_SIZE + tid;
             if (d < head_dim) {
-                local_o[i] = local_o[i] * rescale + p * v_ptr[d];
+                local_o[i] = local_o[i] * rescale + p * __ldg(&v_ptr[d]);
             }
         }
         local_sum = local_sum * rescale + p;
@@ -143,10 +150,10 @@ extern "C" __global__ void flash_decode_reduce(
 
     const int base = (batch_idx * n_heads + head_idx) * n_splits;
 
-    // Find global max across splits
+    // Find global max across splits (via __ldg read-only cache)
     float global_max = -1e10f;
     for (int s = 0; s < n_splits; ++s) {
-        global_max = fmaxf(global_max, partial_max[base + s]);
+        global_max = fmaxf(global_max, __ldg(&partial_max[base + s]));
     }
 
     // Combine partial sums and outputs with rescaling
@@ -160,13 +167,13 @@ extern "C" __global__ void flash_decode_reduce(
     __syncthreads();
 
     for (int s = 0; s < n_splits; ++s) {
-        float rescale = expf(partial_max[base + s] - global_max);
-        float w = partial_sum[base + s] * rescale;
+        float rescale = expf(__ldg(&partial_max[base + s]) - global_max);
+        float w = __ldg(&partial_sum[base + s]) * rescale;
         total_sum += w;
 
         const float* po = partial_O + (base + s) * head_dim;
         for (int d = tid; d < head_dim; d += blockDim.x) {
-            o_ptr[d] += po[d] * rescale;
+            o_ptr[d] += __ldg(&po[d]) * rescale;
         }
     }
     __syncthreads();

@@ -68,9 +68,9 @@ extern "C" __global__ void q4km_matvec_f32(
 
     for (int sb = 0; sb < n_superblocks; ++sb) {
         // Cooperative x load: 256 threads load 256 floats (ONCE for all rows)
-        // Bounds check for last superblock when in_features % 256 != 0
+        // __ldg(): read-only cache — x is shared across all output rows
         const int x_pos = sb * QK_K + tid;
-        s_x[tid] = (x_pos < in_features) ? x[x_pos] : 0.0f;
+        s_x[tid] = (x_pos < in_features) ? __ldg(&x[x_pos]) : 0.0f;
         __syncthreads();
 
         float x_val = s_x[x_idx];
@@ -156,7 +156,7 @@ extern "C" __global__ void q6k_matvec_f32(
 
     for (int sb = 0; sb < n_superblocks; ++sb) {
         const int x_pos = sb * QK_K + tid;
-        s_x[tid] = (x_pos < in_features) ? x[x_pos] : 0.0f;
+        s_x[tid] = (x_pos < in_features) ? __ldg(&x[x_pos]) : 0.0f;
         __syncthreads();
 
         // x position: grp*128 + sub*32 + l
@@ -238,7 +238,7 @@ extern "C" __global__ void q8_0_matvec_f32(
 
         float local = 0.0f;
         for (int j = 0; j < QK8_0; ++j) {
-            local += (float)qs[j] * x_b[j];
+            local += (float)__ldg(&qs[j]) * __ldg(&x_b[j]);
         }
         partial_sum += d * local;
     }

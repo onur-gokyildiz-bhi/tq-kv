@@ -26,18 +26,21 @@ impl TqDevice {
     }
 
     /// Select CUDA device if available, otherwise fall back to CPU.
-    /// Initializes the kernel registry for GPU tensor operations.
+    /// Detects GPU compute capability and loads arch-matched PTX kernels.
     #[cfg(feature = "cuda")]
     pub fn cuda_if_available(ordinal: usize) -> super::Result<Self> {
         match CudaContext::new(ordinal) {
             Ok(ctx) => {
-                eprintln!("CUDA device {} initialized", ordinal);
+                // Detect GPU compute capability for multi-arch PTX selection
+                let (sm_major, sm_minor) = get_compute_capability(ordinal);
+                eprintln!("CUDA device {} initialized (sm_{}{})", ordinal, sm_major, sm_minor);
+
                 // Non-default stream for CUDA Graph capture.
                 // Event tracking disabled: single-stream inference, no cross-stream sync.
                 let stream = ctx.new_stream()
                     .map_err(|e| super::TqError::Msg(format!("stream create: {}", e)))?;
                 unsafe { ctx.disable_event_tracking(); }
-                let registry = super::kernels::KernelRegistry::new(&ctx, &stream)
+                let registry = super::kernels::KernelRegistry::new(&ctx, &stream, sm_major, sm_minor)
                     .map_err(|e| super::TqError::Msg(format!("kernel init: {}", e)))?;
                 let registry = std::sync::Arc::new(registry);
                 // Set global registry so GPU tensor ops can access kernels
@@ -124,4 +127,41 @@ impl PartialEq for TqDevice {
             _ => false,
         }
     }
+}
+
+/// Query GPU compute capability via CUDA driver API.
+/// Returns (sm_major, sm_minor), e.g. (8, 6) for RTX 3080.
+/// Falls back to (8, 6) if the query fails.
+#[cfg(feature = "cuda")]
+fn get_compute_capability(ordinal: usize) -> (u32, u32) {
+    use cudarc::driver::sys;
+    let mut device: sys::CUdevice = 0;
+    let mut major: i32 = 0;
+    let mut minor: i32 = 0;
+    unsafe {
+        let res = sys::cuDeviceGet(&mut device, ordinal as i32);
+        if res != sys::cudaError_enum::CUDA_SUCCESS {
+            eprintln!("[cuda] WARNING: cuDeviceGet failed ({:?}), assuming sm_86", res);
+            return (8, 6);
+        }
+        let res = sys::cuDeviceGetAttribute(
+            &mut major,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            device,
+        );
+        if res != sys::cudaError_enum::CUDA_SUCCESS {
+            eprintln!("[cuda] WARNING: cuDeviceGetAttribute(major) failed ({:?}), assuming sm_86", res);
+            return (8, 6);
+        }
+        let res = sys::cuDeviceGetAttribute(
+            &mut minor,
+            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            device,
+        );
+        if res != sys::cudaError_enum::CUDA_SUCCESS {
+            eprintln!("[cuda] WARNING: cuDeviceGetAttribute(minor) failed ({:?}), assuming sm_86", res);
+            return (8, 6);
+        }
+    }
+    (major as u32, minor as u32)
 }

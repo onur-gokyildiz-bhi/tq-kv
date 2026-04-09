@@ -585,7 +585,7 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
     __shared__ float s_sum_exp;
 
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        s_q[d] = Q[head_idx * head_dim + d];
+        s_q[d] = __ldg(&Q[head_idx * head_dim + d]);
     }
     __syncthreads();
 
@@ -605,7 +605,7 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
         const float* k_row = kv_k + k * head_dim;
         float partial_dot = 0.0f;
         for (int d = tid; d < head_dim; d += blockDim.x) {
-            partial_dot += s_q[d] * k_row[d];
+            partial_dot += s_q[d] * __ldg(&k_row[d]);
         }
         float score_local = block_reduce_sum(partial_dot) * scale;
 
@@ -631,7 +631,7 @@ extern "C" __global__ void gqa_decode_attention_graph_f32(
         for (int i = 0; i < n_acc; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
-                acc[i] = acc[i] * s_rescale + w * v_row[d];
+                acc[i] = acc[i] * s_rescale + w * __ldg(&v_row[d]);
             }
         }
         running_max = s_max;
@@ -670,7 +670,7 @@ extern "C" __global__ void gqa_decode_attention_f32(
     __shared__ float s_sum_exp;
 
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        s_q[d] = Q[head_idx * head_dim + d];
+        s_q[d] = __ldg(&Q[head_idx * head_dim + d]);
     }
     __syncthreads();
 
@@ -686,11 +686,11 @@ extern "C" __global__ void gqa_decode_attention_f32(
 
     // Stream over valid KV positions
     for (int k = 0; k < seq_len; ++k) {
-        // Cooperative dot product: Q[head] · K[kv_head, k]
+        // Cooperative dot product: Q[head] · K[kv_head, k] with __ldg() read-only cache
         const float* k_row = kv_k + k * head_dim;
         float partial_dot = 0.0f;
         for (int d = tid; d < head_dim; d += blockDim.x) {
-            partial_dot += s_q[d] * k_row[d];
+            partial_dot += s_q[d] * __ldg(&k_row[d]);
         }
         float score_local = block_reduce_sum(partial_dot) * scale;
 
@@ -719,7 +719,7 @@ extern "C" __global__ void gqa_decode_attention_f32(
         for (int i = 0; i < n_acc; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
-                acc[i] = acc[i] * s_rescale + w * v_row[d];
+                acc[i] = acc[i] * s_rescale + w * __ldg(&v_row[d]);
             }
         }
         running_max = s_max;

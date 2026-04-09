@@ -44,15 +44,15 @@ pub struct KernelRegistry {
 }
 
 impl KernelRegistry {
-    /// Initialize the kernel registry — loads all 11 compiled PTX modules.
-    pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self, DriverError> {
+    /// Initialize the kernel registry — detects GPU arch, loads matching PTX modules.
+    pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, sm_major: u32, sm_minor: u32) -> Result<Self, DriverError> {
         let mut reg = Self {
             ctx: ctx.clone(),
             stream: stream.clone(),
             modules: std::collections::HashMap::new(),
             cublas: std::sync::OnceLock::new(),
         };
-        reg.load_all_ptx()?;
+        reg.load_all_ptx(sm_major, sm_minor)?;
         Ok(reg)
     }
 
@@ -64,35 +64,35 @@ impl KernelRegistry {
         })
     }
 
-    /// Load all compiled PTX modules from embedded strings.
-    fn load_all_ptx(&mut self) -> Result<(), DriverError> {
-        let ptx_sources: &[(&str, &str)] = &[
-            ("elementwise", PTX_ELEMENTWISE),
-            // flash_attention: deferred (PTX JIT issue with mma.h on sm_86)
-            // ("flash_attention", PTX_FLASH_ATTENTION),
-            ("flash_decode", PTX_FLASH_DECODE),
-            ("fused_attention", PTX_FUSED_ATTENTION),
-            ("fused_layer", PTX_FUSED_LAYER),
-            ("tensor_ops", PTX_TENSOR_OPS),
-            ("fused_mlp", PTX_FUSED_MLP),
-            ("fused_norm", PTX_FUSED_NORM),
-            ("hadamard", PTX_HADAMARD),
-            ("qmatmul", PTX_QMATMUL),
-            ("rope", PTX_ROPE),
-            ("sampling", PTX_SAMPLING),
-            ("softmax", PTX_SOFTMAX),
-            ("sparse_v", PTX_SPARSE_V),
-            ("tq_compress", PTX_TQ_COMPRESS),
-            ("trig_score", PTX_TRIG_SCORE),
-        ];
+    /// Load PTX modules for the best matching GPU architecture.
+    fn load_all_ptx(&mut self, sm_major: u32, sm_minor: u32) -> Result<(), DriverError> {
+        let arch = best_compiled_arch(sm_major, sm_minor);
+        let ptx_sources = ptx_sources_for_arch(arch);
+        eprintln!("[cuda] GPU sm_{}{} → loading PTX for sm_{} ({} compiled arches: {:?})",
+            sm_major, sm_minor, arch, COMPILED_ARCHES.len(), COMPILED_ARCHES);
+
+        if ptx_sources.is_empty() {
+            eprintln!("[cuda] ERROR: no PTX available for arch sm_{}", arch);
+            return Err(DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_PTX));
+        }
+
         let mut loaded = 0;
+        let mut skipped = Vec::new();
         for &(name, ptx_src) in ptx_sources {
+            // flash_attention: deferred (PTX JIT issue with mma.h)
+            if name == "flash_attention" {
+                skipped.push(name);
+                continue;
+            }
             match self.load_ptx_module(name, ptx_src) {
                 Ok(()) => loaded += 1,
-                Err(e) => eprintln!("[cuda] WARNING: failed to load {} PTX: {:?}", name, e),
+                Err(e) => eprintln!("[cuda] WARNING: failed to load {} PTX (sm_{}): {:?}", name, arch, e),
             }
         }
-        eprintln!("[cuda] Loaded {}/{} PTX modules", loaded, ptx_sources.len());
+        if !skipped.is_empty() {
+            eprintln!("[cuda] Skipped: {:?}", skipped);
+        }
+        eprintln!("[cuda] Loaded {}/{} PTX modules (sm_{})", loaded, ptx_sources.len() - skipped.len(), arch);
         if loaded == 0 {
             return Err(DriverError(cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_PTX));
         }

@@ -307,7 +307,20 @@ impl CudaBackend {
         let ctx = cudarc::driver::CudaContext::new(0)
             .map_err(|e| format!("CUDA init failed: {}", e))?;
         let stream = ctx.default_stream();
-        let registry = crate::cuda::kernels::KernelRegistry::new(&ctx, &stream)
+        // Detect GPU compute capability for multi-arch PTX selection
+        let (sm_major, sm_minor) = {
+            use cudarc::driver::sys;
+            let mut device: sys::CUdevice = 0;
+            let mut major: i32 = 0;
+            let mut minor: i32 = 0;
+            unsafe {
+                sys::cuDeviceGet(&mut device, 0);
+                sys::cuDeviceGetAttribute(&mut major, sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+                sys::cuDeviceGetAttribute(&mut minor, sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+            }
+            (major as u32, minor as u32)
+        };
+        let registry = crate::cuda::kernels::KernelRegistry::new(&ctx, &stream, sm_major, sm_minor)
             .map_err(|e| format!("kernel load failed: {}", e))?;
         Ok(Self {
             stream, registry, cpu: CpuBackend::new(),
