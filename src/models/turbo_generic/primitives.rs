@@ -6,6 +6,11 @@ use crate::cuda::Result;
 use crate::gguf::GgmlDType;
 use crate::qmatmul as qmm;
 
+/// Bail macro compatible with our error type.
+macro_rules! bail {
+    ($($arg:tt)*) => { return Err(TqError::Msg(format!($($arg)*))) };
+}
+
 // ============================================================
 // Traits and primitives (replaces candle_nn)
 // ============================================================
