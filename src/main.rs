@@ -1101,12 +1101,17 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
         bench_prompt.to_string()
     };
 
+    let n_runs = if tq_only { 2 } else { 3 };  // TQ + TQ+TriAttn (or Standard + TQ + TQ+TriAttn)
+
     // --- Run 1: Standard (no TQ) ---
+    // Explicitly disable TriAttention for standard + TQ runs
+    models::turbo_generic::set_triattention_override(false);
+
     let std_result = if tq_only {
         None
     } else {
         if !json_output {
-            eprintln!("[1/2] Loading model (standard)...");
+            eprintln!("[1/{}] Loading model (standard)...", n_runs);
         }
         let mut engine_std = load_engine(None)?;
         let result = bench_run(&mut engine_std, &formatted_prompt, &gen_params)?;
@@ -1118,38 +1123,45 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
         Some(result)
     };
 
-    // --- Run 2: TurboQuant 4-bit ---
+    // --- Run 2: TurboQuant 4-bit (no TriAttention) ---
+    let run_idx = if tq_only { 1 } else { 2 };
     if !json_output {
-        if tq_only { eprintln!("[1/1] Loading model (TQ 4-bit)..."); }
-        else { eprintln!("[2/2] Loading model (TQ 4-bit)..."); }
+        eprintln!("[{}/{}] Loading model (TQ 4-bit)...", run_idx, n_runs);
     }
-    let mut tq_config = tq_kv::TurboQuantConfig::balanced(); // 4-bit, no calibration overhead
-    // Apply env var overrides (TQ_GROUP, TQ_SINK, etc.)
+    let mut tq_config = tq_kv::TurboQuantConfig::balanced(); // 4-bit
     if let Ok(val) = std::env::var("TQ_GROUP") {
         if let Ok(gs) = val.parse::<usize>() { tq_config.group_size = gs; }
     }
-    // Load TriAttention config from calibration (if TQ_TRIATTN=1) without
-    // applying calibrated codebook/rotation to TQ config — those slow down GPU fused path.
-    if std::env::var("TQ_TRIATTN").ok().map_or(false, |v| v == "1") {
-        if let Some(cal_data) = calibrate::load_calibration_for_model(model_name) {
-            calibrate::init_triattention(&cal_data, cal_data.head_dim);
-        }
-    }
-    let mut engine_tq = load_engine(Some(tq_config))?;
-
+    let mut engine_tq = load_engine(Some(tq_config.clone()))?;
     let tq_result = bench_run(&mut engine_tq, &formatted_prompt, &gen_params)?;
-
     if !json_output {
         eprintln!("  TQ 4-bit: {:.1} tok/s, {:.2}s total, TTFT {:.3}s\n",
             tq_result.tok_per_sec, tq_result.total_secs, tq_result.ttft_secs);
     }
+    drop(engine_tq);
 
-    // --- Speculative decoding (optional) ---
-    let spec_result = if let Some(draft_name) = draft_model {
+    // --- Run 3: TQ 4-bit + TriAttention ---
+    let run_idx = if tq_only { 2 } else { 3 };
+    if !json_output {
+        eprintln!("[{}/{}] Loading model (TQ+TriAttn)...", run_idx, n_runs);
+    }
+    // Enable TriAttention and load calibration
+    models::turbo_generic::set_triattention_override(true);
+    if let Some(cal_data) = calibrate::load_calibration_for_model(model_name) {
+        calibrate::init_triattention(&cal_data, cal_data.head_dim);
+    }
+    let mut engine_tri = load_engine(Some(tq_config))?;
+    let tri_result = bench_run(&mut engine_tri, &formatted_prompt, &gen_params)?;
+    if !json_output {
+        eprintln!("  TQ+TriAttn: {:.1} tok/s, {:.2}s total, TTFT {:.3}s\n",
+            tri_result.tok_per_sec, tri_result.total_secs, tri_result.ttft_secs);
+    }
+
+    // --- Speculative decoding (optional, uses TQ+TriAttn engine) ---
+    let _spec_result = if let Some(draft_name) = draft_model {
         if !json_output {
             eprintln!("Loading draft model ({}) for speculative decoding (K={})...", draft_name, spec_k);
         }
-        // Load draft engine (same TQ config as target or none)
         let mut draft_engine = if let Some(model_config) = config::get_model(draft_name) {
             model::load_engine(model_config, None, None, None, cli.cpu)?
         } else {
@@ -1161,20 +1173,17 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
             Engine::load_with_device(&gguf_path, &tok_path, arch, None, cli.cpu)?
         };
 
-        // Clear target engine KV cache for fresh speculative run
-        engine_tq.clear_cache();
-        engine_tq.model.0.clear_kv_cache();
+        engine_tri.clear_cache();
+        engine_tri.model.0.clear_kv_cache();
 
         let t0 = std::time::Instant::now();
         let (spec_output, avg_accepted) = Engine::speculative_generate(
-            &mut engine_tq, &mut draft_engine,
+            &mut engine_tri, &mut draft_engine,
             &formatted_prompt, &gen_params, spec_k,
             |_| {},
         )?;
         let elapsed = t0.elapsed().as_secs_f64();
-        let n_tokens = spec_output.split_whitespace().count(); // approximate
-        // Count actual generated tokens from tokenizer
-        let spec_tokens = engine_tq.tokenizer.encode(&*spec_output, false)
+        let spec_tokens = engine_tri.tokenizer.encode(&*spec_output, false)
             .map(|e| e.get_ids().len() as u32)
             .unwrap_or(0);
 
@@ -1187,7 +1196,9 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
     } else {
         None
     };
-    drop(engine_tq);
+    drop(engine_tri);
+    // Restore TriAttention override
+    models::turbo_generic::clear_triattention_override();
 
     // --- KV cache estimates ---
     let (n_layers, n_kv_heads, head_dim) = if let Some(entry) = catalog::find(model_name) {
@@ -1197,8 +1208,12 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
     };
     let kv_bytes = 2 * n_layers * n_kv_heads * head_dim * 2 * (tokens as usize);
     let kv_mb = kv_bytes as f64 / (1024.0 * 1024.0);
-    let kv_compressed_mb = kv_mb / 3.8;
-    let compression_ratio = 3.8;
+    let tq_compression = 3.8;
+    let kv_tq_mb = kv_mb / tq_compression;
+    // TriAttention: budget limits stored tokens (default 2048, but for 100-token bench ~all kept)
+    let tri_budget = models::turbo_generic::get_triattention_budget();
+    let tri_effective_tokens = std::cmp::min(tokens as usize, tri_budget);
+    let kv_tri_mb = kv_mb * (tri_effective_tokens as f64 / tokens as f64) / tq_compression;
 
     // --- Output ---
     if json_output {
@@ -1211,9 +1226,15 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
                 "ttft_secs": tq_result.ttft_secs,
                 "tokens_generated": tq_result.tokens_generated,
             },
+            "tq_triattn": {
+                "total_secs": tri_result.total_secs,
+                "tok_per_sec": tri_result.tok_per_sec,
+                "ttft_secs": tri_result.ttft_secs,
+                "tokens_generated": tri_result.tokens_generated,
+            },
             "kv_cache_mb": kv_mb,
-            "kv_compressed_mb": kv_compressed_mb,
-            "compression_ratio": compression_ratio,
+            "kv_tq_mb": kv_tq_mb,
+            "kv_triattn_mb": kv_tri_mb,
         });
         if let Some(ref s) = std_result {
             json["standard"] = serde_json::json!({
@@ -1222,59 +1243,78 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
                 "ttft_secs": s.ttft_secs,
                 "tokens_generated": s.tokens_generated,
             });
-            json["speedup_pct"] = serde_json::json!(
-                ((tq_result.tok_per_sec / s.tok_per_sec) - 1.0) * 100.0
-            );
         }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
     } else {
+        // Helper: format delta percentage
+        let fmt_delta = |a: f64, b: f64, higher_is_better: bool| -> String {
+            if b == 0.0 { return String::new(); }
+            let ratio = a / b;
+            if higher_is_better {
+                if ratio > 1.0 { format!("+{:.0}%", (ratio - 1.0) * 100.0) }
+                else { format!("-{:.0}%", (1.0 - ratio) * 100.0) }
+            } else {
+                if ratio < 1.0 { format!("-{:.0}%", (1.0 - ratio) * 100.0) }
+                else { format!("+{:.0}%", (ratio - 1.0) * 100.0) }
+            }
+        };
+
         println!();
-        println!("+============================================================+");
-        println!("|  TurboQuant Benchmark -- {:<33}|", display_name);
-        println!("+============================================================+");
+        println!("+==============================================================================+");
+        println!("|  TurboQuant Benchmark -- {:<51}|", display_name);
+        println!("+==============================================================================+");
 
         if let Some(ref s) = std_result {
-            let time_delta = if tq_result.total_secs < s.total_secs {
-                format!("-{:.0}%", (1.0 - tq_result.total_secs / s.total_secs) * 100.0)
-            } else {
-                format!("+{:.0}%", (tq_result.total_secs / s.total_secs - 1.0) * 100.0)
-            };
-            let toks_delta = if tq_result.tok_per_sec > s.tok_per_sec {
-                format!("+{:.0}%", (tq_result.tok_per_sec / s.tok_per_sec - 1.0) * 100.0)
-            } else {
-                format!("-{:.0}%", (1.0 - tq_result.tok_per_sec / s.tok_per_sec) * 100.0)
-            };
-            let ttft_delta = if tq_result.ttft_secs > s.ttft_secs {
-                format!("+{:.0}%", (tq_result.ttft_secs / s.ttft_secs - 1.0) * 100.0)
-            } else {
-                format!("-{:.0}%", (1.0 - tq_result.ttft_secs / s.ttft_secs) * 100.0)
-            };
-
-            println!("| {:<20} | {:<11} | {:<11} | {:<7} |", "Metric", "Standard", "TQ 4-bit", "Delta");
-            println!("+----------------------+-------------+-------------+---------+");
-            println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-                "Tokens generated", s.tokens_generated, tq_result.tokens_generated, "");
-            println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-                "Total time", format!("{:.2}s", s.total_secs), format!("{:.2}s", tq_result.total_secs), time_delta);
-            println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-                "tok/s", format!("{:.1}", s.tok_per_sec), format!("{:.1}", tq_result.tok_per_sec), toks_delta);
-            println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-                "TTFT", format!("{:.3}s", s.ttft_secs), format!("{:.3}s", tq_result.ttft_secs), ttft_delta);
+            println!("| {:<16} | {:<11} | {:<11} | {:<11} | {:<7} |",
+                "Metric", "Standard", "TQ 4-bit", "TQ+TriAttn", "vs Std");
+            println!("+------------------+-------------+-------------+-------------+---------+");
+            println!("| {:<16} | {:<11} | {:<11} | {:<11} | {:<7} |",
+                "Tokens", s.tokens_generated, tq_result.tokens_generated, tri_result.tokens_generated, "");
+            println!("| {:<16} | {:<11} | {:<11} | {:<11} | {:<7} |",
+                "Total time",
+                format!("{:.2}s", s.total_secs),
+                format!("{:.2}s", tq_result.total_secs),
+                format!("{:.2}s", tri_result.total_secs),
+                fmt_delta(tri_result.total_secs, s.total_secs, false));
+            println!("| {:<16} | {:<11} | {:<11} | {:<11} | {:<7} |",
+                "tok/s",
+                format!("{:.1}", s.tok_per_sec),
+                format!("{:.1}", tq_result.tok_per_sec),
+                format!("{:.1}", tri_result.tok_per_sec),
+                fmt_delta(tri_result.tok_per_sec, s.tok_per_sec, true));
+            println!("| {:<16} | {:<11} | {:<11} | {:<11} | {:<7} |",
+                "TTFT",
+                format!("{:.3}s", s.ttft_secs),
+                format!("{:.3}s", tq_result.ttft_secs),
+                format!("{:.3}s", tri_result.ttft_secs),
+                fmt_delta(tri_result.ttft_secs, s.ttft_secs, false));
+            println!("| {:<16} | {:<11} | {:<11} | {:<11} | {:<7} |",
+                "KV cache (est.)",
+                format!("{:.0} MB", kv_mb),
+                format!("{:.1} MB", kv_tq_mb),
+                format!("{:.1} MB", kv_tri_mb),
+                fmt_delta(kv_tri_mb, kv_mb, false));
+            println!("| {:<16} | {:<11} | {:<11} | {:<11} | {:<7} |",
+                "Compression",
+                "1.0x",
+                format!("{:.1}x", tq_compression),
+                format!("{:.0}x", kv_mb / kv_tri_mb.max(0.001)),
+                "");
         } else {
-            println!("| {:<20} | {:<11} |", "Metric", "TQ 4-bit");
-            println!("+----------------------+-------------+");
-            println!("| {:<20} | {:<11} |", "Tokens generated", tq_result.tokens_generated);
-            println!("| {:<20} | {:<11} |", "Total time", format!("{:.2}s", tq_result.total_secs));
-            println!("| {:<20} | {:<11} |", "tok/s", format!("{:.1}", tq_result.tok_per_sec));
-            println!("| {:<20} | {:<11} |", "TTFT", format!("{:.3}s", tq_result.ttft_secs));
+            println!("| {:<16} | {:<11} | {:<11} |",
+                "Metric", "TQ 4-bit", "TQ+TriAttn");
+            println!("+------------------+-------------+-------------+");
+            println!("| {:<16} | {:<11} | {:<11} |",
+                "Tokens", tq_result.tokens_generated, tri_result.tokens_generated);
+            println!("| {:<16} | {:<11} | {:<11} |",
+                "Total time", format!("{:.2}s", tq_result.total_secs), format!("{:.2}s", tri_result.total_secs));
+            println!("| {:<16} | {:<11} | {:<11} |",
+                "tok/s", format!("{:.1}", tq_result.tok_per_sec), format!("{:.1}", tri_result.tok_per_sec));
+            println!("| {:<16} | {:<11} | {:<11} |",
+                "TTFT", format!("{:.3}s", tq_result.ttft_secs), format!("{:.3}s", tri_result.ttft_secs));
         }
 
-        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-            "KV cache (est.)", format!("{:.0} MB", kv_mb), format!("{:.0} MB", kv_compressed_mb),
-            format!("-{:.0}%", (1.0 - 1.0 / compression_ratio) * 100.0));
-        println!("| {:<20} | {:<11} | {:<11} | {:<7} |",
-            "Compression ratio", "1.0x", format!("{:.1}x", compression_ratio), "");
-        println!("+============================================================+");
+        println!("+==============================================================================+");
     }
 
     Ok(())

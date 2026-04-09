@@ -810,9 +810,26 @@ pub(crate) fn get_compact_ratio() -> usize {
     *C.get_or_init(|| std::env::var("TQ_COMPACT_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(5))
 }
 
+/// Override for TriAttention enable state. -1 = use env var, 0 = disabled, 1 = enabled.
+/// Allows bench to toggle TriAttention between runs without process restart.
+pub(crate) static TRIATTENTION_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
 pub(crate) fn get_triattention_enabled() -> bool {
-    pub(crate) static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ov = TRIATTENTION_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov >= 0 { return ov == 1; }
+    // Default: check env var once
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *C.get_or_init(|| std::env::var("TQ_TRIATTN").ok().map(|v| v == "1").unwrap_or(false))
+}
+
+/// Set triattention enabled/disabled override (for bench multi-run).
+pub(crate) fn set_triattention_override(enabled: bool) {
+    TRIATTENTION_OVERRIDE.store(if enabled { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Clear triattention override (fall back to env var).
+pub(crate) fn clear_triattention_override() {
+    TRIATTENTION_OVERRIDE.store(-1, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub(crate) fn get_triattention_budget() -> usize {
