@@ -81,7 +81,7 @@ fn compress_head_keys(
     for s in 0..seq_len {
         let offset = s * head_dim;
         let key_vec = &head_keys[offset..offset + head_dim];
-        let (packed, norm) =
+        let (packed, norm, _) =
             tq_kv::compress_single_key_with_signs(key_vec, head_dim, config, signs);
         cache.append_raw(&packed, norm);
     }

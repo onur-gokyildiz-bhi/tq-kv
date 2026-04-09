@@ -102,7 +102,7 @@ pub unsafe extern "C" fn tq_compress_and_append(
     }
 
     let key = slice::from_raw_parts(key_data, len);
-    let (packed, norm) = compress_single_key_with_signs(key, ctx.dim, &ctx.config, &ctx.signs);
+    let (packed, norm, _token_mean) = compress_single_key_with_signs(key, ctx.dim, &ctx.config, &ctx.signs);
     ctx.cache.append_raw(&packed, norm);
     0
 }
@@ -287,7 +287,7 @@ pub unsafe extern "C" fn tq_layer_compress_and_append(
     for h in 0..ctx.n_kv_heads {
         let offset = h * ctx.head_dim;
         let key = &data[offset..offset + ctx.head_dim];
-        let (packed, norm) =
+        let (packed, norm, _) =
             compress_single_key_with_signs(key, ctx.head_dim, &ctx.heads[h].config, &ctx.heads[h].signs);
         ctx.heads[h].cache.append_raw(&packed, norm);
     }

@@ -300,7 +300,7 @@ pub fn run_full_benchmark() {
             // Compress keys incrementally
             let mut cache = CompressedKeys::new_empty(bits, dim, config.rotation_seed);
             for chunk in key_data.chunks_exact(dim) {
-                let (packed, norm) = compress_single_key_with_signs(chunk, dim, &config, &signs);
+                let (packed, norm, _token_mean) = compress_single_key_with_signs(chunk, dim, &config, &signs);
                 cache.append_raw(&packed, norm);
             }
 

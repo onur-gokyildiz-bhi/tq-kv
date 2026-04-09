@@ -180,7 +180,7 @@ fn main() {
     let mut cache = CompressedKeys::new_empty(4, dim, config_4bit.rotation_seed);
     for i in 0..num_vectors {
         let key = &data[i * dim..(i + 1) * dim];
-        let (packed, norm) = compress_single_key_with_signs(key, dim, &config_4bit, &signs);
+        let (packed, norm, _token_mean) = compress_single_key_with_signs(key, dim, &config_4bit, &signs);
         cache.append_raw(&packed, norm);
     }
 

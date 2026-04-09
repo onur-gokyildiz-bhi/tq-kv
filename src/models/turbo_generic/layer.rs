@@ -722,12 +722,12 @@ impl LayerWeights {
                         } else if self.padded_head_dim > hdim {
                             let mut padded = vec![0.0f32; self.padded_head_dim];
                             padded[..hdim].copy_from_slice(key_vec);
-                            let (packed, norm) = tq_kv::compress_single_key_with_signs(
+                            let (packed, norm, _token_mean) = tq_kv::compress_single_key_with_signs(
                                 &padded, self.padded_head_dim, &head_config, &self.signs,
                             );
                             cache.k_per_head[h].append_raw(&packed, norm);
                         } else {
-                            let (packed, norm) = tq_kv::compress_single_key_with_signs(
+                            let (packed, norm, _token_mean) = tq_kv::compress_single_key_with_signs(
                                 key_vec, hdim, &head_config, &self.signs,
                             );
                             cache.k_per_head[h].append_raw(&packed, norm);
