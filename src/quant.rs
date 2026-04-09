@@ -226,6 +226,27 @@ pub fn dequantize_bf16(data: &[u8], n_elements: usize) -> Vec<f32> {
 // ─── Dispatch ─────────────────────────────────────────────────
 
 /// Dequantize raw tensor data to f32 based on GGML dtype.
+// ─── Q8_1: 40 bytes → 32 f32 values ─────────────────────────
+// Block: [f32 d][f32 s][i8 qs × 32] — signed 8-bit with scale + sum
+
+pub fn dequantize_q8_1(data: &[u8], n_elements: usize) -> Vec<f32> {
+    const BLOCK_SIZE: usize = 40; // 4 (f32 d) + 4 (f32 s) + 32 (i8 qs)
+    const BLOCK_NUMEL: usize = 32;
+    let n_blocks = n_elements / BLOCK_NUMEL;
+    let mut output = Vec::with_capacity(n_elements);
+
+    for b in 0..n_blocks {
+        let block = &data[b * BLOCK_SIZE..];
+        let d = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        // s (sum) is stored but not needed for dequant — it's used for dot product optimization
+        for i in 0..BLOCK_NUMEL {
+            let qs = block[8 + i] as i8;
+            output.push(qs as f32 * d);
+        }
+    }
+    output
+}
+
 // ─── Q4_0: 18 bytes → 32 f32 values ─────────────────────────
 // Block: [f16 d][u8 qs × 16] — each byte holds 2 nibbles (4-bit unsigned, offset by 8)
 
@@ -341,6 +362,7 @@ pub fn dequantize(data: &[u8], dtype: GgmlDType, n_elements: usize) -> Vec<f32> 
         GgmlDType::Q5_0 => dequantize_q5_0(data, n_elements),
         GgmlDType::Q5_1 => dequantize_q5_1(data, n_elements),
         GgmlDType::Q8_0 => dequantize_q8_0(data, n_elements),
+        GgmlDType::Q8_1 => dequantize_q8_1(data, n_elements),
         GgmlDType::Q4K => dequantize_q4k(data, n_elements),
         GgmlDType::Q5K => dequantize_q5k(data, n_elements),
         GgmlDType::Q6K => dequantize_q6k(data, n_elements),
