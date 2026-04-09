@@ -258,6 +258,8 @@ impl GenericTurboModel {
             Ok(tensor) => tensor,
             Err(_) => {
                 eprintln!("  (tie_word_embeddings: reusing token_embd.weight for output)");
+                eprintln!("  [debug] emb shape=({}, {}), dtype={:?}",
+                    tok_embeddings_q.shape.0, tok_embeddings_q.shape.1, tok_embeddings_q.dtype);
                 tok_embeddings_q
             }
         };
