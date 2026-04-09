@@ -1294,6 +1294,19 @@ pub fn decompress_keys(compressed: &CompressedKeys, _config: &TurboQuantConfig) 
         }
     }
 
+    // Inverse per-token mean removal: add back stored means
+    // (reverse of compress: mean subtracted after channel_bias, so restore before channel_bias)
+    if let Some(ref means) = compressed.key_means {
+        for (i, chunk) in result.chunks_exact_mut(dim).enumerate() {
+            if i < means.len() {
+                let mean = means[i];
+                for val in chunk.iter_mut() {
+                    *val += mean;
+                }
+            }
+        }
+    }
+
     // Inverse Pre-Rotation Centering: add bias back
     if let Some(ref bias) = _config.key_channel_bias {
         for chunk in result.chunks_exact_mut(dim) {

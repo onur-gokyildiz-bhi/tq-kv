@@ -562,10 +562,12 @@ pub fn tq_compress_key(
     centroids: &CudaSlice<f32>,    // [n_centroids]
     packed_out: &mut CudaSlice<u8>,  // [n_kv_heads, bytes_per_key]
     norms_out: &mut CudaSlice<f32>,  // [n_kv_heads]
+    means_out: Option<&mut CudaSlice<f32>>,  // [n_kv_heads] per-token means (None = skip)
     n_kv_heads: usize,
     head_dim: usize,
     n_centroids: usize,
     bytes_per_key: usize,
+    center_keys: bool,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("tq_compress", "tq_compress_key_f32")?;
     let n_boundaries = n_centroids - 1;
@@ -578,12 +580,23 @@ pub fn tq_compress_key(
     let hd = head_dim as i32;
     let nc = n_centroids as i32;
     let bpk = bytes_per_key as i32;
+    let ck = if center_keys { 1i32 } else { 0i32 };
+    // means_out: pass actual GPU buffer pointer, or null (0u64) if not needed
+    let null_ptr: u64 = 0;
     unsafe {
-        reg.stream.launch_builder(&f)
-            .arg(key_vectors).arg(signs).arg(boundaries).arg(centroids)
-            .arg(packed_out).arg(norms_out)
-            .arg(&hd).arg(&nc).arg(&bpk)
-            .launch(cfg)?;
+        if let Some(means) = means_out {
+            reg.stream.launch_builder(&f)
+                .arg(key_vectors).arg(signs).arg(boundaries).arg(centroids)
+                .arg(packed_out).arg(norms_out).arg(means)
+                .arg(&hd).arg(&nc).arg(&bpk).arg(&ck)
+                .launch(cfg)?;
+        } else {
+            reg.stream.launch_builder(&f)
+                .arg(key_vectors).arg(signs).arg(boundaries).arg(centroids)
+                .arg(packed_out).arg(norms_out).arg(&null_ptr)
+                .arg(&hd).arg(&nc).arg(&bpk).arg(&ck)
+                .launch(cfg)?;
+        }
     }
     Ok(())
 }

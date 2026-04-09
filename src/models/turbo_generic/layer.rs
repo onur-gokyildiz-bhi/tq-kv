@@ -635,14 +635,16 @@ impl LayerWeights {
                             self.n_kv_head
                         ).map_err(|e| TqError::Msg(format!("norms alloc: {}", e)))?;
 
-                        // GPU compress: Hadamard + quantize + pack
+                        // GPU compress: mean removal + Hadamard + quantize + pack
                         crate::cuda::kernels::tq_compress_key(
                             reg, k_gpu,
                             self.signs_gpu.as_ref().unwrap(),
                             self.boundaries_gpu.as_ref().unwrap(),
                             self.centroids_gpu.as_ref().unwrap(),
                             &mut packed_gpu, &mut norms_gpu,
+                            None, // means_out: GPU TQ fused path ignores means (shift-invariant)
                             self.n_kv_head, self.head_dim, n_centroids, bytes_per_key,
+                            self.tq_config.center_keys,
                         ).map_err(|e| TqError::Msg(format!("tq_compress_key: {}", e)))?;
 
                         // V data: already on GPU in scratch or k tensor

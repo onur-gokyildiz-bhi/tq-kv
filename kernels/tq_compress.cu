@@ -55,9 +55,11 @@ extern "C" __global__ void tq_compress_key_f32(
     const float* __restrict__ centroids,      // [n_centroids]
     uint8_t* __restrict__ packed_out,         // [n_kv_heads, bytes_per_key]
     float* __restrict__ norms_out,            // [n_kv_heads]
+    float* __restrict__ means_out,            // [n_kv_heads] per-token means (or NULL)
     const int head_dim,
     const int n_centroids,                    // 2^bits (4, 8, or 16)
-    const int bytes_per_key                   // ceil(head_dim * bits / 8)
+    const int bytes_per_key,                  // ceil(head_dim * bits / 8)
+    const int center_keys                     // 1 = subtract per-token mean before Hadamard
 ) {
     const int head = blockIdx.x;
     const int tid = threadIdx.x;
@@ -65,7 +67,6 @@ extern "C" __global__ void tq_compress_key_f32(
 
     extern __shared__ float s_mem[];
     float* s_data = s_mem;                    // [head_dim] for key + Hadamard
-    // boundaries + centroids loaded into shared mem after s_data
     float* s_bounds = s_mem + head_dim;       // [n_boundaries]
     float* s_cents = s_bounds + n_boundaries; // [n_centroids]
 
@@ -83,6 +84,23 @@ extern "C" __global__ void tq_compress_key_f32(
         s_data[i] = key[i] * signs[i];
     }
     __syncthreads();
+
+    // Step 1.5: Per-token mean removal (softmax shift-invariance)
+    // Subtract mean BEFORE Hadamard → zero-mean vector → codebook gets more precision
+    if (center_keys) {
+        float partial_sum = 0.0f;
+        for (int i = tid; i < head_dim; i += blockDim.x) {
+            partial_sum += s_data[i];
+        }
+        float mean = block_reduce_sum(partial_sum) / (float)head_dim;
+        for (int i = tid; i < head_dim; i += blockDim.x) {
+            s_data[i] -= mean;
+        }
+        if (tid == 0 && means_out != nullptr) {
+            means_out[head] = mean;
+        }
+        __syncthreads();
+    }
 
     // Step 2: In-place Hadamard transform
     shared_hadamard(s_data, head_dim);
