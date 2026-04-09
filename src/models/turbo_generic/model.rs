@@ -277,6 +277,10 @@ impl GenericTurboModel {
                 let wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
                 let wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
                 let wv = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
+                if layer_idx == 0 {
+                    eprintln!("  [debug] L0 wq=({},{}) wk=({},{}) wv=({},{})",
+                        wq.shape.0, wq.shape.1, wk.shape.0, wk.shape.1, wv.shape.0, wv.shape.1);
+                }
                 QkvWeights::Separate {
                     wq: QMatMul::from_qtensor(wq)?,
                     wk: QMatMul::from_qtensor(wk)?,
@@ -1514,6 +1518,28 @@ impl GenericTurboModel {
         } else { None };
         #[cfg(not(feature = "cuda"))]
         let _t_lm: Option<std::time::Instant> = None;
+        // Debug: compare GPU vs CPU lm_head output
+        if gpu_debug {
+            if let Ok(h) = x.to_vec1() {
+                let n = h.len();
+                let l2: f64 = h.iter().map(|&v| (v as f64)*(v as f64)).sum::<f64>().sqrt();
+                eprintln!("[gpu-debug] pre-lm_head: n={} l2={:.4}", n, l2);
+
+                // CPU reference matmul for lm_head
+                if let qmm::QMatMul::Quantized(ref qw) = self.output.inner {
+                    let cpu_logits = backend.qmatmul(&h, qw, 1, qw.in_features(), qw.out_features());
+                    let (cmn, cmx) = cpu_logits.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+                        |(mn,mx),&v| (mn.min(v), mx.max(v)));
+                    let top_cpu: Vec<(usize, f32)> = {
+                        let mut idx: Vec<(usize,f32)> = cpu_logits.iter().copied().enumerate().collect();
+                        idx.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+                        idx.into_iter().take(5).collect()
+                    };
+                    eprintln!("[gpu-debug] CPU lm_head: n={} min={:.4} max={:.4} top5={:?}",
+                        cpu_logits.len(), cmn, cmx, top_cpu);
+                }
+            }
+        }
         let output = self.output.forward(&x, backend)?;
         let output = if let Some(cap) = self.final_logit_softcap {
             apply_softcap(&output, cap)?

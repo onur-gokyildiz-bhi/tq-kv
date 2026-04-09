@@ -254,17 +254,18 @@ pub fn dequantize_q4_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = 18; // 2 (f16 d) + 16 (4-bit × 32 / 2)
     const BLOCK_NUMEL: usize = 32;
     let n_blocks = n_elements / BLOCK_NUMEL;
-    let mut output = Vec::with_capacity(n_elements);
+    let mut output = vec![0.0f32; n_elements];
 
     for b in 0..n_blocks {
         let block = &data[b * BLOCK_SIZE..];
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let out = &mut output[b * BLOCK_NUMEL..];
         for j in 0..BLOCK_NUMEL / 2 {
             let byte = block[2 + j];
-            let lo = (byte & 0x0F) as i32 - 8;
-            let hi = ((byte >> 4) & 0x0F) as i32 - 8;
-            output.push(lo as f32 * d);
-            output.push(hi as f32 * d);
+            let x0 = (byte & 0x0F) as i32 - 8;
+            let x1 = ((byte >> 4) & 0x0F) as i32 - 8;
+            out[j] = x0 as f32 * d;               // low nibble → first half
+            out[j + BLOCK_NUMEL / 2] = x1 as f32 * d; // high nibble → second half
         }
     }
     output
@@ -277,18 +278,19 @@ pub fn dequantize_q4_1(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = 20; // 2 (f16 d) + 2 (f16 m) + 16
     const BLOCK_NUMEL: usize = 32;
     let n_blocks = n_elements / BLOCK_NUMEL;
-    let mut output = Vec::with_capacity(n_elements);
+    let mut output = vec![0.0f32; n_elements];
 
     for b in 0..n_blocks {
         let block = &data[b * BLOCK_SIZE..];
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let m = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let out = &mut output[b * BLOCK_NUMEL..];
         for j in 0..BLOCK_NUMEL / 2 {
             let byte = block[4 + j];
-            let lo = (byte & 0x0F) as f32;
-            let hi = ((byte >> 4) & 0x0F) as f32;
-            output.push(lo * d + m);
-            output.push(hi * d + m);
+            let x0 = (byte & 0x0F) as f32;
+            let x1 = ((byte >> 4) & 0x0F) as f32;
+            out[j] = x0 * d + m;
+            out[j + BLOCK_NUMEL / 2] = x1 * d + m;
         }
     }
     output
@@ -301,23 +303,23 @@ pub fn dequantize_q5_0(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = 22; // 2 (f16 d) + 4 (qh) + 16 (qs)
     const BLOCK_NUMEL: usize = 32;
     let n_blocks = n_elements / BLOCK_NUMEL;
-    let mut output = Vec::with_capacity(n_elements);
+    let mut output = vec![0.0f32; n_elements];
 
     for b in 0..n_blocks {
         let block = &data[b * BLOCK_SIZE..];
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let out = &mut output[b * BLOCK_NUMEL..];
         for j in 0..BLOCK_NUMEL / 2 {
             let byte = block[6 + j];
-            let lo4 = (byte & 0x0F) as i32;
-            let hi4 = ((byte >> 4) & 0x0F) as i32;
-            // 5th bit from qh bitmask
-            let lo5 = ((qh >> (j * 2)) & 1) as i32;
-            let hi5 = ((qh >> (j * 2 + 1)) & 1) as i32;
-            let lo = lo4 | (lo5 << 4);
-            let hi = hi4 | (hi5 << 4);
-            output.push((lo as f32 - 16.0) * d);
-            output.push((hi as f32 - 16.0) * d);
+            // Low nibble → first half of block (positions 0..15)
+            let xh_0 = ((qh >> j) & 1) as i32;
+            let x0 = ((byte & 0x0F) as i32) | (xh_0 << 4);
+            out[j] = (x0 as f32 - 16.0) * d;
+            // High nibble → second half of block (positions 16..31)
+            let xh_1 = ((qh >> (j + 16)) & 1) as i32;
+            let x1 = (((byte >> 4) & 0x0F) as i32) | (xh_1 << 4);
+            out[j + BLOCK_NUMEL / 2] = (x1 as f32 - 16.0) * d;
         }
     }
     output
@@ -330,23 +332,24 @@ pub fn dequantize_q5_1(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = 24; // 2 (d) + 2 (m) + 4 (qh) + 16 (qs)
     const BLOCK_NUMEL: usize = 32;
     let n_blocks = n_elements / BLOCK_NUMEL;
-    let mut output = Vec::with_capacity(n_elements);
+    let mut output = vec![0.0f32; n_elements];
 
     for b in 0..n_blocks {
         let block = &data[b * BLOCK_SIZE..];
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         let m = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
         let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let out = &mut output[b * BLOCK_NUMEL..];
         for j in 0..BLOCK_NUMEL / 2 {
             let byte = block[8 + j];
-            let lo4 = (byte & 0x0F) as f32;
-            let hi4 = ((byte >> 4) & 0x0F) as f32;
-            let lo5 = ((qh >> (j * 2)) & 1) as f32;
-            let hi5 = ((qh >> (j * 2 + 1)) & 1) as f32;
-            let lo = lo4 + lo5 * 16.0;
-            let hi = hi4 + hi5 * 16.0;
-            output.push(lo * d + m);
-            output.push(hi * d + m);
+            // Low nibble → first half, qh bit at position j
+            let xh_0 = ((qh >> j) & 1) as f32;
+            let x0 = (byte & 0x0F) as f32 + xh_0 * 16.0;
+            out[j] = x0 * d + m;
+            // High nibble → second half, qh bit at position j+16
+            let xh_1 = ((qh >> (j + 16)) & 1) as f32;
+            let x1 = ((byte >> 4) & 0x0F) as f32 + xh_1 * 16.0;
+            out[j + BLOCK_NUMEL / 2] = x1 * d + m;
         }
     }
     output
