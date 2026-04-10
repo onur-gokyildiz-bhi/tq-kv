@@ -42,9 +42,21 @@ pub struct TriAttentionConfig {
     /// Eviction interval in tokens (default: 128).
     pub eviction_interval: usize,
     /// KV budget: max tokens to retain after eviction.
+    /// If retention_ratio > 0, budget = seq_len × retention_ratio (dynamic).
     pub budget: usize,
     /// Multi-offset set D for averaging: {1, 2, 4, ..., 2^16}.
     pub offsets: Vec<usize>,
+    /// V3: Hard prefix protection — first N tokens NEVER evicted.
+    /// Covers system prompt, few-shot examples, critical context.
+    /// Default: 128 (Tom V3: 128). Set via TQ_TRIATTN_PREFIX.
+    pub prefix_protection: usize,
+    /// V3: Number of segments for per-segment eviction quota.
+    /// Context divided into K equal buckets; each loses tokens proportionally.
+    /// Prevents global sort from starving any region. Default: 8.
+    pub n_segments: usize,
+    /// V3: Retention ratio (0.0-1.0). Budget = seq_len × retention.
+    /// 0.9 = evict 10%. 0.0 = disabled (use fixed budget). Default: 0.9.
+    pub retention_ratio: f32,
 }
 
 impl TriAttentionConfig {
@@ -74,6 +86,12 @@ impl TriAttentionConfig {
             eviction_interval: 128,
             budget: 2048,
             offsets,
+            prefix_protection: std::env::var("TQ_TRIATTN_PREFIX")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(128),
+            n_segments: std::env::var("TQ_TRIATTN_SEGMENTS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(8),
+            retention_ratio: std::env::var("TQ_TRIATTN_RETENTION")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(0.9),
         }
     }
 
@@ -268,6 +286,11 @@ pub fn select_top_keys(
 ///
 /// # Returns
 /// Per-head Vec of indices to RETAIN (includes sink tokens).
+/// V3 eviction: prefix protection + per-segment quota + dynamic retention.
+///
+/// V1 (old): global sort, evict lowest-scoring, sink_count=4 only protection.
+/// V3 (new): prefix_protection (128), K segments with proportional eviction,
+///           dynamic budget = seq_len × retention_ratio (default 0.9).
 pub fn evict_pass(
     all_keys_pre_rope: &[&[f32]],
     current_pos: usize,
@@ -277,44 +300,99 @@ pub fn evict_pass(
 ) -> Vec<Vec<usize>> {
     let n_kv_heads = all_keys_pre_rope.len();
     let n_keys = key_positions.len();
-    let budget = config.budget;
 
-    // Sink tokens are always retained — only score non-sink tokens
-    let non_sink_positions = &key_positions[sink_count..];
-    let non_sink_budget = budget.saturating_sub(sink_count);
+    // V3: Dynamic budget from retention ratio (overrides fixed budget if set)
+    let budget = if config.retention_ratio > 0.0 && config.retention_ratio < 1.0 {
+        (n_keys as f32 * config.retention_ratio) as usize
+    } else {
+        config.budget
+    };
+
+    // V3: Protected zone = max(sink_count, prefix_protection)
+    let protected = config.prefix_protection.max(sink_count).min(n_keys);
+
+    let evictable_count = n_keys.saturating_sub(protected);
+    let evictable_budget = budget.saturating_sub(protected);
 
     let mut result = Vec::with_capacity(n_kv_heads);
 
     for kv_head in 0..n_kv_heads {
         let head_dim = config.head_dim;
-        let non_sink_keys = &all_keys_pre_rope[kv_head][sink_count * head_dim..];
 
-        if non_sink_positions.len() <= non_sink_budget {
-            // All fit within budget
+        if evictable_count <= evictable_budget || n_keys <= budget {
+            // All fit within budget — no eviction needed
             result.push((0..n_keys).collect());
             continue;
         }
 
+        // Score only evictable tokens (after protected zone)
+        let evictable_keys = &all_keys_pre_rope[kv_head][protected * head_dim..];
+        let evictable_positions = &key_positions[protected..];
+
         let scores = score_kv_head(
-            non_sink_keys,
+            evictable_keys,
             kv_head,
             current_pos,
-            non_sink_positions,
+            evictable_positions,
             config,
         );
 
-        let mut retained = select_top_keys(&scores, non_sink_budget);
-        // Shift indices back to global positions (add sink_count offset)
-        for idx in &mut retained {
-            *idx += sink_count;
+        // V3: Per-segment eviction quota
+        let retained_evictable = if config.n_segments > 1 && evictable_count > config.n_segments {
+            select_top_keys_segmented(&scores, evictable_budget, config.n_segments)
+        } else {
+            select_top_keys(&scores, evictable_budget)
+        };
+
+        // Build full retained list: protected + evictable survivors
+        let mut full_retained: Vec<usize> = (0..protected).collect();
+        for idx in retained_evictable {
+            full_retained.push(idx + protected);
         }
-        // Prepend sink tokens
-        let mut full_retained: Vec<usize> = (0..sink_count).collect();
-        full_retained.extend(retained);
+        full_retained.sort_unstable();
         result.push(full_retained);
     }
 
     result
+}
+
+/// V3: Per-segment eviction — divide tokens into K segments, retain proportionally.
+/// Prevents global sort from starving any region of the context.
+fn select_top_keys_segmented(scores: &[f32], budget: usize, n_segments: usize) -> Vec<usize> {
+    let n = scores.len();
+    if budget >= n { return (0..n).collect(); }
+    if n_segments <= 1 { return select_top_keys(scores, budget); }
+
+    let seg_size = (n + n_segments - 1) / n_segments;
+    let mut retained = Vec::with_capacity(budget);
+    let mut remaining_budget = budget;
+    let mut remaining_tokens = n;
+
+    for seg in 0..n_segments {
+        let seg_start = seg * seg_size;
+        let seg_end = (seg_start + seg_size).min(n);
+        if seg_start >= n { break; }
+        let seg_len = seg_end - seg_start;
+
+        // Proportional quota: this segment's share of remaining budget
+        let seg_quota = if remaining_tokens > 0 {
+            ((seg_len as f64 / remaining_tokens as f64) * remaining_budget as f64).ceil() as usize
+        } else { 0 };
+        let seg_quota = seg_quota.min(seg_len).min(remaining_budget);
+
+        // Score + select within segment
+        let seg_scores = &scores[seg_start..seg_end];
+        let seg_selected = select_top_keys(seg_scores, seg_quota);
+        for idx in seg_selected {
+            retained.push(seg_start + idx);
+        }
+
+        remaining_budget = remaining_budget.saturating_sub(seg_quota);
+        remaining_tokens = remaining_tokens.saturating_sub(seg_len);
+    }
+
+    retained.sort_unstable();
+    retained
 }
 
 #[cfg(test)]
