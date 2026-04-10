@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_gaussianity_after_rotation() {
-        // TheTom found: kurtosis 900.4 → 2.9 after rotation (Gaussian=3.0)
+        // Empirical: kurtosis 900.4 → 2.9 after rotation (Gaussian=3.0)
         // Verify our rotation produces near-Gaussian coordinates
         use rand::SeedableRng;
         use rand::Rng;

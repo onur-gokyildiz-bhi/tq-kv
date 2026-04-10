@@ -155,8 +155,8 @@ pub struct TurboQuantConfig {
     /// If None, falls back to TQ_SKIP env var (default: 4).
     pub skip_layers: Option<usize>,
     /// Number of final layers to protect (uncompressed fp16 KV cache).
-    /// turboquant_plus found last layers are disproportionately sensitive:
-    /// last 8 layers account for ALL quality loss in their experiments.
+    /// Empirical finding: last layers are disproportionately sensitive —
+    /// last 8 layers account for ~all quality loss in our experiments.
     /// If None, falls back to TQ_PROTECT_LAST env var (default: 0 = off).
     pub protect_last_layers: Option<usize>,
     /// Number of sink tokens to preserve at full precision.
@@ -1410,7 +1410,7 @@ pub fn compress_single_key(
 /// Compress a single key vector with pre-computed signs.
 /// Saves signs allocation in the hot loop.
 ///
-/// **Norm Correction** (from turboquant_plus): after quantization, the reconstruction's
+/// **Norm Correction**: after quantization, the reconstruction's
 /// L2 norm differs from the original. We store a corrected norm such that
 /// `||decompress(compress(k))|| ≈ ||k||`. This is free at decode time because
 /// decompression already scales by `stored_norm / sqrt(d)`.

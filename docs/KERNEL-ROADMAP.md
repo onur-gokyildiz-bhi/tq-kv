@@ -85,6 +85,24 @@
 - **A.3:** `71de975` — Lazy embedding dequant: 6.5 GB → 4.8 GB
 - **A.2:** Deferred — raw_data release CPU fallback'i kırar. R.3 refactor sonrası.
 
+### 4.6 Multi-Arch Build + Kernel Optimizations ✅
+- **Commit:** `6a399a2` — Multi-arch CUDA build (sm_75/80/86/89/90)
+- build.rs: per-arch PTX compilation (80 PTX files), TQ_CUDA_ARCHES override
+- Runtime GPU detection: cuDeviceGetAttribute → best_compiled_arch()
+- common.cuh: TQ_HAS_CP_ASYNC, TQ_HAS_FP8, TQ_HAS_TMA, TQ_SMEM_MAX_KB
+- **__ldg() read-only cache:** flash_decode, qmatmul (x loads, Q8_0), fused_attention (GQA decode)
+- **Warp-reduce broadcast:** flash_decode saves 1 __syncthreads per KV token
+- **Sonuç:** 17.6 → 18.2 tok/s (+3.4%), PPL unchanged
+- **Bank conflict audit:** No actionable conflicts (stride-1 access, broadcast-safe)
+
+### 4.7 cp.async Double-Buffer (sm_80+ Tiered) ✅
+- **Commit:** `2d02d3b` — cp.async pipeline for qmatmul x prefetch
+- common.cuh: tq_cp_async_f32/commit/wait_all/wait_one via inline PTX
+- q4km_matvec + q6k_matvec: double-buffered s_x[2][QK_K], async prefetch next superblock
+- sm_75 fallback: synchronous __ldg() (unchanged behavior)
+- Verified: sm_75=0, sm_80+=10 cp.async instructions per kernel
+- **Sonuç:** 18.2 → 18.4 tok/s (+1.1%), PPL unchanged
+
 ---
 
 ## Kernel Boyut Hedefleri
@@ -155,29 +173,29 @@ Bu kernel'lar hiçbir açık kaynak projede yok:
 
 ---
 
-## Phase 6: Competitive Gap Close — turboquant_plus Parity (3-6 hafta)
+## Phase 6: Platform & Scale Parity (3-6 hafta)
 
-> Tom'un bizden iyi olduğu 2 alan: platform coverage ve large-model validation.
+> İki cephe açık: platform coverage (CUDA-only) ve large-model validation (sadece 7B).
 > Bu phase her ikisini de kapatır.
 
 ### 6.1 Metal Backend (Apple Silicon)
-- **Neden:** turboquant_plus en güçlü Metal'de (M1/M2/M5 validated). Biz CUDA-only.
+- **Neden:** Local LLM kullanıcısının %40+'ı Mac. Biz CUDA-only.
 - **Yaklaşım:** `ComputeBackend` trait zaten var → `MetalBackend` impl
 - **Metal Shading Language:** Q4K matvec, RoPE, RmsNorm, softmax, attention
 - **metal-rs** veya **wgpu** (WebGPU): cross-platform fallback
-- **TQ kernels:** Hadamard + codebook WHT rotation (Tom'un fp16 vectorized approach'u referans)
+- **TQ kernels:** Hadamard + codebook WHT rotation (fp16 vectorized referans)
 - **Hedef:** M1+ Mac'lerde Qwen2 7B çalıştır, tok/s benchmark
-- **Etki:** Apple kullanıcı tabanı açılır (%40+ local LLM kullanıcısı Mac)
+- **Etki:** Apple kullanıcı tabanı açılır
 
 ### 6.2 Vulkan Backend (AMD/Intel/Qualcomm)
-- **Neden:** Tom Vulkan desteği var (AMD RDNA4 validated). Biz sıfır.
+- **Neden:** AMD RDNA4 ve Intel Arc kullanıcıları için sıfır desteğimiz var.
 - **Yaklaşım:** `VulkanBackend` impl via `vulkano` veya `wgpu` compute shaders
 - **Öncelik:** Decode matvec + attention (prefill cuBLAS olmadan yavaş olabilir)
 - **Min viable:** Q4K matvec + GQA attention + RoPE + RmsNorm
 - **Etki:** AMD GPU kullanıcıları (özellikle Linux gaming community)
 
 ### 6.3 Large Model Validation Suite
-- **Neden:** Tom 70B, 104B'de 128K context'te validated. Biz sadece 7B test ettik.
+- **Neden:** Sadece 7B test ettik. 70B+ ve 128K context iddiaları doğrulanmadı.
 - **Plan:**
   - Llama 3.1 70B Q4_K_M: PPL + NIAH @ 4K/16K/32K
   - Qwen2.5 72B Q4_K_M: PPL + NIAH @ 4K/32K
@@ -188,7 +206,7 @@ Bu kernel'lar hiçbir açık kaynak projede yok:
 - **Etki:** "Büyük modellerde test etmediler" argümanı kapanır
 
 ### 6.4 Automated Benchmark CI
-- **Neden:** Tom 511 Python test + reproducible benchmark. Biz 96 test, manual bench.
+- **Neden:** 96 test, manual bench. Regresyonu yakalayacak otomatik bir şey yok.
 - **Plan:**
   - GitHub Actions: her PR'da `cargo test` + PPL regression check
   - Benchmark artifact: tok/s + PPL + VRAM → JSON → trend tracking
@@ -197,7 +215,7 @@ Bu kernel'lar hiçbir açık kaynak projede yok:
 - **Etki:** Her commit'in kalitesi ölçülü, regresyon yakalanır
 
 ### 6.5 Community Validation Program
-- **Neden:** Tom 50+ tester, çoklu GPU/model raporları. Biz tek geliştirici.
+- **Neden:** Tek geliştirici. Çoklu GPU/model raporu için bağımsız test yok.
 - **Plan:**
   - `tq doctor` genişlet: GPU uyumluluk + model uyumluluk raporu
   - `tq report` komutu: tek tuşla PPL/tok/s/VRAM raporu → GitHub issue template
@@ -210,14 +228,14 @@ Bu kernel'lar hiçbir açık kaynak projede yok:
 ## Competitive Moat Summary
 
 ```
-TQ-KV Benzersiz (Tom'da YOK):
+TQ-KV Benzersiz Özellikler:
   TriAttention     → CONSTANT memory KV (128K = 4.8 MB)
-  Pre-RoPE         → Symmetric 4-bit on Q4KM WORKS (Tom: catastrophic)
+  Pre-RoPE         → Symmetric 4-bit on Q4KM WORKS
   SRHT QJL         → Error correction (+4.5 dB SNR)
   KV Compaction    → 25x token reduction
   Own CUDA stack   → Zero dependencies, full control
 
-Tom'un Avantajı (Phase 6 ile kapatılacak):
+Açık Cepheler (Phase 6 ile kapatılacak):
   Metal            → Phase 6.1 (MetalBackend)
   Vulkan           → Phase 6.2 (VulkanBackend)
   Large models     → Phase 6.3 (70B/104B validation)
@@ -292,16 +310,157 @@ Tom'un Avantajı (Phase 6 ile kapatılacak):
 
 ---
 
+## Phase 8: Research-Driven Advances (RESEARCH-2026.md'den)
+
+> Araştırma taramasından çıkan, mevcut stack'e eklenebilecek teknikler.
+> Her biri bağımsız, sprint olarak planlanabilir.
+
+### 8.0 TriAttention V3 Upgrade — YÜKSEK ÖNCELİK
+
+**Durum:** Mevcut TriAttention = naive V1. V1 NIAH end FAIL. V3 hedefi: +0.006% PPL, NIAH all-pass.
+
+**V3'ün üç eklentisi:**
+
+1. **Prefix protection (128 token):** İlk 128 token ASLA evict edilmez.
+   - Bizim sink_tokens=4 yetersiz — system prompt + initial context korunmalı
+   - `tq-kv/src/triattention.rs` — protected set'e prefix ekle
+   - `TQ_TRIATTN_PREFIX=128` env var
+
+2. **Per-segment eviction quota (K=8):** Context K eşit segment'e bölünür.
+   Her segment'ten orantılı evict. Global sort eviction'ı tek bölgeye yoğunlaştırıyor → o
+   bölgedeki bilgi kayboluyor → NIAH fail. Segment quota bunu önler.
+   - `tq-kv/src/triattention.rs` — segment-aware eviction
+   - `kernels/trig_score.cu` — segment boundary parameters
+   - `TQ_TRIATTN_SEGMENTS=8` env var
+
+3. **Conservative retention default:** Budget = seq_len × 0.9 (90% retention).
+   Mevcut budget=128 çok agresif (%94 eviction → +10.6% PPL).
+   Beklenti: %10 evict = +0.006%, %15 evict = +0.48%, %30+ evict = kötü.
+
+**NIAH test protocol:**
+- 32K/64K context, 3 pozisyon (start/mid/end)
+- Strict checker: exact string match only
+- `-b 512` batch size (eviction'ın gerçekten fire etmesi için)
+- Min 3 chunk PPL (tek chunk noise'dan ayırt edilemez)
+
+**V3'ün bile çözemediği (bizim fırsat):**
+- Qwen3.5 hybrid Mamba+Attention: NIAH mid/end FAIL
+  - Sadece rotated K dims'i score'luyor, %75 unrotated dims görünmüyor
+  - Çözüm: trig score + direct cosine over unrotated dims
+- 85% retention NIAH middle PARTIAL → Quest offload ile geri retrieve (Phase 8.4)
+- Multi-needle test yok → bizim Sprint E'de yapılacak
+
+**Etki:** PPL +10.6% → +0.5%, NIAH 32K all-pass, TQ+V3 full stack ~4.2x total compression
+
+---
+
+### 8.1 Entropy Coding Layer (KVTC insight, ICLR 2026)
+
+**Kaynak:** arxiv 2511.01815 — KVTC: 20-40x compression via PCA + entropy coding
+**Bizde:** Quantized indices (2/3/4-bit) direkt packed olarak saklanıyor.
+**Yenilik:** Indices üzerine ANS (Asymmetric Numeral Systems) veya Huffman coding.
+Lloyd-Max codebook sonrası index dağılımı uniform DEĞİL (merkez centroid'ler daha sık).
+Entropy coding bu non-uniformity'yi exploit eder.
+
+- **Dosya:** Yeni `tq-kv/src/entropy.rs` — ANS encode/decode
+- **CUDA:** `kernels/entropy_decode.cu` — GPU parallel ANS decode (attention sırasında)
+- **Etki:** Compression 5x → 8-10x, **sıfır kalite kaybı** (lossless layer)
+- **Storage:** ~%30-40 ek sıkıştırma (3-bit indices entropy ~2.1 bit effective)
+- **Risk:** Decode latency ekler (ANS decode serial). GPU parallel ANS gerekli.
+- **Referans:** NVIDIA nvCOMP kütüphanesi ANS implementasyonu var
+
+### 8.2 Per-Channel Adaptive Codebook (KIVI insight)
+
+**Kaynak:** arxiv 2402.02750 — KIVI: per-channel asymmetric 2-bit, <1% PPL
+**Bizde:** Per-vector norm + global codebook. Tüm dimension'lar aynı dağılım varsayılıyor.
+**Yenilik:** Her dimension'a özel scale + zero-point. Rotation sonrası bile per-dim variance farklı.
+
+- **Dosya:** `tq-kv/src/codebook.rs` — `PerChannelCodebook` struct
+- **CUDA:** `kernels/tq_compress.cu` — per-dim scale/zero shared memory'de
+- **Etki:** 2-bit PPL dramatik iyileşme (KIVI <1% vs bizim >>5%)
+- **Storage:** 2 × head_dim × f16 per layer (scale + zero) = 512 byte/layer, ihmal edilebilir
+- **Mean-removal ile birleşir:** center → per-channel scale → rotate → quantize
+
+### 8.3 Cross-Layer KV Sharing (CommonKV / XQuant insight)
+
+**Kaynak:** arxiv 2508.16134 (CommonKV), 2510.11236 (XQuant sub-1.4 bit)
+**Bizde:** Her layer bağımsız compress ediliyor.
+**Yenilik:** Adjacent layer'ların KV cache'i %80-98 benzer (SVD analizi).
+Delta coding: layer N'i base olarak sakla, layer N+1'i delta olarak.
+
+- **Dosya:** `tq-kv/src/cross_layer.rs` — delta compression between layers
+- **Etki:** Per-layer storage %50-80 azalma. 3-bit → effective ~1.5-bit.
+- **Risk:** Decode'da layer N'i decompress edip N+1'i reconstruct etmek latency ekler.
+- **Strateji:** 4-layer group'lar (base + 3 delta). Base full quality, delta'lar 2-bit.
+
+### 8.4 Quest-Style Offload + Retrieve (TriAttention v2)
+
+**Kaynak:** Quest (Tang et al. 2024) — page-level KV retrieval, near-lossless
+**Bizde:** TriAttention evict = kalıcı silme. NIAH'ta bilgi kaybı riski.
+**Yenilik:** Evict etme, TQ-compressed olarak CPU'ya offload et. FAISS index tut. Gerektiğinde retrieve.
+
+- **Dosya:** `src/models/turbo_generic/kv_cache.rs` — `OffloadedKvCache` struct
+- **CPU side:** FAISS-rs veya custom ANN index (quantized key'ler üzerinde)
+- **PCIe transfer:** top-32 retrieve = 32 × 128 × 4 = 16 KB, ~5 µs
+- **Etki:** Constant GPU memory + near-lossless long-context recall
+- **Risk:** PCIe latency per-token. Batch retrieve ile amortize edilir.
+- **TriAttention ile synergy:** Score < threshold → offload (bugün: delete). Score needed → retrieve.
+
+### 8.5 Marlin lop3 Register Dequant
+
+**Kaynak:** IST-DASLab/marlin — W4A16 near-peak tensor core throughput
+**Bizde:** Q4K dequant scalar loop (shift + mask + cast + scale). Functional ama slow path.
+**Yenilik:** `lop3` PTX instruction: 3-input LUT, tek instruction'da nibble extract + zero-extend.
+Register'larda dequant → FP16 → WMMA/tensor core MMA.
+
+- **Dosya:** `kernels/qmatmul.cu` — `q4km_matvec` inner loop değişiklik
+- **Etki:** Decode matvec %15-20 hızlanma (dequant compute → ~0, bandwidth utilization ↑)
+- **Arch:** sm_75+ (lop3 tüm arch'larda var)
+- **Risk:** Q4_K_M format Marlin'in INT4'ünden farklı — nibble layout adaptation gerekli
+
+### 8.6 Fused RoPE + Softcap in Flash Decode
+
+**Kaynak:** FlashDecoding v2+ iterations (Tri Dao)
+**Bizde:** RoPE ayrı kernel, softcap ayrı kernel, flash_decode ayrı kernel = 3 launch/layer.
+**Yenilik:** Hepsini tek kernel'da fuse et. K load edildiğinde RoPE anında uygula. Score'a softcap uygula.
+
+- **Dosya:** `kernels/flash_decode.cu` — K load loop'una RoPE inline
+- **Etki:** 32 layer × 2 extra launch = 64 kernel launch eliminasyonu, %10-15 decode hız
+- **Risk:** Kernel complexity artar, register pressure. Profiling ile doğrula.
+
+### 8.7 Learned Linear Adapter (KVLinC alternative to QJL)
+
+**Kaynak:** arxiv 2510.05373 — KVLinC: Hadamard + learned correction
+**Bizde:** QJL random projection ile error correction (+4.5 dB SNR).
+**Yenilik:** Random projection yerine **learned linear adapter**. Per-layer small matrix (128×128).
+Calibration sırasında öğrenilir, inference'da sabit.
+
+- **Dosya:** `tq-kv/src/linear_adapter.rs` — calibration + apply
+- **Eğitim:** MSE minimize: `adapter(compressed_key) ≈ original_key`. 5 dakika calibration.
+- **Etki:** QJL'den daha iyi error correction, daha az storage (no signs vector)
+- **Risk:** Per-layer 128×128 matrix = 64 KB/layer × 32 layer = 2 MB. Kabul edilebilir.
+- **QJL ile karşılaştır:** A/B test, hangisi PPL'de daha iyi?
+
+---
+
 ## Öncelik Özeti
 
 ```
-Hemen:    Flash decode fix → long-context unlock
-Kısa:     Tensor Core WMMA → %50 hız artışı potansiyeli
-Orta:     Sliding window + MoE → yeni model ailesi desteği
+✅ Done:  Phase 1-3 (doğruluk, performans, multi-model kernels)
+✅ Done:  Phase 4.5-4.7 (RAM fix, multi-arch, cp.async, common v2)
+Sonraki:  Mean-removal (MEAN-REMOVAL-PLAN.md) → +0.33 attention quality
+          Entropy coding (8.1) → 5x→8-10x compression, sıfır kalite kaybı
+          Per-channel codebook (8.2) → 2-bit viability
+          Fused RoPE+softcap (8.6) → %10-15 hız
+          Marlin lop3 dequant (8.5) → %15-20 hız
+Orta:     Quest offload+retrieve (8.4) → near-lossless long-context
+          Self-speculative decode (7.6) → 2x hız, 0 VRAM
+          Cross-layer sharing (8.3) → effective sub-2-bit
+          KVLinC learned adapter (8.7) → QJL replacement candidate
 Uzun:     FP8 + Multi-GPU → production serving
 Paralel:  Dashboard + HF compat + safetensors → DX & görünürlük
-Rekabet:  Metal + Vulkan + 70B validation → turboquant_plus parity
-Gelecek:  Speculative decode → TQ×spec fusion = multiplicative gain
+Rekabet:  Metal + Vulkan + 70B validation
+Gelecek:  Block-diagonal rotation research + spec fusion
 ```
 
 ---

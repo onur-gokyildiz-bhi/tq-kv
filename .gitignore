@@ -8,8 +8,9 @@
 *.docx
 *.pdf
 !paper/*.pdf
-/docs/
+/docs/*
 !docs/tq-demo.gif
+!docs/KERNEL-ROADMAP.md
 .claude/
 candle-patches/
 TODOS.md

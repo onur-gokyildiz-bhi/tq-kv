@@ -48,7 +48,7 @@ pub struct TriAttentionConfig {
     pub offsets: Vec<usize>,
     /// V3: Hard prefix protection — first N tokens NEVER evicted.
     /// Covers system prompt, few-shot examples, critical context.
-    /// Default: 128 (Tom V3: 128). Set via TQ_TRIATTN_PREFIX.
+    /// Default: 128. Set via TQ_TRIATTN_PREFIX.
     pub prefix_protection: usize,
     /// V3: Number of segments for per-segment eviction quota.
     /// Context divided into K equal buckets; each loses tokens proportionally.
