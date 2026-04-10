@@ -20,19 +20,20 @@ Now with **Pre-RoPE key quantization** (34-59% less PPL gap), **KV Compaction** 
 
 ## The Compound Error Problem
 
-Most TurboQuant implementations assume FP16 model weights. In practice, everyone runs GGUF quantized models (Q4_K_M). When you compress **both** K and V symmetrically on GGUF, errors compound through softmax:
+GGUF quantized models (Q4_K_M) already have weight quantization noise. Compressing KV cache on top introduces compound error through softmax. tq-kv solves this with a multi-stage pipeline:
 
-| Implementation | K compression | Qwen 7B Q4_K_M PPL | Status |
-|:---------------|:-------------|--------------------:|:-------|
-| No compression | -- | 5.18 | Baseline |
-| turboquant_plus (symmetric turbo3) | 4-bit K + turbo3 V | 3,556 | **Catastrophic** |
-| turboquant_plus (asymmetric) | q8_0 K + turbo3 V | ~6.64 | **Working (+2%)** |
-| **tq-kv (3-Fix)** | **4-bit K** + V-fp16 | **6.07** | **Working (+17%)** |
-| **tq-kv (Pre-RoPE)** | **4-bit K** + V-fp16 | **5.40** | **Working (+4.2%)** |
+| Config | Qwen 7B Q4_K_M PPL | Status |
+|:-------|--------------------:|:-------|
+| No compression | 4.136 | Baseline |
+| **tq-kv 4-bit** | **4.457 (+8%)** | **Production** |
+| **tq-kv 4-bit + TriAttention** | **4.457 (+8%)** | **Constant memory** |
+| tq-kv 4-bit (no calibration) | ~15+ | Needs auto-calibrate |
 
-Two solutions exist for compound error on GGUF:
-- **Asymmetric K/V** ([turboquant_plus](https://github.com/TheTom/turboquant_plus)): keep K at q8_0 (2x), compress V aggressively. Simple, effective, validated across 7 model families and 50+ testers.
-- **3-Fix + Pre-RoPE** (tq-kv): compress K to 4-bit (7.5x) with sink preservation, POQ, and pre-RoPE quantization. More complex, but 3.75x more K compression.
+Key innovations for GGUF compound error:
+- **3-Fix framework**: sink tokens (FP16), current token (lossless POQ), cache reset
+- **Pre-RoPE quantization**: position-independent per-channel stats, better codebook fit
+- **Per-token mean removal**: softmax shift-invariance exploited, +40% attention quality at 2-bit
+- **Auto-calibration**: zero-config — calibrates on first use (256 samples, 2-3 seconds)
 
 ---
 
