@@ -10,7 +10,7 @@
 
 Implementation of Google's [TurboQuant](https://arxiv.org/abs/2504.19874) (ICLR 2026) with the **3-Fix framework** that enables aggressive key compression (4-bit, 7.5x) on GGUF quantized models -- where symmetric K compression produces catastrophic output.
 
-Now with **Pre-RoPE key quantization** (34-59% less PPL gap), **KV Compaction** (up to 25x token reduction), and **TriAttention** eviction for constant-memory KV cache at any context length.
+Now with **Pre-RoPE key quantization** (34-59% less PPL gap), **KV Compaction** (up to 25x token reduction), **TriAttention** eviction for constant-memory KV cache, **per-token mean removal** (+40% attention quality at 2-bit), and **multi-arch CUDA** (Turing → Hopper).
 
 <p align="center">
   <img src="docs/tq-demo.gif" alt="tq-engine Web UI demo — Qwen2.5 7B with TurboQuant 4-bit KV compression" width="720">
@@ -163,21 +163,25 @@ Input KV vector (from GGUF Q4_K_M model)
     |
 [0] Pre-RoPE capture (optional)            O(1)
     |  Compress BEFORE RoPE for position-independent stats
-    |  +34-59% PPL gap reduction
     |
-[1] Randomized Hadamard Transform           O(d log d)
+[1] Channel bias subtraction (calibrated)   O(d)
+    |  Remove weight-quantization artifacts
+    |
+[2] Per-token mean removal                   O(d)
+    |  Softmax shift-invariant: attention ignores mean
+    |  Frees codebook precision (+40% cosine sim @ 2-bit)
+    |
+[3] Randomized Hadamard Transform            O(d log d)
     |  Decorrelates outliers -> coordinates ~ Gaussian
-    |  Verified: kurtosis 35.3 -> 3.3 (Gaussian=3.0)
     |
-[2] Lloyd-Max Codebook + Adaptive Sigma      O(d)
-    |  Per-vector sigma = ||x|| / sqrt(d)
-    |  Norm correction: ||decompress|| matches ||original||
+[4] Per-channel adaptive sigma (KIVI-style)  O(d)
+    |  Per-dimension variance from calibration
+    |  Lloyd-Max codebook + norm correction
     |
-[3] SRHT QJL Error Correction (optional)     O(d log d)
-    |  Structured Hadamard projection (not dense random)
-    |  Adaptive: auto-enables at long context
+[5] SRHT QJL Error Correction (optional)     O(d log d)
+    |  Structured Hadamard projection (+4.5 dB SNR)
     |
-Output: packed indices + corrected norm
+Output: packed indices + corrected norm + mean
         7.5x compression at 4-bit (keys only)
 ```
 
@@ -209,8 +213,14 @@ Based on [TriAttention](https://arxiv.org/abs/2604.04921) (Mao et al., 2026). Pr
 **Orthogonal to TurboQuant**: TriAttention decides *which* tokens to keep (eviction), TurboQuant decides *how* to compress them (quantization). Combined: fixed-size KV cache at any context length.
 
 ```bash
-# Enable TriAttention (requires calibration: tq calibrate <model>)
-TQ_TRIATTN=1 TQ_TRIATTN_BUDGET=256 tq chat qwen2:7b --turbo-quant
+# TQ+TriAttention is ON by default with --turbo-quant (requires calibration)
+tq chat qwen2:7b --turbo-quant
+
+# Disable TriAttention (TQ-only mode)
+TQ_TRIATTN=0 tq chat qwen2:7b --turbo-quant
+
+# Custom budget
+TQ_TRIATTN_BUDGET=256 tq chat qwen2:7b --turbo-quant
 ```
 
 #### Memory Projection (Qwen2.5-7B, TQ 4-bit + TriAttention, budget=128)
@@ -273,9 +283,13 @@ TQ_TRIATTN=1 TQ_TRIATTN_BUDGET=256 tq chat qwen2:7b --turbo-quant
 | `TQ_GROUP` | 32 | Group size for per-group sigma |
 | `TQ_BIAS_CORRECT` | 0 | Softmax bias correction (experimental) |
 | `TQ_NO_CAL` | 0 | Disable calibration auto-loading |
-| `TQ_TRIATTN` | 0 | TriAttention eviction (1=enabled, requires calibration) |
+| `TQ_TRIATTN` | **on** | TriAttention eviction (on by default with --turbo-quant, 0=disable) |
 | `TQ_TRIATTN_BUDGET` | 2048 | Max KV tokens to retain (fixed memory ceiling) |
 | `TQ_TRIATTN_INTERVAL` | 128 | Eviction check interval in tokens |
+| `TQ_CENTER_KEYS` | 1 | Per-token mean removal (softmax shift-invariant, +40% @ 2-bit) |
+| `TQ_MAX_SEQ` | 2048 | Maximum KV cache sequence length |
+| `TQ_NO_PER_CHANNEL` | 0 | Disable per-channel sigma (KIVI-style, for A/B testing) |
+| `TQ_CUDA_ARCHES` | all | CUDA target arches (e.g. "86" for dev, "75,80,86,89,90" for release) |
 
 ---
 
@@ -314,7 +328,15 @@ tq chat qwen2:7b           # terminal chat
 
 Web UI at localhost:11435. Works with ChatBox and Open WebUI.
 
-5 architectures: Qwen2, Llama, Mistral, Phi3, Gemma2 -- auto-detected from GGUF.
+4 validated models: Qwen2.5 7B/0.5B, Llama 3.1 8B, Mistral 7B. Auto-detected from GGUF metadata.
+
+### 3-Way Benchmark
+
+```bash
+tq bench qwen2:7b                    # Standard vs TQ vs TQ+TriAttention
+tq perplexity -m qwen2:7b --compare eval.txt  # 3-way PPL comparison
+scripts/ppl-check.sh                  # Regression CI (9 checks, tight thresholds)
+```
 
 ---
 
@@ -322,33 +344,34 @@ Web UI at localhost:11435. Works with ChatBox and Open WebUI.
 
 > RTX 3080 10GB, Qwen 2.5 7B Q4_K_M, own CUDA kernels (no candle/llama.cpp dependency)
 
-| Metric | Value |
-|:-------|------:|
-| **Decode (steady-state, CUDA Graph)** | **19 tok/s** |
-| **Decode (100 token average)** | **17.8 tok/s** |
-| **TTFT (12 token prompt)** | **0.33s** |
-| **PPL** | **13.296** |
-| **Peak VRAM** | ~4.5 GB |
+| Mode | tok/s | TTFT | PPL | KV Memory |
+|:-----|------:|-----:|----:|:---------:|
+| **Standard** | **18.5** | 0.19s | 4.136 | grows linearly |
+| **TQ 4-bit** | **16.1** | 0.10s | 4.457 (+8%) | 3.8x smaller |
+| **TQ+TriAttention** | **15.2** | 0.11s | 4.457 (+8%) | **constant** |
 
-### Custom CUDA Kernel Stack
+4 validated models: Qwen2.5 7B/0.5B, Llama 3.1 8B, Mistral 7B. Auto-calibration on first use.
 
-- **Fused layer kernels**: RmsNorm + Q4K QKV + bias, gateup + SiLU, down + residual (3 launches/layer vs 13)
-- **Q4K/Q6K fused matvec**: dequant + dot product in single kernel (no intermediate F32 buffer)
-- **GQA decode attention**: online softmax, graph-safe (seq_len from GPU scalar)
-- **GPU-side dequant**: Q4K/Q6K to F32 for cuBLAS SGEMM prefill (streaming, no persistent cache)
-- **CUDA Graph replay**: entire decode layer loop as single GPU operation (zero CPU dispatch)
-- **GPU argmax**: 4 bytes D2H instead of 600KB vocabulary transfer
+### Custom CUDA Kernel Stack (78 kernels, 16 files, 4.4K lines)
+
+- **Multi-arch**: sm_75 (Turing) → sm_90 (Hopper), runtime GPU detect, per-arch PTX
+- **Butterfly reduce**: `__shfl_xor_sync` broadcast to all threads (no broadcast hacks)
+- **cp.async pipeline**: double-buffered qmatmul on Ampere+ (sm_80+), sync fallback on Turing
+- **Fused layer kernels**: RmsNorm + Q4K QKV + bias, gateup + SiLU, down + residual
+- **Q4K/Q6K/Q8_0 fused matvec**: `__ldg` read-only cache, dequant + dot in single kernel
+- **Flash decode v2**: split-KV parallelism for long context (>256 tokens), online softmax
+- **TQ fused attention**: compressed KV → attention score without decompression (moat kernel)
+- **CUDA Graph replay**: short context (<256) as single GPU operation, auto-fallback to eager mode
 
 ### Optimization History
 
-| Phase | tok/s | TTFT | Key Change |
-|:------|------:|-----:|:-----------|
-| Baseline (candle) | 1.3 | -- | candle framework |
-| Custom CUDA kernels | 1.9 | -- | Own matvec, RoPE, attention |
-| DecodeScratch + fused | 10.1 | 4.8s | Zero-alloc decode, fused kernels |
-| **GPU prefill pipeline** | **11.0** | **1.05s** | GPU dequant + SGEMM, GPU causal mask |
-| **+ CUDA Graph** | **17.8** | **0.33s** | Graph replay, Q6K matvec for lm_head |
-| **+ TriAttention (b=256)** | **15.3** | **0.24s** | Constant-memory KV, zero overhead |
+| Phase | tok/s | Key Change |
+|:------|------:|:-----------|
+| Baseline (candle) | 1.3 | candle framework |
+| Custom CUDA kernels | 1.9 | Own matvec, RoPE, attention |
+| DecodeScratch + fused | 10.1 | Zero-alloc decode, fused kernels |
+| GPU prefill + CUDA Graph | 17.8 | Graph replay, Q6K lm_head |
+| **v2 kernels + multi-arch** | **18.5** | `__ldg`, warp-reduce, cp.async, butterfly reduce |
 
 ---
 
