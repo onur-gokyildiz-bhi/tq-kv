@@ -661,17 +661,31 @@ pub(crate) fn get_skip_layers(config: &tq_kv::TurboQuantConfig) -> usize {
 }
 
 /// Number of final layers to keep uncompressed (fp16 KV cache).
-/// turboquant_plus found last layers are disproportionately sensitive to
-/// quantization: last 8 layers account for ALL quality loss on some models.
-/// Boundary protection (first N + last M) recovers 37-91% of quality gap.
-/// Override with TQ_PROTECT_LAST env var (e.g. TQ_PROTECT_LAST=2).
+/// Last layers are disproportionately sensitive to quantization — they feed
+/// directly into the LM head and small KV errors cause large logit errors.
+/// Boundary protection (last N layers uncompressed) breaks the compound error
+/// chain and recovers generation quality at modest compression cost.
+///
+/// Bug #2 investigation (2026-04-10): combined with Pre-RoPE (default ON),
+/// protect_last=8 gives 4-5/5 acceptable on the validation prompt suite while
+/// keeping high compression ratio.
+///
+/// Validation results (Pre-RoPE ON):
+///   protect=0:  3/5 acceptable
+///   protect=8:  4/5 acceptable — production default
+///   protect=16: 5/5 acceptable (very conservative)
+///
+/// Default 8: balances generation quality and compression ratio.
+/// Combined with TQ_PRE_ROPE=1 (default), 20 layers compressed for Qwen2.5-7B.
+/// See docs/BUG2-FINDINGS.md for full investigation.
+/// Override with TQ_PROTECT_LAST=0 to disable (research/ablation).
 pub(crate) fn get_protect_last_layers(config: &tq_kv::TurboQuantConfig) -> usize {
     if let Some(n) = config.protect_last_layers {
         return n;
     }
     pub(crate) static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("TQ_PROTECT_LAST").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        std::env::var("TQ_PROTECT_LAST").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
     })
 }
 
@@ -795,9 +809,17 @@ pub(crate) fn get_bias_correction() -> bool {
     *C.get_or_init(|| std::env::var("TQ_BIAS_CORRECT").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false))
 }
 
+/// Pre-RoPE quantization: compress keys BEFORE rotary position embedding.
+/// Pre-RoPE keys have position-independent per-channel statistics, giving
+/// dramatically better codebook fit and recovering 34-59% of the quality gap
+/// vs post-RoPE quantization (paper: BUG2-FINDINGS confirmed).
+///
+/// Default: ON (paper-published configuration). Without it, post-RoPE keys
+/// produce compound generation errors at >8 compressed layers.
+/// Override with TQ_PRE_ROPE=0 for ablation/research mode.
 pub(crate) fn get_pre_rope() -> bool {
     pub(crate) static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *C.get_or_init(|| std::env::var("TQ_PRE_ROPE").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false))
+    *C.get_or_init(|| std::env::var("TQ_PRE_ROPE").ok().map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(true))
 }
 
 pub(crate) fn get_compact_threshold() -> usize {
