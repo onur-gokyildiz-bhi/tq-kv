@@ -1062,19 +1062,18 @@ fn cmd_perplexity(cli: &Cli) -> Result<()> {
         // 2. TQ 4-bit (no TriAttention)
         eprintln!("[2/3] Perplexity: TQ 4-bit...");
         models::turbo_generic::set_triattention_override(false);
-        // resolve_tq_config internally enables TriAttn — override back to false after
-        let tq_config_2 = resolve_tq_config_for_model(true, cli.tq_bits, Some(model_name));
+        let tq_config_shared = resolve_tq_config_for_model(true, cli.tq_bits, Some(model_name));
+        // resolve_tq_config enables TriAttn internally — force off for TQ-only
         models::turbo_generic::set_triattention_override(false);
-        let mut engine_tq = load_engine(tq_config_2)?;
+        let mut engine_tq = load_engine(tq_config_shared.clone())?;
         let ppl_tq = engine_tq.compute_perplexity(&text)?;
         drop(engine_tq);
         eprintln!("  TQ 4-bit PPL: {:.3}", ppl_tq);
 
-        // 3. TQ + TriAttention (fresh resolve to avoid state leaks)
+        // 3. TQ + TriAttention (same config, just enable TriAttn)
         eprintln!("[3/3] Perplexity: TQ+TriAttention...");
         models::turbo_generic::set_triattention_override(true);
-        let tq_config_3 = resolve_tq_config_for_model(true, cli.tq_bits, Some(model_name));
-        let mut engine_tri = load_engine(tq_config_3)?;
+        let mut engine_tri = load_engine(tq_config_shared)?;
         let ppl_tri = engine_tri.compute_perplexity(&text)?;
         drop(engine_tri);
         eprintln!("  TQ+TriAttn PPL: {:.3}", ppl_tri);
