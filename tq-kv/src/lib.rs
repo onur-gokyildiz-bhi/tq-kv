@@ -184,6 +184,13 @@ pub struct TurboQuantConfig {
     /// Storage: 4 bytes per token per head (~3% overhead). Default: true.
     pub center_keys: bool,
 
+    /// Per-channel sigma in the rotated domain (KIVI-style adaptive codebook).
+    /// After Hadamard rotation, each dimension still has different variance.
+    /// Using per-channel sigma instead of per-vector sigma gives the codebook
+    /// better per-dimension adaptation — critical for 2-bit quality.
+    /// Computed from calibration. Length = head_dim. None = use per-vector sigma (legacy).
+    pub rotated_channel_sigma: Option<Vec<f32>>,
+
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
     pub use_qjl: bool,
@@ -214,6 +221,7 @@ impl Default for TurboQuantConfig {
             per_head_bits: None,
             pre_rope: false,
             center_keys: true,
+            rotated_channel_sigma: None,
         }
     }
 }
@@ -1255,7 +1263,7 @@ pub fn decompress_keys(compressed: &CompressedKeys, _config: &TurboQuantConfig) 
         &compressed.packed_indices, compressed.count * dim, compressed.bits,
     );
 
-    // Dequantize with adaptive sigma per vector
+    // Dequantize with per-channel sigma (KIVI) or per-vector sigma (legacy)
     let mut result = Vec::with_capacity(compressed.count * dim);
     for i in 0..compressed.count {
         let start = i * dim;
@@ -1265,13 +1273,22 @@ pub fn decompress_keys(compressed: &CompressedKeys, _config: &TurboQuantConfig) 
             result.extend(std::iter::repeat(0.0f32).take(dim));
             continue;
         }
-        let adaptive_sigma = norm / (dim as f32).sqrt();
-        let cb = codebook::Codebook {
-            sigma: adaptive_sigma,
-            ..base_cb.clone()
-        };
-        for &idx in indices {
-            result.push(cb.dequantize(idx));
+        if let Some(ref pcs) = _config.rotated_channel_sigma {
+            // KIVI per-channel: per-vector norm × per-channel ratio
+            let per_vector_sigma = norm / (dim as f32).sqrt();
+            let mean_sigma: f32 = pcs.iter().sum::<f32>() / dim as f32;
+            for (d, &idx) in indices.iter().enumerate() {
+                let ratio = pcs[d] / mean_sigma;
+                let effective_sigma = per_vector_sigma * ratio;
+                let cb = codebook::Codebook { sigma: effective_sigma, ..base_cb.clone() };
+                result.push(cb.dequantize(idx));
+            }
+        } else {
+            let adaptive_sigma = norm / (dim as f32).sqrt();
+            let cb = codebook::Codebook { sigma: adaptive_sigma, ..base_cb.clone() };
+            for &idx in indices {
+                result.push(cb.dequantize(idx));
+            }
         }
     }
 
@@ -1447,6 +1464,18 @@ pub fn compress_single_key_with_signs(
 
     let indices: Vec<u8> = if norm < 1e-10 {
         vec![0u8; dim]
+    } else if let Some(ref pcs) = config.rotated_channel_sigma {
+        // KIVI per-channel: per-vector norm × per-channel ratio
+        // per_vector_sigma captures this token's magnitude
+        // relative_sigma[d] captures per-dimension variance differences
+        let per_vector_sigma = norm / (dim as f32).sqrt();
+        let mean_sigma: f32 = pcs.iter().sum::<f32>() / dim as f32;
+        rotated.iter().enumerate().map(|(d, &v)| {
+            let ratio = pcs[d] / mean_sigma;
+            let effective_sigma = per_vector_sigma * ratio;
+            let cb = codebook::Codebook { sigma: effective_sigma, ..base_cb };
+            cb.quantize(v)
+        }).collect()
     } else {
         let sigma = norm / (dim as f32).sqrt();
         if let Some(ref cal_cb) = config.calibrated_codebook {
@@ -1459,16 +1488,29 @@ pub fn compress_single_key_with_signs(
 
     // Norm correction
     let corrected_norm = if norm > 1e-10 {
-        let sigma = norm / (dim as f32).sqrt();
-        let recon_norm_sq: f32 = if let Some(ref cal_cb) = config.calibrated_codebook {
-            indices.iter()
-                .map(|&idx| { let v = cal_cb.dequantize(idx) * sigma; v * v })
+        let recon_norm_sq: f32 = if let Some(ref pcs) = config.rotated_channel_sigma {
+            let per_vector_sigma = norm / (dim as f32).sqrt();
+            let mean_sigma: f32 = pcs.iter().sum::<f32>() / dim as f32;
+            indices.iter().enumerate()
+                .map(|(d, &idx)| {
+                    let ratio = pcs[d] / mean_sigma;
+                    let effective_sigma = per_vector_sigma * ratio;
+                    let cb = codebook::Codebook { sigma: effective_sigma, ..base_cb };
+                    let v = cb.dequantize(idx); v * v
+                })
                 .sum()
         } else {
-            let cb = codebook::Codebook { sigma, ..base_cb };
-            indices.iter()
-                .map(|&idx| { let v = cb.dequantize(idx); v * v })
-                .sum()
+            let sigma = norm / (dim as f32).sqrt();
+            if let Some(ref cal_cb) = config.calibrated_codebook {
+                indices.iter()
+                    .map(|&idx| { let v = cal_cb.dequantize(idx) * sigma; v * v })
+                    .sum()
+            } else {
+                let cb = codebook::Codebook { sigma, ..base_cb };
+                indices.iter()
+                    .map(|&idx| { let v = cb.dequantize(idx); v * v })
+                    .sum()
+            }
         };
         let recon_norm = recon_norm_sq.sqrt();
         if recon_norm > 1e-10 { norm * norm / recon_norm } else { norm }

@@ -60,6 +60,14 @@ pub struct CalibrationData {
     /// Subtracting this bias before Hadamard rotation restores the Gaussian assumption.
     #[serde(default)]
     pub key_channel_bias: Option<Vec<f32>>,
+    /// Per-channel sigma in rotated domain (KIVI-style).
+    /// After Hadamard rotation, each dimension still has different variance.
+    /// Using per-channel sigma instead of per-vector sigma gives the codebook
+    /// better per-dimension adaptation — critical for 2-bit quality.
+    /// Length = head_dim. Computed from calibration samples in rotated domain.
+    #[serde(default)]
+    pub rotated_channel_sigma: Option<Vec<f32>>,
+
     /// Eigenvalue spectrum from PCA (descending order).
     /// SpectralQuant insight: only d_eff ≈ 4 dimensions carry signal.
     #[serde(default)]
@@ -158,6 +166,14 @@ impl CalibrationData {
         if let Some(d_eff) = self.d_eff {
             config.spectral_d_eff = d_eff;
             eprintln!("  Spectral d_eff={} (QJL will target signal dimensions only)", d_eff);
+        }
+        // Per-channel sigma (KIVI-style adaptive codebook in rotated domain)
+        // Disable with TQ_NO_PER_CHANNEL=1 for A/B testing
+        if !std::env::var("TQ_NO_PER_CHANNEL").ok().map_or(false, |v| v == "1") {
+            if let Some(ref sigma) = self.rotated_channel_sigma {
+                config.rotated_channel_sigma = Some(sigma.clone());
+                eprintln!("  Per-channel sigma enabled ({} dimensions)", sigma.len());
+            }
         }
         // Apply auto-assigned per-head bits from calibration (env var TQ_HEAD_BITS overrides)
         if config.per_head_bits.is_none() {
@@ -491,6 +507,56 @@ pub fn auto_assign_head_bits(
 ///
 /// Subtracting this bias before Hadamard rotation restores the assumption,
 /// improving quantization quality. On FP16 models, bias ≈ 0 (no effect).
+/// Per-channel std-dev in the rotated domain (KIVI-style).
+/// After rotation, each dimension has different variance. Using per-channel sigma
+/// instead of per-vector sigma gives the codebook better precision at low bit widths.
+pub fn compute_rotated_channel_sigma(
+    data: &[f32],
+    head_dim: usize,
+    signs: &[f32],
+    channel_bias: Option<&[f32]>,
+    center_keys: bool,
+) -> Vec<f32> {
+    let count = data.len() / head_dim;
+    if count == 0 {
+        return vec![1.0; head_dim];
+    }
+
+    let mut sum = vec![0.0f64; head_dim];
+    let mut sum_sq = vec![0.0f64; head_dim];
+
+    for chunk in data.chunks_exact(head_dim) {
+        let mut rotated = chunk.to_vec();
+
+        // Apply same pipeline as compress: bias → mean → rotate
+        if let Some(bias) = channel_bias {
+            for (v, &b) in rotated.iter_mut().zip(bias.iter()) {
+                *v -= b;
+            }
+        }
+        if center_keys {
+            let mean = rotated.iter().sum::<f32>() / head_dim as f32;
+            for v in rotated.iter_mut() {
+                *v -= mean;
+            }
+        }
+        tq_kv::hadamard::randomized_hadamard_with_signs(&mut rotated, signs);
+
+        for (d, &v) in rotated.iter().enumerate() {
+            sum[d] += v as f64;
+            sum_sq[d] += (v as f64) * (v as f64);
+        }
+    }
+
+    let n = count as f64;
+    sum.iter().zip(sum_sq.iter())
+        .map(|(&s, &sq)| {
+            let var = (sq / n) - (s / n) * (s / n);
+            (var.max(1e-10).sqrt()) as f32
+        })
+        .collect()
+}
+
 pub fn compute_key_channel_bias(data: &[f32], head_dim: usize) -> Vec<f32> {
     let count = data.len() / head_dim;
     if count == 0 {
@@ -606,6 +672,21 @@ pub fn compute_calibration(
         };
     let rope_freqs = compute_rope_freqs(head_dim, 10000.0);
 
+    // 7. Per-channel sigma in rotated domain (KIVI-style)
+    // After Hadamard rotation, each dimension still has different std-dev.
+    // Using per-channel sigma improves codebook precision at 2-bit.
+    eprintln!("  Per-channel sigma (KIVI-style)...");
+    let signs = tq_kv::hadamard::generate_signs(head_dim, 0x0054_5552_4230);
+    let rotated_channel_sigma = compute_rotated_channel_sigma(
+        data, head_dim, &signs,
+        Some(&key_channel_bias),
+        true, // center_keys
+    );
+    let sigma_min = rotated_channel_sigma.iter().cloned().fold(f32::MAX, f32::min);
+    let sigma_max = rotated_channel_sigma.iter().cloned().fold(f32::MIN, f32::max);
+    let sigma_ratio = if sigma_min > 1e-10 { sigma_max / sigma_min } else { 0.0 };
+    eprintln!("    Sigma range: {:.4}..{:.4} (ratio {:.1}x)", sigma_min, sigma_max, sigma_ratio);
+
     CalibrationData {
         model: model_name.to_string(),
         head_dim,
@@ -618,6 +699,7 @@ pub fn compute_calibration(
         head_importance,
         auto_head_bits,
         key_channel_bias: Some(key_channel_bias),
+        rotated_channel_sigma: Some(rotated_channel_sigma),
         eigenvalues: if eigenvalues.is_empty() { None } else { Some(eigenvalues) },
         d_eff: Some(d_eff_95),
         tri_q_centers: if tri_q_centers.is_empty() { None } else { Some(tri_q_centers) },
