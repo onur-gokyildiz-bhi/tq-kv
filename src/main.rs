@@ -1433,9 +1433,11 @@ fn cmd_niah(cli: &Cli) -> Result<()> {
 
     let actual_words = haystack.split_whitespace().count();
 
-    // Plain text completion prompt (chat template tokenization unreliable)
-    // Model continues the document; we check if it mentions the needle naturally
-    let prompt = format!("{}\n\nThe project codename mentioned in the document is", haystack);
+    // Plain text completion (chat template tokens cause inference issues)
+    let prompt = format!(
+        "{}\n\nBased on the document, the secret project codename is",
+        haystack
+    );
 
     eprintln!("============================================");
     eprintln!("  NIAH Test — {}", model_name);
@@ -1466,21 +1468,19 @@ fn cmd_niah(cli: &Cli) -> Result<()> {
         Engine::load_with_device(&gguf_path, &tok_path, arch, tq_config, cli.cpu)?
     };
 
+    // Greedy (same as bench command) for deterministic NIAH
     let params = GenerationParams {
         max_tokens,
-        temperature: 0.0,  // greedy (ArgMax)
+        temperature: 0.0,  // ArgMax greedy
         ..Default::default()
     };
 
+    engine.clear_cache();
+
     let mut output = String::new();
-    let mut token_count = 0u32;
     let _ = engine.generate(&prompt, &params, |token| {
-        eprint!("{}", token);
         output.push_str(token);
-        token_count += 1;
     })?;
-    eprintln!();
-    eprintln!("[debug] Generated {} tokens, prompt {} chars, output {} chars", token_count, prompt.len(), output.len());
 
     let lower = output.to_lowercase();
     let found = lower.contains(&needle_id.to_lowercase());

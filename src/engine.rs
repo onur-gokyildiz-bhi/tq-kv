@@ -315,9 +315,10 @@ impl Engine {
         Ok(Self { model, tokenizer, device, position: 0, eos_token_ids, quality_gate: None })
     }
 
-    /// Clear KV cache.
+    /// Clear KV cache (both position counter and per-layer KV buffers).
     pub fn clear_cache(&mut self) {
         self.position = 0;
+        self.model.0.clear_kv_cache();
     }
 
     /// Enable quality gate — monitors running PPL during generation.
@@ -342,8 +343,11 @@ impl Engine {
     where
         F: FnMut(&str),
     {
+        // add_special_tokens=true so chat template tokens like <|im_start|>
+        // are recognized as their actual token IDs (151644 etc) instead of
+        // being split into plain text characters
         let encoding = self.tokenizer
-            .encode(prompt, false)
+            .encode(prompt, true)
             .map_err(|e| anyhow::anyhow!("Tokenize error: {}", e))?;
         let prompt_tokens = encoding.get_ids().to_vec();
 
