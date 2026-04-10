@@ -1186,19 +1186,15 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
         }
     };
 
-    // Detect chat template for proper prompt formatting
+    // Detect chat template for proper prompt formatting.
+    // Use chat::format_chat with the project default system prompt so command-form
+    // prompts ("Explain how X works:") behave the same here as in `tq chat`.
+    // Without a system message Qwen2.5-Instruct collapses on imperative prompts and
+    // emits leading garbage tokens, which is what made photosynthesis Q4 look like
+    // a tokenization bug in earlier sessions.
     let formatted_prompt = if let Some(entry) = catalog::find(model_name) {
-        let lower = entry.arch.to_lowercase();
-        if lower.contains("qwen") {
-            format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", bench_prompt)
-        } else if lower.contains("llama") {
-            format!(
-                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-                bench_prompt
-            )
-        } else {
-            bench_prompt.to_string()
-        }
+        let template = chat::ChatTemplate::detect(entry.filename);
+        chat::format_chat(&template, config::DEFAULT_SYSTEM_PROMPT, bench_prompt)
     } else {
         bench_prompt.to_string()
     };
