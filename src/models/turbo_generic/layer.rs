@@ -67,6 +67,9 @@ pub(crate) struct LayerWeights {
     pub(crate) boundaries_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     #[cfg(feature = "cuda")]
     pub(crate) centroids_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    /// KIVI per-channel sigma [head_dim] — uploaded from calibration
+    #[cfg(feature = "cuda")]
+    pub(crate) channel_sigma_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     /// Expanded signs [n_head × head_dim] for GPU Q pre-rotation
     #[cfg(feature = "cuda")]
     pub(crate) signs_expanded_gpu: Option<cudarc::driver::CudaSlice<f32>>,
@@ -626,6 +629,13 @@ impl LayerWeights {
                             self.centroids_gpu = Some(reg.stream.clone_htod(centroids)
                                 .map_err(|e| TqError::Msg(format!("centroids upload: {}", e)))?);
                         }
+                        // KIVI per-channel sigma upload (once)
+                        if self.channel_sigma_gpu.is_none() {
+                            if let Some(ref sigma) = self.tq_config.rotated_channel_sigma {
+                                self.channel_sigma_gpu = Some(reg.stream.clone_htod(sigma)
+                                    .map_err(|e| TqError::Msg(format!("channel_sigma upload: {}", e)))?);
+                            }
+                        }
 
                         // Alloc temp GPU buffers for compress output
                         let mut packed_gpu: cudarc::driver::CudaSlice<u8> = reg.stream.alloc_zeros(
@@ -635,14 +645,15 @@ impl LayerWeights {
                             self.n_kv_head
                         ).map_err(|e| TqError::Msg(format!("norms alloc: {}", e)))?;
 
-                        // GPU compress: mean removal + Hadamard + quantize + pack
+                        // GPU compress: mean removal + per-channel sigma + Hadamard + quantize + pack
                         crate::cuda::kernels::tq_compress_key(
                             reg, k_gpu,
                             self.signs_gpu.as_ref().unwrap(),
                             self.boundaries_gpu.as_ref().unwrap(),
                             self.centroids_gpu.as_ref().unwrap(),
                             &mut packed_gpu, &mut norms_gpu,
-                            None, // means_out: GPU TQ fused path ignores means (shift-invariant)
+                            None, // means_out: fused path ignores means (shift-invariant)
+                            self.channel_sigma_gpu.as_ref(), // KIVI per-channel sigma
                             self.n_kv_head, self.head_dim, n_centroids, bytes_per_key,
                             self.tq_config.center_keys,
                         ).map_err(|e| TqError::Msg(format!("tq_compress_key: {}", e)))?;
@@ -1211,6 +1222,19 @@ impl LayerWeights {
                             rotated_q.extend_from_slice(&rq);
                         }
 
+                        // KIVI per-channel: pre-scale rotated query by sigma ratios
+                        // so fused attention centroid lookup accounts for per-dim variance.
+                        // score = sum(q[d]*ratio[d] * centroids[idx[d]]) * norm/sqrt(dim) * scale
+                        if let Some(ref pcs) = self.tq_config.rotated_channel_sigma {
+                            let mean_sigma: f32 = pcs.iter().sum::<f32>() / self.head_dim as f32;
+                            for qh in 0..self.n_head {
+                                let base = qh * self.head_dim;
+                                for d in 0..self.head_dim {
+                                    rotated_q[base + d] *= pcs[d] / mean_sigma;
+                                }
+                            }
+                        }
+
                         // Upload rotated query to temp buffer
                         let rq_gpu = reg.stream.clone_htod(&rotated_q)
                             .map_err(|e| TqError::Msg(format!("rq upload: {}", e)))?;
@@ -1530,11 +1554,18 @@ impl LayerWeights {
                         .map(|qh| {
                             let kv_h = qh / n_rep;
                             let q_vec = &q_flat[qh * self.head_dim..(qh + 1) * self.head_dim];
-                            let rotated_q = if let Some(ref matrix) = self.tq_config.rotation_matrix {
+                            let mut rotated_q = if let Some(ref matrix) = self.tq_config.rotation_matrix {
                                 tq_kv::pre_rotate_query_with_matrix(q_vec, matrix)
                             } else {
                                 tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs)
                             };
+                            // KIVI per-channel: pre-scale rotated query
+                            if let Some(ref pcs) = self.tq_config.rotated_channel_sigma {
+                                let mean_sigma: f32 = pcs.iter().sum::<f32>() / pcs.len() as f32;
+                                for (d, v) in rotated_q.iter_mut().enumerate() {
+                                    *v *= pcs[d] / mean_sigma;
+                                }
+                            }
                             let mut scores = Vec::with_capacity(total_len);
 
                             // Segment 1: Sink keys (standard dot product, not compressed)

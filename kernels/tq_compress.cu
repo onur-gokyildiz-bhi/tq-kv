@@ -56,6 +56,7 @@ extern "C" __global__ void tq_compress_key_f32(
     uint8_t* __restrict__ packed_out,         // [n_kv_heads, bytes_per_key]
     float* __restrict__ norms_out,            // [n_kv_heads]
     float* __restrict__ means_out,            // [n_kv_heads] per-token means (or NULL)
+    const float* __restrict__ channel_sigma,  // [head_dim] per-channel sigma (or NULL = per-vector)
     const int head_dim,
     const int n_centroids,                    // 2^bits (4, 8, or 16)
     const int bytes_per_key,                  // ceil(head_dim * bits / 8)
@@ -121,9 +122,27 @@ extern "C" __global__ void tq_compress_key_f32(
 
     float inv_sigma = s_inv_sigma;
 
+    // KIVI per-channel sigma: compute mean_sigma for ratio calculation
+    // When channel_sigma != NULL, effective_inv_sigma[d] = 1 / (per_vector_sigma * ratio[d])
+    // where ratio[d] = channel_sigma[d] / mean(channel_sigma)
+    // This gives each dimension its own quantization scale while preserving token magnitude.
+    float mean_channel_sigma = 0.0f;
+    if (channel_sigma != nullptr) {
+        float partial = 0.0f;
+        for (int i = tid; i < head_dim; i += blockDim.x) {
+            partial += channel_sigma[i];
+        }
+        mean_channel_sigma = block_reduce_sum(partial) / (float)head_dim;
+    }
+
     // Step 4: Quantize + pack (4-bit: 2 values per byte)
-    // Thread i handles values at positions tid, tid+blockDim.x, ...
     uint8_t* out = packed_out + head * bytes_per_key;
+
+    // Helper: compute per-dimension inverse sigma
+    #define INV_SIGMA_D(d) \
+        (channel_sigma != nullptr \
+            ? (mean_channel_sigma > 1e-10f ? (1.0f / (s_sigma * channel_sigma[d] / mean_channel_sigma)) : inv_sigma) \
+            : inv_sigma)
 
     if (n_centroids == 16) {
         // 4-bit path: pack 2 indices per byte
@@ -132,7 +151,7 @@ extern "C" __global__ void tq_compress_key_f32(
             int i1 = pair * 2 + 1;
 
             // Quantize i0
-            float v0 = s_data[i0] * inv_sigma;
+            float v0 = s_data[i0] * INV_SIGMA_D(i0);
             uint8_t idx0 = 0;
             for (int b = 0; b < n_boundaries; ++b) {
                 if (v0 > s_bounds[b]) idx0++;
@@ -140,7 +159,7 @@ extern "C" __global__ void tq_compress_key_f32(
             }
 
             // Quantize i1
-            float v1 = s_data[i1] * inv_sigma;
+            float v1 = s_data[i1] * INV_SIGMA_D(i1);
             uint8_t idx1 = 0;
             for (int b = 0; b < n_boundaries; ++b) {
                 if (v1 > s_bounds[b]) idx1++;
@@ -154,7 +173,8 @@ extern "C" __global__ void tq_compress_key_f32(
         for (int quad = tid; quad < head_dim / 4; quad += blockDim.x) {
             uint8_t packed = 0;
             for (int j = 0; j < 4; ++j) {
-                float v = s_data[quad * 4 + j] * inv_sigma;
+                int d = quad * 4 + j;
+                float v = s_data[d] * INV_SIGMA_D(d);
                 uint8_t idx = 0;
                 for (int b = 0; b < n_boundaries; ++b) {
                     if (v > s_bounds[b]) idx++;

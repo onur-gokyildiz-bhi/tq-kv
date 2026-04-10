@@ -412,6 +412,8 @@ impl GenericTurboModel {
                 #[cfg(feature = "cuda")]
                 centroids_gpu: None,
                 #[cfg(feature = "cuda")]
+                channel_sigma_gpu: None,
+                #[cfg(feature = "cuda")]
                 signs_expanded_gpu: None,
                 #[cfg(feature = "cuda")]
                 sink_k_gpu: None,
