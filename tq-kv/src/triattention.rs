@@ -83,7 +83,8 @@ impl TriAttentionConfig {
             n_heads,
             n_kv_heads,
             head_dim,
-            eviction_interval: 128,
+            eviction_interval: std::env::var("TQ_TRIATTN_INTERVAL")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(128),
             budget: 2048,
             offsets,
             prefix_protection: std::env::var("TQ_TRIATTN_PREFIX")

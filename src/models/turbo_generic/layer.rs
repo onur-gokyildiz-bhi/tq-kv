@@ -884,9 +884,15 @@ impl LayerWeights {
                 // #3: Periodic eviction — score and remove low-importance tokens
                 let tri_cfg = cache.tri_config.clone().unwrap();
                 let n_tri_keys = cache.tri_key_positions.len();
+                // V3: dynamic budget from retention_ratio (overrides fixed budget)
+                let effective_budget = if tri_cfg.retention_ratio > 0.0 && tri_cfg.retention_ratio < 1.0 {
+                    (n_tri_keys as f32 * tri_cfg.retention_ratio) as usize
+                } else {
+                    tri_cfg.budget
+                };
                 if cache.tri_tokens_since_eviction >= tri_cfg.eviction_interval
                     && seq_len == 1
-                    && n_tri_keys > tri_cfg.budget
+                    && n_tri_keys > effective_budget
                 {
                     let current_pos = index_pos + seq_len;
                     let tri_keys_ref = cache.tri_keys_pre_rope.as_ref().unwrap();
