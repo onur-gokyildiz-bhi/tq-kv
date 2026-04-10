@@ -26,7 +26,7 @@ GGUF quantized models (Q4_K_M) already have weight quantization noise. Compressi
 |:-------|--------------------:|:-------|
 | No compression | 4.136 | Baseline |
 | **tq-kv 4-bit** | **4.457 (+8%)** | **Production** |
-| **tq-kv 4-bit + TriAttention** | **4.457 (+8%)** | **Constant memory** |
+| **tq-kv 4-bit + TriAttention** | **4.574 (+11%)** | **Constant memory** |
 | tq-kv 4-bit (no calibration) | ~15+ | Needs auto-calibrate |
 
 Key innovations for GGUF compound error:
@@ -285,7 +285,7 @@ TQ_TRIATTN_BUDGET=256 tq chat qwen2:7b --turbo-quant
 | `TQ_BIAS_CORRECT` | 0 | Softmax bias correction (experimental) |
 | `TQ_NO_CAL` | 0 | Disable calibration auto-loading |
 | `TQ_TRIATTN` | **on** | TriAttention eviction (on by default with --turbo-quant, 0=disable) |
-| `TQ_TRIATTN_BUDGET` | 2048 | Max KV tokens to retain (fixed memory ceiling) |
+| `TQ_TRIATTN_BUDGET` | 2048 | Max KV tokens to retain (lower = more aggressive eviction, e.g. 128/256/512) |
 | `TQ_TRIATTN_INTERVAL` | 128 | Eviction check interval in tokens |
 | `TQ_CENTER_KEYS` | 1 | Per-token mean removal (softmax shift-invariant, +40% @ 2-bit) |
 | `TQ_MAX_SEQ` | 2048 | Maximum KV cache sequence length |
@@ -347,9 +347,9 @@ scripts/ppl-check.sh                  # Regression CI (9 checks, tight threshold
 
 | Mode | tok/s | TTFT | PPL | KV Memory |
 |:-----|------:|-----:|----:|:---------:|
-| **Standard** | **18.5** | 0.19s | 4.136 | grows linearly |
+| **Standard** | **18.0** | 0.19s | 4.136 | grows linearly |
 | **TQ 4-bit** | **16.1** | 0.10s | 4.457 (+8%) | 3.8x smaller |
-| **TQ+TriAttention** | **15.2** | 0.11s | 4.457 (+8%) | **constant** |
+| **TQ+TriAttention** | **15.2** | 0.11s | 4.574 (+11%) | **constant** |
 
 4 validated models: Qwen2.5 7B/0.5B, Llama 3.1 8B, Mistral 7B. Auto-calibration on first use.
 
