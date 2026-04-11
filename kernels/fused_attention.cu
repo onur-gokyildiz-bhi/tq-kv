@@ -289,6 +289,88 @@ extern "C" __global__ void tq_centroid_lookup_f32(
     }
 }
 
+// ─── Centroid Lookup with Per-Group Norms (Sprint 1B) ────────
+// Same as tq_centroid_lookup_f32 but reads gnorms[n_kv_heads, max_seq, n_groups]
+// and scales each group of `group_size` dimensions by its own sigma.
+//
+// Output is in the Hadamard-rotated domain — caller still needs
+// hadamard_inverse_batch_f32 afterwards.
+
+extern "C" __global__ void tq_centroid_lookup_grouped_f32(
+    const uint8_t* __restrict__ packed_indices,  // [n_kv_heads, max_seq * bytes_per_key]
+    const float* __restrict__ gnorms,            // [n_kv_heads, max_seq, n_groups]
+    const float* __restrict__ centroids,         // [n_centroids]
+    float* __restrict__ out,                     // output buffer
+    const int n_kv_heads,
+    const int n_keys,
+    const int head_dim,
+    const int group_size,
+    const int bits,
+    const int max_seq,
+    const int key_offset,
+    const int out_stride
+) {
+    const int kv_head = blockIdx.x;
+    const int key_idx = blockIdx.y;
+    if (kv_head >= n_kv_heads || key_idx >= n_keys) return;
+
+    const int tid = threadIdx.x;
+    const int bytes_per_key = (head_dim * bits + 7) / 8;
+    const int n_groups = head_dim / group_size;
+
+    __shared__ float s_centroids[MAX_CENTROIDS];
+    const int n_centroids = 1 << bits;
+    if (tid < n_centroids) s_centroids[tid] = centroids[tid];
+    __syncthreads();
+
+    const int src_pos = key_offset + key_idx;
+    const float* row_gnorms = gnorms + (kv_head * max_seq + src_pos) * n_groups;
+    const uint8_t* key_packed =
+        packed_indices + kv_head * max_seq * bytes_per_key + src_pos * bytes_per_key;
+    float* out_row = out + (kv_head * out_stride + key_idx) * head_dim;
+
+    // Per-group sigma. n_groups is small (2-8) so storing in registers/shmem
+    // would be overkill — recompute per dim is cheap.
+    if (bits == 4) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            int g = d / group_size;
+            float gnorm = row_gnorms[g];
+            float sigma = (gnorm > 1e-10f) ? gnorm / sqrtf((float)group_size) : 0.0f;
+            uint8_t byte = key_packed[d / 2];
+            float c = (d & 1) ? s_centroids[byte >> 4] : s_centroids[byte & 0xF];
+            out_row[d] = c * sigma;
+        }
+    } else if (bits == 2) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            int g = d / group_size;
+            float gnorm = row_gnorms[g];
+            float sigma = (gnorm > 1e-10f) ? gnorm / sqrtf((float)group_size) : 0.0f;
+            uint8_t byte = key_packed[d / 4];
+            int shift = (d & 3) * 2;
+            float c = s_centroids[(byte >> shift) & 3];
+            out_row[d] = c * sigma;
+        }
+    } else if (bits == 3) {
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            int g = d / group_size;
+            float gnorm = row_gnorms[g];
+            float sigma = (gnorm > 1e-10f) ? gnorm / sqrtf((float)group_size) : 0.0f;
+            int bit_offset = d * 3;
+            int byte_idx = bit_offset / 8;
+            int bit_pos  = bit_offset % 8;
+            uint8_t idx;
+            if (bit_pos <= 5) {
+                idx = (key_packed[byte_idx] >> bit_pos) & 7;
+            } else {
+                idx = (key_packed[byte_idx] >> bit_pos) |
+                      ((key_packed[byte_idx + 1] << (8 - bit_pos)) & 7);
+                idx &= 7;
+            }
+            out_row[d] = s_centroids[idx] * sigma;
+        }
+    }
+}
+
 // ─── Fused TQ Attention with Per-Group Norms ─────────────────
 // When using grouped quantization (TQ_GROUP=32), each group of 32
 // dimensions has its own norm/sigma. More accurate but slightly slower.

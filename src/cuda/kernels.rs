@@ -1048,6 +1048,124 @@ pub fn tq_decompress_keys_range(
     Ok(())
 }
 
+/// Per-group decompress (Sprint 1B). Mirror of tq_decompress_keys_v2 but
+/// reads gnorms[n_kv_heads, max_seq, n_groups] and runs the grouped centroid
+/// lookup. The hadamard inverse step is unchanged because the rotation
+/// itself is independent of how sigma was computed. Output layout matches
+/// the per-vector variant: [n_kv_heads, n_keys, head_dim] when contiguous.
+pub fn tq_decompress_keys_grouped(
+    reg: &KernelRegistry,
+    packed_indices: &CudaSlice<u8>,
+    gnorms: &CudaSlice<f32>,             // [n_kv_heads, max_seq, n_groups]
+    centroids: &CudaSlice<f32>,
+    signs: &CudaSlice<f32>,
+    keys_out: &mut CudaSlice<f32>,
+    n_kv_heads: usize,
+    n_keys: usize,
+    head_dim: usize,
+    group_size: usize,
+    bits: usize,
+    max_seq: usize,
+    key_offset: usize,
+    out_stride: usize,
+) -> Result<(), DriverError> {
+    if n_keys == 0 { return Ok(()); }
+    assert!(group_size > 0 && head_dim % group_size == 0,
+        "tq_decompress_keys_grouped: head_dim {} not divisible by group_size {}",
+        head_dim, group_size);
+
+    let f = reg.get_fn("fused_attention", "tq_centroid_lookup_grouped_f32")?;
+    let block = head_dim.min(256) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_heads as u32, n_keys as u32, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nkv = n_kv_heads as i32;
+    let nk = n_keys as i32;
+    let hd = head_dim as i32;
+    let gs = group_size as i32;
+    let b = bits as i32;
+    let ms = max_seq as i32;
+    let ko = key_offset as i32;
+    let os = out_stride as i32;
+
+    let contiguous = out_stride == n_keys && key_offset == 0;
+    if contiguous {
+        unsafe {
+            reg.stream.launch_builder(&f)
+                .arg(packed_indices).arg(gnorms).arg(centroids)
+                .arg(&mut *keys_out)
+                .arg(&nkv).arg(&nk).arg(&hd).arg(&gs).arg(&b).arg(&ms).arg(&ko).arg(&os)
+                .launch(cfg)?;
+        }
+        hadamard_inverse_batch(reg, keys_out, signs, n_kv_heads * n_keys, head_dim)?;
+    } else {
+        // Strided write: lookup into a contiguous temp first, hadamard, then scatter.
+        let total = n_kv_heads * n_keys * head_dim;
+        let mut temp = reg.stream.alloc_zeros::<f32>(total)?;
+        let temp_os = n_keys as i32;
+        unsafe {
+            reg.stream.launch_builder(&f)
+                .arg(packed_indices).arg(gnorms).arg(centroids)
+                .arg(&mut temp)
+                .arg(&nkv).arg(&nk).arg(&hd).arg(&gs).arg(&b).arg(&ms).arg(&ko).arg(&temp_os)
+                .launch(cfg)?;
+        }
+        hadamard_inverse_batch(reg, &mut temp, signs, n_kv_heads * n_keys, head_dim)?;
+        for h in 0..n_kv_heads {
+            let src_off = h * n_keys * head_dim;
+            let dst_off = h * out_stride * head_dim;
+            copy_with_offsets(reg, &temp, keys_out, n_keys * head_dim, src_off, dst_off)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Per-group fused attention launcher (Sprint 1B). Wires the existing
+/// tq_fused_attention_grouped_f32 kernel which has been dead code until
+/// now. Reads gnorms[n_kv_heads, n_keys, n_groups] and produces the
+/// pre-softmax score row [n_heads, n_keys].
+pub fn tq_fused_attention_grouped(
+    reg: &KernelRegistry,
+    query: &CudaSlice<f32>,
+    packed_indices: &CudaSlice<u8>,
+    gnorms: &CudaSlice<f32>,
+    centroids: &CudaSlice<f32>,
+    scores_out: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_keys: usize,
+    head_dim: usize,
+    group_size: usize,
+    bits: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    assert!(group_size > 0 && head_dim % group_size == 0,
+        "tq_fused_attention_grouped: head_dim {} not divisible by group_size {}",
+        head_dim, group_size);
+    let f = reg.get_fn("fused_attention", "tq_fused_attention_grouped_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: ((1 << bits) * 4) as u32,
+    };
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let nk = n_keys as i32;
+    let hd = head_dim as i32;
+    let b = bits as i32;
+    let gs = group_size as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(query).arg(packed_indices).arg(gnorms).arg(centroids).arg(scores_out)
+            .arg(&nh).arg(&nkv).arg(&nk).arg(&hd).arg(&b).arg(&gs).arg(&scale)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Full fused TQ decode attention: compressed score + online softmax + V accumulation.
 /// Single kernel replaces: decompress → matmul → softmax → matmul chain.
 pub fn tq_fused_decode_attention(
