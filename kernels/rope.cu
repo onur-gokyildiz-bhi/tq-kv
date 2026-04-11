@@ -95,6 +95,91 @@ extern "C" __global__ void rope_interleaved_f32(
     }
 }
 
+// ─── Strided Halved RoPE for KV Decompress Cache ─────────────
+// Buffer layout: [n_kv_head, max_seq, head_dim] (head-outer, token-inner).
+// Applies RoPE in-place to a sub-range [start_token .. start_token + n_tokens)
+// for all kv heads in a single launch. Used by the GPU Pre-RoPE attention
+// path: after decompressing freshly added compressed keys we apply RoPE to
+// them once, then they live in the cumulative decomp_cache as post-RoPE
+// keys for the rest of the conversation.
+//
+// Grid: (n_kv_head, n_tokens), one block per (head, token).
+// Block: enough threads to cover head_dim/2.
+
+extern "C" __global__ void rope_halved_strided_f32(
+    float* __restrict__ x,                // [n_kv_head, max_seq, head_dim]
+    const float* __restrict__ cos_table,  // [max_seq_len, rope_dim/2]
+    const float* __restrict__ sin_table,  // [max_seq_len, rope_dim/2]
+    const int n_kv_head,
+    const int max_seq,                    // stride per head (in tokens)
+    const int head_dim,
+    const int rope_dim,                   // typically == head_dim
+    const int start_token,                // first token index in each head's sub-range
+    const int n_tokens,                   // number of tokens to RoPE per head
+    const int pos_offset                  // absolute position offset for the first token
+) {
+    const int head = blockIdx.x;
+    const int t = blockIdx.y;
+    if (head >= n_kv_head || t >= n_tokens) return;
+
+    const int tid = threadIdx.x;
+    const int half = rope_dim / 2;
+    const int abs_pos = pos_offset + t;
+    const int local_pos = start_token + t;
+
+    float* row = x + head * max_seq * head_dim + local_pos * head_dim;
+    const float* cos_ptr = cos_table + abs_pos * half;
+    const float* sin_ptr = sin_table + abs_pos * half;
+
+    for (int i = tid; i < half; i += blockDim.x) {
+        float x0 = row[i];
+        float x1 = row[i + half];
+        float c = cos_ptr[i];
+        float s = sin_ptr[i];
+        row[i]        = x0 * c - x1 * s;
+        row[i + half] = x0 * s + x1 * c;
+    }
+}
+
+// ─── Strided Interleaved RoPE for KV Decompress Cache ────────
+// Same idea as rope_halved_strided_f32 but uses the interleaved
+// pair convention (Llama-style: dims 2i / 2i+1 instead of i / i+half).
+
+extern "C" __global__ void rope_interleaved_strided_f32(
+    float* __restrict__ x,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    const int n_kv_head,
+    const int max_seq,
+    const int head_dim,
+    const int rope_dim,
+    const int start_token,
+    const int n_tokens,
+    const int pos_offset
+) {
+    const int head = blockIdx.x;
+    const int t = blockIdx.y;
+    if (head >= n_kv_head || t >= n_tokens) return;
+
+    const int tid = threadIdx.x;
+    const int half = rope_dim / 2;
+    const int abs_pos = pos_offset + t;
+    const int local_pos = start_token + t;
+
+    float* row = x + head * max_seq * head_dim + local_pos * head_dim;
+    const float* cos_ptr = cos_table + abs_pos * half;
+    const float* sin_ptr = sin_table + abs_pos * half;
+
+    for (int i = tid; i < half; i += blockDim.x) {
+        float x0 = row[2 * i];
+        float x1 = row[2 * i + 1];
+        float c = cos_ptr[i];
+        float s = sin_ptr[i];
+        row[2 * i]     = x0 * c - x1 * s;
+        row[2 * i + 1] = x0 * s + x1 * c;
+    }
+}
+
 // ─── Precompute RoPE Frequency Table ─────────────────────────
 // cos_table[pos, i] = cos(pos * theta_i)
 // sin_table[pos, i] = sin(pos * theta_i)

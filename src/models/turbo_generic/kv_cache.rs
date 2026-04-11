@@ -297,6 +297,59 @@ impl GpuCompressedKv {
         Ok(())
     }
 
+    /// CPU-side append for the grouped norms storage. Mirror of append() but
+    /// takes per-group norms (n_kv_head * n_groups floats) and writes them to
+    /// self.gnorms via memcpy_htod. Used by the layer.rs seed loop and the
+    /// CPU-compress→GPU-cache bridge when pre_rope_mode forces CPU compression.
+    pub(crate) fn append_grouped(
+        &mut self,
+        packed: &[u8],
+        group_norms: &[f32],   // [n_kv_head * n_groups]
+        v_flat: &[f32],
+    ) -> std::result::Result<(), crate::cuda::TqError> {
+        if self.count >= self.max_seq {
+            pub(crate) static WARN_CPU_G: std::sync::Once = std::sync::Once::new();
+            WARN_CPU_G.call_once(|| eprintln!(
+                "[WARN] GpuCompressedKv: max_seq={} reached, TQ context truncated (CPU grouped)",
+                self.max_seq));
+            return Ok(());
+        }
+        let gnorms_dst = match self.gnorms.as_mut() {
+            Some(g) => g,
+            None => return Err(crate::cuda::TqError::Msg(
+                "append_grouped called but gnorms not allocated".to_string())),
+        };
+        let bpk = self.bytes_per_key;
+        let pos = self.count;
+        let hd = self.head_dim;
+        let ng = self.n_groups;
+        let ms = self.max_seq;
+
+        // Packed indices per head
+        for h in 0..self.n_kv_head {
+            let src = &packed[h * bpk..(h + 1) * bpk];
+            let dst_off = (h * ms + pos) * bpk;
+            let _ = self.stream.memcpy_htod(src, &mut self.packed_indices.slice_mut(dst_off..dst_off + bpk));
+        }
+
+        // Per-group norms per head: write n_groups floats per (head, pos)
+        for h in 0..self.n_kv_head {
+            let src = &group_norms[h * ng..(h + 1) * ng];
+            let dst_off = (h * ms + pos) * ng;
+            let _ = self.stream.memcpy_htod(src, &mut gnorms_dst.slice_mut(dst_off..dst_off + ng));
+        }
+
+        // V data per head
+        for h in 0..self.n_kv_head {
+            let src = &v_flat[h * hd..(h + 1) * hd];
+            let dst_off = (h * ms + pos) * hd;
+            let _ = self.stream.memcpy_htod(src, &mut self.v_data.slice_mut(dst_off..dst_off + hd));
+        }
+
+        self.count += 1;
+        Ok(())
+    }
+
     /// Grouped variant of append_gpu (Sprint 1C). Same D2D scatter for
     /// packed indices and V, but writes per-group norms into self.gnorms
     /// instead of the per-vector self.norms. Caller is responsible for

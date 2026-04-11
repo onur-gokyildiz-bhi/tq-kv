@@ -1474,6 +1474,90 @@ pub fn rope_interleaved_with_gpu_pos(
     Ok(())
 }
 
+/// Strided in-place RoPE for the GPU TQ decompress cache.
+/// Buffer layout: [n_kv_head, max_seq, head_dim] (head-outer, token-inner).
+/// Applies RoPE to the sub-range [start_token .. start_token + n_tokens) for
+/// every kv head in a single launch. Used by the GPU Pre-RoPE attention path
+/// after decompressing freshly added compressed keys.
+pub fn rope_halved_strided(
+    reg: &KernelRegistry,
+    x: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_kv_head: usize,
+    max_seq: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    start_token: usize,
+    n_tokens: usize,
+    pos_offset: usize,
+) -> Result<(), DriverError> {
+    if n_tokens == 0 { return Ok(()); }
+    let f = reg.get_fn("rope", "rope_halved_strided_f32")?;
+    let half = rope_dim / 2;
+    let threads = ((half.max(32) + 31) / 32 * 32).min(256) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_head as u32, n_tokens as u32, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nkv = n_kv_head as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    let rd = rope_dim as i32;
+    let st = start_token as i32;
+    let nt = n_tokens as i32;
+    let po = pos_offset as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(x).arg(cos).arg(sin)
+            .arg(&nkv).arg(&ms).arg(&hd).arg(&rd).arg(&st).arg(&nt).arg(&po)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Strided in-place interleaved RoPE for the GPU TQ decompress cache.
+/// Same shape contract as rope_halved_strided but uses the Llama-style
+/// (2i, 2i+1) pair convention.
+pub fn rope_interleaved_strided(
+    reg: &KernelRegistry,
+    x: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_kv_head: usize,
+    max_seq: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    start_token: usize,
+    n_tokens: usize,
+    pos_offset: usize,
+) -> Result<(), DriverError> {
+    if n_tokens == 0 { return Ok(()); }
+    let f = reg.get_fn("rope", "rope_interleaved_strided_f32")?;
+    let half = rope_dim / 2;
+    let threads = ((half.max(32) + 31) / 32 * 32).min(256) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_head as u32, n_tokens as u32, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nkv = n_kv_head as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    let rd = rope_dim as i32;
+    let st = start_token as i32;
+    let nt = n_tokens as i32;
+    let po = pos_offset as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(x).arg(cos).arg(sin)
+            .arg(&nkv).arg(&ms).arg(&hd).arg(&rd).arg(&st).arg(&nt).arg(&po)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 // ─── Tensor shape/elementwise ops (GPU-native) ──────────────
 
 /// GPU strided copy: narrow + transpose via stride remapping.

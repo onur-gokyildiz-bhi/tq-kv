@@ -605,7 +605,18 @@ impl LayerWeights {
                 #[cfg(feature = "cuda")]
                 if gpu_compress_ok {
                     if let Some(reg) = crate::cuda::kernels::global_registry() {
-                        let k_source = &k;
+                        // Pre-RoPE bug fix: previously this site always used &k
+                        // (the post-RoPE tensor), even when pre_rope_mode was on.
+                        // The CPU fallback at L720+ already honored k_pre_rope;
+                        // the GPU path didn't, so the GPU TQ cache silently stored
+                        // post-RoPE keys regardless of TQ_PRE_ROPE. The all-GPU
+                        // decode then re-RoPEd them on read, producing a double
+                        // rotation that quietly degraded generation quality.
+                        let k_source = if pre_rope_mode {
+                            k_pre_rope.as_ref().expect("pre_rope_mode requires k_pre_rope")
+                        } else {
+                            &k
+                        };
                         // K is [1, n_kv_head, 1, head_dim] for decode
                         let k_flat = k_source.reshape(vec![self.n_kv_head, self.head_dim])?;
                         let k_gpu = k_flat.cuda_data();
@@ -813,12 +824,26 @@ impl LayerWeights {
                         ) {
                             Ok(mut gpu) => {
                                 // Seed with all existing compressed keys + actual V data.
+                                // Detect grouped CPU compression: if cache.k_per_head[h].norms
+                                // has count*n_groups entries instead of count, the CPU side
+                                // ran the per-group path (compress_single_key_grouped) and
+                                // every token contributes n_groups floats to .norms. Reading
+                                // .norms[pos] in that case picks the wrong float and silently
+                                // ruins the dequant sigma. Bridge through gnorms instead.
                                 let existing = cache.k_per_head[0].count;
                                 let v_offset = cache.sink_len;
                                 let gpu_bpk = gpu.bytes_per_key;
+                                let cpu_n_groups = if existing > 0 {
+                                    cache.k_per_head[0].norms.len() / existing
+                                } else { 1 };
+                                let use_grouped_seed = cpu_n_groups > 1
+                                    && cpu_n_groups == gpu.n_groups
+                                    && gpu.gnorms.is_some();
+
                                 for pos in 0..existing {
                                     let mut packed_all = Vec::with_capacity(self.n_kv_head * gpu_bpk);
-                                    let mut norms_all = Vec::with_capacity(self.n_kv_head);
+                                    let mut norms_all: Vec<f32> = Vec::with_capacity(
+                                        self.n_kv_head * if use_grouped_seed { cpu_n_groups } else { 1 });
                                     for h in 0..self.n_kv_head {
                                         let h_bpk = cache.k_per_head[h].packed_indices.len() / existing.max(1);
                                         let start = pos * h_bpk;
@@ -828,7 +853,13 @@ impl LayerWeights {
                                         if chunk.len() < gpu_bpk {
                                             packed_all.extend(std::iter::repeat(0u8).take(gpu_bpk - chunk.len()));
                                         }
-                                        norms_all.push(cache.k_per_head[h].norms[pos]);
+                                        if use_grouped_seed {
+                                            let n_off = pos * cpu_n_groups;
+                                            norms_all.extend_from_slice(
+                                                &cache.k_per_head[h].norms[n_off..n_off + cpu_n_groups]);
+                                        } else {
+                                            norms_all.push(cache.k_per_head[h].norms[pos]);
+                                        }
                                     }
                                     let v_data = if let Some(ref v_raw) = cache.v_raw {
                                         let v_pos = v_raw.narrow(2, v_offset + pos, 1)
@@ -842,7 +873,11 @@ impl LayerWeights {
                                     } else {
                                         vec![0.0f32; self.n_kv_head * self.head_dim]
                                     };
-                                    let _ = gpu.append(&packed_all, &norms_all, &v_data);
+                                    if use_grouped_seed {
+                                        let _ = gpu.append_grouped(&packed_all, &norms_all, &v_data);
+                                    } else {
+                                        let _ = gpu.append(&packed_all, &norms_all, &v_data);
+                                    }
                                 }
                                 self.gpu_tq_cache = Some(gpu);
                             }
@@ -857,31 +892,47 @@ impl LayerWeights {
                             let count = cache.k_per_head[0].count;
                             let gpu_bpk = gpu.bytes_per_key;
                             let pos = count - 1;
+                            // Same grouped detection as the seed loop above.
+                            let cpu_n_groups = if count > 0 {
+                                cache.k_per_head[0].norms.len() / count
+                            } else { 1 };
+                            let use_grouped_bridge = cpu_n_groups > 1
+                                && cpu_n_groups == gpu.n_groups
+                                && gpu.gnorms.is_some();
+
                             let mut packed_all = Vec::with_capacity(self.n_kv_head * gpu_bpk);
-                            let mut norms_all = Vec::with_capacity(self.n_kv_head);
+                            let mut norms_all: Vec<f32> = Vec::with_capacity(
+                                self.n_kv_head * if use_grouped_bridge { cpu_n_groups } else { 1 });
                             for h in 0..self.n_kv_head {
                                 let h_bpk = cache.k_per_head[h].packed_indices.len() / count.max(1);
                                 let start = pos * h_bpk;
                                 let end = (start + h_bpk).min(cache.k_per_head[h].packed_indices.len());
                                 let chunk = &cache.k_per_head[h].packed_indices[start..end];
                                 packed_all.extend_from_slice(chunk);
-                                // Pad to GPU layout size if grouped format is smaller
                                 if chunk.len() < gpu_bpk {
                                     packed_all.extend(std::iter::repeat(0u8).take(gpu_bpk - chunk.len()));
                                 }
-                                norms_all.push(cache.k_per_head[h].norms[pos]);
+                                if use_grouped_bridge {
+                                    let n_off = pos * cpu_n_groups;
+                                    norms_all.extend_from_slice(
+                                        &cache.k_per_head[h].norms[n_off..n_off + cpu_n_groups]);
+                                } else {
+                                    norms_all.push(cache.k_per_head[h].norms[pos]);
+                                }
                             }
                             // Extract actual V data for this token from v_raw cache
                             let v_data = if let Some(ref v_raw) = cache.v_raw {
-                                // v_raw: [1, n_kv_head, cached_len, head_dim]
-                                // Extract last position along dim 2
                                 let vlen = v_raw.dim(2)?;
                                 let last_v = v_raw.narrow(2, vlen - 1, 1)?;
                                 last_v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
                             } else {
                                 vec![0.0f32; self.n_kv_head * self.head_dim]
                             };
-                            let _ = gpu.append(&packed_all, &norms_all, &v_data);
+                            if use_grouped_bridge {
+                                let _ = gpu.append_grouped(&packed_all, &norms_all, &v_data);
+                            } else {
+                                let _ = gpu.append(&packed_all, &norms_all, &v_data);
+                            }
                         }
                     }
 
@@ -1296,8 +1347,11 @@ impl LayerWeights {
                         // gnorms is populated. Both per-vector and grouped
                         // kernels write the same scores layout, so the
                         // downstream softmax/V path stays unchanged.
-                        let use_grouped_attn = std::env::var("TQ_GPU_GROUPED")
-                            .ok().map_or(false, |v| v == "1")
+                        // pre_rope on => CPU grouped bridge filled gnorms; per-vector
+                        // gpu.norms is stale and unsafe to read.
+                        let env_grouped = std::env::var("TQ_GPU_GROUPED")
+                            .ok().map_or(false, |v| v == "1");
+                        let use_grouped_attn = (cache.pre_rope || env_grouped)
                             && gpu.gnorms.is_some()
                             && gpu.n_groups > 1;
                         if use_grouped_attn {
@@ -1392,10 +1446,12 @@ impl LayerWeights {
                 // ─── ALL-GPU TQ DECOMPRESS ATTENTION ──────────────────
                 // GPU decompress keys + GPU matmul + GPU softmax + GPU V matmul.
                 // No CPU round-trip. Uses proven two-step decompress (centroid lookup + hadamard inverse).
+                // Pre-RoPE supported via rope_halved/interleaved_strided applied
+                // in-place to freshly decompressed keys (since 2026-04-11).
                 // Falls through to CPU paths when conditions aren't met.
                 #[cfg(feature = "cuda")]
                 if seq_len == 1
-                    && !cache.pre_rope && !has_compacted
+                    && !has_compacted
                     && cache.cold_len == 0
                     && n_compressed > 0
                     && self.padded_head_dim == self.head_dim
@@ -1403,6 +1459,7 @@ impl LayerWeights {
                     && layer_tq_config.channel_scales.is_none()
                     && layer_tq_config.key_channel_bias.is_none()
                     && cache.value_bits == 0
+                    && self.cos.is_cuda() && self.sin.is_cuda()
                 {
                     if let (Some(reg), Some(ref mut gpu), Some(ref signs)) = (
                         crate::cuda::kernels::global_registry(),
@@ -1420,8 +1477,14 @@ impl LayerWeights {
                                 if gpu.decomp_count < n_past_compressed {
                                     let new_start = gpu.decomp_count;
                                     let new_count = n_past_compressed - new_start;
-                                    let use_grouped_decomp = std::env::var("TQ_GPU_GROUPED")
-                                        .ok().map_or(false, |v| v == "1")
+                                    // Use grouped decompress when:
+                                    //   (a) cache.pre_rope is on — CPU grouped compress was
+                                    //       used and the bridge filled gpu.gnorms (gpu.norms
+                                    //       is stale in this case), OR
+                                    //   (b) the user explicitly set TQ_GPU_GROUPED=1.
+                                    let env_grouped = std::env::var("TQ_GPU_GROUPED")
+                                        .ok().map_or(false, |v| v == "1");
+                                    let use_grouped_decomp = (cache.pre_rope || env_grouped)
                                         && gpu.gnorms.is_some()
                                         && gpu.n_groups > 1;
                                     if use_grouped_decomp {
@@ -1442,6 +1505,26 @@ impl LayerWeights {
                                             new_start, ms,
                                         ).map_err(|e| TqError::Msg(format!("decompress_range: {e}")))?;
                                     }
+
+                                    // Pre-RoPE TQ: keys are stored in the cache pre-rotation,
+                                    // so newly decompressed rows must have RoPE applied in-place
+                                    // before they enter the gather/matmul. Subsequent decode
+                                    // steps see them as post-RoPE. Positions are sink_len-relative
+                                    // because the compressed cache only holds non-sink tokens.
+                                    if cache.pre_rope {
+                                        let pos_offset = cache.sink_len + new_start;
+                                        let rope_strided = match self.rope_style {
+                                            RopeStyle::Halved => crate::cuda::kernels::rope_halved_strided,
+                                            RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_strided,
+                                        };
+                                        rope_strided(
+                                            reg, &mut gpu.decomp_cache,
+                                            self.cos.cuda_data(), self.sin.cuda_data(),
+                                            self.n_kv_head, ms, hdim, self.rope_dim,
+                                            new_start, new_count, pos_offset,
+                                        ).map_err(|e| TqError::Msg(format!("pre_rope strided: {e}")))?;
+                                    }
+
                                     gpu.decomp_count = n_past_compressed;
                                 }
                                 // K hot: gather from strided decomp_cache → pre-allocated k_contig
@@ -1614,8 +1697,9 @@ impl LayerWeights {
                             if let Some(ref rq) = rq_gpu {
                                 let mut scores_gpu = reg.stream.alloc_zeros::<f32>(self.n_head * n_past_compressed).ok();
                                 if let Some(ref mut sg) = scores_gpu {
-                                    let use_grouped_attn = std::env::var("TQ_GPU_GROUPED")
-                                        .ok().map_or(false, |v| v == "1")
+                                    let env_grouped = std::env::var("TQ_GPU_GROUPED")
+                                        .ok().map_or(false, |v| v == "1");
+                                    let use_grouped_attn = (cache.pre_rope || env_grouped)
                                         && gpu.gnorms.is_some()
                                         && gpu.n_groups > 1;
                                     let ok = if use_grouped_attn {
