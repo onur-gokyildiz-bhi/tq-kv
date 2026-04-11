@@ -297,6 +297,98 @@ impl GpuCompressedKv {
         Ok(())
     }
 
+    /// Grouped variant of append_gpu (Sprint 1C). Same D2D scatter for
+    /// packed indices and V, but writes per-group norms into self.gnorms
+    /// instead of the per-vector self.norms. Caller is responsible for
+    /// ensuring self.gnorms is allocated (i.e. n_groups > 1).
+    ///
+    /// gnorms_gpu layout: [n_kv_head, n_groups]
+    pub(crate) fn append_gpu_grouped(
+        &mut self,
+        packed_gpu: &cudarc::driver::CudaSlice<u8>,
+        gnorms_gpu: &cudarc::driver::CudaSlice<f32>,
+        v_gpu: &cudarc::driver::CudaSlice<f32>,
+    ) -> std::result::Result<(), crate::cuda::TqError> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use cudarc::driver::sys;
+
+        if self.count >= self.max_seq {
+            pub(crate) static WARN_GPU_G: std::sync::Once = std::sync::Once::new();
+            WARN_GPU_G.call_once(|| eprintln!(
+                "[WARN] GpuCompressedKv: max_seq={} reached, TQ context truncated (D2D grouped)",
+                self.max_seq));
+            return Ok(());
+        }
+        let gnorms_dst = match self.gnorms.as_mut() {
+            Some(g) => g,
+            None => {
+                return Err(crate::cuda::TqError::Msg(
+                    "append_gpu_grouped called but gnorms not allocated (n_groups=1?)".to_string()));
+            }
+        };
+        let bpk = self.bytes_per_key;
+        let pos = self.count;
+        let hd = self.head_dim;
+        let ms = self.max_seq;
+        let ng = self.n_groups;
+        let n_kv = self.n_kv_head;
+        let raw_stream = self.stream.cu_stream();
+
+        // D2D scatter: packed indices (u8) per head
+        {
+            let (src_base, _g1) = packed_gpu.device_ptr(self.stream.as_ref());
+            let (dst_base, _g2) = self.packed_indices.device_ptr_mut(self.stream.as_ref());
+            for h in 0..n_kv {
+                let src_off = (h * bpk) as u64;
+                let dst_off = ((h * ms + pos) * bpk) as u64;
+                let res = unsafe {
+                    sys::cuMemcpyDtoDAsync_v2(dst_base + dst_off, src_base + src_off, bpk as usize, raw_stream)
+                };
+                if res != sys::cudaError_enum::CUDA_SUCCESS {
+                    return Err(crate::cuda::TqError::Msg(format!("d2d packed h={}: {:?}", h, res)));
+                }
+            }
+        }
+
+        // D2D scatter: per-group norms (f32 × n_groups) per head.
+        // gnorms storage layout is [n_kv_head, max_seq, n_groups], so the
+        // destination offset for (head h, token pos) is (h*max_seq + pos)*n_groups.
+        {
+            let (src_base, _g1) = gnorms_gpu.device_ptr(self.stream.as_ref());
+            let (dst_base, _g2) = gnorms_dst.device_ptr_mut(self.stream.as_ref());
+            let bytes_per_head = (ng * 4) as usize;
+            for h in 0..n_kv {
+                let src_off = (h * ng * 4) as u64;
+                let dst_off = ((h * ms + pos) * ng * 4) as u64;
+                let res = unsafe {
+                    sys::cuMemcpyDtoDAsync_v2(dst_base + dst_off, src_base + src_off, bytes_per_head, raw_stream)
+                };
+                if res != sys::cudaError_enum::CUDA_SUCCESS {
+                    return Err(crate::cuda::TqError::Msg(format!("d2d gnorms h={}: {:?}", h, res)));
+                }
+            }
+        }
+
+        // D2D scatter: V data (f32) per head
+        {
+            let (src_base, _g1) = v_gpu.device_ptr(self.stream.as_ref());
+            let (dst_base, _g2) = self.v_data.device_ptr_mut(self.stream.as_ref());
+            for h in 0..n_kv {
+                let src_off = (h * hd * 4) as u64;
+                let dst_off = ((h * ms + pos) * hd * 4) as u64;
+                let res = unsafe {
+                    sys::cuMemcpyDtoDAsync_v2(dst_base + dst_off, src_base + src_off, hd * 4, raw_stream)
+                };
+                if res != sys::cudaError_enum::CUDA_SUCCESS {
+                    return Err(crate::cuda::TqError::Msg(format!("d2d v h={}: {:?}", h, res)));
+                }
+            }
+        }
+
+        self.count += 1;
+        Ok(())
+    }
+
     pub(crate) fn reset(&mut self) {
         self.count = 0;
         self.decomp_count = 0;
@@ -327,6 +419,10 @@ impl GpuCompressedKv {
         let packed_base = self.packed_indices.device_ptr(self.stream.as_ref()).0;
         let norms_base = self.norms.device_ptr(self.stream.as_ref()).0;
         let v_base = self.v_data.device_ptr(self.stream.as_ref()).0;
+        // gnorms is optional — only present when grouped storage is allocated.
+        let gnorms_base = self.gnorms.as_ref()
+            .map(|g| g.device_ptr(self.stream.as_ref()).0);
+        let ng = self.n_groups;
 
         for h in 0..self.n_kv_head {
             for (new_pos, &old_pos) in retained.iter().enumerate() {
@@ -336,10 +432,17 @@ impl GpuCompressedKv {
                 let dst = packed_base + ((h * ms + new_pos) * bpk) as u64;
                 unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, bpk, raw_stream); }
 
-                // Norms
+                // Norms (per-vector legacy)
                 let src = norms_base + ((h * ms + old_pos) as u64) * 4;
                 let dst = norms_base + ((h * ms + new_pos) as u64) * 4;
                 unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, 4, raw_stream); }
+
+                // Per-group norms (Sprint 1C). Layout: [n_kv, max_seq, n_groups]
+                if let Some(base) = gnorms_base {
+                    let src = base + ((h * ms + old_pos) * ng * 4) as u64;
+                    let dst = base + ((h * ms + new_pos) * ng * 4) as u64;
+                    unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, ng * 4, raw_stream); }
+                }
 
                 // V data
                 let src = v_base + ((h * ms + old_pos) * hd) as u64 * 4;

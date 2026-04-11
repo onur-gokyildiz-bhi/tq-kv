@@ -637,34 +637,72 @@ impl LayerWeights {
                             }
                         }
 
-                        // Alloc temp GPU buffers for compress output
-                        let mut packed_gpu: cudarc::driver::CudaSlice<u8> = reg.stream.alloc_zeros(
-                            self.n_kv_head * bytes_per_key
-                        ).map_err(|e| TqError::Msg(format!("packed alloc: {}", e)))?;
-                        let mut norms_gpu: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
-                            self.n_kv_head
-                        ).map_err(|e| TqError::Msg(format!("norms alloc: {}", e)))?;
-
-                        // GPU compress: mean removal + per-channel sigma + Hadamard + quantize + pack
-                        crate::cuda::kernels::tq_compress_key(
-                            reg, k_gpu,
-                            self.signs_gpu.as_ref().unwrap(),
-                            self.boundaries_gpu.as_ref().unwrap(),
-                            self.centroids_gpu.as_ref().unwrap(),
-                            &mut packed_gpu, &mut norms_gpu,
-                            None, // means_out: fused path ignores means (shift-invariant)
-                            self.channel_sigma_gpu.as_ref(), // KIVI per-channel sigma
-                            self.n_kv_head, self.head_dim, n_centroids, bytes_per_key,
-                            self.tq_config.center_keys,
-                        ).map_err(|e| TqError::Msg(format!("tq_compress_key: {}", e)))?;
+                        // Sprint 1C: opt-in grouped GPU compress path. When the
+                        // env flag is on AND the GpuCompressedKv was allocated
+                        // with n_groups>1, run tq_compress_key_grouped and
+                        // scatter to gpu_tq.gnorms instead of the legacy
+                        // per-vector path. center_keys + KIVI per-channel sigma
+                        // are ignored on the grouped path for now (see Sprint 1A
+                        // commit), so we fall back to per-vector if either is on.
+                        let want_grouped = std::env::var("TQ_GPU_GROUPED")
+                            .ok().map_or(false, |v| v == "1");
+                        let gpu_tq_ref = self.gpu_tq_cache.as_ref().unwrap();
+                        let can_grouped = want_grouped
+                            && gpu_tq_ref.n_groups > 1
+                            && !self.tq_config.center_keys
+                            && self.channel_sigma_gpu.is_none();
 
                         // V data: already on GPU in scratch or k tensor
                         let v_flat = v.reshape(vec![self.n_kv_head, self.head_dim])?;
                         let v_gpu = v_flat.cuda_data();
 
-                        // Append to GPU TQ cache
-                        let gpu_tq = self.gpu_tq_cache.as_mut().unwrap();
-                        gpu_tq.append_gpu(&packed_gpu, &norms_gpu, v_gpu)?;
+                        if can_grouped {
+                            let n_groups = gpu_tq_ref.n_groups;
+                            let group_size = gpu_tq_ref.group_size;
+                            // Alloc temp GPU buffers (grouped path)
+                            let mut packed_gpu: cudarc::driver::CudaSlice<u8> = reg.stream.alloc_zeros(
+                                self.n_kv_head * bytes_per_key
+                            ).map_err(|e| TqError::Msg(format!("packed alloc: {}", e)))?;
+                            let mut gnorms_gpu: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+                                self.n_kv_head * n_groups
+                            ).map_err(|e| TqError::Msg(format!("gnorms alloc: {}", e)))?;
+
+                            crate::cuda::kernels::tq_compress_key_grouped(
+                                reg, k_gpu,
+                                self.signs_gpu.as_ref().unwrap(),
+                                self.boundaries_gpu.as_ref().unwrap(),
+                                self.centroids_gpu.as_ref().unwrap(),
+                                &mut packed_gpu, &mut gnorms_gpu,
+                                self.n_kv_head, self.head_dim, group_size,
+                                n_centroids, bytes_per_key,
+                            ).map_err(|e| TqError::Msg(format!("tq_compress_key_grouped: {}", e)))?;
+
+                            let gpu_tq = self.gpu_tq_cache.as_mut().unwrap();
+                            gpu_tq.append_gpu_grouped(&packed_gpu, &gnorms_gpu, v_gpu)?;
+                        } else {
+                            // Legacy per-vector GPU compress path
+                            let mut packed_gpu: cudarc::driver::CudaSlice<u8> = reg.stream.alloc_zeros(
+                                self.n_kv_head * bytes_per_key
+                            ).map_err(|e| TqError::Msg(format!("packed alloc: {}", e)))?;
+                            let mut norms_gpu: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+                                self.n_kv_head
+                            ).map_err(|e| TqError::Msg(format!("norms alloc: {}", e)))?;
+
+                            crate::cuda::kernels::tq_compress_key(
+                                reg, k_gpu,
+                                self.signs_gpu.as_ref().unwrap(),
+                                self.boundaries_gpu.as_ref().unwrap(),
+                                self.centroids_gpu.as_ref().unwrap(),
+                                &mut packed_gpu, &mut norms_gpu,
+                                None,
+                                self.channel_sigma_gpu.as_ref(),
+                                self.n_kv_head, self.head_dim, n_centroids, bytes_per_key,
+                                self.tq_config.center_keys,
+                            ).map_err(|e| TqError::Msg(format!("tq_compress_key: {}", e)))?;
+
+                            let gpu_tq = self.gpu_tq_cache.as_mut().unwrap();
+                            gpu_tq.append_gpu(&packed_gpu, &norms_gpu, v_gpu)?;
+                        }
 
                         // Don't increment cache.cached_len here — it's incremented
                         // after the compress section at line ~1917.
@@ -1254,12 +1292,30 @@ impl LayerWeights {
                         let mut scores_gpu = reg.stream.alloc_zeros::<f32>(self.n_head * n_past_compressed)
                             .map_err(|e| TqError::Msg(format!("scores alloc: {}", e)))?;
                         let scale = 1.0 / (self.head_dim as f32).sqrt();
-                        crate::cuda::kernels::tq_fused_attention(
-                            reg, &rq_gpu, &gpu.packed_indices, &gpu.norms,
-                            &gpu.centroids, &mut scores_gpu,
-                            self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
-                            gpu.bits as usize, scale, gpu.max_seq,
-                        ).map_err(|e| TqError::Msg(format!("tq_fused_attention: {}", e)))?;
+                        // Sprint 1C: route to grouped attention launcher when
+                        // gnorms is populated. Both per-vector and grouped
+                        // kernels write the same scores layout, so the
+                        // downstream softmax/V path stays unchanged.
+                        let use_grouped_attn = std::env::var("TQ_GPU_GROUPED")
+                            .ok().map_or(false, |v| v == "1")
+                            && gpu.gnorms.is_some()
+                            && gpu.n_groups > 1;
+                        if use_grouped_attn {
+                            let gnorms_ref = gpu.gnorms.as_ref().unwrap();
+                            crate::cuda::kernels::tq_fused_attention_grouped(
+                                reg, &rq_gpu, &gpu.packed_indices, gnorms_ref,
+                                &gpu.centroids, &mut scores_gpu,
+                                self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
+                                gpu.group_size, gpu.bits as usize, scale,
+                            ).map_err(|e| TqError::Msg(format!("tq_fused_attention_grouped: {}", e)))?;
+                        } else {
+                            crate::cuda::kernels::tq_fused_attention(
+                                reg, &rq_gpu, &gpu.packed_indices, &gpu.norms,
+                                &gpu.centroids, &mut scores_gpu,
+                                self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
+                                gpu.bits as usize, scale, gpu.max_seq,
+                            ).map_err(|e| TqError::Msg(format!("tq_fused_attention: {}", e)))?;
+                        }
 
                         // Download compressed scores
                         let comp_scores: Vec<f32> = reg.stream.clone_dtoh(&scores_gpu)
@@ -1364,13 +1420,28 @@ impl LayerWeights {
                                 if gpu.decomp_count < n_past_compressed {
                                     let new_start = gpu.decomp_count;
                                     let new_count = n_past_compressed - new_start;
-                                    crate::cuda::kernels::tq_decompress_keys_range(
-                                        reg, &gpu.packed_indices, &gpu.norms,
-                                        &gpu.centroids, signs, &mut gpu.decomp_cache,
-                                        self.n_kv_head, new_count, hdim,
-                                        gpu.bits as usize, ms,
-                                        new_start, ms,
-                                    ).map_err(|e| TqError::Msg(format!("decompress_range: {e}")))?;
+                                    let use_grouped_decomp = std::env::var("TQ_GPU_GROUPED")
+                                        .ok().map_or(false, |v| v == "1")
+                                        && gpu.gnorms.is_some()
+                                        && gpu.n_groups > 1;
+                                    if use_grouped_decomp {
+                                        let gnorms_ref = gpu.gnorms.as_ref().unwrap();
+                                        crate::cuda::kernels::tq_decompress_keys_grouped(
+                                            reg, &gpu.packed_indices, gnorms_ref,
+                                            &gpu.centroids, signs, &mut gpu.decomp_cache,
+                                            self.n_kv_head, new_count, hdim,
+                                            gpu.group_size, gpu.bits as usize, ms,
+                                            new_start, ms,
+                                        ).map_err(|e| TqError::Msg(format!("decompress_grouped: {e}")))?;
+                                    } else {
+                                        crate::cuda::kernels::tq_decompress_keys_range(
+                                            reg, &gpu.packed_indices, &gpu.norms,
+                                            &gpu.centroids, signs, &mut gpu.decomp_cache,
+                                            self.n_kv_head, new_count, hdim,
+                                            gpu.bits as usize, ms,
+                                            new_start, ms,
+                                        ).map_err(|e| TqError::Msg(format!("decompress_range: {e}")))?;
+                                    }
                                     gpu.decomp_count = n_past_compressed;
                                 }
                                 // K hot: gather from strided decomp_cache → pre-allocated k_contig
@@ -1543,12 +1614,26 @@ impl LayerWeights {
                             if let Some(ref rq) = rq_gpu {
                                 let mut scores_gpu = reg.stream.alloc_zeros::<f32>(self.n_head * n_past_compressed).ok();
                                 if let Some(ref mut sg) = scores_gpu {
-                                    let ok = crate::cuda::kernels::tq_fused_attention(
-                                        reg, rq, &gpu.packed_indices, &gpu.norms,
-                                        &gpu.centroids, sg,
-                                        self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
-                                        gpu.bits as usize, scale, gpu.max_seq,
-                                    );
+                                    let use_grouped_attn = std::env::var("TQ_GPU_GROUPED")
+                                        .ok().map_or(false, |v| v == "1")
+                                        && gpu.gnorms.is_some()
+                                        && gpu.n_groups > 1;
+                                    let ok = if use_grouped_attn {
+                                        let gnorms_ref = gpu.gnorms.as_ref().unwrap();
+                                        crate::cuda::kernels::tq_fused_attention_grouped(
+                                            reg, rq, &gpu.packed_indices, gnorms_ref,
+                                            &gpu.centroids, sg,
+                                            self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
+                                            gpu.group_size, gpu.bits as usize, scale,
+                                        )
+                                    } else {
+                                        crate::cuda::kernels::tq_fused_attention(
+                                            reg, rq, &gpu.packed_indices, &gpu.norms,
+                                            &gpu.centroids, sg,
+                                            self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
+                                            gpu.bits as usize, scale, gpu.max_seq,
+                                        )
+                                    };
                                     if ok.is_ok() {
                                         reg.stream.clone_dtoh(sg).ok()
                                     } else { None }
