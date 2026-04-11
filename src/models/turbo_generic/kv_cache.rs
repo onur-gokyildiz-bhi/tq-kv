@@ -1019,6 +1019,18 @@ pub(crate) fn get_compact_threshold() -> usize {
     *C.get_or_init(|| std::env::var("TQ_COMPACT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+/// Grouped GPU TQ path enabled. Default true (was opt-in via TQ_GPU_GROUPED=1
+/// during Sprint 1C until parity was confirmed). Setting `TQ_GPU_GROUPED=0`
+/// forces the legacy per-vector path — kept as an escape hatch for ablation
+/// or in case future kernels expose a regression.
+pub(crate) fn get_gpu_grouped_enabled() -> bool {
+    pub(crate) static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_GPU_GROUPED")
+        .ok()
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true))
+}
+
 pub(crate) fn get_compact_ratio() -> usize {
     pub(crate) static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *C.get_or_init(|| std::env::var("TQ_COMPACT_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(5))

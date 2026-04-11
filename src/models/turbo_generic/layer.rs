@@ -648,15 +648,17 @@ impl LayerWeights {
                             }
                         }
 
-                        // Sprint 1C: opt-in grouped GPU compress path. When the
-                        // env flag is on AND the GpuCompressedKv was allocated
-                        // with n_groups>1, run tq_compress_key_grouped and
-                        // scatter to gpu_tq.gnorms instead of the legacy
-                        // per-vector path. center_keys + KIVI per-channel sigma
-                        // are ignored on the grouped path for now (see Sprint 1A
-                        // commit), so we fall back to per-vector if either is on.
-                        let want_grouped = std::env::var("TQ_GPU_GROUPED")
-                            .ok().map_or(false, |v| v == "1");
+                        // Sprint 1C: grouped GPU compress path. When the
+                        // GpuCompressedKv was allocated with n_groups>1, run
+                        // tq_compress_key_grouped and scatter to gpu_tq.gnorms
+                        // instead of the legacy per-vector path. center_keys
+                        // + KIVI per-channel sigma are ignored on the grouped
+                        // path for now (see Sprint 1A commit), so we fall back
+                        // to per-vector if either is on.
+                        // Sprint 1D: flipped to default-enabled after parity
+                        // verification (5-prompt suite identical, perf within
+                        // run-to-run noise). TQ_GPU_GROUPED=0 disables it.
+                        let want_grouped = super::kv_cache::get_gpu_grouped_enabled();
                         let gpu_tq_ref = self.gpu_tq_cache.as_ref().unwrap();
                         let can_grouped = want_grouped
                             && gpu_tq_ref.n_groups > 1
@@ -1349,8 +1351,8 @@ impl LayerWeights {
                         // downstream softmax/V path stays unchanged.
                         // pre_rope on => CPU grouped bridge filled gnorms; per-vector
                         // gpu.norms is stale and unsafe to read.
-                        let env_grouped = std::env::var("TQ_GPU_GROUPED")
-                            .ok().map_or(false, |v| v == "1");
+                        // Sprint 1D: flipped grouped to default-enabled.
+                        let env_grouped = super::kv_cache::get_gpu_grouped_enabled();
                         let use_grouped_attn = (cache.pre_rope || env_grouped)
                             && gpu.gnorms.is_some()
                             && gpu.n_groups > 1;
@@ -1480,9 +1482,9 @@ impl LayerWeights {
                                     //   (a) cache.pre_rope is on — CPU grouped compress was
                                     //       used and the bridge filled gpu.gnorms (gpu.norms
                                     //       is stale in this case), OR
-                                    //   (b) the user explicitly set TQ_GPU_GROUPED=1.
-                                    let env_grouped = std::env::var("TQ_GPU_GROUPED")
-                                        .ok().map_or(false, |v| v == "1");
+                                    //   (b) Sprint 1D default — grouped on by default,
+                                    //       TQ_GPU_GROUPED=0 to disable.
+                                    let env_grouped = super::kv_cache::get_gpu_grouped_enabled();
                                     let use_grouped_decomp = (cache.pre_rope || env_grouped)
                                         && gpu.gnorms.is_some()
                                         && gpu.n_groups > 1;
@@ -1700,8 +1702,7 @@ impl LayerWeights {
                             if let Some(ref rq) = rq_gpu {
                                 let mut scores_gpu = reg.stream.alloc_zeros::<f32>(self.n_head * n_past_compressed).ok();
                                 if let Some(ref mut sg) = scores_gpu {
-                                    let env_grouped = std::env::var("TQ_GPU_GROUPED")
-                                        .ok().map_or(false, |v| v == "1");
+                                    let env_grouped = super::kv_cache::get_gpu_grouped_enabled();
                                     let use_grouped_attn = (cache.pre_rope || env_grouped)
                                         && gpu.gnorms.is_some()
                                         && gpu.n_groups > 1;
