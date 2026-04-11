@@ -1037,10 +1037,14 @@ pub fn tq_decompress_keys_range(
         }
         hadamard_inverse_batch(reg, &mut temp, signs, n_kv_heads * n_keys, head_dim)?;
 
-        // Scatter from contiguous temp to strided output
+        // Scatter from contiguous temp to strided output.
+        // Per-head destination row is `key_offset` (not 0) — incremental decode
+        // writes a single new row at index `key_offset` while preserving prior rows.
+        // Bug fixed 2026-04-11: previously dst_off omitted the key_offset shift,
+        // so step-2+ decodes silently overwrote row 0 of every head.
         for h in 0..n_kv_heads {
             let src_off = h * n_keys * head_dim;
-            let dst_off = h * out_stride * head_dim;
+            let dst_off = (h * out_stride + key_offset) * head_dim;
             copy_with_offsets(reg, &temp, keys_out, n_keys * head_dim, src_off, dst_off)?;
         }
     }
@@ -1113,9 +1117,11 @@ pub fn tq_decompress_keys_grouped(
                 .launch(cfg)?;
         }
         hadamard_inverse_batch(reg, &mut temp, signs, n_kv_heads * n_keys, head_dim)?;
+        // Same bug + fix as tq_decompress_keys_range above: dst_off must add
+        // key_offset, otherwise step-2+ incremental decodes scribble row 0.
         for h in 0..n_kv_heads {
             let src_off = h * n_keys * head_dim;
-            let dst_off = h * out_stride * head_dim;
+            let dst_off = (h * out_stride + key_offset) * head_dim;
             copy_with_offsets(reg, &temp, keys_out, n_keys * head_dim, src_off, dst_off)?;
         }
     }

@@ -1468,7 +1468,6 @@ impl LayerWeights {
                     ) {
                         let gpu_result: Result<Tensor> = (|| {
                             let hdim = self.head_dim;
-                            let scale = 1.0 / (hdim as f64).sqrt();
                             let stream = reg.stream.clone();
 
                             // Step 1: Incremental GPU decompress + K hot gather
@@ -1591,8 +1590,12 @@ impl LayerWeights {
                             let k_full = repeat_kv(k_full, n_rep)?;
 
                             // Step 3: Q @ K^T on GPU (q_f32 already CUDA from attention_wo)
+                            // BUG fix 2026-04-11: was `/ scale` which is `* sqrt(d)` (off by d=128).
+                            // The correct scaling for attention logits is `(q @ k.T) / sqrt(d)`,
+                            // i.e. multiply by `scale = 1/sqrt(d)`. Has been wrong since 3888d39 —
+                            // PPL never hit this path (seq_len > 1) so the bug went unnoticed.
                             debug_assert!(q_f32.is_cuda(), "Q should be GPU in all-GPU path");
-                            let mut att = (q_f32.matmul(&k_full.t()?)? / scale)?;
+                            let mut att = (q_f32.matmul(&k_full.t()?)? / (hdim as f64).sqrt())?;
                             if let Some(cap) = self.attn_logit_softcap {
                                 att = apply_softcap(&att, cap)?;
                             }
