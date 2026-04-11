@@ -764,9 +764,14 @@ impl LayerWeights {
                         };
                         let max_seq = std::env::var("TQ_MAX_SEQ").ok()
                             .and_then(|v| v.parse().ok()).unwrap_or(2048usize);
+                        // Sprint 1A: pass through layer_tq_config.group_size so the
+                        // grouped norms buffer is allocated when grouped mode is on.
+                        // The grouped path still has to be flipped on by Sprint 1C
+                        // (TQ_GPU_GROUPED) before this buffer is actually written.
+                        let group_size = layer_tq_config.group_size;
                         match GpuCompressedKv::new(
                             reg.stream.clone(), self.n_kv_head, self.n_head,
-                            self.head_dim, head_bits, max_seq, cb,
+                            self.head_dim, head_bits, max_seq, cb, group_size,
                         ) {
                             Ok(mut gpu) => {
                                 // Seed with all existing compressed keys + actual V data.

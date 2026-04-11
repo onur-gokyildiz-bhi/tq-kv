@@ -54,8 +54,17 @@ pub(crate) struct CompactedCacheHead {
 pub(crate) struct GpuCompressedKv {
     /// Packed indices: [n_kv_head, max_seq, bytes_per_key] (flat)
     pub(crate) packed_indices: cudarc::driver::CudaSlice<u8>,
-    /// Per-vector norms: [n_kv_head, max_seq]
+    /// Per-vector norms: [n_kv_head, max_seq] — legacy per-vector path.
+    /// Always allocated so the existing fused_attention/decompress kernels keep
+    /// working. When the grouped path takes over (Sprint 1D) this can be
+    /// retired.
     pub(crate) norms: cudarc::driver::CudaSlice<f32>,
+    /// Per-group norms: [n_kv_head, max_seq, n_groups]. Allocated only when
+    /// `n_groups > 1` (i.e. grouped compression is enabled). The grouped
+    /// compress kernel writes here; grouped attention/decompress kernels read
+    /// here. Sprint 1A: structure exists but isn't wired into the active path
+    /// until Sprint 1C flips on `TQ_GPU_GROUPED`.
+    pub(crate) gnorms: Option<cudarc::driver::CudaSlice<f32>>,
     /// Codebook centroids: [n_centroids] — uploaded once
     pub(crate) centroids: cudarc::driver::CudaSlice<f32>,
     /// V data (f32): [n_kv_head, max_seq, head_dim]
@@ -78,6 +87,10 @@ pub(crate) struct GpuCompressedKv {
     pub(crate) n_kv_head: usize,
     pub(crate) n_heads: usize,
     pub(crate) head_dim: usize,
+    /// Per-token group count for the grouped path. 1 means per-vector (legacy).
+    pub(crate) n_groups: usize,
+    /// Group size in dims. 0 means per-vector mode (n_groups == 1).
+    pub(crate) group_size: usize,
     pub(crate) bytes_per_key: usize,
     pub(crate) bits: u8,
     pub(crate) stream: std::sync::Arc<cudarc::driver::CudaStream>,
@@ -105,17 +118,35 @@ impl GpuCompressedKv {
         bits: u8,
         max_seq: usize,
         centroids: &[f32],
+        group_size: usize,
     ) -> std::result::Result<Self, crate::cuda::TqError> {
         let bytes_per_key = (head_dim * bits as usize + 7) / 8;
         let total_indices = n_kv_head * max_seq * bytes_per_key;
         let total_norms = n_kv_head * max_seq;
         let total_v = n_kv_head * max_seq * head_dim;
 
+        // Sprint 1A: only allocate per-group norms when grouped mode is
+        // requested (group_size > 0 and head_dim divides cleanly). Per-vector
+        // norms are still allocated unconditionally so the existing kernels
+        // keep working until the grouped path is wired in Sprint 1C/1D.
+        let n_groups = if group_size > 0 && head_dim % group_size == 0 {
+            head_dim / group_size
+        } else {
+            1
+        };
+
         let _ = stream.context().check_err();
         let packed_indices = stream.alloc_zeros::<u8>(total_indices)
             .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv indices: {}", e)))?;
         let norms = stream.alloc_zeros::<f32>(total_norms)
             .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv norms: {}", e)))?;
+        let gnorms = if n_groups > 1 {
+            let total_gnorms = n_kv_head * max_seq * n_groups;
+            Some(stream.alloc_zeros::<f32>(total_gnorms)
+                .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv gnorms: {}", e)))?)
+        } else {
+            None
+        };
         let v_data = stream.alloc_zeros::<f32>(total_v)
             .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv v: {}", e)))?;
         let gpu_centroids = stream.clone_htod(centroids)
@@ -130,16 +161,21 @@ impl GpuCompressedKv {
             .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv k_contig: {}", e)))?);
         let v_contig = std::sync::Arc::new(stream.alloc_zeros::<f32>(total_v)
             .map_err(|e| crate::cuda::TqError::Msg(format!("GpuCompressedKv v_contig: {}", e)))?);
-        eprintln!("[gpu-tq] pre-allocated {}×{}×{} = {:.1}MB compressed + {:.1}MB decomp cache",
+        let gnorm_bytes = n_groups.saturating_sub(1) * n_kv_head * max_seq * 4;
+        eprintln!("[gpu-tq] pre-allocated {}×{}×{} = {:.1}MB compressed + {:.1}MB decomp cache (grouped: n_groups={}, +{:.2}MB gnorms)",
             n_kv_head, max_seq, bytes_per_key,
             (total_indices + total_norms * 4 + total_v * 4) as f64 / 1e6,
-            (total_v * 4) as f64 / 1e6);
+            (total_v * 4) as f64 / 1e6,
+            n_groups,
+            gnorm_bytes as f64 / 1e6);
 
         Ok(Self {
-            packed_indices, norms, centroids: gpu_centroids, v_data,
+            packed_indices, norms, gnorms, centroids: gpu_centroids, v_data,
             rotated_q, output_buf, decomp_cache, decomp_count: 0,
             k_contig, v_contig,
-            count: 0, max_seq, n_kv_head, n_heads, head_dim, bytes_per_key, bits,
+            count: 0, max_seq, n_kv_head, n_heads, head_dim,
+            n_groups, group_size,
+            bytes_per_key, bits,
             stream,
         })
     }

@@ -619,6 +619,56 @@ pub fn tq_compress_key(
     Ok(())
 }
 
+/// GPU TurboQuant key compression with PER-GROUP sigma.
+/// Mirrors CPU compress_single_key_grouped: head_dim is split into n_groups
+/// blocks of `group_size` each, every block carries its own L2 norm /
+/// sigma, and the centroid lookup uses the per-group sigma. Output norms
+/// are arranged as [n_kv_heads, n_groups] (row-major over heads).
+///
+/// Constraints: head_dim % group_size == 0. Center-keys + per-channel sigma
+/// (KIVI) are not supported on this path yet — they layer on top of a single
+/// per-vector sigma and will be redesigned in a later sprint.
+pub fn tq_compress_key_grouped(
+    reg: &KernelRegistry,
+    key_vectors: &CudaSlice<f32>,    // [n_kv_heads, head_dim]
+    signs: &CudaSlice<f32>,          // [head_dim]
+    boundaries: &CudaSlice<f32>,     // [n_centroids - 1]
+    centroids: &CudaSlice<f32>,      // [n_centroids]
+    packed_out: &mut CudaSlice<u8>,  // [n_kv_heads, bytes_per_key]
+    gnorms_out: &mut CudaSlice<f32>, // [n_kv_heads, n_groups]
+    n_kv_heads: usize,
+    head_dim: usize,
+    group_size: usize,
+    n_centroids: usize,
+    bytes_per_key: usize,
+) -> Result<(), DriverError> {
+    assert!(group_size > 0, "group_size must be > 0");
+    assert!(head_dim % group_size == 0,
+        "head_dim {} must be divisible by group_size {}", head_dim, group_size);
+    let f = reg.get_fn("tq_compress", "tq_compress_key_grouped_f32")?;
+    let n_boundaries = n_centroids - 1;
+    let n_groups = head_dim / group_size;
+    // Shared memory layout: s_data + s_bounds + s_cents + s_gsig + s_gnorm
+    let shmem = ((head_dim + n_boundaries + n_centroids + 2 * n_groups) * 4) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_heads as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: shmem,
+    };
+    let hd = head_dim as i32;
+    let gs = group_size as i32;
+    let nc = n_centroids as i32;
+    let bpk = bytes_per_key as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(key_vectors).arg(signs).arg(boundaries).arg(centroids)
+            .arg(packed_out).arg(gnorms_out)
+            .arg(&hd).arg(&gs).arg(&nc).arg(&bpk)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// TriAttention: score all keys for all KV heads using trigonometric series.
 /// Grid: (n_kv_heads, 1, 1), Block: 256 threads.
 /// Scores pre-RoPE keys without full attention computation.
