@@ -25,13 +25,65 @@ static PREFILL_SCRATCH: std::sync::Mutex<Option<CudaSlice<f32>>> = std::sync::Mu
 #[allow(dead_code)]
 static PREFILL_SCRATCH_F16: std::sync::Mutex<Option<CudaSlice<half::f16>>> = std::sync::Mutex::new(None);
 
+/// Raw weight bytes, either owned (heap `Vec<u8>`) or a zero-copy slice into
+/// a memory-mapped file. `as_slice()` is the unified accessor.
+///
+/// `Mmap` keeps an `Arc<Mmap>` alive so the mapping stays valid for the full
+/// lifetime of the weight, even if the original `GgufContent` is dropped.
+#[derive(Debug)]
+pub enum RawBytes {
+    Owned(Vec<u8>),
+    Mmap {
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        /// Byte range into the mmap (inclusive start, exclusive end).
+        range: std::ops::Range<usize>,
+    },
+}
+
+impl RawBytes {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            RawBytes::Owned(v) => v.as_slice(),
+            RawBytes::Mmap { mmap, range } => &mmap[range.clone()],
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            RawBytes::Owned(v) => v.len(),
+            RawBytes::Mmap { range, .. } => range.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl Clone for RawBytes {
+    fn clone(&self) -> Self {
+        match self {
+            // Owned clone: allocate + copy (existing behaviour).
+            RawBytes::Owned(v) => RawBytes::Owned(v.clone()),
+            // Mmap clone: Arc refcount bump, no byte copy.
+            RawBytes::Mmap { mmap, range } => RawBytes::Mmap {
+                mmap: mmap.clone(),
+                range: range.clone(),
+            },
+        }
+    }
+}
+
 /// Quantized weight matrix stored in GGML block format.
 ///
 /// When CUDA is enabled, raw weight bytes are lazily uploaded to GPU
 /// on first use and cached for subsequent forward passes.
 pub struct QWeight {
-    /// Raw quantized bytes (GGML block layout).
-    pub raw_data: Vec<u8>,
+    /// Raw quantized bytes (GGML block layout). Either owned or mmap-backed.
+    pub raw_data: RawBytes,
     /// Quantization type (Q4_K_M, Q6_K, Q8_0, F16, F32, ...).
     pub dtype: GgmlDType,
     /// Weight shape: (out_features, in_features) — row-major.
@@ -79,8 +131,23 @@ impl std::fmt::Debug for QWeight {
 }
 
 impl QWeight {
-    /// Create from raw GGUF tensor data.
+    /// Create from an owned `Vec<u8>` of GGUF tensor data.
     pub fn new(raw_data: Vec<u8>, dtype: GgmlDType, shape: (usize, usize)) -> Self {
+        Self::new_raw(RawBytes::Owned(raw_data), dtype, shape)
+    }
+
+    /// Create from mmap-backed bytes (zero-copy).
+    pub fn new_mmap(
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        range: std::ops::Range<usize>,
+        dtype: GgmlDType,
+        shape: (usize, usize),
+    ) -> Self {
+        Self::new_raw(RawBytes::Mmap { mmap, range }, dtype, shape)
+    }
+
+    /// Low-level constructor accepting any `RawBytes` variant.
+    pub fn new_raw(raw_data: RawBytes, dtype: GgmlDType, shape: (usize, usize)) -> Self {
         Self {
             raw_data, dtype, shape,
             cpu_cache: OnceLock::new(),
@@ -96,7 +163,7 @@ impl QWeight {
     /// Dequantize entire weight matrix to f32.
     pub fn dequantize(&self) -> Vec<f32> {
         let n_elements = self.shape.0 * self.shape.1;
-        quant::dequantize(&self.raw_data, self.dtype, n_elements)
+        quant::dequantize(self.raw_data.as_slice(), self.dtype, n_elements)
     }
 
     /// Dequantize to TqTensor.
@@ -117,7 +184,7 @@ impl QWeight {
         if let TqDevice::Cuda { .. } = device {
             let stream = device.cuda_stream()?;
             self.gpu_cache.get_or_init(|| {
-                stream.clone_htod(&self.raw_data)
+                stream.clone_htod(self.raw_data.as_slice())
                     .expect("QWeight GPU upload failed")
             });
         }
@@ -156,7 +223,7 @@ impl QWeight {
         #[cfg(feature = "cuda")]
         if self.gpu_cache.get().is_some() {
             let freed = self.raw_data.len();
-            self.raw_data = Vec::new();
+            self.raw_data = RawBytes::Owned(Vec::new());
             self.cpu_cache = OnceLock::new(); // also drop f32 cache if any
             if freed > 0 {
                 static TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -170,7 +237,7 @@ impl QWeight {
 
     pub fn gpu_cache_or_upload(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> &CudaSlice<u8> {
         self.gpu_cache.get_or_init(|| {
-            match stream.clone_htod(&self.raw_data) {
+            match stream.clone_htod(self.raw_data.as_slice()) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("WARNING: QWeight GPU upload failed ({}), using empty placeholder", e);
@@ -341,7 +408,7 @@ impl QMatMul {
 
         // Lazy GPU cache: upload weight bytes once, reuse for all subsequent calls
         let w_gpu = qw.gpu_cache.get_or_init(|| {
-            stream.clone_htod(&qw.raw_data)
+            stream.clone_htod(qw.raw_data.as_slice())
                 .expect("QWeight GPU upload failed")
         });
 
@@ -753,7 +820,7 @@ mod tests {
         let cloned = qw.clone();
         assert_eq!(cloned.dtype, GgmlDType::F32);
         assert_eq!(cloned.shape, (2, 2));
-        assert_eq!(cloned.raw_data, w_data);
+        assert_eq!(cloned.raw_data.as_slice(), w_data.as_slice());
         // Dequantized values should match
         assert_eq!(qw.dequantize(), cloned.dequantize());
     }

@@ -276,12 +276,6 @@ impl Engine {
             ModelWeights(w)
         } else {
             // GGUF path
-            let mut file = std::fs::File::open(model_path)
-                .with_context(|| format!("Cannot open model: {}", model_path.display()))?;
-
-            let content = GgufContent::read(&mut file)
-                .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
-
             let tq = tq_config.unwrap_or_else(|| {
                 let mut cfg = TurboQuantConfig::balanced();
                 cfg.skip_layers = Some(999);
@@ -292,8 +286,22 @@ impl Engine {
             if compressed {
                 eprintln!("TurboQuant: {}-bit KV cache", tq.bits);
             }
-            let w = turbo_generic::GenericTurboModel::from_gguf(content, &mut file, &device, tq)
-                .map_err(|e| anyhow::anyhow!("Model load error: {}", e))?;
+            // TQ_MMAP=1: memory-mapped GGUF (zero-copy into GPU, lower RSS).
+            let use_mmap = std::env::var("TQ_MMAP").ok().as_deref() == Some("1");
+            let w = if use_mmap {
+                eprintln!("GGUF mmap mode (TQ_MMAP=1)");
+                let src = crate::gguf::GgufMmapSource::open(model_path)
+                    .map_err(|e| anyhow::anyhow!("GGUF mmap error: {}", e))?;
+                turbo_generic::GenericTurboModel::build_from_source(&src, &device, tq)
+                    .map_err(|e| anyhow::anyhow!("Model load error: {}", e))?
+            } else {
+                let mut file = std::fs::File::open(model_path)
+                    .with_context(|| format!("Cannot open model: {}", model_path.display()))?;
+                let content = GgufContent::read(&mut file)
+                    .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
+                turbo_generic::GenericTurboModel::from_gguf(content, &mut file, &device, tq)
+                    .map_err(|e| anyhow::anyhow!("Model load error: {}", e))?
+            };
             ModelWeights(w)
         };
         eprintln!("Model loaded!");

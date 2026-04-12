@@ -108,6 +108,16 @@ impl GenericTurboModel {
         Self::build(&src, device, tq_config)
     }
 
+    /// Public entry point: construct from any `WeightSource`.
+    /// Used by engine.rs to switch between mmap/non-mmap GGUF paths.
+    pub fn build_from_source<WS: WeightSource>(
+        src: &WS,
+        device: &Device,
+        tq_config: TurboQuantConfig,
+    ) -> Result<Self> {
+        Self::build(src, device, tq_config)
+    }
+
     /// Format-agnostic model builder. Consumes a `WeightSource`
     /// (GGUF or safetensors) and constructs a `GenericTurboModel`.
     pub(crate) fn build<WS: WeightSource>(
@@ -255,7 +265,7 @@ impl GenericTurboModel {
         let (emb_raw, emb_full) = if tok_embeddings_lazy {
             (Some(emb_raw_data), None)
         } else {
-            let dequant = crate::quant::dequantize(&emb_raw_data, emb_dtype,
+            let dequant = crate::quant::dequantize(emb_raw_data.as_slice(), emb_dtype,
                 emb_shape.0 * emb_shape.1);
             let tensor = Tensor::from_vec(dequant, vec![emb_shape.0, emb_shape.1], device)?;
             (None, Some(tensor))

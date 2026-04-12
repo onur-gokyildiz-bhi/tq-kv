@@ -34,6 +34,7 @@ rayon = "1.10"
 matrixmultiply = "0.3"
 uuid = { version = "1", features = ["v4"] }
 safetensors = "0.4"
+memmap2 = "0.9"
 
 [[bin]]
 name = "tq"
