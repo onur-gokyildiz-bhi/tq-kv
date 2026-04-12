@@ -407,6 +407,18 @@ fn resolve_tq_config_for_model(turbo_quant: bool, tq_bits: u8, model_name: Optio
                 if let Some(cal_data) = cal_data {
                     eprintln!("Using calibrated channel bias + per-head bits");
                     cal_data.apply_to_config(&mut config);
+                    // Sprint 3: apply auto_layer_bits from calibration
+                    if let Some(ref alb) = cal_data.auto_layer_bits {
+                        let n_2 = alb.iter().filter(|&&b| b == 2).count();
+                        let n_3 = alb.iter().filter(|&&b| b == 3).count();
+                        let n_4 = alb.iter().filter(|&&b| b == 4).count();
+                        let n_skip = alb.iter().filter(|&&b| b == 0).count();
+                        if n_2 > 0 || n_3 > 0 {
+                            eprintln!("  Auto layer bits: {} skip, {} @2-bit, {} @3-bit, {} @4-bit",
+                                n_skip, n_2, n_3, n_4);
+                        }
+                        models::turbo_generic::set_auto_layer_bits(alb.clone());
+                    }
                     // TriAttention ON by default with TQ (the product mode).
                     // Disable with TQ_TRIATTN=0 or set_triattention_override(false).
                     let tri_disabled = std::env::var("TQ_TRIATTN").ok().map_or(false, |v| v == "0");
@@ -1244,7 +1256,13 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
     if !json_output {
         eprintln!("[{}/{}] Loading model (TQ 4-bit)...", run_idx, n_runs);
     }
-    let mut tq_config = tq_kv::TurboQuantConfig::balanced(); // 4-bit
+    let bench_bits: u8 = std::env::var("TQ_BITS").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(4);
+    let mut tq_config = match bench_bits {
+        2 => tq_kv::TurboQuantConfig::extreme(),
+        3 => tq_kv::TurboQuantConfig::aggressive(),
+        _ => tq_kv::TurboQuantConfig::balanced(),
+    };
     if let Ok(val) = std::env::var("TQ_GROUP") {
         if let Ok(gs) = val.parse::<usize>() { tq_config.group_size = gs; }
     }

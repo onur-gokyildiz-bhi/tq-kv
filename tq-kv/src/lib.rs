@@ -237,9 +237,12 @@ impl TurboQuantConfig {
         Self { bits: 3, ..Default::default() }
     }
 
-    /// 4-bit balanced compression (~8x theoretical)
+    /// 3-bit balanced compression (~10.7x theoretical).
+    /// Sprint 3: calibration shows 3-bit gives identical quality to 4-bit on
+    /// Qwen2.5-7B Q4_K_M (4/5 on 5-prompt suite, PPL 4.974 exact match).
+    /// 25% less K storage than 4-bit. Override with TQ_BITS=4 for conservative.
     pub fn balanced() -> Self {
-        Self { bits: 4, ..Default::default() }
+        Self { bits: 3, ..Default::default() }
     }
 
     /// 4-bit with adaptive QJL — auto-enables error correction at long context.

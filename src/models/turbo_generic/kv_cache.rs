@@ -1115,6 +1115,15 @@ pub(crate) fn parse_layer_bits() -> &'static Vec<(usize, usize, u8)> {
     })
 }
 
+/// Calibrated per-layer bits (Sprint 3). Set from CalibrationData.auto_layer_bits
+/// at model load time. 0 = uncompressed (skip/protect), 2/3/4 = bit width.
+pub(crate) static AUTO_LAYER_BITS: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Set auto_layer_bits from calibration data. Called once at model load.
+pub(crate) fn set_auto_layer_bits(bits: Vec<u8>) {
+    let _ = AUTO_LAYER_BITS.set(bits);
+}
+
 /// Layer-adaptive bitwidth: assign different bit widths to different layer ranges.
 /// Format: "start-end:bits[,start-end:bits]" e.g. "4-15:2,16-27:4"
 /// Unspecified layers use the default TQ bits. Layers below TQ_SKIP or within
@@ -1131,10 +1140,18 @@ pub(crate) fn get_layer_bits(layer_idx: usize, default_bits: u8, config: &tq_kv:
         return None; // uncompressed — boundary protection (last M)
     }
 
+    // Priority 1: explicit TQ_LAYER_BITS env var (manual override)
     let ranges = parse_layer_bits();
     for &(start, end, bits) in ranges {
         if layer_idx >= start && layer_idx <= end {
             return Some(bits);
+        }
+    }
+
+    // Priority 2: calibrated auto_layer_bits (Sprint 3)
+    if let Some(auto_bits) = AUTO_LAYER_BITS.get() {
+        if layer_idx < auto_bits.len() && auto_bits[layer_idx] > 0 {
+            return Some(auto_bits[layer_idx]);
         }
     }
 

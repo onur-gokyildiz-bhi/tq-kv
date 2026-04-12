@@ -111,6 +111,12 @@ pub struct CalibrationData {
     /// Used by get_layer_bits() to auto-skip the most sensitive layers.
     #[serde(default)]
     pub per_layer_sensitivity: Option<Vec<f32>>,
+
+    /// Auto-assigned per-layer bit widths from sensitivity scoring.
+    /// Layers with high 2-bit cos_sim → 2-bit, rest → 4-bit.
+    /// Applied by get_layer_bits() when calibration is loaded.
+    #[serde(default)]
+    pub auto_layer_bits: Option<Vec<u8>>,
 }
 
 impl CalibrationData {
@@ -802,21 +808,51 @@ pub fn compute_calibration(
     let sigma_ratio = if sigma_min > 1e-10 { sigma_max / sigma_min } else { 0.0 };
     eprintln!("    Sigma range: {:.4}..{:.4} (ratio {:.1}x)", sigma_min, sigma_max, sigma_ratio);
 
-    // 8. Per-layer sensitivity scoring (Sprint 2)
-    let per_layer_sensitivity = if !collector.layer_samples.is_empty() {
-        eprintln!("  Per-layer sensitivity scoring (4-bit, group_size=32)...");
-        let scores = compute_layer_sensitivity(collector, 4, 32);
-        for (i, &s) in scores.iter().enumerate() {
-            let label = if s < 0.95 { " ← SENSITIVE" } else { "" };
-            eprintln!("    L{:2}: cos_sim={:.4}{}", i, s, label);
+    // 8. Per-layer sensitivity scoring (Sprint 2) + adaptive bitwidth (Sprint 3)
+    let (per_layer_sensitivity, auto_layer_bits) = if !collector.layer_samples.is_empty() {
+        eprintln!("  Per-layer sensitivity scoring...");
+        let scores_4bit = compute_layer_sensitivity(collector, 4, 32);
+        let scores_2bit = compute_layer_sensitivity(collector, 2, 32);
+        let n_layers = scores_4bit.len();
+
+        // Sprint 3: auto-assign bits per layer based on 2-bit quality.
+        // Threshold: if 2-bit cos_sim ≥ 0.98, layer is "robust" → use 2-bit.
+        // Otherwise keep 4-bit. Skip/protect layers get None (uncompressed).
+        let threshold_2bit = std::env::var("TQ_2BIT_THRESHOLD")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(0.98f32);
+        let skip = std::env::var("TQ_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize);
+        let protect = std::env::var("TQ_PROTECT_LAST").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize);
+
+        let mut layer_bits = Vec::with_capacity(n_layers);
+        let mut n_2bit = 0usize;
+        let mut n_4bit = 0usize;
+        let mut n_skip = 0usize;
+
+        for i in 0..n_layers {
+            let is_skip = i < skip;
+            let is_protect = i >= n_layers.saturating_sub(protect);
+            if is_skip || is_protect {
+                layer_bits.push(0u8); // 0 = uncompressed (skip/protect)
+                n_skip += 1;
+            } else if scores_2bit[i] >= threshold_2bit {
+                layer_bits.push(2);
+                n_2bit += 1;
+            } else {
+                layer_bits.push(4);
+                n_4bit += 1;
+            }
+            let label = if is_skip || is_protect { "SKIP" }
+                else if scores_2bit[i] >= threshold_2bit { "2-bit" }
+                else { "4-bit" };
+            eprintln!("    L{:2}: 4bit={:.4} 2bit={:.4} → {}",
+                i, scores_4bit[i], scores_2bit[i], label);
         }
-        let n_sensitive = scores.iter().filter(|&&s| s < 0.95).count();
-        let n_good = scores.iter().filter(|&&s| s >= 0.95).count();
-        eprintln!("  Summary: {} layers compressible (≥0.95), {} sensitive (<0.95)",
-            n_good, n_sensitive);
-        Some(scores)
+        eprintln!("  Auto bits: {} skip, {} @ 2-bit, {} @ 4-bit (threshold={:.2})",
+            n_skip, n_2bit, n_4bit, threshold_2bit);
+
+        (Some(scores_4bit), Some(layer_bits))
     } else {
-        None
+        (None, None)
     };
 
     CalibrationData {
@@ -842,6 +878,7 @@ pub fn compute_calibration(
         tri_n_heads: if collector.n_heads > 0 { Some(collector.n_heads) } else { None },
         tri_n_kv_heads: if collector.tri_k_sums.is_empty() { None } else { Some(collector.tri_k_sums.len()) },
         per_layer_sensitivity,
+        auto_layer_bits,
     }
 }
 

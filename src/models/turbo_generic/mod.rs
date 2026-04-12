@@ -34,4 +34,4 @@ mod layer;
 mod model;
 
 pub use model::GenericTurboModel;
-pub(crate) use kv_cache::{set_triattention_override, clear_triattention_override, get_triattention_budget};
+pub(crate) use kv_cache::{set_triattention_override, clear_triattention_override, get_triattention_budget, set_auto_layer_bits};
