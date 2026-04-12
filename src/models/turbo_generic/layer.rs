@@ -1682,6 +1682,84 @@ impl LayerWeights {
                                 ));
                             }
                             if let Some(kh) = k_hot { k_parts_gpu.push(kh); }
+
+                            // Sprint F phase 2: retrieve offloaded tokens on cache miss.
+                            // Decompress K + V from CPU offload cache, apply RoPE, upload.
+                            // V1: retrieve all offloaded tokens (capped at 32). Future: top-K scoring.
+                            let mut n_retrieved = 0usize;
+                            if super::kv_cache::get_offload_enabled() {
+                                if let Some(ref oc) = self.offload_cache {
+                                    if let Some(entries) = oc.retrieve_all_for_layer(self.layer_idx) {
+                                        let max_retrieve = 32;
+                                        let to_retrieve = entries.len().min(max_retrieve);
+                                        if to_retrieve > 0 {
+                                            let config = &layer_tq_config;
+                                            let bpk = oc.bytes_per_key;
+                                            let gs = oc.group_size;
+                                            let ng = oc.n_groups;
+                                            let bits = oc.bits;
+
+                                            // Layout: [n_kv_head, to_retrieve, head_dim] (head-outer)
+                                            // Iterate head-first to match the tensor layout.
+                                            let mut all_k = vec![0.0f32; self.n_kv_head * to_retrieve * hdim];
+                                            for h in 0..self.n_kv_head {
+                                                for (ti, entry) in entries.iter().take(to_retrieve).enumerate() {
+                                                    let packed = &entry.packed_k[h * bpk..(h + 1) * bpk];
+                                                    let gnorms_h = &entry.gnorms[h * ng..(h + 1) * ng];
+                                                    let mut ck = tq_kv::CompressedKeys::new_empty(bits, hdim, config.rotation_seed);
+                                                    ck.group_size = gs;
+                                                    ck.append_raw_grouped(packed, gnorms_h, None);
+                                                    let decompressed = tq_kv::decompress_keys_grouped(&ck, config);
+                                                    let off = (h * to_retrieve + ti) * hdim;
+                                                    all_k[off..off + hdim].copy_from_slice(&decompressed[..hdim.min(decompressed.len())]);
+                                                }
+                                            }
+
+                                            // Apply RoPE (pre-RoPE → post-RoPE)
+                                            if cache.pre_rope {
+                                                let cos_data = self.cos.as_slice();
+                                                let sin_data = self.sin.as_slice();
+                                                let half = self.rope_dim / 2;
+                                                for h in 0..self.n_kv_head {
+                                                    for (ti, entry) in entries.iter().take(to_retrieve).enumerate() {
+                                                        let pos = entry.seq_pos;
+                                                        if pos * half + half > cos_data.len() { continue; }
+                                                        let cos_row = &cos_data[pos * half..pos * half + half];
+                                                        let sin_row = &sin_data[pos * half..pos * half + half];
+                                                        let off = (h * to_retrieve + ti) * hdim;
+                                                        for i in 0..half {
+                                                            let x0 = all_k[off + i];
+                                                            let x1 = all_k[off + i + half];
+                                                            all_k[off + i] = x0 * cos_row[i] - x1 * sin_row[i];
+                                                            all_k[off + i + half] = x0 * sin_row[i] + x1 * cos_row[i];
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // V layout: [n_kv_head, to_retrieve, head_dim] (head-outer)
+                                            // Entry v_data is [n_kv_head * head_dim] = h0...hN for one token.
+                                            let mut all_v = vec![0.0f32; self.n_kv_head * to_retrieve * hdim];
+                                            for h in 0..self.n_kv_head {
+                                                for (ti, entry) in entries.iter().take(to_retrieve).enumerate() {
+                                                    let src = &entry.v_data[h * hdim..(h + 1) * hdim];
+                                                    let dst_off = (h * to_retrieve + ti) * hdim;
+                                                    all_v[dst_off..dst_off + hdim].copy_from_slice(src);
+                                                }
+                                            }
+
+                                            // Upload K to GPU
+                                            if let Ok(k_gpu) = stream.clone_htod(&all_k) {
+                                                k_parts_gpu.push(Tensor::from_cuda(
+                                                    k_gpu, vec![1, self.n_kv_head, to_retrieve, hdim], stream.clone(),
+                                                ));
+                                            }
+                                            n_retrieved = to_retrieve;
+                                        }
+                                    }
+                                }
+                            }
+
                             if n_compressed > 0 {
                                 let k_cur = k.to_dtype(DType::F32)?;
                                 debug_assert!(k_cur.is_cuda(), "current K should be GPU");
@@ -1739,6 +1817,28 @@ impl LayerWeights {
                                     stream.clone(),
                                 );
                                 v_parts_gpu.push(v_hot);
+                            }
+                            // Sprint F: insert retrieved V from offloaded cache (matches K order above)
+                            if n_retrieved > 0 {
+                                if let Some(ref oc) = self.offload_cache {
+                                    if let Some(entries) = oc.retrieve_all_for_layer(self.layer_idx) {
+                                        let to_retrieve = entries.len().min(n_retrieved);
+                                        // Layout: [n_kv_head, to_retrieve, head_dim] (head-outer)
+                                        let mut all_v = vec![0.0f32; self.n_kv_head * to_retrieve * hdim];
+                                        for h in 0..self.n_kv_head {
+                                            for (ti, entry) in entries.iter().take(to_retrieve).enumerate() {
+                                                let src = &entry.v_data[h * hdim..(h + 1) * hdim];
+                                                let dst_off = (h * to_retrieve + ti) * hdim;
+                                                all_v[dst_off..dst_off + hdim].copy_from_slice(src);
+                                            }
+                                        }
+                                        if let Ok(v_gpu) = stream.clone_htod(&all_v) {
+                                            v_parts_gpu.push(Tensor::from_cuda(
+                                                v_gpu, vec![1, self.n_kv_head, to_retrieve, hdim], stream.clone(),
+                                            ));
+                                        }
+                                    }
+                                }
                             }
                             if n_compressed > 0 {
                                 let v_cur = v.to_dtype(DType::F32)?;
