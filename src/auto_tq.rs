@@ -29,12 +29,21 @@ pub struct SwapPlan {
 ///   surface a clear message pointing the user at `TQ_LAYER_SWAP=1`).
 /// - `1`        → enable only when needed (model doesn't fit at 92% VRAM).
 /// - `force`    → always enable, regardless of fit (for bench/parity testing).
+/// Decide whether to enable layer streaming.
+///
+/// * `kv_per_token_bytes` — bytes per decoded token across all layers
+///   (keys + values, fp16).
+/// * `max_context` — worst-case context (e.g. `TQ_MAX_SEQ` or a conservative
+///   32K default). Never pass the 4K default — it under-sizes KV on
+///   long-context 27B+ runs and leads to a permissive plan that OOMs.
 pub fn decide_layer_swap(
     device: &Device,
     model_size_bytes: u64,
     n_layers: usize,
-    kv_cache_bytes: u64,
+    kv_per_token_bytes: u64,
+    max_context: usize,
 ) -> SwapPlan {
+    let kv_cache_bytes = kv_per_token_bytes.saturating_mul(max_context as u64);
     if !device.is_cuda() {
         return SwapPlan {
             enabled: false,

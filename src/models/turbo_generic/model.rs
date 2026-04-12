@@ -945,10 +945,14 @@ impl GenericTurboModel {
                 }
             }
 
-            // ── Layer-swap wait hook: make compute stream wait for this
-            //    layer's H2D copy (no-op for pinned layers / swap disabled).
+            // ── Layer-swap pre-hook:
+            //    (1) flush graveyard — drop any CudaSlices whose compute-
+            //        completion event has fired (safe to cuMemFree now).
+            //    (2) wait_for_layer — compute stream waits on the layer's
+            //        H2D-ready event from the prior iteration's prefetch.
             #[cfg(feature = "cuda")]
-            if let Some(ref sm) = layer_swap {
+            if let Some(ref mut sm) = layer_swap {
+                sm.flush_graveyard();
                 sm.wait_for_layer(layer_idx)
                     .expect("layer_swap wait_for_layer failed");
             }
@@ -1596,6 +1600,13 @@ impl GenericTurboModel {
                     }
                 }
             }
+        }
+
+        // Drain any remaining graveyard entries so CudaSlices from the last
+        // 1-2 streamed layers don't accumulate across decode steps.
+        #[cfg(feature = "cuda")]
+        if let Some(ref mut sm) = layer_swap {
+            sm.drain_graveyard();
         }
 
         // Restore layer_swap + pointer cache after the loop.

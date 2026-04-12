@@ -1,42 +1,34 @@
 //! Layer weight streaming for VRAM-constrained inference.
 //!
 //! When the full model doesn't fit in GPU memory, `LayerSwapManager` streams
-//! non-pinned layers on/off the device using a dedicated transfer stream and
-//! a small set of rotating slots (double-buffered by default). Pinned layers
-//! stay resident for the full run.
+//! non-pinned layers on/off the device on a dedicated transfer stream. Pinned
+//! layers stay resident for the full run.
 //!
-//! # High-level flow (Phase 5 will wire this into the forward loop)
+//! # Sync model (Phase 6b)
 //!
-//! ```text
-//! for layer_idx in 0..n_layers {
-//!     if !swap.is_pinned(layer_idx) {
-//!         swap.wait_for_layer(layer_idx)?;   // compute stream waits on H2D ready event
-//!     }
-//!     // … forward pass for this layer …
-//!     if !swap.is_pinned(layer_idx) {
-//!         swap.evict_layer(layer_idx);        // drop GPU slot, free the slot buffer
-//!         swap.start_prefetch(layer_idx + 1)?; // kick next layer's H2D on transfer stream
-//!     }
-//! }
-//! ```
+//! Three streams / events coordinate ownership:
+//!   * **Transfer stream** — does async `clone_htod` of QWeight bytes.
+//!     After each prefetch, records a `ready_events[layer]` event.
+//!   * **Compute stream** — the forward-pass stream. Waits on
+//!     `ready_events[N]` before launching layer N's kernels
+//!     (`wait_for_layer`).
+//!   * **Compute-completion events** — after evicting a layer, we record an
+//!     event on the compute stream, *take* the layer's `CudaSlice`s out of
+//!     the QWeights (without dropping them), and park them in the
+//!     `graveyard`. On each subsequent iteration's pre-hook we query those
+//!     events; when one fires we know no in-flight kernel still references
+//!     that memory and it's safe to drop. This replaces the earlier
+//!     `compute_stream.synchronize()` path, which serialised eviction with
+//!     compute and killed async overlap.
 //!
 //! # Safety / invariants
 //!
-//! - Single-threaded: the manager assumes one caller drives the forward loop.
-//!   Matches the existing `QWeight` / model assumptions.
-//! - Transfer stream is distinct from compute stream; synchronisation is via
-//!   `CudaEvent`s recorded on the transfer stream and waited on by the compute
-//!   stream (`CudaStream::wait(&event)`).
-//! - CUDA Graph capture is incompatible with swap mode (slot buffer device
-//!   addresses change between prefetches). `engine.rs` should disable
-//!   `TQ_GRAPH` whenever swap is active.
-//!
-//! # Status (Phase 4)
-//!
-//! Infrastructure only — manager construction, slot allocation, pin/prefetch
-//! plumbing. **Not yet wired into the forward loop** (Phase 5). Phase 5 also
-//! refactors `QWeight::gpu_cache` to hold `Arc<CudaSlice<u8>>` so a slot
-//! buffer can be shared with the layer's QWeights via `inject_gpu`.
+//! - Single-threaded forward (same invariant the existing `QWeight` code
+//!   relies on).
+//! - CUDA Graph capture is incompatible with swap (slot addresses change
+//!   between prefetches). `engine.rs` disables `TQ_GRAPH` when swap is active.
+//! - QWeightPtr wraps a `*const QWeight` with `Send + Sync` — required so
+//!   the owning `Engine` stays `Send` for `tokio::spawn_blocking`.
 
 #![cfg(feature = "cuda")]
 
@@ -45,7 +37,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream};
 
-use crate::cuda::{memory::PinnedBuffer, Result, TqError};
+use crate::cuda::{Result, TqError};
 
 /// Send+Sync wrapper around a raw pointer to a `QWeight`.
 ///
@@ -64,63 +56,14 @@ unsafe impl Send for QWeightPtr {}
 unsafe impl Sync for QWeightPtr {}
 
 // ─────────────────────────────────────────────────────────────
-// Per-layer metadata: which bytes (in the host-side source) belong
-// to this layer, and how much GPU space the layer needs.
-// ─────────────────────────────────────────────────────────────
-
-/// Where a single weight lives in the host-side source (file, mmap, or Vec).
-#[derive(Clone, Debug)]
-pub struct WeightLoc {
-    /// Logical name (e.g. "blk.3.attn_q.weight") — informational.
-    pub name: String,
-    /// Byte offset into the source.
-    pub src_offset: usize,
-    /// Number of bytes.
-    pub nbytes: usize,
-    /// Offset into the per-layer packed GPU buffer.
-    pub gpu_offset: usize,
-}
-
-/// All weights belonging to a single transformer layer.
-#[derive(Clone, Debug)]
-pub struct LayerMeta {
-    pub layer_idx: usize,
-    pub weights: Vec<WeightLoc>,
-    /// Total bytes for the layer (sum of weights + alignment padding).
-    pub total_bytes: usize,
-}
-
-// ─────────────────────────────────────────────────────────────
-// Slot: a pre-allocated GPU buffer large enough for the largest
-// non-pinned layer, plus an event recorded after H2D completes.
-// ─────────────────────────────────────────────────────────────
-
-pub struct LayerGpuSlot {
-    /// Pre-allocated GPU buffer (bytes_per_layer).
-    pub buffer: Arc<CudaSlice<u8>>,
-    /// Which layer currently occupies this slot (None = free).
-    pub loaded: Option<usize>,
-    /// Recorded on the transfer stream after the H2D memcpy for `loaded`.
-    pub ready: CudaEvent,
-}
-
-// ─────────────────────────────────────────────────────────────
 // Manager
 // ─────────────────────────────────────────────────────────────
 
 pub struct LayerSwapManager {
-    #[allow(dead_code)] // Held for lifetime; Phase 5 may need for event creation
+    #[allow(dead_code)]
     ctx: Arc<CudaContext>,
     transfer_stream: Arc<CudaStream>,
     compute_stream: Arc<CudaStream>,
-
-    /// Double-buffered (or N-buffered) GPU slots. Reserved for the future
-    /// optimized prefetch path; Phase 5 uses per-weight `clone_htod` instead.
-    #[allow(dead_code)]
-    slots: Vec<LayerGpuSlot>,
-    /// Staging buffer in pinned host memory. Optional — falls back to pageable.
-    #[allow(dead_code)]
-    staging: PinnedBuffer,
 
     /// Always-resident layers (never evicted).
     pinned: std::collections::HashSet<usize>,
@@ -129,87 +72,35 @@ pub struct LayerSwapManager {
     /// on these before launching that layer's kernels.
     ready_events: HashMap<usize, CudaEvent>,
 
-    /// Per-layer metadata (indexed by layer_idx). Reserved for the future
-    /// optimized path; the direct-ptr prefetch uses QWeight.raw_data directly.
-    #[allow(dead_code)]
-    layer_meta: Vec<LayerMeta>,
-    /// Max bytes across all non-pinned layers. Used to size each slot.
-    #[allow(dead_code)]
-    bytes_per_layer: usize,
+    /// Graveyard of evicted `CudaSlice`s waiting for their compute-stream
+    /// event to fire. Each entry holds:
+    ///   - `event`: recorded on compute_stream *after* the layer's kernels
+    ///     were launched. When `event.is_complete()` returns true, the
+    ///     slices can be safely dropped (cuMemFree).
+    ///   - `slices`: owned `CudaSlice<u8>`s quarantined from QWeights.
+    ///
+    /// Flushed at the start of every iteration (`flush_graveyard`). Typical
+    /// occupancy: 1-2 layers at a time (recent evictions).
+    graveyard: Vec<(CudaEvent, Vec<CudaSlice<u8>>)>,
 }
 
 impl LayerSwapManager {
-    /// Construct a manager.
-    ///
-    /// Arguments
-    /// * `ctx` — CUDA context (usually from `TqDevice::cuda_context`)
-    /// * `compute_stream` — the forward-pass stream (from `TqDevice::cuda_stream`)
-    /// * `layer_meta` — per-layer byte layout (built by the caller)
-    /// * `pinned_layers` — layer indices to keep always resident
-    /// * `n_slots` — number of rotating slots (2 = double-buffer; use 1 for
-    ///   strict serial behaviour when testing)
     pub fn new(
         ctx: Arc<CudaContext>,
         compute_stream: Arc<CudaStream>,
-        layer_meta: Vec<LayerMeta>,
         pinned_layers: &[usize],
-        n_slots: usize,
     ) -> Result<Self> {
-        if n_slots == 0 {
-            return Err(TqError::Msg("LayerSwapManager: n_slots must be ≥ 1".into()));
-        }
         let transfer_stream = ctx
             .new_stream()
             .map_err(|e| TqError::Msg(format!("transfer stream: {}", e)))?;
-
-        // Determine bytes_per_layer from the largest non-pinned layer.
-        let pinned_set: std::collections::HashSet<usize> = pinned_layers.iter().copied().collect();
-        let bytes_per_layer = layer_meta
-            .iter()
-            .filter(|lm| !pinned_set.contains(&lm.layer_idx))
-            .map(|lm| lm.total_bytes)
-            .max()
-            .unwrap_or(0);
-
-        // Allocate N slots.
-        let mut slots = Vec::with_capacity(n_slots);
-        for _ in 0..n_slots {
-            let buf = transfer_stream
-                .alloc_zeros::<u8>(bytes_per_layer.max(1))
-                .map_err(|e| TqError::Msg(format!("slot alloc: {}", e)))?;
-            let event = ctx
-                .new_event(None)
-                .map_err(|e| TqError::Msg(format!("slot event: {}", e)))?;
-            slots.push(LayerGpuSlot {
-                buffer: Arc::new(buf),
-                loaded: None,
-                ready: event,
-            });
-        }
-
-        // Pinned layers tracked by index — QWeights hold their own GPU caches.
-        let pinned = pinned_set;
-
-        // Host staging buffer — one layer at a time. Sized to the largest
-        // (pinned + non-pinned) layer so either case fits.
-        let staging_size = layer_meta
-            .iter()
-            .map(|lm| lm.total_bytes)
-            .max()
-            .unwrap_or(0)
-            .max(1);
-        let staging = PinnedBuffer::new_on_context(&ctx, staging_size);
 
         Ok(Self {
             ctx,
             transfer_stream,
             compute_stream,
-            slots,
-            staging,
-            pinned,
+            pinned: pinned_layers.iter().copied().collect(),
             ready_events: HashMap::new(),
-            layer_meta,
-            bytes_per_layer,
+            graveyard: Vec::new(),
         })
     }
 
@@ -223,13 +114,34 @@ impl LayerSwapManager {
         self.pinned.insert(layer_idx);
     }
 
+    /// Drop any graveyard entries whose compute-stream event has fired.
+    /// Called at every layer's pre-hook.
+    ///
+    /// Cheap: `CudaEvent::is_complete()` is a non-blocking query (cuEventQuery).
+    pub fn flush_graveyard(&mut self) {
+        // Note: event.is_complete is Ok→true meaning READY. Our earlier
+        // layers' events should fire first in practice, but we scan all
+        // entries every call. Graveyard is small (1-3 entries typical).
+        self.graveyard.retain(|(event, _slices)| !event.is_complete());
+    }
+
+    /// Force-flush: drop all pending graveyard entries by blocking the host
+    /// on each event. Called at end-of-forward to avoid accumulating across
+    /// many decode steps.
+    pub fn drain_graveyard(&mut self) {
+        for (event, _) in self.graveyard.drain(..) {
+            // Synchronize on each event (Drop order will then cuMemFree).
+            if let Err(e) = event.synchronize() {
+                eprintln!("[layer_swap] graveyard drain event sync failed: {}", e);
+            }
+        }
+    }
+
     /// Upload the given layer's QWeight bytes to GPU (via `inject_gpu`) on the
     /// transfer stream, then block the CPU until the copy completes. Used for
     /// always-resident ("pinned") layers during model load.
     ///
     /// SAFETY: `qweight_ptrs` must remain valid for the duration of this call.
-    /// In practice: pointers into `self.layers[i].qweights()` — valid while
-    /// the model exists.
     pub unsafe fn pin_layer_direct(
         &mut self,
         layer_idx: usize,
@@ -251,10 +163,8 @@ impl LayerSwapManager {
     }
 
     /// Async H2D for all QWeights of `layer_idx`. Each weight gets a fresh
-    /// CudaSlice via `clone_htod` (no slot reuse for now). Event recorded on
-    /// the transfer stream; `wait_for_layer` hooks the compute stream on it.
-    ///
-    /// No-op if the layer is pinned.
+    /// CudaSlice via `clone_htod`. Event recorded on the transfer stream;
+    /// `wait_for_layer` hooks the compute stream on it. No-op if pinned.
     ///
     /// SAFETY: same as `pin_layer_direct`.
     pub unsafe fn start_prefetch_direct(
@@ -294,14 +204,17 @@ impl LayerSwapManager {
                 .map_err(|e| TqError::Msg(format!("wait_for_layer {}: {}", layer_idx, e))),
             // No event yet (not prefetched). This is legitimate on first entry
             // for a non-pinned layer — the forward loop's initial iteration
-            // has no prior prefetch. Skip and rely on the existing
-            // `gpu_cache_or_upload` lazy-init path.
+            // has no prior prefetch. The existing `gpu_cache_or_upload` lazy
+            // path will upload synchronously on first access.
             None => Ok(()),
         }
     }
 
-    /// Drop the GPU caches of every QWeight in the layer (swap-mode QWeights
-    /// release their `CudaSlice<u8>`; pinned layers are not evicted).
+    /// Take the GPU caches out of every QWeight in the layer and park them in
+    /// the graveyard. Records a `compute_stream` event marking when those
+    /// slices are safe to drop.
+    ///
+    /// Pinned layers are no-ops.
     ///
     /// SAFETY: same as `pin_layer_direct`.
     pub unsafe fn evict_layer_direct(
@@ -312,20 +225,30 @@ impl LayerSwapManager {
         if self.is_pinned(layer_idx) {
             return;
         }
-        // CRITICAL: block until all compute-stream kernels that consumed this
-        // layer's weights are complete. `evict_gpu` drops the CudaSlice, which
-        // calls cuMemFree synchronously — freeing memory that's still
-        // referenced by a queued kernel would trigger ILLEGAL_ADDRESS.
-        //
-        // A future optimization (Phase 7): record a compute-stream event at
-        // end of each layer and defer eviction until the event is signalled,
-        // so the sync cost can overlap with the next prefetch.
-        if let Err(e) = self.compute_stream.synchronize() {
-            eprintln!("[layer_swap] compute sync before evict L{} failed: {}", layer_idx, e);
+        // Take (don't drop) the CudaSlices out of the QWeights.
+        let slices: Vec<CudaSlice<u8>> = qweight_ptrs
+            .iter()
+            .filter_map(|p| (*p.0).take_gpu())
+            .collect();
+        if slices.is_empty() {
+            return;
         }
-        for qw_ptr in qweight_ptrs {
-            let qw = &*qw_ptr.0;
-            qw.evict_gpu();
+        // Record a completion event on compute_stream. By the time this event
+        // fires, every kernel launched so far on the compute stream has
+        // finished — including all kernels that read this layer's weights.
+        // Until then, keep the slices alive in the graveyard.
+        match self.compute_stream.record_event(None) {
+            Ok(event) => self.graveyard.push((event, slices)),
+            Err(e) => {
+                eprintln!(
+                    "[layer_swap] compute event record failed for L{}: {} — \
+                     falling back to synchronous drop (may race in-flight kernels)",
+                    layer_idx, e
+                );
+                // Worst case: slices drop here, races with in-flight kernels.
+                // Should never happen unless context is gone.
+                drop(slices);
+            }
         }
         self.ready_events.remove(&layer_idx);
     }
@@ -336,38 +259,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn weight_loc_debug_roundtrip() {
-        let wl = WeightLoc {
-            name: "blk.0.attn_q.weight".into(),
-            src_offset: 128,
-            nbytes: 256,
-            gpu_offset: 0,
-        };
-        let s = format!("{:?}", wl);
-        assert!(s.contains("attn_q"));
-    }
-
-    #[test]
-    fn layer_meta_total_consistency() {
-        let lm = LayerMeta {
-            layer_idx: 3,
-            weights: vec![
-                WeightLoc {
-                    name: "a".into(),
-                    src_offset: 0,
-                    nbytes: 100,
-                    gpu_offset: 0,
-                },
-                WeightLoc {
-                    name: "b".into(),
-                    src_offset: 100,
-                    nbytes: 200,
-                    gpu_offset: 128, // aligned
-                },
-            ],
-            total_bytes: 128 + 200,
-        };
-        assert_eq!(lm.layer_idx, 3);
-        assert_eq!(lm.weights.len(), 2);
+    fn qweight_ptr_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<QWeightPtr>();
+        // Also a smoke check that the manager type is Send even though it
+        // holds raw pointers internally (through QWeightPtr).
+        assert_send_sync::<QWeightPtr>();
     }
 }

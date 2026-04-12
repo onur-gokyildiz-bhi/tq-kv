@@ -178,6 +178,22 @@ impl<T> SwapCell<T> {
             }
         }
     }
+
+    /// Take the stored value (moves ownership out; leaves slot empty).
+    /// Fast mode cannot support take (OnceLock is one-shot) — returns None.
+    ///
+    /// Used by `LayerSwapManager` to defer `CudaSlice` drop to a graveyard:
+    /// the slice is kept alive until a compute-stream event confirms that
+    /// all in-flight kernels using that memory have completed. Dropping
+    /// synchronously (via `evict`) would race cuMemFree against the kernel.
+    pub fn take(&self) -> Option<T> {
+        if self.swap_mode {
+            // SAFETY: see struct docstring.
+            unsafe { (*self.swap.get()).take() }
+        } else {
+            None
+        }
+    }
 }
 
 impl Clone for RawBytes {
@@ -303,6 +319,17 @@ impl QWeight {
     #[cfg(feature = "cuda")]
     pub fn evict_gpu(&self) {
         self.gpu_cache.evict();
+    }
+
+    /// Move the GPU cache's CudaSlice out, leaving the cache empty. Returns
+    /// None in fast mode (OnceLock is one-shot) or when already empty.
+    ///
+    /// `LayerSwapManager` uses this to quarantine an evicted slice in a
+    /// graveyard until a compute-stream event fires, so the drop (and
+    /// implicit cuMemFree) can't race with an in-flight kernel.
+    #[cfg(feature = "cuda")]
+    pub fn take_gpu(&self) -> Option<CudaSlice<u8>> {
+        self.gpu_cache.take()
     }
 
     /// Install an externally-allocated GPU slice (swap mode only — no-op in

@@ -338,7 +338,7 @@ impl Engine {
         #[cfg(feature = "cuda")]
         if swap_active && device.is_cuda() {
             use crate::auto_tq::{decide_layer_swap, pinned_indices};
-            use crate::layer_swap::{LayerSwapManager, LayerMeta};
+            use crate::layer_swap::LayerSwapManager;
 
             let mut inner = model;
             let n_layers = inner.0.layers.len();
@@ -350,15 +350,24 @@ impl Engine {
                 .flat_map(|l| l.qweights())
                 .map(|qw| qw.raw_data.len() as u64)
                 .sum();
-            // KV cache rough estimate (fp16, first layer as representative).
-            let kv_bytes: u64 = if let Some(l0) = inner.0.layers.first() {
-                let per_token = 2u64 * l0.n_kv_head as u64 * l0.head_dim as u64 * 2;
-                per_token * 4096 * n_layers as u64 // 4K ctx default
+            // KV per-token-bytes (fp16 K + V across all layers).
+            let kv_per_token_bytes: u64 = if let Some(l0) = inner.0.layers.first() {
+                // 2 = K+V, 2 bytes/element (fp16), × n_kv_head × head_dim
+                2u64 * l0.n_kv_head as u64 * l0.head_dim as u64 * 2 * n_layers as u64
             } else {
                 0
             };
+            // Worst-case context: TQ_MAX_SEQ env override, else 32K conservative
+            // default (matches common long-context configs and prevents swap
+            // policy from under-planning VRAM on 27B+ runs).
+            let max_context: usize = std::env::var("TQ_MAX_SEQ")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32_768);
 
-            let plan = decide_layer_swap(&device, model_bytes, n_layers, kv_bytes);
+            let plan = decide_layer_swap(
+                &device, model_bytes, n_layers, kv_per_token_bytes, max_context,
+            );
             eprintln!("  Layer-swap plan: {}", plan.reason);
 
             if !plan.enabled {
@@ -369,13 +378,10 @@ impl Engine {
                 let compute_stream = device.cuda_stream()
                     .map_err(|e| anyhow::anyhow!("layer_swap compute stream: {}", e))?;
                 let pinned_layers = pinned_indices(n_layers, plan.pin_count);
-                let layer_meta: Vec<LayerMeta> = Vec::new();
                 let mut manager = LayerSwapManager::new(
                     ctx,
                     compute_stream,
-                    layer_meta,
                     &pinned_layers,
-                    2,
                 ).map_err(|e| anyhow::anyhow!("layer_swap manager: {}", e))?;
 
                 let qws_per_layer: Vec<Vec<crate::layer_swap::QWeightPtr>> = inner.0
