@@ -1651,28 +1651,38 @@ impl LayerWeights {
 
                             // Sprint F: retrieve from GPU cold tier — ZERO CPU involvement.
                             // Cold tier stores post-RoPE decompressed K (from decomp_cache
-                            // at eviction time). Just gather contiguously and cat into K_full.
+                            // at eviction time). Gather contiguously and cat into K_full.
+                            // V2: cap at TQ_MAX_RETRIEVE (default 16) most-recent cold tokens.
+                            // Keeps attention cost bounded regardless of cold tier size.
                             let mut n_retrieved = 0usize;
                             #[cfg(feature = "cuda")]
                             if super::kv_cache::get_offload_enabled() {
                                 if let Some(ref cold) = self.gpu_cold_cache {
                                     if cold.count > 0 {
-                                        let n_cold = cold.count;
+                                        let max_retrieve = {
+                                            static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                                            *C.get_or_init(|| std::env::var("TQ_MAX_RETRIEVE")
+                                                .ok().and_then(|v| v.parse().ok()).unwrap_or(16))
+                                        };
+                                        // Take the most recent cold tokens (highest seq_pos = most informative)
+                                        let n_cold = cold.count.min(max_retrieve);
+                                        let cold_offset = cold.count.saturating_sub(n_cold);
                                         let mc = cold.max_cold;
 
                                         // Gather contiguous K from strided cold.k_data
                                         // (post-RoPE, no decompress or RoPE needed)
+                                        // cold_offset skips oldest tokens when cold.count > max_retrieve
                                         let mut cold_k_buf = reg.stream.alloc_zeros::<f32>(
                                             self.n_kv_head * n_cold * hdim
                                         ).map_err(|e| TqError::Msg(format!("cold k buf: {}", e)))?;
-                                        crate::cuda::kernels::strided_copy_args(
-                                            reg, &cold.k_data, &mut cold_k_buf,
-                                            self.n_kv_head * n_cold * hdim, 3,
-                                            &[(self.n_kv_head as i32), (n_cold as i32), (hdim as i32)],
-                                            &[((n_cold * hdim) as i32), (hdim as i32), 1],
-                                            &[((mc * hdim) as i32), (hdim as i32), 1],
-                                            0,
-                                        ).map_err(|e| TqError::Msg(format!("cold k gather: {e}")))?;
+                                        for h in 0..self.n_kv_head {
+                                            let src_off = (h * mc + cold_offset) * hdim;
+                                            let dst_off = h * n_cold * hdim;
+                                            crate::cuda::kernels::copy_with_offsets(
+                                                reg, &cold.k_data, &cold_k_buf,
+                                                n_cold * hdim, src_off, dst_off,
+                                            ).map_err(|e| TqError::Msg(format!("cold k gather: {e}")))?;
+                                        }
 
                                         k_parts_gpu.push(Tensor::from_cuda(
                                             cold_k_buf, vec![1, self.n_kv_head, n_cold, hdim], stream.clone(),
@@ -1746,18 +1756,18 @@ impl LayerWeights {
                                 if let Some(ref cold) = self.gpu_cold_cache {
                                     let n_cold = n_retrieved;
                                     let mc = cold.max_cold;
-                                    // Gather contiguous V from strided cold.v_data
+                                    let cold_offset = cold.count.saturating_sub(n_cold);
                                     let mut cold_v_buf = reg.stream.alloc_zeros::<f32>(
                                         self.n_kv_head * n_cold * hdim
                                     ).map_err(|e| TqError::Msg(format!("cold v buf: {}", e)))?;
-                                    crate::cuda::kernels::strided_copy_args(
-                                        reg, &cold.v_data, &mut cold_v_buf,
-                                        self.n_kv_head * n_cold * hdim, 3,
-                                        &[(self.n_kv_head as i32), (n_cold as i32), (hdim as i32)],
-                                        &[((n_cold * hdim) as i32), (hdim as i32), 1],
-                                        &[((mc * hdim) as i32), (hdim as i32), 1],
-                                        0,
-                                    ).map_err(|e| TqError::Msg(format!("cold v gather: {e}")))?;
+                                    for h in 0..self.n_kv_head {
+                                        let src_off = (h * mc + cold_offset) * hdim;
+                                        let dst_off = h * n_cold * hdim;
+                                        crate::cuda::kernels::copy_with_offsets(
+                                            reg, &cold.v_data, &cold_v_buf,
+                                            n_cold * hdim, src_off, dst_off,
+                                        ).map_err(|e| TqError::Msg(format!("cold v gather: {e}")))?;
+                                    }
                                     v_parts_gpu.push(Tensor::from_cuda(
                                         cold_v_buf, vec![1, self.n_kv_head, n_cold, hdim], stream.clone(),
                                     ));
