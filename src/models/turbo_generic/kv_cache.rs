@@ -877,7 +877,12 @@ pub(crate) fn get_protect_last_layers(config: &tq_kv::TurboQuantConfig) -> usize
     }
     pub(crate) static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("TQ_PROTECT_LAST").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+        // Sprint 2: reduced from 8 to 2 based on per-layer sensitivity calibration.
+        // All 28 layers have cos_sim ≥ 0.9954 at 4-bit group_size=32. The compound
+        // error from compressing ALL layers (protect=0) regresses quality, but
+        // protecting just the last 2 (LM-head-adjacent) layers preserves 4/5 on
+        // the 5-prompt suite while compressing 22/28 layers (was 16/28 with protect=8).
+        std::env::var("TQ_PROTECT_LAST").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
     })
 }
 

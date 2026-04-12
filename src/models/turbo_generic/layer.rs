@@ -194,7 +194,7 @@ impl LayerWeights {
             let k_for_cal = k.reshape(vec![b_sz, seq_len, self.n_kv_head, self.head_dim])?
                 .transpose(1, 2)?.contiguous()?;
             if let Ok(k_f32) = k_for_cal.to_dtype(DType::F32)?.flatten_all()?.to_vec1() {
-                crate::calibrate::maybe_collect(&k_f32, self.n_kv_head, seq_len, self.head_dim);
+                crate::calibrate::maybe_collect(&k_f32, self.n_kv_head, seq_len, self.head_dim, self.layer_idx);
             }
         }
 

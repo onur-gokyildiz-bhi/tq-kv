@@ -101,6 +101,16 @@ pub struct CalibrationData {
     /// Number of KV heads.
     #[serde(default)]
     pub tri_n_kv_heads: Option<usize>,
+
+    // -- Per-layer sensitivity (Sprint 2: quantization-aware layer selection) --
+
+    /// Per-layer compression sensitivity. Range [0.0, 1.0] where 1.0 = lossless
+    /// (layer is perfectly reconstructed after TQ compress→decompress) and
+    /// lower values indicate quality degradation. Computed during calibration
+    /// as mean cosine similarity between original and TQ-compressed key vectors.
+    /// Used by get_layer_bits() to auto-skip the most sensitive layers.
+    #[serde(default)]
+    pub per_layer_sensitivity: Option<Vec<f32>>,
 }
 
 impl CalibrationData {
@@ -210,6 +220,12 @@ pub struct CalibrationCollector {
     pub tri_q_counts: Vec<usize>,
     pub tri_k_counts: Vec<usize>,
     pub n_heads: usize,
+    // -- Per-layer sensitivity scoring (Sprint 2) --
+    /// Per-layer key samples for sensitivity scoring. Indexed by layer_idx.
+    /// Each entry stores up to `layer_max_samples` key vectors (flat f32, head_dim each).
+    pub layer_samples: Vec<Vec<f32>>,
+    pub layer_sample_counts: Vec<usize>,
+    pub layer_max_samples: usize,
 }
 
 impl CalibrationCollector {
@@ -230,13 +246,17 @@ impl CalibrationCollector {
             tri_q_counts: Vec::new(),
             tri_k_counts: Vec::new(),
             n_heads: 0,
+            layer_samples: Vec::new(),
+            layer_sample_counts: Vec::new(),
+            layer_max_samples: 64, // ~64 key vectors per layer suffices for sensitivity
         }
     }
 
     /// Collect key vectors from a k tensor [batch, n_kv_heads, seq_len, head_dim].
     /// Collects samples from first KV head for codebook calibration,
-    /// and per-head norm stats from ALL heads for importance scoring.
-    pub fn collect_from_tensor(&mut self, k_flat: &[f32], n_kv_heads: usize, seq_len: usize, head_dim: usize) {
+    /// per-head norm stats from ALL heads for importance scoring,
+    /// and per-layer samples for sensitivity scoring (Sprint 2).
+    pub fn collect_from_tensor(&mut self, k_flat: &[f32], n_kv_heads: usize, seq_len: usize, head_dim: usize, layer_idx: usize) {
         // Initialize per-head accumulators on first call
         if self.n_kv_heads == 0 && n_kv_heads > 0 {
             self.n_kv_heads = n_kv_heads;
@@ -262,17 +282,37 @@ impl CalibrationCollector {
             }
         }
 
-        // Collect samples from first KV head for codebook calibration
-        if self.count >= self.max_samples {
-            return;
+        // Per-layer samples for sensitivity scoring (Sprint 2).
+        // Must run BEFORE the codebook-full early return so all 28 layers
+        // collect samples even after the codebook buffer is full.
+        // Store key vectors from the FIRST head only (same as codebook calibration).
+        // Extend layer_samples vector if we see a new layer_idx.
+        while self.layer_samples.len() <= layer_idx {
+            self.layer_samples.push(Vec::new());
+            self.layer_sample_counts.push(0);
         }
-        let remaining = self.max_samples - self.count;
-        let to_collect = seq_len.min(remaining);
-        for s in 0..to_collect {
-            let offset = s * head_dim; // first head, position s
-            if offset + head_dim <= k_flat.len() {
-                self.samples.extend_from_slice(&k_flat[offset..offset + head_dim]);
-                self.count += 1;
+        if self.layer_sample_counts[layer_idx] < self.layer_max_samples {
+            let remaining = self.layer_max_samples - self.layer_sample_counts[layer_idx];
+            let to_collect = seq_len.min(remaining);
+            for s in 0..to_collect {
+                let offset = s * head_dim; // first head
+                if offset + head_dim <= k_flat.len() {
+                    self.layer_samples[layer_idx].extend_from_slice(&k_flat[offset..offset + head_dim]);
+                    self.layer_sample_counts[layer_idx] += 1;
+                }
+            }
+        }
+
+        // Collect samples from first KV head for codebook calibration
+        if self.count < self.max_samples {
+            let remaining = self.max_samples - self.count;
+            let to_collect = seq_len.min(remaining);
+            for s in 0..to_collect {
+                let offset = s * head_dim; // first head, position s
+                if offset + head_dim <= k_flat.len() {
+                    self.samples.extend_from_slice(&k_flat[offset..offset + head_dim]);
+                    self.count += 1;
+                }
             }
         }
     }
@@ -370,12 +410,11 @@ pub fn init_collector(head_dim: usize, max_samples: usize) -> Arc<Mutex<Calibrat
 /// Check if calibration collection is active and collect from k tensor if so.
 /// Called from turbo_generic.rs forward_attn().
 #[inline]
-pub fn maybe_collect(k_flat: &[f32], n_kv_heads: usize, seq_len: usize, head_dim: usize) {
+pub fn maybe_collect(k_flat: &[f32], n_kv_heads: usize, seq_len: usize, head_dim: usize, layer_idx: usize) {
     if let Some(collector) = CALIBRATION_COLLECTOR.get() {
         if let Ok(mut c) = collector.lock() {
-            if !c.is_full() {
-                c.collect_from_tensor(k_flat, n_kv_heads, seq_len, head_dim);
-            }
+            // Always collect per-layer samples even if codebook samples are full
+            c.collect_from_tensor(k_flat, n_kv_heads, seq_len, head_dim, layer_idx);
         }
     }
 }
@@ -493,6 +532,82 @@ pub fn auto_assign_head_bits(
         bits[idx] = high_bits;
     }
     bits
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer sensitivity scoring (Sprint 2)
+// ---------------------------------------------------------------------------
+
+/// Compute per-layer TQ compression sensitivity from collected per-layer key samples.
+///
+/// For each layer, compresses the collected key samples with TQ at the given bit width,
+/// decompresses, and measures mean cosine similarity vs the original. Returns a Vec<f32>
+/// of length n_layers where 1.0 = perfect reconstruction, lower = more sensitive.
+///
+/// Layers with no samples (e.g. uncompressed skip/protect layers) get score 1.0.
+pub fn compute_layer_sensitivity(collector: &CalibrationCollector, bits: u8, group_size: usize) -> Vec<f32> {
+    let n_layers = collector.layer_samples.len();
+    let hdim = collector.head_dim;
+    if n_layers == 0 || hdim == 0 { return Vec::new(); }
+
+    let config = tq_kv::TurboQuantConfig {
+        bits,
+        group_size,
+        ..tq_kv::TurboQuantConfig::balanced()
+    };
+    let signs = tq_kv::hadamard::generate_signs(hdim, config.rotation_seed);
+
+    let mut scores = Vec::with_capacity(n_layers);
+    for layer_idx in 0..n_layers {
+        let n_samples = collector.layer_sample_counts[layer_idx];
+        if n_samples < 2 {
+            scores.push(1.0);
+            continue;
+        }
+        let samples = &collector.layer_samples[layer_idx];
+        // Compress each key vector and measure cosine similarity
+        let use_grouped = group_size > 0 && hdim % group_size == 0;
+        let mut cos_sum = 0.0f64;
+        let mut count = 0usize;
+        for i in 0..n_samples {
+            let start = i * hdim;
+            let end = start + hdim;
+            if end > samples.len() { break; }
+            let original = &samples[start..end];
+
+            // Compress → decompress round-trip
+            let decompressed = if use_grouped {
+                let (packed, gnorms, _, _) = tq_kv::compress_single_key_grouped(
+                    original, hdim, &config, &signs,
+                );
+                let mut cache = tq_kv::CompressedKeys::new_empty(bits, hdim, config.rotation_seed);
+                cache.group_size = group_size;
+                cache.append_raw_grouped(&packed, &gnorms, None);
+                tq_kv::decompress_keys_grouped(&cache, &config)
+            } else {
+                let (packed, norm, _) = tq_kv::compress_single_key_with_signs(
+                    original, hdim, &config, &signs,
+                );
+                let mut cache = tq_kv::CompressedKeys::new_empty(bits, hdim, config.rotation_seed);
+                cache.append_raw(&packed, norm);
+                tq_kv::decompress_keys(&cache, &config)
+            };
+            if decompressed.len() != hdim { continue; }
+
+            // Cosine similarity
+            let dot: f64 = original.iter().zip(decompressed.iter())
+                .map(|(&a, &b)| a as f64 * b as f64).sum();
+            let norm_a: f64 = original.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+            let norm_b: f64 = decompressed.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+            if norm_a > 1e-10 && norm_b > 1e-10 {
+                cos_sum += dot / (norm_a * norm_b);
+                count += 1;
+            }
+        }
+        let mean_cos = if count > 0 { (cos_sum / count as f64) as f32 } else { 1.0 };
+        scores.push(mean_cos);
+    }
+    scores
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +802,23 @@ pub fn compute_calibration(
     let sigma_ratio = if sigma_min > 1e-10 { sigma_max / sigma_min } else { 0.0 };
     eprintln!("    Sigma range: {:.4}..{:.4} (ratio {:.1}x)", sigma_min, sigma_max, sigma_ratio);
 
+    // 8. Per-layer sensitivity scoring (Sprint 2)
+    let per_layer_sensitivity = if !collector.layer_samples.is_empty() {
+        eprintln!("  Per-layer sensitivity scoring (4-bit, group_size=32)...");
+        let scores = compute_layer_sensitivity(collector, 4, 32);
+        for (i, &s) in scores.iter().enumerate() {
+            let label = if s < 0.95 { " ← SENSITIVE" } else { "" };
+            eprintln!("    L{:2}: cos_sim={:.4}{}", i, s, label);
+        }
+        let n_sensitive = scores.iter().filter(|&&s| s < 0.95).count();
+        let n_good = scores.iter().filter(|&&s| s >= 0.95).count();
+        eprintln!("  Summary: {} layers compressible (≥0.95), {} sensitive (<0.95)",
+            n_good, n_sensitive);
+        Some(scores)
+    } else {
+        None
+    };
+
     CalibrationData {
         model: model_name.to_string(),
         head_dim,
@@ -709,6 +841,7 @@ pub fn compute_calibration(
         tri_rope_freqs: Some(rope_freqs),
         tri_n_heads: if collector.n_heads > 0 { Some(collector.n_heads) } else { None },
         tri_n_kv_heads: if collector.tri_k_sums.is_empty() { None } else { Some(collector.tri_k_sums.len()) },
+        per_layer_sensitivity,
     }
 }
 
