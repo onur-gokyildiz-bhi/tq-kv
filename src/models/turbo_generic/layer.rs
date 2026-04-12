@@ -78,6 +78,9 @@ pub(crate) struct LayerWeights {
     pub(crate) sink_k_gpu: Option<cudarc::driver::CudaSlice<f32>>,
     #[cfg(feature = "cuda")]
     pub(crate) sink_v_gpu: Option<cudarc::driver::CudaSlice<f32>>,
+    /// Quest-style CPU offload cache: stores evicted tokens for retrieval (Sprint F).
+    /// Initialized lazily on first TriAttention eviction when TQ_OFFLOAD=1.
+    pub(crate) offload_cache: Option<super::kv_cache::OffloadedKvCache>,
     /// SmoothAttention: per-channel scales to migrate K outliers to Q.
     /// K is divided by these scales (reducing outliers), Q is multiplied (lossless since Q stays fp32).
     /// Computed during calibration or from running statistics.
@@ -1083,6 +1086,104 @@ impl LayerWeights {
                                         }
                                     }
                                 }
+                                // Sprint F: offload evicted tokens to CPU before GPU compact.
+                                // Saves compressed K + V for future cache-miss retrieval.
+                                #[cfg(feature = "cuda")]
+                                if super::kv_cache::get_offload_enabled() {
+                                    if let Some(ref gpu) = self.gpu_tq_cache {
+                                        // Compute evicted indices (complement of compressed_retain)
+                                        let retain_set: std::collections::HashSet<usize> =
+                                            compressed_retain.iter().copied().collect();
+                                        let evicted_indices: Vec<usize> = (0..compressed_count)
+                                            .filter(|i| !retain_set.contains(i))
+                                            .collect();
+
+                                        if !evicted_indices.is_empty() {
+                                            // Lazy-init offload cache
+                                            if self.offload_cache.is_none() {
+                                                self.offload_cache = Some(super::kv_cache::OffloadedKvCache::new(
+                                                    self.n_layers, self.tq_config.bits,
+                                                    self.head_dim, self.n_kv_head,
+                                                    self.tq_config.group_size,
+                                                ));
+                                            }
+
+                                            // Download evicted compressed K + V from GPU
+                                            if let Some(reg) = crate::cuda::kernels::global_registry() {
+                                                let bpk = gpu.bytes_per_key;
+                                                let ms = gpu.max_seq;
+                                                let hd = self.head_dim;
+                                                let ng = gpu.n_groups;
+
+                                                for &idx in &evicted_indices {
+                                                    // Compute original sequence position
+                                                    let seq_pos = cache.tri_key_positions
+                                                        .get(sink_n + idx).copied().unwrap_or(0);
+
+                                                    // Download packed K indices
+                                                    let mut packed_k = vec![0u8; self.n_kv_head * bpk];
+                                                    for h in 0..self.n_kv_head {
+                                                        let gpu_off = (h * ms + idx) * bpk;
+                                                        if let Ok(chunk) = reg.stream.clone_dtoh(
+                                                            &gpu.packed_indices.slice(gpu_off..gpu_off + bpk)
+                                                        ) {
+                                                            packed_k[h * bpk..(h + 1) * bpk]
+                                                                .copy_from_slice(&chunk);
+                                                        }
+                                                    }
+
+                                                    // Download per-group norms
+                                                    let mut gnorms = vec![0.0f32; self.n_kv_head * ng];
+                                                    if let Some(ref gn) = gpu.gnorms {
+                                                        for h in 0..self.n_kv_head {
+                                                            let gpu_off = (h * ms + idx) * ng;
+                                                            if let Ok(chunk) = reg.stream.clone_dtoh(
+                                                                &gn.slice(gpu_off..gpu_off + ng)
+                                                            ) {
+                                                                gnorms[h * ng..(h + 1) * ng]
+                                                                    .copy_from_slice(&chunk);
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // Download V data
+                                                    let mut v_data = vec![0.0f32; self.n_kv_head * hd];
+                                                    for h in 0..self.n_kv_head {
+                                                        let gpu_off = (h * ms + idx) * hd;
+                                                        if let Ok(chunk) = reg.stream.clone_dtoh(
+                                                            &gpu.v_data.slice(gpu_off..gpu_off + hd)
+                                                        ) {
+                                                            v_data[h * hd..(h + 1) * hd]
+                                                                .copy_from_slice(&chunk);
+                                                        }
+                                                    }
+
+                                                    self.offload_cache.as_mut().unwrap().offload(
+                                                        self.layer_idx,
+                                                        super::kv_cache::OffloadedKvEntry {
+                                                            seq_pos,
+                                                            packed_k,
+                                                            gnorms,
+                                                            v_data,
+                                                        },
+                                                    );
+                                                }
+
+                                                {
+                                                    use std::sync::atomic::{AtomicBool, Ordering};
+                                                    static OFFLOAD_PRINTED: AtomicBool = AtomicBool::new(false);
+                                                    if !OFFLOAD_PRINTED.swap(true, Ordering::Relaxed) {
+                                                        let oc = self.offload_cache.as_ref().unwrap();
+                                                        eprintln!("[quest-offload] L{}: {} tokens offloaded to CPU ({:.1} KB)",
+                                                            self.layer_idx, evicted_indices.len(),
+                                                            oc.memory_bytes() as f64 / 1024.0);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Compact GPU TQ cache in-place (D2D gather, no re-seed)
                                 #[cfg(feature = "cuda")]
                                 if let Some(ref mut gpu) = self.gpu_tq_cache {
@@ -1092,9 +1193,13 @@ impl LayerWeights {
 
                             cache.tri_key_positions = new_positions;
 
-                            if self.layer_idx == 0 {
-                                eprintln!("[tri-evict] {}/{} retained (evicted {})",
-                                    retained.len(), n_tri_keys, evicted);
+                            {
+                                use std::sync::atomic::{AtomicBool, Ordering};
+                                static EVICT_PRINTED: AtomicBool = AtomicBool::new(false);
+                                if !EVICT_PRINTED.swap(true, Ordering::Relaxed) {
+                                    eprintln!("[tri-evict] L{}: {}/{} retained (evicted {})",
+                                        self.layer_idx, retained.len(), n_tri_keys, evicted);
+                                }
                             }
                         }
                     }

@@ -539,7 +539,15 @@ pub(crate) fn gpu_tri_score_and_select(
     let n_kv_heads = tri_keys.len();
     let n_keys = key_positions.len();
     let head_dim = config.head_dim;
-    let budget = config.budget;
+    // Use dynamic budget from retention_ratio (same as evict_pass in triattention.rs).
+    // The static config.budget (default 2048) is a hard ceiling; retention_ratio (0.9)
+    // gives the per-eviction target. Without this, tokens are never actually evicted
+    // because budget=2048 > n_keys at typical context lengths.
+    let budget = if config.retention_ratio > 0.0 && config.retention_ratio < 1.0 {
+        (n_keys as f32 * config.retention_ratio) as usize
+    } else {
+        config.budget
+    };
     if n_keys == 0 || n_kv_heads == 0 {
         return Ok(vec![(0..n_keys).collect(); n_kv_heads]);
     }
@@ -1041,6 +1049,14 @@ pub(crate) fn get_compact_ratio() -> usize {
     *C.get_or_init(|| std::env::var("TQ_COMPACT_RATIO").ok().and_then(|v| v.parse().ok()).unwrap_or(5))
 }
 
+/// Quest-style CPU offload enabled. When on, evicted tokens are saved to CPU
+/// instead of deleted, and can be retrieved on cache miss during attention.
+/// Default: off (Sprint F experimental). Enable with TQ_OFFLOAD=1.
+pub(crate) fn get_offload_enabled() -> bool {
+    pub(crate) static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *C.get_or_init(|| std::env::var("TQ_OFFLOAD").ok().map(|v| v == "1").unwrap_or(false))
+}
+
 /// Override for TriAttention enable state. -1 = use env var, 0 = disabled, 1 = enabled.
 /// Allows bench to toggle TriAttention between runs without process restart.
 pub(crate) static TRIATTENTION_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
@@ -1438,5 +1454,95 @@ impl GpuKvCache {
             vec![1, 1, 1, self.max_seq],
             self.stream.clone(),
         )
+    }
+}
+
+// ============================================================
+// Quest-style CPU Offload Cache (Sprint F)
+// ============================================================
+
+/// Single offloaded compressed KV entry — one token's worth of compressed K + raw V.
+/// Stored on CPU after TriAttention eviction. Can be retrieved on cache miss.
+#[derive(Debug, Clone)]
+pub(crate) struct OffloadedKvEntry {
+    /// Original sequence position (for RoPE reconstruction)
+    pub(crate) seq_pos: usize,
+    /// Packed TQ indices: [n_kv_head * bytes_per_key]
+    pub(crate) packed_k: Vec<u8>,
+    /// Per-group norms: [n_kv_head * n_groups] (grouped path)
+    pub(crate) gnorms: Vec<f32>,
+    /// V data (f32): [n_kv_head * head_dim]
+    pub(crate) v_data: Vec<f32>,
+}
+
+/// CPU-side storage for tokens evicted by TriAttention.
+/// Instead of deleting evicted tokens, we save them here for potential retrieval
+/// when a future query has high attention to an evicted position ("cache miss").
+///
+/// V1 uses simple Vec storage with linear scan for retrieval.
+/// Future: FAISS index for O(log n) search at >32K offloaded tokens.
+#[derive(Debug, Clone)]
+pub(crate) struct OffloadedKvCache {
+    /// Per-layer storage of offloaded entries.
+    pub(crate) layers: Vec<Vec<OffloadedKvEntry>>,
+    /// Config for decompression on retrieval.
+    pub(crate) bits: u8,
+    pub(crate) head_dim: usize,
+    pub(crate) n_kv_head: usize,
+    pub(crate) group_size: usize,
+    pub(crate) bytes_per_key: usize,
+    pub(crate) n_groups: usize,
+}
+
+impl OffloadedKvCache {
+    pub(crate) fn new(
+        n_layers: usize,
+        bits: u8,
+        head_dim: usize,
+        n_kv_head: usize,
+        group_size: usize,
+    ) -> Self {
+        let bytes_per_key = (head_dim * bits as usize + 7) / 8;
+        let n_groups = if group_size > 0 && head_dim % group_size == 0 {
+            head_dim / group_size
+        } else { 1 };
+        Self {
+            layers: (0..n_layers).map(|_| Vec::new()).collect(),
+            bits,
+            head_dim,
+            n_kv_head,
+            group_size,
+            bytes_per_key,
+            n_groups,
+        }
+    }
+
+    /// Store an evicted token's compressed K + V data.
+    pub(crate) fn offload(&mut self, layer_idx: usize, entry: OffloadedKvEntry) {
+        if layer_idx < self.layers.len() {
+            self.layers[layer_idx].push(entry);
+        }
+    }
+
+    /// Total number of offloaded tokens across all layers.
+    pub(crate) fn total_offloaded(&self) -> usize {
+        self.layers.iter().map(|l| l.len()).max().unwrap_or(0)
+    }
+
+    /// Retrieve and decompress offloaded keys for a given layer.
+    /// Returns (decompressed_keys, v_data, seq_positions) for attention scoring.
+    /// Keys are returned in Hadamard domain (pre-inverse-WHT) for fused scoring,
+    /// or fully decompressed depending on the caller's needs.
+    pub(crate) fn retrieve_all_for_layer(&self, layer_idx: usize) -> Option<&[OffloadedKvEntry]> {
+        self.layers.get(layer_idx).filter(|l| !l.is_empty()).map(|l| l.as_slice())
+    }
+
+    /// Memory usage in bytes.
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.layers.iter().map(|l| {
+            l.iter().map(|e| {
+                e.packed_k.len() + e.gnorms.len() * 4 + e.v_data.len() * 4 + 8
+            }).sum::<usize>()
+        }).sum()
     }
 }

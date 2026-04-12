@@ -419,6 +419,7 @@ impl GenericTurboModel {
                 sink_k_gpu: None,
                 #[cfg(feature = "cuda")]
                 sink_v_gpu: None,
+                offload_cache: None,
                 smooth_k_scales: compute_smooth_scales(&tq_config, head_dim, device, false),
                 smooth_q_scales: compute_smooth_scales(&tq_config, head_dim, device, true),
                 span_attn: tracing::span!(tracing::Level::TRACE, "attn"),
