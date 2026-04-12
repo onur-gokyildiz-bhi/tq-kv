@@ -94,6 +94,24 @@ impl TqDevice {
             _ => panic!("cuda_stream() called on CPU device"),
         }
     }
+
+    /// Create a fresh CUDA stream dedicated to H2D transfers, independent of
+    /// the compute stream. The manager records events on this stream after
+    /// each prefetch so the compute stream can wait before launching the
+    /// corresponding layer's kernels.
+    ///
+    /// Unlike the compute stream (which has event tracking disabled for
+    /// CUDA-Graph replay), this stream keeps event tracking on — the
+    /// `CudaStream::record_event` / `wait` pair depends on it.
+    #[cfg(feature = "cuda")]
+    pub fn new_transfer_stream(&self) -> super::Result<std::sync::Arc<cudarc::driver::CudaStream>> {
+        match self {
+            TqDevice::Cuda { context, .. } => context
+                .new_stream()
+                .map_err(|e| super::TqError::Msg(format!("transfer stream create: {}", e))),
+            _ => Err(super::TqError::Msg("new_transfer_stream on CPU device".into())),
+        }
+    }
 }
 
 impl std::fmt::Debug for TqDevice {

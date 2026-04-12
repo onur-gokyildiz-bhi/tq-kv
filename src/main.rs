@@ -17,6 +17,8 @@ mod download;
 mod engine;
 mod hub;
 mod inference;
+#[cfg(feature = "cuda")]
+pub mod layer_swap;
 mod model;
 #[allow(dead_code)]
 mod models;

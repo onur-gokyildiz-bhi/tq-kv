@@ -61,27 +61,109 @@ impl GpuMemoryPool {
 
 /// Pinned (page-locked) host memory for async H2D transfers.
 ///
-/// Allocated with cudaMallocHost for DMA-capable access.
-/// Used during model loading to overlap transfer with GPU compute.
-pub struct PinnedBuffer {
-    pub data: Vec<u8>,
-    pub size: usize,
-    /// Whether this buffer is actually pinned (requires CUDA runtime).
-    pub is_pinned: bool,
+/// Allocated with `cuMemHostAlloc` (via `CudaContext::alloc_pinned`) using the
+/// `CU_MEMHOSTALLOC_WRITECOMBINED` flag — optimal for H2D-only staging buffers.
+///
+/// Two variants:
+///   - `Pinned { .. }`   — real DMA-capable host memory (requires a CUDA context)
+///   - `Pageable { .. }` — plain `Vec<u8>` fallback when no CUDA context is active
+///
+/// Only the pinned variant enables truly asynchronous H2D on a non-default
+/// stream; pageable staging forces synchronous memcpy.
+pub enum PinnedBuffer {
+    #[cfg(feature = "cuda")]
+    Pinned {
+        /// Owns the pinned allocation; Drop frees via `cuMemFreeHost`.
+        inner: cudarc::driver::PinnedHostSlice<u8>,
+        size: usize,
+    },
+    Pageable {
+        data: Vec<u8>,
+        size: usize,
+    },
 }
 
 impl PinnedBuffer {
-    /// Allocate a pinned buffer (falls back to regular malloc without CUDA).
-    pub fn new(size: usize) -> Self {
-        Self {
-            data: vec![0u8; size],
-            size,
-            is_pinned: false, // TODO Phase 4: cudaMallocHost
+    /// Allocate a pinned buffer from the given CUDA context. Returns `Pageable`
+    /// fallback if the pinned allocation fails (e.g. OOM — pinned memory is a
+    /// scarce resource on the host).
+    #[cfg(feature = "cuda")]
+    pub fn new_on_context(
+        ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        size: usize,
+    ) -> Self {
+        // SAFETY: `alloc_pinned` leaves memory uninitialised; callers must write
+        // before reading. Our usage always writes (loading from file/mmap)
+        // before calling memcpy_htod.
+        match unsafe { ctx.alloc_pinned::<u8>(size) } {
+            Ok(inner) => PinnedBuffer::Pinned { inner, size },
+            Err(e) => {
+                eprintln!(
+                    "[cuda] alloc_pinned({} bytes) failed: {} — falling back to pageable",
+                    size, e
+                );
+                PinnedBuffer::Pageable { data: vec![0u8; size], size }
+            }
         }
     }
 
-    pub fn as_slice(&self) -> &[u8] { &self.data[..self.size] }
-    pub fn as_mut_slice(&mut self) -> &mut [u8] { &mut self.data[..self.size] }
+    /// CPU-only constructor (no CUDA available — plain heap Vec).
+    pub fn new(size: usize) -> Self {
+        PinnedBuffer::Pageable { data: vec![0u8; size], size }
+    }
+
+    pub fn size(&self) -> usize {
+        match self {
+            #[cfg(feature = "cuda")]
+            PinnedBuffer::Pinned { size, .. } => *size,
+            PinnedBuffer::Pageable { size, .. } => *size,
+        }
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            PinnedBuffer::Pinned { .. } => true,
+            PinnedBuffer::Pageable { .. } => false,
+        }
+    }
+
+    /// Read-only view of the host-side bytes. Synchronises with any pending
+    /// stream work on pinned allocations (safe if no transfer is in flight).
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(feature = "cuda")]
+            PinnedBuffer::Pinned { inner, size } => {
+                let ptr = inner.as_ptr().expect("pinned event sync");
+                unsafe { std::slice::from_raw_parts(ptr, *size) }
+            }
+            PinnedBuffer::Pageable { data, size } => &data[..*size],
+        }
+    }
+
+    /// Mutable view for staging bytes before an H2D copy. Synchronises on
+    /// pinned allocations — callers must not hold this across a memcpy_htod.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            #[cfg(feature = "cuda")]
+            PinnedBuffer::Pinned { inner, size } => {
+                let ptr = inner.as_mut_ptr().expect("pinned event sync");
+                unsafe { std::slice::from_raw_parts_mut(ptr, *size) }
+            }
+            PinnedBuffer::Pageable { data, size } => &mut data[..*size],
+        }
+    }
+
+    /// Access the underlying `PinnedHostSlice` if this buffer is pinned.
+    /// Used by the LayerSwapManager for async `memcpy_htod` on the transfer
+    /// stream.
+    #[cfg(feature = "cuda")]
+    pub fn as_pinned_slice(&mut self) -> Option<&mut cudarc::driver::PinnedHostSlice<u8>> {
+        match self {
+            PinnedBuffer::Pinned { inner, .. } => Some(inner),
+            PinnedBuffer::Pageable { .. } => None,
+        }
+    }
 }
 
 /// KV cache memory planner.
