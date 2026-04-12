@@ -224,9 +224,12 @@ pub struct QWeight {
     /// Lazily dequantized f32 weight (avoids re-dequant per forward).
     cpu_cache: OnceLock<Vec<f32>>,
     /// Lazily uploaded GPU copy of raw_data (avoids re-upload per forward).
-    /// In swap mode this is evictable (see `SwapCell`).
+    /// In swap mode this is evictable (see `SwapCell`). Arc-wrapped so a
+    /// LayerSwapManager lane can share its pre-allocated slot buffer with
+    /// the QWeights of the currently-active layer (zero-alloc prefetch via
+    /// in-place `memcpy_htod`).
     #[cfg(feature = "cuda")]
-    pub(crate) gpu_cache: SwapCell<CudaSlice<u8>>,
+    pub(crate) gpu_cache: SwapCell<std::sync::Arc<CudaSlice<u8>>>,
     /// Lazily dequantized + uploaded f32 weights on GPU (for Q6K and other dtypes
     /// without fused GPU kernels — avoids re-dequant + re-upload per forward).
     #[cfg(feature = "cuda")]
@@ -321,25 +324,26 @@ impl QWeight {
         self.gpu_cache.evict();
     }
 
-    /// Move the GPU cache's CudaSlice out, leaving the cache empty. Returns
+    /// Move the GPU cache Arc out, leaving the cache empty. Returns
     /// None in fast mode (OnceLock is one-shot) or when already empty.
     ///
-    /// `LayerSwapManager` uses this to quarantine an evicted slice in a
-    /// graveyard until a compute-stream event fires, so the drop (and
-    /// implicit cuMemFree) can't race with an in-flight kernel.
+    /// `LayerSwapManager` uses this to drop the QWeight's strong reference
+    /// on eviction; the lane retains its own Arc so the slice stays alive
+    /// and the slot buffer is ready for the next in-place prefetch.
     #[cfg(feature = "cuda")]
-    pub fn take_gpu(&self) -> Option<CudaSlice<u8>> {
+    pub fn take_gpu(&self) -> Option<std::sync::Arc<CudaSlice<u8>>> {
         self.gpu_cache.take()
     }
 
     /// Install an externally-allocated GPU slice (swap mode only — no-op in
     /// fast mode if already initialised).
     ///
-    /// Used by `LayerSwapManager` on prefetch: the manager pre-allocates a
-    /// double-buffered slot, does the H2D copy on a transfer stream, then calls
-    /// `inject_gpu` so subsequent forward calls on this weight use the slot.
+    /// Used by `LayerSwapManager` on prefetch: the manager pre-allocates
+    /// lane slot buffers as `Arc<CudaSlice<u8>>`, performs in-place
+    /// `memcpy_htod` to fill them, then `Arc::clone`s each into the
+    /// corresponding QWeight via this method — zero cudaMalloc per prefetch.
     #[cfg(feature = "cuda")]
-    pub fn inject_gpu(&self, slice: CudaSlice<u8>) {
+    pub fn inject_gpu(&self, slice: std::sync::Arc<CudaSlice<u8>>) {
         self.gpu_cache.inject(slice);
     }
 
@@ -350,8 +354,10 @@ impl QWeight {
         if let TqDevice::Cuda { .. } = device {
             let stream = device.cuda_stream()?;
             self.gpu_cache.get_or_init(|| {
-                stream.clone_htod(self.raw_data.as_slice())
-                    .expect("QWeight GPU upload failed")
+                std::sync::Arc::new(
+                    stream.clone_htod(self.raw_data.as_slice())
+                        .expect("QWeight GPU upload failed"),
+                )
             });
         }
         Ok(())
@@ -406,14 +412,14 @@ impl QWeight {
 
     pub fn gpu_cache_or_upload(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> &CudaSlice<u8> {
         self.gpu_cache.get_or_init(|| {
-            match stream.clone_htod(self.raw_data.as_slice()) {
+            std::sync::Arc::new(match stream.clone_htod(self.raw_data.as_slice()) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("WARNING: QWeight GPU upload failed ({}), using empty placeholder", e);
                     stream.alloc_zeros::<u8>(1).expect("cannot alloc 1 byte on GPU")
                 }
-            }
-        })
+            })
+        }).as_ref()
     }
 
     /// Number of output features (rows).
@@ -585,10 +591,13 @@ impl QMatMul {
         let stream = x.cuda_stream();
 
         // Lazy GPU cache: upload weight bytes once, reuse for all subsequent calls
-        let w_gpu = qw.gpu_cache.get_or_init(|| {
-            stream.clone_htod(qw.raw_data.as_slice())
-                .expect("QWeight GPU upload failed")
+        let w_gpu_arc = qw.gpu_cache.get_or_init(|| {
+            std::sync::Arc::new(
+                stream.clone_htod(qw.raw_data.as_slice())
+                    .expect("QWeight GPU upload failed"),
+            )
         });
+        let w_gpu: &CudaSlice<u8> = w_gpu_arc.as_ref();
 
         // For decode (batch=1), use fused matvec kernel
         if batch_elements == 1 {

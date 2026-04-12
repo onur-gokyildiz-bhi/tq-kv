@@ -4,30 +4,42 @@
 //! non-pinned layers on/off the device on a dedicated transfer stream. Pinned
 //! layers stay resident for the full run.
 //!
-//! # Sync model (Phase 6b)
+//! # Lane pool (Phase 7 real)
 //!
-//! Three streams / events coordinate ownership:
-//!   * **Transfer stream** — does async `clone_htod` of QWeight bytes.
-//!     After each prefetch, records a `ready_events[layer]` event.
-//!   * **Compute stream** — the forward-pass stream. Waits on
-//!     `ready_events[N]` before launching layer N's kernels
-//!     (`wait_for_layer`).
-//!   * **Compute-completion events** — after evicting a layer, we record an
-//!     event on the compute stream, *take* the layer's `CudaSlice`s out of
-//!     the QWeights (without dropping them), and park them in the
-//!     `graveyard`. On each subsequent iteration's pre-hook we query those
-//!     events; when one fires we know no in-flight kernel still references
-//!     that memory and it's safe to drop. This replaces the earlier
-//!     `compute_stream.synchronize()` path, which serialised eviction with
-//!     compute and killed async overlap.
+//! Earlier phases did a `clone_htod` per QWeight per prefetch — 7 cudaMalloc
+//! per layer per decode token on dense transformers, which on Qwen2.5-32B
+//! (52 streamed layers) collapsed decode to 0.2 tok/s.
+//!
+//! The pool-of-lanes design eliminates that malloc thrash:
+//!   * At startup the manager allocates `N` **lanes**, each containing one
+//!     `Arc<CudaSlice<u8>>` per QWeight slot (sized to that weight's packed
+//!     bytes). Total: `n_lanes * Σ QWeight-bytes` — e.g. 2×280 MB = 560 MB
+//!     for 32B.
+//!   * On prefetch: pick a free lane, `memcpy_htod` each weight's bytes
+//!     **in place** into the lane's slot (no cudaMalloc), then `Arc::clone`
+//!     each slot and `inject_gpu` it into the corresponding QWeight.
+//!   * On eviction: QWeight drops its Arc. Lane keeps its Arc, so the
+//!     buffer stays alive and is ready for the next prefetch — back to
+//!     `memcpy_htod` with zero alloc.
+//!
+//! # Sync model
+//!
+//! Three primitives coordinate:
+//!   * **Transfer stream** does async H2D into lane slots. After each
+//!     prefetch records `ready_events[layer]`.
+//!   * **Compute stream** (forward pass) waits on that event before
+//!     launching the layer's kernels (`wait_for_layer`).
+//!   * **Compute-completion events** — on eviction we record an event on
+//!     the compute stream. The lane is not freed for re-prefetch until
+//!     that event fires (tracked via `pending_eviction`), so the memcpy
+//!     into the slot can't race with an in-flight kernel reading it.
 //!
 //! # Safety / invariants
 //!
-//! - Single-threaded forward (same invariant the existing `QWeight` code
-//!   relies on).
-//! - CUDA Graph capture is incompatible with swap (slot addresses change
-//!   between prefetches). `engine.rs` disables `TQ_GRAPH` when swap is active.
-//! - QWeightPtr wraps a `*const QWeight` with `Send + Sync` — required so
+//! - Single-threaded forward (matches QWeight invariant).
+//! - CUDA Graph + swap are mutually exclusive (slot device addresses change
+//!   between prefetches). `engine.rs` disables `TQ_GRAPH` under swap.
+//! - `QWeightPtr` wraps `*const QWeight` with `Send + Sync`; required so
 //!   the owning `Engine` stays `Send` for `tokio::spawn_blocking`.
 
 #![cfg(feature = "cuda")]
@@ -40,20 +52,32 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream};
 use crate::cuda::{Result, TqError};
 
 /// Send+Sync wrapper around a raw pointer to a `QWeight`.
-///
-/// Needed because the forward loop stashes `*const QWeight` in
-/// `GenericTurboModel::layer_qweight_ptrs`, and the whole `Engine` must be
-/// moveable across threads (e.g. `tokio::task::spawn_blocking` in `serve.rs`).
-/// Pointers are valid as long as the owning `LayerWeights` Vec isn't
-/// reallocated — which never happens after model load.
 #[derive(Copy, Clone)]
 pub struct QWeightPtr(pub *const crate::qmatmul::QWeight);
 
-// SAFETY: QWeight is Sync (SwapCell / OnceLock / UnsafeCell invariants held by
-// single-threaded forward). The raw pointer doesn't add any extra aliasing
-// hazards beyond what a `&QWeight` already has.
 unsafe impl Send for QWeightPtr {}
 unsafe impl Sync for QWeightPtr {}
+
+// ─────────────────────────────────────────────────────────────
+// Lane: one set of pre-allocated slot buffers matching the
+// per-QWeight structure of every non-pinned layer.
+// ─────────────────────────────────────────────────────────────
+
+struct Lane {
+    /// One Arc<CudaSlice> per QWeight of a layer, in the order produced by
+    /// `LayerWeights::qweight_ptrs`. All layers are assumed to share the same
+    /// QWeight structure (count + sizes). True for all decoder-only
+    /// transformers we target (qwen2/3, llama, mistral, gemma, phi3).
+    slots: Vec<Arc<CudaSlice<u8>>>,
+    /// Currently-loaded layer_idx, None if empty or pending-evict-cleared.
+    loaded: Option<usize>,
+    /// Compute-stream event marking when prior kernels that read this lane
+    /// have finished. The lane cannot be re-prefetched until the event
+    /// fires, otherwise `memcpy_htod` would race the kernel. `None` means
+    /// the lane has never been used OR the prior eviction's event has
+    /// already been cleared.
+    pending_evict_event: Option<CudaEvent>,
+}
 
 // ─────────────────────────────────────────────────────────────
 // Manager
@@ -65,23 +89,14 @@ pub struct LayerSwapManager {
     transfer_stream: Arc<CudaStream>,
     compute_stream: Arc<CudaStream>,
 
-    /// Always-resident layers (never evicted).
     pinned: std::collections::HashSet<usize>,
-
-    /// Ready events per active (non-pinned) layer — the compute stream waits
-    /// on these before launching that layer's kernels.
+    /// H2D completion events per layer currently loaded in a lane.
     ready_events: HashMap<usize, CudaEvent>,
 
-    /// Graveyard of evicted `CudaSlice`s waiting for their compute-stream
-    /// event to fire. Each entry holds:
-    ///   - `event`: recorded on compute_stream *after* the layer's kernels
-    ///     were launched. When `event.is_complete()` returns true, the
-    ///     slices can be safely dropped (cuMemFree).
-    ///   - `slices`: owned `CudaSlice<u8>`s quarantined from QWeights.
-    ///
-    /// Flushed at the start of every iteration (`flush_graveyard`). Typical
-    /// occupancy: 1-2 layers at a time (recent evictions).
-    graveyard: Vec<(CudaEvent, Vec<CudaSlice<u8>>)>,
+    /// Pool of pre-allocated lanes. Indexed by lane id (0..n_lanes).
+    lanes: Vec<Lane>,
+    /// Per-layer → lane id mapping for layers currently loaded in a lane.
+    layer_lane: HashMap<usize, usize>,
 }
 
 impl LayerSwapManager {
@@ -100,46 +115,64 @@ impl LayerSwapManager {
             compute_stream,
             pinned: pinned_layers.iter().copied().collect(),
             ready_events: HashMap::new(),
-            graveyard: Vec::new(),
+            lanes: Vec::new(),
+            layer_lane: HashMap::new(),
         })
     }
 
-    /// Is this layer always resident?
     pub fn is_pinned(&self, layer_idx: usize) -> bool {
         self.pinned.contains(&layer_idx)
     }
 
-    /// Mark a layer as always resident.
     pub fn mark_pinned(&mut self, layer_idx: usize) {
         self.pinned.insert(layer_idx);
     }
 
-    /// Drop any graveyard entries whose compute-stream event has fired.
-    /// Called at every layer's pre-hook.
+    /// Pre-allocate `n_lanes` worth of slot buffers, sized from the template
+    /// layer's QWeight sizes. Call once after `mark_pinned`/`pin_layer_direct`
+    /// have finished, before the first `start_prefetch_direct`.
     ///
-    /// Cheap: `CudaEvent::is_complete()` is a non-blocking query (cuEventQuery).
-    pub fn flush_graveyard(&mut self) {
-        // Note: event.is_complete is Ok→true meaning READY. Our earlier
-        // layers' events should fire first in practice, but we scan all
-        // entries every call. Graveyard is small (1-3 entries typical).
-        self.graveyard.retain(|(event, _slices)| !event.is_complete());
-    }
-
-    /// Force-flush: drop all pending graveyard entries by blocking the host
-    /// on each event. Called at end-of-forward to avoid accumulating across
-    /// many decode steps.
-    pub fn drain_graveyard(&mut self) {
-        for (event, _) in self.graveyard.drain(..) {
-            // Synchronize on each event (Drop order will then cuMemFree).
-            if let Err(e) = event.synchronize() {
-                eprintln!("[layer_swap] graveyard drain event sync failed: {}", e);
+    /// SAFETY: pointers must outlive the manager (same invariant as
+    /// `pin_layer_direct`). Only reads `QWeight::raw_data.len()`.
+    pub unsafe fn allocate_lanes(
+        &mut self,
+        n_lanes: usize,
+        template_ptrs: &[QWeightPtr],
+    ) -> Result<()> {
+        assert!(
+            self.lanes.is_empty(),
+            "allocate_lanes called twice — pool already initialised"
+        );
+        let mut total_bytes: usize = 0;
+        for _ in 0..n_lanes {
+            let mut slots: Vec<Arc<CudaSlice<u8>>> = Vec::with_capacity(template_ptrs.len());
+            for p in template_ptrs {
+                let qw = &*p.0;
+                let nbytes = qw.raw_data.len();
+                let slice = self
+                    .transfer_stream
+                    .alloc_zeros::<u8>(nbytes)
+                    .map_err(|e| TqError::Msg(format!("lane slot alloc ({} bytes): {}", nbytes, e)))?;
+                slots.push(Arc::new(slice));
+                total_bytes += nbytes;
             }
+            self.lanes.push(Lane {
+                slots,
+                loaded: None,
+                pending_evict_event: None,
+            });
         }
+        eprintln!(
+            "  Layer-swap lanes: {} × {} slots ({:.1} MB total)",
+            n_lanes,
+            template_ptrs.len(),
+            total_bytes as f64 / 1_048_576.0,
+        );
+        Ok(())
     }
 
-    /// Upload the given layer's QWeight bytes to GPU (via `inject_gpu`) on the
-    /// transfer stream, then block the CPU until the copy completes. Used for
-    /// always-resident ("pinned") layers during model load.
+    /// Upload the given layer's QWeight bytes to GPU and block until the
+    /// copy completes. Used for always-resident layers.
     ///
     /// SAFETY: `qweight_ptrs` must remain valid for the duration of this call.
     pub unsafe fn pin_layer_direct(
@@ -153,7 +186,7 @@ impl LayerSwapManager {
                 .transfer_stream
                 .clone_htod(qw.raw_data.as_slice())
                 .map_err(|e| TqError::Msg(format!("pin H2D layer {}: {}", layer_idx, e)))?;
-            qw.inject_gpu(gpu);
+            qw.inject_gpu(Arc::new(gpu));
         }
         self.transfer_stream
             .synchronize()
@@ -162,15 +195,38 @@ impl LayerSwapManager {
         Ok(())
     }
 
-    /// Async H2D for all QWeights of `layer_idx`. Each weight gets a fresh
-    /// CudaSlice via `clone_htod`. Event recorded on the transfer stream;
-    /// `wait_for_layer` hooks the compute stream on it. No-op if pinned.
+    /// Pick an available lane: prefer empty/cleared, else one whose
+    /// `pending_evict_event` has fired. Blocks on the oldest lane's event
+    /// if none are ready.
+    fn claim_lane(&mut self) -> Result<usize> {
+        // First pass: find a fully free lane (no loaded + no pending event).
+        for (i, lane) in self.lanes.iter_mut().enumerate() {
+            if lane.loaded.is_none() {
+                // If there's a pending event, query it non-blocking first.
+                if let Some(ev) = &lane.pending_evict_event {
+                    if ev.is_complete() {
+                        lane.pending_evict_event = None;
+                        return Ok(i);
+                    }
+                } else {
+                    return Ok(i);
+                }
+            }
+        }
+        // Second pass: no lane is free. Block on the first lane's event.
+        let lane = &mut self.lanes[0];
+        if let Some(ev) = lane.pending_evict_event.take() {
+            ev.synchronize()
+                .map_err(|e| TqError::Msg(format!("lane claim sync: {}", e)))?;
+        }
+        lane.loaded = None;
+        Ok(0)
+    }
+
+    /// Async H2D (memcpy into pre-allocated lane slot; NO alloc) and inject
+    /// the lane's Arc<CudaSlice> into each QWeight.
     ///
-    /// Before allocating: flushes the graveyard and, if it's still full,
-    /// blocks on the oldest entry's compute event. This caps in-flight GPU
-    /// memory at `max_graveyard_depth` layers worth — otherwise prefetch
-    /// issues allocations faster than compute can free them, OOMing on
-    /// large models (e.g. 32B with 10GB VRAM).
+    /// No-op if `layer_idx` is pinned or already loaded in a lane.
     ///
     /// SAFETY: same as `pin_layer_direct`.
     pub unsafe fn start_prefetch_direct(
@@ -181,35 +237,66 @@ impl LayerSwapManager {
         if self.is_pinned(layer_idx) {
             return Ok(());
         }
-        // Throttle: cap outstanding graveyard entries. If we're about to
-        // exceed, block on the oldest event before issuing the new prefetch.
-        const MAX_GRAVEYARD_DEPTH: usize = 2;
-        self.flush_graveyard();
-        while self.graveyard.len() >= MAX_GRAVEYARD_DEPTH {
-            let (event, _slices) = self.graveyard.remove(0);
-            event.synchronize().map_err(|e| {
-                TqError::Msg(format!("graveyard throttle sync L{}: {}", layer_idx, e))
-            })?;
-            // _slices drops here, cuMemFree runs.
+        if self.layer_lane.contains_key(&layer_idx) {
+            return Ok(()); // already in a lane
         }
-        for qw_ptr in qweight_ptrs {
+        if self.lanes.is_empty() {
+            return Err(TqError::Msg(
+                "start_prefetch_direct before allocate_lanes".into(),
+            ));
+        }
+        let lane_idx = self.claim_lane()?;
+
+        // In-place memcpy_htod into each slot of the lane.
+        let lane = &mut self.lanes[lane_idx];
+        if lane.slots.len() != qweight_ptrs.len() {
+            return Err(TqError::Msg(format!(
+                "lane slot count {} != layer QWeight count {}",
+                lane.slots.len(),
+                qweight_ptrs.len()
+            )));
+        }
+        for (slot_arc, qw_ptr) in lane.slots.iter_mut().zip(qweight_ptrs.iter()) {
             let qw = &*qw_ptr.0;
-            let gpu = self
-                .transfer_stream
-                .clone_htod(qw.raw_data.as_slice())
-                .map_err(|e| TqError::Msg(format!("prefetch H2D layer {}: {}", layer_idx, e)))?;
-            qw.inject_gpu(gpu);
+            let src = qw.raw_data.as_slice();
+            // The Arc has 2+ strong refs during active layer + graveyard;
+            // we need &mut CudaSlice. Get it via Arc::get_mut which succeeds
+            // only if no other clones exist (i.e. on the first prefetch OR
+            // after all prior QWeights in this lane have evict_gpu'd).
+            match Arc::get_mut(slot_arc) {
+                Some(buf) => {
+                    let mut view = buf.slice_mut(0..src.len());
+                    self.transfer_stream
+                        .memcpy_htod(src, &mut view)
+                        .map_err(|e| TqError::Msg(format!(
+                            "prefetch memcpy_htod L{}: {}",
+                            layer_idx, e
+                        )))?;
+                }
+                None => {
+                    return Err(TqError::Msg(format!(
+                        "lane slot still referenced by QWeight (strong_count = {}) — \
+                         prior layer not yet evicted when prefetching L{}",
+                        Arc::strong_count(slot_arc),
+                        layer_idx
+                    )));
+                }
+            }
+            // Share the Arc with the QWeight for this forward.
+            qw.inject_gpu(Arc::clone(slot_arc));
         }
+        // Record H2D-ready event for cross-stream sync.
         let event = self
             .transfer_stream
             .record_event(None)
-            .map_err(|e| TqError::Msg(format!("prefetch event layer {}: {}", layer_idx, e)))?;
+            .map_err(|e| TqError::Msg(format!("prefetch event L{}: {}", layer_idx, e)))?;
         self.ready_events.insert(layer_idx, event);
+        lane.loaded = Some(layer_idx);
+        self.layer_lane.insert(layer_idx, lane_idx);
         Ok(())
     }
 
-    /// Block the compute stream (not the CPU) on the layer's H2D-ready event.
-    /// Pinned layers are a no-op (already resident).
+    /// Block the compute stream on the layer's H2D-ready event.
     pub fn wait_for_layer(&self, layer_idx: usize) -> Result<()> {
         if self.is_pinned(layer_idx) {
             return Ok(());
@@ -219,19 +306,16 @@ impl LayerSwapManager {
                 .compute_stream
                 .wait(event)
                 .map_err(|e| TqError::Msg(format!("wait_for_layer {}: {}", layer_idx, e))),
-            // No event yet (not prefetched). This is legitimate on first entry
-            // for a non-pinned layer — the forward loop's initial iteration
-            // has no prior prefetch. The existing `gpu_cache_or_upload` lazy
-            // path will upload synchronously on first access.
+            // No event: legitimate on first iteration of a non-pinned layer
+            // that wasn't pre-prefetched. Lazy upload fills it synchronously.
             None => Ok(()),
         }
     }
 
-    /// Take the GPU caches out of every QWeight in the layer and park them in
-    /// the graveyard. Records a `compute_stream` event marking when those
-    /// slices are safe to drop.
-    ///
-    /// Pinned layers are no-ops.
+    /// Drop each QWeight's Arc<CudaSlice>. The lane retains its Arc, so the
+    /// slot buffer stays alive and can be `memcpy_htod`'d over next time.
+    /// Record a compute-stream event on the lane so subsequent prefetches
+    /// wait for the pending kernel work to complete before reusing the slot.
     ///
     /// SAFETY: same as `pin_layer_direct`.
     pub unsafe fn evict_layer_direct(
@@ -242,32 +326,44 @@ impl LayerSwapManager {
         if self.is_pinned(layer_idx) {
             return;
         }
-        // Take (don't drop) the CudaSlices out of the QWeights.
-        let slices: Vec<CudaSlice<u8>> = qweight_ptrs
-            .iter()
-            .filter_map(|p| (*p.0).take_gpu())
-            .collect();
-        if slices.is_empty() {
-            return;
-        }
-        // Record a completion event on compute_stream. By the time this event
-        // fires, every kernel launched so far on the compute stream has
-        // finished — including all kernels that read this layer's weights.
-        // Until then, keep the slices alive in the graveyard.
-        match self.compute_stream.record_event(None) {
-            Ok(event) => self.graveyard.push((event, slices)),
-            Err(e) => {
-                eprintln!(
-                    "[layer_swap] compute event record failed for L{}: {} — \
-                     falling back to synchronous drop (may race in-flight kernels)",
-                    layer_idx, e
-                );
-                // Worst case: slices drop here, races with in-flight kernels.
-                // Should never happen unless context is gone.
-                drop(slices);
-            }
+        for qw_ptr in qweight_ptrs {
+            let qw = &*qw_ptr.0;
+            let _ = qw.take_gpu();
         }
         self.ready_events.remove(&layer_idx);
+        if let Some(lane_idx) = self.layer_lane.remove(&layer_idx) {
+            // Record event NOW so the lane can't be reused until compute
+            // finishes with the slice. With Arc we don't need a graveyard —
+            // the slot Arc in the lane keeps the buffer alive.
+            match self.compute_stream.record_event(None) {
+                Ok(event) => {
+                    self.lanes[lane_idx].pending_evict_event = Some(event);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[layer_swap] evict event record L{}: {} — falling back to blocking sync",
+                        layer_idx, e
+                    );
+                    let _ = self.compute_stream.synchronize();
+                }
+            }
+            self.lanes[lane_idx].loaded = None;
+        }
+    }
+
+    /// Kept for forward-loop compatibility. No-op in lane design (lane
+    /// pending_evict_event replaces the graveyard).
+    pub fn flush_graveyard(&mut self) {}
+
+    /// Kept for forward-loop compatibility. Block on every lane's pending
+    /// eviction event so all prior kernel work is drained before the next
+    /// forward call.
+    pub fn drain_graveyard(&mut self) {
+        for lane in &mut self.lanes {
+            if let Some(ev) = lane.pending_evict_event.take() {
+                let _ = ev.synchronize();
+            }
+        }
     }
 }
 
@@ -278,9 +374,6 @@ mod tests {
     #[test]
     fn qweight_ptr_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<QWeightPtr>();
-        // Also a smoke check that the manager type is Send even though it
-        // holds raw pointers internally (through QWeightPtr).
         assert_send_sync::<QWeightPtr>();
     }
 }

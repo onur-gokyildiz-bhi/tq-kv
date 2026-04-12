@@ -435,9 +435,26 @@ impl Engine {
                     }
                 }
 
+                // Pre-allocate the streaming lane pool once (no per-prefetch
+                // cudaMalloc). Uses the first non-pinned layer as the
+                // structural template — same QWeight count + sizes across
+                // layers holds for all decoder-only transformers we target.
+                if n_layers > pinned_layers.len() {
+                    let template_idx = (0..n_layers)
+                        .find(|i| !manager.is_pinned(*i))
+                        .unwrap_or(0);
+                    let n_lanes: usize = std::env::var("TQ_SWAP_LANES")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(2);
+                    unsafe {
+                        manager.allocate_lanes(n_lanes, &qws_per_layer[template_idx])
+                            .map_err(|e| anyhow::anyhow!("allocate_lanes: {}", e))?;
+                    }
+                }
+
                 // Kick initial prefetch for the first un-pinned layer so the
-                // compute stream has something to wait on at layer 0 if it's
-                // streamed. (No-op if the first layer is pinned.)
+                // compute stream has something to wait on at layer 0.
                 for layer_idx in 0..n_layers {
                     if !manager.is_pinned(layer_idx) {
                         unsafe {
