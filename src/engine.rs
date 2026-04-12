@@ -343,13 +343,20 @@ impl Engine {
             let mut inner = model;
             let n_layers = inner.0.layers.len();
 
-            // Estimate model bytes: sum of QWeight raw_data lengths.
+            // Estimate model bytes: sum of per-layer QWeight raw_data lengths.
             let model_bytes: u64 = inner.0
                 .layers
                 .iter()
                 .flat_map(|l| l.qweights())
                 .map(|qw| qw.raw_data.len() as u64)
                 .sum();
+            // output.weight (lm_head) and token_embd are NOT layer weights —
+            // they stay resident for the full run. Account for them in the
+            // kv/fixed side so the layer budget doesn't over-commit.
+            let lm_head_bytes: u64 = match &inner.0.output.inner {
+                crate::qmatmul::QMatMul::Quantized(qw) => qw.raw_data.len() as u64,
+                _ => 0,
+            };
             // KV per-token-bytes (fp16 K + V across all layers).
             let kv_per_token_bytes: u64 = if let Some(l0) = inner.0.layers.first() {
                 // 2 = K+V, 2 bytes/element (fp16), × n_kv_head × head_dim
@@ -365,8 +372,16 @@ impl Engine {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32_768);
 
+            // Fold lm_head into the "kv/fixed" account so the layer pin budget
+            // leaves headroom for the always-resident lm_head (and its dequant
+            // scratch during logit computation — reserve 2× the packed size
+            // as a conservative estimate for cuBLAS workspace).
+            let fixed_lm_head: u64 = lm_head_bytes * 2;
+            let kv_per_token_bytes_adj = kv_per_token_bytes
+                + (fixed_lm_head / max_context.max(1) as u64);
+
             let plan = decide_layer_swap(
-                &device, model_bytes, n_layers, kv_per_token_bytes, max_context,
+                &device, model_bytes, n_layers, kv_per_token_bytes_adj, max_context,
             );
             eprintln!("  Layer-swap plan: {}", plan.reason);
 
@@ -413,8 +428,18 @@ impl Engine {
                     }
                 }
 
+                // Explicitly upload lm_head to GPU now — it's queried lazily
+                // by the final matmul and would otherwise OOM mid-forward on
+                // VRAM-tight models (Qwen2.5-32B's lm_head alone is ~380MB
+                // Q4K + 1-1.5GB dequant scratch at logit time).
+                if let crate::qmatmul::QMatMul::Quantized(qw) = &inner.0.output.inner {
+                    if let Err(e) = qw.upload_to_gpu(&device) {
+                        eprintln!("  Layer-swap: lm_head upload failed: {} — may OOM mid-forward", e);
+                    }
+                }
+
                 eprintln!(
-                    "  Layer-swap installed: {} pinned, {} streamed",
+                    "  Layer-swap installed: {} pinned, {} streamed (lm_head resident)",
                     pinned_layers.len(),
                     n_layers.saturating_sub(pinned_layers.len()),
                 );
