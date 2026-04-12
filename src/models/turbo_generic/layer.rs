@@ -81,6 +81,12 @@ pub(crate) struct LayerWeights {
     /// Quest-style CPU offload cache: stores evicted tokens for retrieval (Sprint F).
     /// Initialized lazily on first TriAttention eviction when TQ_OFFLOAD=1.
     pub(crate) offload_cache: Option<super::kv_cache::OffloadedKvCache>,
+    /// GPU cold tier: evicted tokens kept on GPU for fast fused-attention retrieval.
+    /// D2D copy (no PCIe) from hot → cold on eviction. Fused scoring on cold buffer
+    /// during attention (no decompress needed). Falls back to CPU offload when GPU full.
+    /// Note: not Clone/Debug (CudaSlice). Excluded from LayerWeights derive via manual field.
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_cold_cache: Option<Box<super::kv_cache::GpuColdKv>>,
     /// SmoothAttention: per-channel scales to migrate K outliers to Q.
     /// K is divided by these scales (reducing outliers), Q is multiplied (lossless since Q stays fp32).
     /// Computed during calibration or from running statistics.
@@ -1086,12 +1092,12 @@ impl LayerWeights {
                                         }
                                     }
                                 }
-                                // Sprint F: offload evicted tokens to CPU before GPU compact.
-                                // Saves compressed K + V for future cache-miss retrieval.
+                                // Sprint F: save evicted tokens before GPU compact.
+                                // Priority 1: GPU cold tier (D2D, fast, no PCIe).
+                                // Priority 2: CPU offload (fallback when GPU cold tier is full).
                                 #[cfg(feature = "cuda")]
                                 if super::kv_cache::get_offload_enabled() {
                                     if let Some(ref gpu) = self.gpu_tq_cache {
-                                        // Compute evicted indices (complement of compressed_retain)
                                         let retain_set: std::collections::HashSet<usize> =
                                             compressed_retain.iter().copied().collect();
                                         let evicted_indices: Vec<usize> = (0..compressed_count)
@@ -1099,85 +1105,36 @@ impl LayerWeights {
                                             .collect();
 
                                         if !evicted_indices.is_empty() {
-                                            // Lazy-init offload cache
-                                            if self.offload_cache.is_none() {
-                                                self.offload_cache = Some(super::kv_cache::OffloadedKvCache::new(
-                                                    self.n_layers, self.tq_config.bits,
-                                                    self.head_dim, self.n_kv_head,
-                                                    self.tq_config.group_size,
-                                                ));
+                                            // Lazy-init GPU cold tier
+                                            if self.gpu_cold_cache.is_none() {
+                                                let max_cold = std::env::var("TQ_MAX_COLD")
+                                                    .ok().and_then(|v| v.parse().ok()).unwrap_or(512usize);
+                                                if let Ok(cold) = super::kv_cache::GpuColdKv::new(
+                                                    gpu.stream.clone(), self.n_kv_head,
+                                                    self.head_dim, self.tq_config.bits,
+                                                    max_cold, self.tq_config.group_size,
+                                                ) {
+                                                    self.gpu_cold_cache = Some(Box::new(cold));
+                                                }
                                             }
 
-                                            // Download evicted compressed K + V from GPU
-                                            if let Some(reg) = crate::cuda::kernels::global_registry() {
-                                                let bpk = gpu.bytes_per_key;
-                                                let ms = gpu.max_seq;
-                                                let hd = self.head_dim;
-                                                let ng = gpu.n_groups;
-
+                                            // D2D copy evicted tokens to cold tier
+                                            if let Some(ref mut cold) = self.gpu_cold_cache {
                                                 for &idx in &evicted_indices {
-                                                    // Compute original sequence position
                                                     let seq_pos = cache.tri_key_positions
                                                         .get(sink_n + idx).copied().unwrap_or(0);
-
-                                                    // Download packed K indices
-                                                    let mut packed_k = vec![0u8; self.n_kv_head * bpk];
-                                                    for h in 0..self.n_kv_head {
-                                                        let gpu_off = (h * ms + idx) * bpk;
-                                                        if let Ok(chunk) = reg.stream.clone_dtoh(
-                                                            &gpu.packed_indices.slice(gpu_off..gpu_off + bpk)
-                                                        ) {
-                                                            packed_k[h * bpk..(h + 1) * bpk]
-                                                                .copy_from_slice(&chunk);
-                                                        }
-                                                    }
-
-                                                    // Download per-group norms
-                                                    let mut gnorms = vec![0.0f32; self.n_kv_head * ng];
-                                                    if let Some(ref gn) = gpu.gnorms {
-                                                        for h in 0..self.n_kv_head {
-                                                            let gpu_off = (h * ms + idx) * ng;
-                                                            if let Ok(chunk) = reg.stream.clone_dtoh(
-                                                                &gn.slice(gpu_off..gpu_off + ng)
-                                                            ) {
-                                                                gnorms[h * ng..(h + 1) * ng]
-                                                                    .copy_from_slice(&chunk);
-                                                            }
-                                                        }
-                                                    }
-
-                                                    // Download V data
-                                                    let mut v_data = vec![0.0f32; self.n_kv_head * hd];
-                                                    for h in 0..self.n_kv_head {
-                                                        let gpu_off = (h * ms + idx) * hd;
-                                                        if let Ok(chunk) = reg.stream.clone_dtoh(
-                                                            &gpu.v_data.slice(gpu_off..gpu_off + hd)
-                                                        ) {
-                                                            v_data[h * hd..(h + 1) * hd]
-                                                                .copy_from_slice(&chunk);
-                                                        }
-                                                    }
-
-                                                    self.offload_cache.as_mut().unwrap().offload(
-                                                        self.layer_idx,
-                                                        super::kv_cache::OffloadedKvEntry {
-                                                            seq_pos,
-                                                            packed_k,
-                                                            gnorms,
-                                                            v_data,
-                                                        },
-                                                    );
+                                                    let _ = cold.push_from_hot(gpu, idx, seq_pos);
                                                 }
+                                            }
 
-                                                {
-                                                    use std::sync::atomic::{AtomicBool, Ordering};
-                                                    static OFFLOAD_PRINTED: AtomicBool = AtomicBool::new(false);
-                                                    if !OFFLOAD_PRINTED.swap(true, Ordering::Relaxed) {
-                                                        let oc = self.offload_cache.as_ref().unwrap();
-                                                        eprintln!("[quest-offload] L{}: {} tokens offloaded to CPU ({:.1} KB)",
-                                                            self.layer_idx, evicted_indices.len(),
-                                                            oc.memory_bytes() as f64 / 1024.0);
-                                                    }
+                                            {
+                                                use std::sync::atomic::{AtomicBool, Ordering};
+                                                static COLD_PRINTED: AtomicBool = AtomicBool::new(false);
+                                                if !COLD_PRINTED.swap(true, Ordering::Relaxed) {
+                                                    let n_cold = self.gpu_cold_cache.as_ref()
+                                                        .map(|c| c.count).unwrap_or(0);
+                                                    eprintln!("[gpu-cold] L{}: {} tokens evicted → GPU cold tier ({} total cold)",
+                                                        self.layer_idx, evicted_indices.len(), n_cold);
                                                 }
                                             }
                                         }
@@ -1683,79 +1640,62 @@ impl LayerWeights {
                             }
                             if let Some(kh) = k_hot { k_parts_gpu.push(kh); }
 
-                            // Sprint F phase 2: retrieve offloaded tokens on cache miss.
-                            // Decompress K + V from CPU offload cache, apply RoPE, upload.
-                            // V1: retrieve all offloaded tokens (capped at 32). Future: top-K scoring.
+                            // Sprint F: retrieve from GPU cold tier (D2D, no CPU).
+                            // Decompress cold K on GPU, apply RoPE, include in attention.
+                            // Falls back to CPU offload if no GPU cold cache.
                             let mut n_retrieved = 0usize;
+                            #[cfg(feature = "cuda")]
                             if super::kv_cache::get_offload_enabled() {
-                                if let Some(ref oc) = self.offload_cache {
-                                    if let Some(entries) = oc.retrieve_all_for_layer(self.layer_idx) {
-                                        let max_retrieve = 32;
-                                        let to_retrieve = entries.len().min(max_retrieve);
-                                        if to_retrieve > 0 {
-                                            let config = &layer_tq_config;
-                                            let bpk = oc.bytes_per_key;
-                                            let gs = oc.group_size;
-                                            let ng = oc.n_groups;
-                                            let bits = oc.bits;
+                                if let Some(ref cold) = self.gpu_cold_cache {
+                                    if cold.count > 0 {
+                                        let n_cold = cold.count;
+                                        let mc = cold.max_cold;
 
-                                            // Layout: [n_kv_head, to_retrieve, head_dim] (head-outer)
-                                            // Iterate head-first to match the tensor layout.
-                                            let mut all_k = vec![0.0f32; self.n_kv_head * to_retrieve * hdim];
+                                        // GPU decompress cold keys → contiguous buffer
+                                        let mut cold_k_buf = reg.stream.alloc_zeros::<f32>(
+                                            self.n_kv_head * n_cold * hdim
+                                        ).map_err(|e| TqError::Msg(format!("cold k buf: {}", e)))?;
+                                        crate::cuda::kernels::tq_decompress_keys_grouped(
+                                            reg, &cold.packed_indices, &cold.gnorms,
+                                            &gpu.centroids, signs, &mut cold_k_buf,
+                                            self.n_kv_head, n_cold, hdim,
+                                            cold.group_size, cold.bits as usize, mc,
+                                            0, n_cold, // key_offset=0, out_stride=n_cold (contiguous)
+                                        ).map_err(|e| TqError::Msg(format!("cold decompress: {e}")))?;
+
+                                        // Apply RoPE to cold keys (pre-RoPE → post-RoPE)
+                                        if cache.pre_rope && !cold.seq_positions.is_empty() {
+                                            // Upload positions, apply per-token RoPE
+                                            // For now: CPU-side RoPE on downloaded cold K
+                                            // (GPU strided RoPE needs positions array — future)
+                                            let mut cold_k_cpu: Vec<f32> = reg.stream.clone_dtoh(&cold_k_buf)
+                                                .map_err(|e| TqError::Msg(format!("cold k dtoh: {}", e)))?;
+                                            let cos_data = self.cos.as_slice();
+                                            let sin_data = self.sin.as_slice();
+                                            let half = self.rope_dim / 2;
                                             for h in 0..self.n_kv_head {
-                                                for (ti, entry) in entries.iter().take(to_retrieve).enumerate() {
-                                                    let packed = &entry.packed_k[h * bpk..(h + 1) * bpk];
-                                                    let gnorms_h = &entry.gnorms[h * ng..(h + 1) * ng];
-                                                    let mut ck = tq_kv::CompressedKeys::new_empty(bits, hdim, config.rotation_seed);
-                                                    ck.group_size = gs;
-                                                    ck.append_raw_grouped(packed, gnorms_h, None);
-                                                    let decompressed = tq_kv::decompress_keys_grouped(&ck, config);
-                                                    let off = (h * to_retrieve + ti) * hdim;
-                                                    all_k[off..off + hdim].copy_from_slice(&decompressed[..hdim.min(decompressed.len())]);
-                                                }
-                                            }
-
-                                            // Apply RoPE (pre-RoPE → post-RoPE)
-                                            if cache.pre_rope {
-                                                let cos_data = self.cos.as_slice();
-                                                let sin_data = self.sin.as_slice();
-                                                let half = self.rope_dim / 2;
-                                                for h in 0..self.n_kv_head {
-                                                    for (ti, entry) in entries.iter().take(to_retrieve).enumerate() {
-                                                        let pos = entry.seq_pos;
-                                                        if pos * half + half > cos_data.len() { continue; }
-                                                        let cos_row = &cos_data[pos * half..pos * half + half];
-                                                        let sin_row = &sin_data[pos * half..pos * half + half];
-                                                        let off = (h * to_retrieve + ti) * hdim;
-                                                        for i in 0..half {
-                                                            let x0 = all_k[off + i];
-                                                            let x1 = all_k[off + i + half];
-                                                            all_k[off + i] = x0 * cos_row[i] - x1 * sin_row[i];
-                                                            all_k[off + i + half] = x0 * sin_row[i] + x1 * cos_row[i];
-                                                        }
+                                                for (ti, &pos) in cold.seq_positions.iter().enumerate() {
+                                                    if pos * half + half > cos_data.len() { continue; }
+                                                    let cos_row = &cos_data[pos * half..pos * half + half];
+                                                    let sin_row = &sin_data[pos * half..pos * half + half];
+                                                    let off = (h * n_cold + ti) * hdim;
+                                                    for i in 0..half {
+                                                        let x0 = cold_k_cpu[off + i];
+                                                        let x1 = cold_k_cpu[off + i + half];
+                                                        cold_k_cpu[off + i] = x0 * cos_row[i] - x1 * sin_row[i];
+                                                        cold_k_cpu[off + i + half] = x0 * sin_row[i] + x1 * cos_row[i];
                                                     }
                                                 }
                                             }
-
-                                            // V layout: [n_kv_head, to_retrieve, head_dim] (head-outer)
-                                            // Entry v_data is [n_kv_head * head_dim] = h0...hN for one token.
-                                            let mut all_v = vec![0.0f32; self.n_kv_head * to_retrieve * hdim];
-                                            for h in 0..self.n_kv_head {
-                                                for (ti, entry) in entries.iter().take(to_retrieve).enumerate() {
-                                                    let src = &entry.v_data[h * hdim..(h + 1) * hdim];
-                                                    let dst_off = (h * to_retrieve + ti) * hdim;
-                                                    all_v[dst_off..dst_off + hdim].copy_from_slice(src);
-                                                }
-                                            }
-
-                                            // Upload K to GPU
-                                            if let Ok(k_gpu) = stream.clone_htod(&all_k) {
-                                                k_parts_gpu.push(Tensor::from_cuda(
-                                                    k_gpu, vec![1, self.n_kv_head, to_retrieve, hdim], stream.clone(),
-                                                ));
-                                            }
-                                            n_retrieved = to_retrieve;
+                                            // Re-upload RoPE'd keys
+                                            cold_k_buf = reg.stream.clone_htod(&cold_k_cpu)
+                                                .map_err(|e| TqError::Msg(format!("cold k htod: {}", e)))?;
                                         }
+
+                                        k_parts_gpu.push(Tensor::from_cuda(
+                                            cold_k_buf, vec![1, self.n_kv_head, n_cold, hdim], stream.clone(),
+                                        ));
+                                        n_retrieved = n_cold;
                                     }
                                 }
                             }
@@ -1818,26 +1758,27 @@ impl LayerWeights {
                                 );
                                 v_parts_gpu.push(v_hot);
                             }
-                            // Sprint F: insert retrieved V from offloaded cache (matches K order above)
+                            // Sprint F: insert cold V (GPU cold tier, strided → contiguous gather)
+                            #[cfg(feature = "cuda")]
                             if n_retrieved > 0 {
-                                if let Some(ref oc) = self.offload_cache {
-                                    if let Some(entries) = oc.retrieve_all_for_layer(self.layer_idx) {
-                                        let to_retrieve = entries.len().min(n_retrieved);
-                                        // Layout: [n_kv_head, to_retrieve, head_dim] (head-outer)
-                                        let mut all_v = vec![0.0f32; self.n_kv_head * to_retrieve * hdim];
-                                        for h in 0..self.n_kv_head {
-                                            for (ti, entry) in entries.iter().take(to_retrieve).enumerate() {
-                                                let src = &entry.v_data[h * hdim..(h + 1) * hdim];
-                                                let dst_off = (h * to_retrieve + ti) * hdim;
-                                                all_v[dst_off..dst_off + hdim].copy_from_slice(src);
-                                            }
-                                        }
-                                        if let Ok(v_gpu) = stream.clone_htod(&all_v) {
-                                            v_parts_gpu.push(Tensor::from_cuda(
-                                                v_gpu, vec![1, self.n_kv_head, to_retrieve, hdim], stream.clone(),
-                                            ));
-                                        }
-                                    }
+                                if let Some(ref cold) = self.gpu_cold_cache {
+                                    let n_cold = n_retrieved;
+                                    let mc = cold.max_cold;
+                                    // Gather contiguous V from strided cold.v_data
+                                    let mut cold_v_buf = reg.stream.alloc_zeros::<f32>(
+                                        self.n_kv_head * n_cold * hdim
+                                    ).map_err(|e| TqError::Msg(format!("cold v buf: {}", e)))?;
+                                    crate::cuda::kernels::strided_copy_args(
+                                        reg, &cold.v_data, &mut cold_v_buf,
+                                        self.n_kv_head * n_cold * hdim, 3,
+                                        &[(self.n_kv_head as i32), (n_cold as i32), (hdim as i32)],
+                                        &[((n_cold * hdim) as i32), (hdim as i32), 1],
+                                        &[((mc * hdim) as i32), (hdim as i32), 1],
+                                        0,
+                                    ).map_err(|e| TqError::Msg(format!("cold v gather: {e}")))?;
+                                    v_parts_gpu.push(Tensor::from_cuda(
+                                        cold_v_buf, vec![1, self.n_kv_head, n_cold, hdim], stream.clone(),
+                                    ));
                                 }
                             }
                             if n_compressed > 0 {

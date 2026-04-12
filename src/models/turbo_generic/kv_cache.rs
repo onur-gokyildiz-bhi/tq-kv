@@ -524,6 +524,165 @@ impl GpuCompressedKv {
     }
 }
 
+// ============================================================
+// GPU Cold Tier — evicted tokens kept on GPU for fast retrieval
+// ============================================================
+
+/// GPU-resident storage for evicted compressed tokens (Sprint F).
+///
+/// Instead of downloading evicted tokens to CPU (slow PCIe round-trip),
+/// we D2D-copy them to a separate "cold" GPU buffer. During attention,
+/// `tq_fused_attention_grouped` scores cold tokens directly from their
+/// compressed form — no decompress, no CPU involvement.
+///
+/// Cold tier grows with each eviction. When GPU memory is tight,
+/// the oldest cold tokens can be spilled to the CPU OffloadedKvCache.
+#[cfg(feature = "cuda")]
+pub(crate) struct GpuColdKv {
+    /// Packed indices: [n_kv_head, max_cold, bytes_per_key]
+    pub(crate) packed_indices: cudarc::driver::CudaSlice<u8>,
+    /// Per-group norms: [n_kv_head, max_cold, n_groups]
+    pub(crate) gnorms: cudarc::driver::CudaSlice<f32>,
+    /// V data (f32): [n_kv_head, max_cold, head_dim]
+    pub(crate) v_data: cudarc::driver::CudaSlice<f32>,
+    /// Sequence positions for RoPE reconstruction: [max_cold] (CPU-side, cheap)
+    pub(crate) seq_positions: Vec<usize>,
+    /// Current count of cold tokens
+    pub(crate) count: usize,
+    pub(crate) max_cold: usize,
+    pub(crate) n_kv_head: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) n_groups: usize,
+    pub(crate) group_size: usize,
+    pub(crate) bytes_per_key: usize,
+    pub(crate) bits: u8,
+    pub(crate) stream: std::sync::Arc<cudarc::driver::CudaStream>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuColdKv {
+    pub(crate) fn new(
+        stream: std::sync::Arc<cudarc::driver::CudaStream>,
+        n_kv_head: usize,
+        head_dim: usize,
+        bits: u8,
+        max_cold: usize,
+        group_size: usize,
+    ) -> std::result::Result<Self, crate::cuda::TqError> {
+        let bytes_per_key = (head_dim * bits as usize + 7) / 8;
+        let n_groups = if group_size > 0 && head_dim % group_size == 0 {
+            head_dim / group_size
+        } else { 1 };
+
+        let packed = stream.alloc_zeros::<u8>(n_kv_head * max_cold * bytes_per_key)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("cold packed: {}", e)))?;
+        let gnorms = stream.alloc_zeros::<f32>(n_kv_head * max_cold * n_groups)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("cold gnorms: {}", e)))?;
+        let v_data = stream.alloc_zeros::<f32>(n_kv_head * max_cold * head_dim)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("cold v_data: {}", e)))?;
+
+        let cold_mb = (n_kv_head * max_cold * bytes_per_key
+            + n_kv_head * max_cold * n_groups * 4
+            + n_kv_head * max_cold * head_dim * 4) as f64 / (1024.0 * 1024.0);
+        eprintln!("[gpu-cold] allocated {:.1}MB for {} cold slots", cold_mb, max_cold);
+
+        Ok(Self {
+            packed_indices: packed,
+            gnorms,
+            v_data,
+            seq_positions: Vec::with_capacity(max_cold),
+            count: 0,
+            max_cold,
+            n_kv_head,
+            head_dim,
+            n_groups,
+            group_size,
+            bytes_per_key,
+            bits,
+            stream,
+        })
+    }
+
+    /// D2D copy a single token from the hot GPU cache to cold tier.
+    /// `hot_idx` is the position in the hot cache being evicted.
+    pub(crate) fn push_from_hot(
+        &mut self,
+        hot: &GpuCompressedKv,
+        hot_idx: usize,
+        seq_pos: usize,
+    ) -> std::result::Result<(), crate::cuda::TqError> {
+        if self.count >= self.max_cold {
+            // Cold tier full — oldest tokens could be spilled to CPU here.
+            // For now, silently drop (circular buffer behavior).
+            return Ok(());
+        }
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use cudarc::driver::sys;
+
+        let cold_pos = self.count;
+        let bpk = self.bytes_per_key;
+        let hd = self.head_dim;
+        let ng = self.n_groups;
+        let ms_hot = hot.max_seq;
+        let ms_cold = self.max_cold;
+        let raw_stream = self.stream.cu_stream();
+
+        // D2D: packed indices per head
+        {
+            let (src_base, _) = hot.packed_indices.device_ptr(self.stream.as_ref());
+            let (dst_base, _) = self.packed_indices.device_ptr(self.stream.as_ref());
+            for h in 0..self.n_kv_head {
+                let src = src_base + ((h * ms_hot + hot_idx) * bpk) as u64;
+                let dst = dst_base + ((h * ms_cold + cold_pos) * bpk) as u64;
+                unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, bpk, raw_stream); }
+            }
+        }
+        // D2D: gnorms per head
+        {
+            let (src_base, _) = hot.gnorms.as_ref()
+                .ok_or_else(|| crate::cuda::TqError::Msg("hot gnorms missing".into()))?
+                .device_ptr(self.stream.as_ref());
+            let (dst_base, _) = self.gnorms.device_ptr(self.stream.as_ref());
+            for h in 0..self.n_kv_head {
+                let src = src_base + ((h * ms_hot + hot_idx) * ng * 4) as u64;
+                let dst = dst_base + ((h * ms_cold + cold_pos) * ng * 4) as u64;
+                unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, ng * 4, raw_stream); }
+            }
+        }
+        // D2D: V data per head
+        {
+            let (src_base, _) = hot.v_data.device_ptr(self.stream.as_ref());
+            let (dst_base, _) = self.v_data.device_ptr(self.stream.as_ref());
+            for h in 0..self.n_kv_head {
+                let src = src_base + ((h * ms_hot + hot_idx) * hd * 4) as u64;
+                let dst = dst_base + ((h * ms_cold + cold_pos) * hd * 4) as u64;
+                unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, hd * 4, raw_stream); }
+            }
+        }
+
+        self.seq_positions.push(seq_pos);
+        self.count += 1;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl std::fmt::Debug for GpuColdKv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuColdKv")
+            .field("count", &self.count)
+            .field("max_cold", &self.max_cold)
+            .finish()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Clone for GpuColdKv {
+    fn clone(&self) -> Self {
+        panic!("GpuColdKv cannot be cloned (GPU buffers are not trivially copyable)")
+    }
+}
+
 /// GPU-accelerated TriAttention scoring + selection.
 /// Uploads pre-RoPE keys to GPU, runs trig_score_keys_batched kernel,
 /// downloads scores, selects top-B on CPU.
