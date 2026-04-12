@@ -325,6 +325,48 @@ impl GgufContent {
     }
 }
 
+// ─── WeightSource ────────────────────────────────────────────
+//
+// Abstraction over weight-file formats (GGUF, safetensors) so model
+// construction in `turbo_generic::model::build` can be format-agnostic.
+// The forward-time loading code just asks for named metadata + tensors.
+
+/// Source of weights + metadata. Implemented by GGUF and safetensors backends.
+///
+/// `tensor` is `&self` (not `&mut`); implementations that need mutable state
+/// (e.g. a `Read + Seek` cursor for GGUF) should use interior mutability.
+/// Callers are single-threaded during model construction.
+pub trait WeightSource {
+    /// Look up a metadata value by key.
+    fn metadata(&self, key: &str) -> Option<&GgufValue>;
+
+    /// Load a named tensor as a `QWeight`.
+    fn tensor(&self, name: &str, device: &TqDevice) -> Result<QWeight>;
+}
+
+/// Thin wrapper that adapts `(GgufContent, &mut R)` to `WeightSource`.
+pub struct GgufSource<'a, R: Read + Seek> {
+    content: &'a GgufContent,
+    reader: std::cell::RefCell<&'a mut R>,
+}
+
+impl<'a, R: Read + Seek> GgufSource<'a, R> {
+    pub fn new(content: &'a GgufContent, reader: &'a mut R) -> Self {
+        Self { content, reader: std::cell::RefCell::new(reader) }
+    }
+}
+
+impl<'a, R: Read + Seek> WeightSource for GgufSource<'a, R> {
+    fn metadata(&self, key: &str) -> Option<&GgufValue> {
+        self.content.metadata.get(key)
+    }
+
+    fn tensor(&self, name: &str, device: &TqDevice) -> Result<QWeight> {
+        let mut r = self.reader.borrow_mut();
+        self.content.tensor(&mut **r, name, device)
+    }
+}
+
 // ─── GGUF Writer ─────────────────────────────────────────────
 
 /// Write a complete GGUF v3 file.

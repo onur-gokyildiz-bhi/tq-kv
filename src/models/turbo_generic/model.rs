@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::backend::ComputeBackend;
 use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
 use crate::cuda::Result;
-use crate::gguf::{GgufContent, GgmlDType};
+use crate::gguf::{GgufContent, GgmlDType, WeightSource, GgufSource};
 use crate::qmatmul as qmm;
 use tq_kv::TurboQuantConfig;
 
@@ -97,13 +97,25 @@ fn detect_rope_style(arch: &str) -> RopeStyle {
 }
 
 impl GenericTurboModel {
+    /// Load from a GGUF file (thin wrapper over `build`).
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
         ct: GgufContent,
         reader: &mut R,
         device: &Device,
         tq_config: TurboQuantConfig,
     ) -> Result<Self> {
-        let md_get = |s: &str| match ct.metadata.get(s) {
+        let src = GgufSource::new(&ct, reader);
+        Self::build(&src, device, tq_config)
+    }
+
+    /// Format-agnostic model builder. Consumes a `WeightSource`
+    /// (GGUF or safetensors) and constructs a `GenericTurboModel`.
+    pub(crate) fn build<WS: WeightSource>(
+        src: &WS,
+        device: &Device,
+        tq_config: TurboQuantConfig,
+    ) -> Result<Self> {
+        let md_get = |s: &str| match src.metadata(s) {
             None => bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
@@ -177,18 +189,18 @@ impl GenericTurboModel {
             for key in ["attention.value_length", "attention.sliding_window",
                         "attention.query_pre_attn_scalar"] {
                 let full_key = format!("{arch}.{key}");
-                if let Some(val) = ct.get(&full_key) {
+                if let Some(val) = src.metadata(&full_key) {
                     eprintln!("  [gguf] {full_key} = {val:?}");
                 }
             }
         }
 
         // Auto-detect features from GGUF tensors
-        let has_bias = ct.tensor(reader, "blk.0.attn_q.bias", device).is_ok();
-        let has_merged_qkv = ct.tensor(reader, "blk.0.attn_qkv.weight", device).is_ok();
-        let has_ffn_gate = ct.tensor(reader, "blk.0.ffn_gate.weight", device).is_ok();
-        let has_post_attn_norm = ct.tensor(reader, "blk.0.post_attention_norm.weight", device).is_ok();
-        let has_post_ffn_norm = ct.tensor(reader, "blk.0.post_ffw_norm.weight", device).is_ok();
+        let has_bias = src.tensor("blk.0.attn_q.bias", device).is_ok();
+        let has_merged_qkv = src.tensor("blk.0.attn_qkv.weight", device).is_ok();
+        let has_ffn_gate = src.tensor("blk.0.ffn_gate.weight", device).is_ok();
+        let has_post_attn_norm = src.tensor("blk.0.post_attention_norm.weight", device).is_ok();
+        let has_post_ffn_norm = src.tensor("blk.0.post_ffw_norm.weight", device).is_ok();
 
         let qkv_style = if has_merged_qkv { "merged" } else { "separate" };
         let mlp_style = if n_expert > 1 {
@@ -231,7 +243,7 @@ impl GenericTurboModel {
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         // Embeddings: lazy dequant on GPU (saves ~2 GB), full dequant on CPU
-        let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
+        let tok_embeddings_q = src.tensor("token_embd.weight", device)?;
         let emb_dtype = tok_embeddings_q.dtype;
         let emb_shape = tok_embeddings_q.shape;
         #[cfg(feature = "cuda")]
@@ -250,12 +262,12 @@ impl GenericTurboModel {
         };
         let norm = {
             let n = RmsNorm::from_qtensor(
-                ct.tensor(reader, "output_norm.weight", device)?, rms_norm_eps, device,
+                src.tensor("output_norm.weight", device)?, rms_norm_eps, device,
             )?;
             if arch.contains("gemma") { n.with_add_unit() } else { n }
         };
         // Detect tie_word_embeddings: if output.weight is missing, reuse token embeddings
-        let output = match ct.tensor(reader, "output.weight", device) {
+        let output = match src.tensor("output.weight", device) {
             Ok(tensor) => tensor,
             Err(_) => {
                 eprintln!("  (tie_word_embeddings: reusing token_embd.weight for output)");
@@ -272,12 +284,12 @@ impl GenericTurboModel {
 
             // Attention weights: merged QKV (Phi-3.5) or separate (most models)
             let qkv = if has_merged_qkv {
-                let wqkv = ct.tensor(reader, &format!("{prefix}.attn_qkv.weight"), device)?;
+                let wqkv = src.tensor(&format!("{prefix}.attn_qkv.weight"), device)?;
                 QkvWeights::Merged { wqkv: QMatMul::from_qtensor(wqkv)? }
             } else {
-                let wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
-                let wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
-                let wv = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
+                let wq = src.tensor(&format!("{prefix}.attn_q.weight"), device)?;
+                let wk = src.tensor(&format!("{prefix}.attn_k.weight"), device)?;
+                let wv = src.tensor(&format!("{prefix}.attn_v.weight"), device)?;
                 if layer_idx == 0 {
                     eprintln!("  [debug] L0 wq=({},{}) wk=({},{}) wv=({},{})",
                         wq.shape.0, wq.shape.1, wk.shape.0, wk.shape.1, wv.shape.0, wv.shape.1);
@@ -288,33 +300,33 @@ impl GenericTurboModel {
                     wv: QMatMul::from_qtensor(wv)?,
                 }
             };
-            let attention_wo = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
+            let attention_wo = src.tensor(&format!("{prefix}.attn_output.weight"), device)?;
 
             // Optional biases (Qwen2 has them, Llama/Phi/Gemma don't)
             let attention_bq = if has_bias {
-                Some(ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?.dequantize_to_device(device)?)
+                Some(src.tensor(&format!("{prefix}.attn_q.bias"), device)?.dequantize_to_device(device)?)
             } else {
                 None
             };
             let attention_bk = if has_bias {
-                Some(ct.tensor(reader, &format!("{prefix}.attn_k.bias"), device)?.dequantize_to_device(device)?)
+                Some(src.tensor(&format!("{prefix}.attn_k.bias"), device)?.dequantize_to_device(device)?)
             } else {
                 None
             };
             let attention_bv = if has_bias {
-                Some(ct.tensor(reader, &format!("{prefix}.attn_v.bias"), device)?.dequantize_to_device(device)?)
+                Some(src.tensor(&format!("{prefix}.attn_v.bias"), device)?.dequantize_to_device(device)?)
             } else {
                 None
             };
 
             // MLP: 3-gate (most models), 2-gate up/down (Phi-3.5), or MoE
             let mlp_or_moe = if n_expert > 1 {
-                let gate_inp = ct.tensor(reader, &format!("{prefix}.ffn_gate_inp.weight"), device)?;
+                let gate_inp = src.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
                 let mut experts = Vec::with_capacity(n_expert);
                 for i in 0..n_expert {
-                    let w1 = ct.tensor(reader, &format!("{prefix}.ffn_gate.{i}.weight"), device)?;
-                    let w2 = ct.tensor(reader, &format!("{prefix}.ffn_down.{i}.weight"), device)?;
-                    let w3 = ct.tensor(reader, &format!("{prefix}.ffn_up.{i}.weight"), device)?;
+                    let w1 = src.tensor(&format!("{prefix}.ffn_gate.{i}.weight"), device)?;
+                    let w2 = src.tensor(&format!("{prefix}.ffn_down.{i}.weight"), device)?;
+                    let w3 = src.tensor(&format!("{prefix}.ffn_up.{i}.weight"), device)?;
                     experts.push(Mlp {
                         feed_forward_w1: QMatMul::from_qtensor(w1)?,
                         feed_forward_w2: QMatMul::from_qtensor(w2)?,
@@ -328,9 +340,9 @@ impl GenericTurboModel {
                     experts,
                 }
             } else if has_ffn_gate {
-                let w1 = ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
-                let w2 = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
-                let w3 = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
+                let w1 = src.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
+                let w2 = src.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
+                let w3 = src.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
                 MlpOrMoe::Mlp(Mlp {
                     feed_forward_w1: QMatMul::from_qtensor(w1)?,
                     feed_forward_w2: QMatMul::from_qtensor(w2)?,
@@ -339,26 +351,26 @@ impl GenericTurboModel {
                 })
             } else {
                 // Phi-style: only ffn_up and ffn_down (no ffn_gate)
-                let up = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
-                let down = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
+                let up = src.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
+                let down = src.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
                 MlpOrMoe::UpDown(MlpUpDown {
                     ffn_up: QMatMul::from_qtensor(up)?,
                     ffn_down: QMatMul::from_qtensor(down)?,
                 })
             };
 
-            let attention_norm = ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?;
-            let ffn_norm = ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?;
+            let attention_norm = src.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
+            let ffn_norm = src.tensor(&format!("{prefix}.ffn_norm.weight"), device)?;
 
             // Optional post-norms (Gemma2)
             let post_attention_norm = if has_post_attn_norm {
-                let t = ct.tensor(reader, &format!("{prefix}.post_attention_norm.weight"), device)?;
+                let t = src.tensor(&format!("{prefix}.post_attention_norm.weight"), device)?;
                 Some(RmsNorm::from_qtensor(t, rms_norm_eps, device)?)
             } else {
                 None
             };
             let post_ffn_norm = if has_post_ffn_norm {
-                let t = ct.tensor(reader, &format!("{prefix}.post_ffw_norm.weight"), device)?;
+                let t = src.tensor(&format!("{prefix}.post_ffw_norm.weight"), device)?;
                 Some(RmsNorm::from_qtensor(t, rms_norm_eps, device)?)
             } else {
                 None
