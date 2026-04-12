@@ -166,6 +166,12 @@ impl LayerSwapManager {
     /// CudaSlice via `clone_htod`. Event recorded on the transfer stream;
     /// `wait_for_layer` hooks the compute stream on it. No-op if pinned.
     ///
+    /// Before allocating: flushes the graveyard and, if it's still full,
+    /// blocks on the oldest entry's compute event. This caps in-flight GPU
+    /// memory at `max_graveyard_depth` layers worth — otherwise prefetch
+    /// issues allocations faster than compute can free them, OOMing on
+    /// large models (e.g. 32B with 10GB VRAM).
+    ///
     /// SAFETY: same as `pin_layer_direct`.
     pub unsafe fn start_prefetch_direct(
         &mut self,
@@ -174,6 +180,17 @@ impl LayerSwapManager {
     ) -> Result<()> {
         if self.is_pinned(layer_idx) {
             return Ok(());
+        }
+        // Throttle: cap outstanding graveyard entries. If we're about to
+        // exceed, block on the oldest event before issuing the new prefetch.
+        const MAX_GRAVEYARD_DEPTH: usize = 2;
+        self.flush_graveyard();
+        while self.graveyard.len() >= MAX_GRAVEYARD_DEPTH {
+            let (event, _slices) = self.graveyard.remove(0);
+            event.synchronize().map_err(|e| {
+                TqError::Msg(format!("graveyard throttle sync L{}: {}", layer_idx, e))
+            })?;
+            // _slices drops here, cuMemFree runs.
         }
         for qw_ptr in qweight_ptrs {
             let qw = &*qw_ptr.0;

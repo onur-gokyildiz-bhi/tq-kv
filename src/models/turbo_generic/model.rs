@@ -553,47 +553,61 @@ impl GenericTurboModel {
         }
 
         // Pre-warm weight caches: dequant on CPU + upload to GPU.
-        // Disable with TQ_NO_WARMUP=1 on low-memory systems.
+        // - TQ_NO_WARMUP=1: skip (low-memory systems).
+        // - TQ_LAYER_SWAP=1|force: skip (LayerSwapManager manages QWeight GPU
+        //   residency via pin/prefetch; warmup would double-upload and OOM).
         let do_warmup = std::env::var("TQ_NO_WARMUP").map(|v| v != "1").unwrap_or(true);
-        if do_warmup {
+        let swap_active = matches!(
+            std::env::var("TQ_LAYER_SWAP").ok().as_deref(),
+            Some("1") | Some("force")
+        );
+        let warmup_qweights = do_warmup && !swap_active;
         let b = model.backend.as_ref();
-        eprintln!("  Pre-warming weight caches ({} layers, backend={})...", block_count, b.name());
-        model.output.warmup(b);
-        // Final norm weight
-        b.warmup_f32(model.norm.weight.as_slice());
-        for layer in &model.layers {
-            layer.attention_wo.warmup(b);
-            match &layer.qkv {
-                QkvWeights::Separate { wq, wk, wv } => { wq.warmup(b); wk.warmup(b); wv.warmup(b); }
-                QkvWeights::Merged { wqkv } => { wqkv.warmup(b); }
-            }
-            // Norm weights → GPU cache
-            b.warmup_f32(layer.attention_norm.weight.as_slice());
-            b.warmup_f32(layer.ffn_norm.weight.as_slice());
-            if let Some(ref n) = layer.post_attention_norm {
-                b.warmup_f32(n.weight.as_slice());
-            }
-            if let Some(ref n) = layer.post_ffn_norm {
-                b.warmup_f32(n.weight.as_slice());
-            }
-            match &layer.mlp_or_moe {
-                MlpOrMoe::Mlp(mlp) => {
-                    mlp.feed_forward_w1.warmup(b);
-                    mlp.feed_forward_w2.warmup(b);
-                    mlp.feed_forward_w3.warmup(b);
+
+        if warmup_qweights {
+            eprintln!("  Pre-warming weight caches ({} layers, backend={})...", block_count, b.name());
+            model.output.warmup(b);
+            // Final norm weight
+            b.warmup_f32(model.norm.weight.as_slice());
+            for layer in &model.layers {
+                layer.attention_wo.warmup(b);
+                match &layer.qkv {
+                    QkvWeights::Separate { wq, wk, wv } => { wq.warmup(b); wk.warmup(b); wv.warmup(b); }
+                    QkvWeights::Merged { wqkv } => { wqkv.warmup(b); }
                 }
-                MlpOrMoe::UpDown(ud) => {
-                    ud.ffn_up.warmup(b);
-                    ud.ffn_down.warmup(b);
+                // Norm weights → GPU cache
+                b.warmup_f32(layer.attention_norm.weight.as_slice());
+                b.warmup_f32(layer.ffn_norm.weight.as_slice());
+                if let Some(ref n) = layer.post_attention_norm {
+                    b.warmup_f32(n.weight.as_slice());
                 }
-                MlpOrMoe::MoE { experts, feed_forward_gate_inp, .. } => {
-                    feed_forward_gate_inp.warmup(b);
-                    for exp in experts { exp.feed_forward_w1.warmup(b); exp.feed_forward_w2.warmup(b); exp.feed_forward_w3.warmup(b); }
+                if let Some(ref n) = layer.post_ffn_norm {
+                    b.warmup_f32(n.weight.as_slice());
+                }
+                match &layer.mlp_or_moe {
+                    MlpOrMoe::Mlp(mlp) => {
+                        mlp.feed_forward_w1.warmup(b);
+                        mlp.feed_forward_w2.warmup(b);
+                        mlp.feed_forward_w3.warmup(b);
+                    }
+                    MlpOrMoe::UpDown(ud) => {
+                        ud.ffn_up.warmup(b);
+                        ud.ffn_down.warmup(b);
+                    }
+                    MlpOrMoe::MoE { experts, feed_forward_gate_inp, .. } => {
+                        feed_forward_gate_inp.warmup(b);
+                        for exp in experts { exp.feed_forward_w1.warmup(b); exp.feed_forward_w2.warmup(b); exp.feed_forward_w3.warmup(b); }
+                    }
                 }
             }
+            eprintln!("  Weight caches warmed.");
+        } else if swap_active {
+            eprintln!("  QWeight warmup skipped (layer-swap active; manager handles GPU residency).");
         }
-        // Upload persistent tensors to GPU (norm weights, cos/sin, biases).
-        // Full broadcast GPU support enables this (stride-based kernels).
+
+        // Persistent tensor upload runs ALWAYS (even with swap / no-warmup) —
+        // these are small (cos/sin/norm weights/biases) and required by the
+        // forward kernels regardless of QWeight residency strategy.
         #[cfg(feature = "cuda")]
         if b.is_gpu() {
             if let Ok(gpu) = model.norm.weight.to_device_auto() { model.norm.weight = gpu; }
@@ -613,13 +627,9 @@ impl GenericTurboModel {
             // Eager warmup would double VRAM usage (f32 + f16 caches).
         }
 
-        eprintln!("  Weight caches warmed.");
-
         // Note: A.2 (raw_data release after GPU upload) was attempted but caused
         // crashes in CPU fallback paths (e.g. Q6K prefill dequant). Deferred until
         // all forward paths are fully GPU-resident with no CPU fallback.
-
-        } // end if do_warmup
 
         Ok(model)
     }
