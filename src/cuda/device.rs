@@ -147,6 +147,29 @@ impl PartialEq for TqDevice {
     }
 }
 
+/// Query total VRAM on a device via `cuDeviceTotalMem_v2`. Falls back to 0 on
+/// failure — callers should treat 0 as "unknown" and either skip VRAM-based
+/// policies or defer to `TQ_VRAM_MB`.
+#[cfg(feature = "cuda")]
+pub fn total_vram_bytes(ordinal: usize) -> u64 {
+    use cudarc::driver::sys;
+    let mut device: sys::CUdevice = 0;
+    let mut bytes: usize = 0;
+    unsafe {
+        let res = sys::cuDeviceGet(&mut device, ordinal as i32);
+        if res != sys::cudaError_enum::CUDA_SUCCESS {
+            eprintln!("[cuda] cuDeviceGet failed: {:?}", res);
+            return 0;
+        }
+        let res = sys::cuDeviceTotalMem_v2(&mut bytes, device);
+        if res != sys::cudaError_enum::CUDA_SUCCESS {
+            eprintln!("[cuda] cuDeviceTotalMem failed: {:?}", res);
+            return 0;
+        }
+    }
+    bytes as u64
+}
+
 /// Query GPU compute capability via CUDA driver API.
 /// Returns (sm_major, sm_minor), e.g. (8, 6) for RTX 3080.
 /// Falls back to (8, 6) if the query fails.

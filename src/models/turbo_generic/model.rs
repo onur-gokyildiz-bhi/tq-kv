@@ -484,9 +484,22 @@ impl GenericTurboModel {
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
             #[cfg(feature = "cuda")]
-            graph_manager: crate::cuda::graph::CudaGraphManager::new(
-                std::env::var("TQ_GRAPH").map(|v| v == "1").unwrap_or(false)
-            ),
+            // CUDA Graph and layer swap are mutually exclusive: graph replay
+            // captures device addresses, which change every prefetch under
+            // swap. If either TQ_LAYER_SWAP=1 or =force is set, disable graph.
+            graph_manager: crate::cuda::graph::CudaGraphManager::new({
+                let graph_wanted = std::env::var("TQ_GRAPH").map(|v| v == "1").unwrap_or(false);
+                let swap_active = matches!(
+                    std::env::var("TQ_LAYER_SWAP").ok().as_deref(),
+                    Some("1") | Some("force")
+                );
+                if graph_wanted && swap_active {
+                    eprintln!("[cuda] TQ_GRAPH disabled (TQ_LAYER_SWAP active)");
+                    false
+                } else {
+                    graph_wanted
+                }
+            }),
             #[cfg(feature = "cuda")]
             graph_output: None,
             #[cfg(feature = "cuda")]

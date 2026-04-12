@@ -312,6 +312,17 @@ impl LayerSwapManager {
         if self.is_pinned(layer_idx) {
             return;
         }
+        // CRITICAL: block until all compute-stream kernels that consumed this
+        // layer's weights are complete. `evict_gpu` drops the CudaSlice, which
+        // calls cuMemFree synchronously — freeing memory that's still
+        // referenced by a queued kernel would trigger ILLEGAL_ADDRESS.
+        //
+        // A future optimization (Phase 7): record a compute-stream event at
+        // end of each layer and defer eviction until the event is signalled,
+        // so the sync cost can overlap with the next prefetch.
+        if let Err(e) = self.compute_stream.synchronize() {
+            eprintln!("[layer_swap] compute sync before evict L{} failed: {}", layer_idx, e);
+        }
         for qw_ptr in qweight_ptrs {
             let qw = &*qw_ptr.0;
             qw.evict_gpu();

@@ -327,52 +327,96 @@ impl Engine {
 
         // Install LayerSwapManager if swap mode was requested.
         //
-        // Phase 5 MVP: "force" pins EVERY layer — the manager is loaded and
-        // the forward-loop hooks fire, but every layer is resident so no
-        // actual eviction happens. This validates the inject/wait/evict
-        // plumbing end-to-end against a known-good baseline.
+        // TQ_LAYER_SWAP semantics:
+        //   unset / 0 → off (default)
+        //   1         → on only when model doesn't fit in VRAM (opt-in)
+        //   force     → always on, all layers pinned (validation path)
         //
-        // Phase 6 will parse TQ_LAYER_SWAP=1 properly + pick a pin_count based
-        // on VRAM and start leaving the middle layers un-pinned (real swap).
+        // Per feedback (user preference): swap is NEVER auto-enabled on a
+        // fitting model — the tok/s regression would break the default
+        // experience. `1` turns itself off if the model fits.
         #[cfg(feature = "cuda")]
         if swap_active && device.is_cuda() {
-            let mut inner = model;
+            use crate::auto_tq::{decide_layer_swap, pinned_indices};
             use crate::layer_swap::{LayerSwapManager, LayerMeta};
-            let ctx = device.cuda_context().clone();
-            let compute_stream = device.cuda_stream()
-                .map_err(|e| anyhow::anyhow!("layer_swap compute stream: {}", e))?;
-            let n_layers = inner.0.layers.len();
-            // Empty layer_meta — the direct-ptr API doesn't consult it.
-            // Pinned = every layer for the MVP path; Phase 6 relaxes this.
-            let pinned_layers: Vec<usize> = (0..n_layers).collect();
-            let layer_meta: Vec<LayerMeta> = Vec::new();
-            let mut manager = LayerSwapManager::new(
-                ctx,
-                compute_stream,
-                layer_meta,
-                &pinned_layers,
-                2, // n_slots (unused by direct-ptr path)
-            ).map_err(|e| anyhow::anyhow!("layer_swap manager: {}", e))?;
 
-            // Pre-compute QWeight pointers per layer (lives as long as `inner`).
-            let qws_per_layer: Vec<Vec<crate::layer_swap::QWeightPtr>> = inner.0
+            let mut inner = model;
+            let n_layers = inner.0.layers.len();
+
+            // Estimate model bytes: sum of QWeight raw_data lengths.
+            let model_bytes: u64 = inner.0
                 .layers
                 .iter()
-                .map(|l| l.qweight_ptrs())
-                .collect();
+                .flat_map(|l| l.qweights())
+                .map(|qw| qw.raw_data.len() as u64)
+                .sum();
+            // KV cache rough estimate (fp16, first layer as representative).
+            let kv_bytes: u64 = if let Some(l0) = inner.0.layers.first() {
+                let per_token = 2u64 * l0.n_kv_head as u64 * l0.head_dim as u64 * 2;
+                per_token * 4096 * n_layers as u64 // 4K ctx default
+            } else {
+                0
+            };
 
-            // Pin every layer (MVP).
-            for (layer_idx, ptrs) in qws_per_layer.iter().enumerate() {
-                unsafe {
-                    manager.pin_layer_direct(layer_idx, ptrs)
-                        .map_err(|e| anyhow::anyhow!("pin layer {}: {}", layer_idx, e))?;
+            let plan = decide_layer_swap(&device, model_bytes, n_layers, kv_bytes);
+            eprintln!("  Layer-swap plan: {}", plan.reason);
+
+            if !plan.enabled {
+                // e.g. TQ_LAYER_SWAP=1 but model fits. Don't install manager.
+                model = inner;
+            } else {
+                let ctx = device.cuda_context().clone();
+                let compute_stream = device.cuda_stream()
+                    .map_err(|e| anyhow::anyhow!("layer_swap compute stream: {}", e))?;
+                let pinned_layers = pinned_indices(n_layers, plan.pin_count);
+                let layer_meta: Vec<LayerMeta> = Vec::new();
+                let mut manager = LayerSwapManager::new(
+                    ctx,
+                    compute_stream,
+                    layer_meta,
+                    &pinned_layers,
+                    2,
+                ).map_err(|e| anyhow::anyhow!("layer_swap manager: {}", e))?;
+
+                let qws_per_layer: Vec<Vec<crate::layer_swap::QWeightPtr>> = inner.0
+                    .layers
+                    .iter()
+                    .map(|l| l.qweight_ptrs())
+                    .collect();
+
+                // Pin the selected layers at load time (synchronous H2D).
+                for &layer_idx in &pinned_layers {
+                    unsafe {
+                        manager.pin_layer_direct(layer_idx, &qws_per_layer[layer_idx])
+                            .map_err(|e| anyhow::anyhow!("pin layer {}: {}", layer_idx, e))?;
+                    }
                 }
-            }
-            eprintln!("  Layer-swap: all {} layers pinned (MVP validation mode)", n_layers);
 
-            inner.0.layer_swap = Some(manager);
-            inner.0.layer_qweight_ptrs = qws_per_layer;
-            model = inner;
+                // Kick initial prefetch for the first un-pinned layer so the
+                // compute stream has something to wait on at layer 0 if it's
+                // streamed. (No-op if the first layer is pinned.)
+                for layer_idx in 0..n_layers {
+                    if !manager.is_pinned(layer_idx) {
+                        unsafe {
+                            manager.start_prefetch_direct(
+                                layer_idx,
+                                &qws_per_layer[layer_idx],
+                            ).map_err(|e| anyhow::anyhow!("initial prefetch L{}: {}", layer_idx, e))?;
+                        }
+                        break;
+                    }
+                }
+
+                eprintln!(
+                    "  Layer-swap installed: {} pinned, {} streamed",
+                    pinned_layers.len(),
+                    n_layers.saturating_sub(pinned_layers.len()),
+                );
+
+                inner.0.layer_swap = Some(manager);
+                inner.0.layer_qweight_ptrs = qws_per_layer;
+                model = inner;
+            }
         }
 
         let tokenizer = Tokenizer::from_file(tokenizer_path)
