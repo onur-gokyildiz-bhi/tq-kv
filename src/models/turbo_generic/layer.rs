@@ -881,6 +881,21 @@ impl LayerWeights {
                                             Ok(d) => d,
                                             Err(_) => vec![0.0f32; self.n_kv_head * self.head_dim],
                                         }
+                                    } else if let Some(ref v_store) = cache.v_compressed {
+                                        // value_bits > 0: decompress V for this position
+                                        let v_all = super::kv_cache::decompress_values_store(
+                                            v_store, self.n_kv_head, self.head_dim,
+                                            cache.cached_len, q.device(),
+                                        ).ok();
+                                        if let Some(ref vt) = v_all {
+                                            vt.narrow(2, v_offset + pos, 1)
+                                                .and_then(|t| t.to_dtype(DType::F32))
+                                                .and_then(|t| t.flatten_all())
+                                                .and_then(|t| t.to_vec1())
+                                                .unwrap_or_else(|_| vec![0.0f32; self.n_kv_head * self.head_dim])
+                                        } else {
+                                            vec![0.0f32; self.n_kv_head * self.head_dim]
+                                        }
                                     } else {
                                         vec![0.0f32; self.n_kv_head * self.head_dim]
                                     };
@@ -931,13 +946,16 @@ impl LayerWeights {
                                     norms_all.push(cache.k_per_head[h].norms[pos]);
                                 }
                             }
-                            // Extract actual V data for this token from v_raw cache
+                            // Extract V data: prefer v_raw, fall back to live v tensor.
+                            // When value_bits > 0, v_raw is None (V stored in v_compressed).
+                            // The live v tensor has the current token's V in fp32.
                             let v_data = if let Some(ref v_raw) = cache.v_raw {
                                 let vlen = v_raw.dim(2)?;
                                 let last_v = v_raw.narrow(2, vlen - 1, 1)?;
                                 last_v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
                             } else {
-                                vec![0.0f32; self.n_kv_head * self.head_dim]
+                                // v_raw is None (value_bits > 0). Use live v tensor directly.
+                                v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
                             };
                             if use_grouped_bridge {
                                 let _ = gpu.append_grouped(&packed_all, &norms_all, &v_data);
@@ -1531,7 +1549,6 @@ impl LayerWeights {
                     && cache.k_per_head[0].qjl_corrections.is_none()
                     && layer_tq_config.channel_scales.is_none()
                     && layer_tq_config.key_channel_bias.is_none()
-                    && cache.value_bits == 0
                     && self.cos.is_cuda() && self.sin.is_cuda()
                 {
                     if let (Some(reg), Some(ref mut gpu), Some(ref signs)) = (
