@@ -343,11 +343,13 @@ impl Engine {
     where
         F: FnMut(&str),
     {
-        // add_special_tokens=true so chat template tokens like <|im_start|>
-        // are recognized as their actual token IDs (151644 etc) instead of
-        // being split into plain text characters
+        // add_special_tokens: controls whether the tokenizer's post-processor
+        // (BOS/EOS insertion) runs. Chat template special tokens like <|im_start|>
+        // are always recognized via the vocabulary regardless of this flag.
+        // TQ_NO_SPECIAL=1 disables post-processor for debugging.
+        let add_special = !std::env::var("TQ_NO_SPECIAL").ok().map_or(false, |v| v == "1");
         let encoding = self.tokenizer
-            .encode(prompt, true)
+            .encode(prompt, add_special)
             .map_err(|e| anyhow::anyhow!("Tokenize error: {}", e))?;
         let prompt_tokens = encoding.get_ids().to_vec();
 
@@ -356,6 +358,29 @@ impl Engine {
         }
 
         eprintln!("Prompt tokens: {}", prompt_tokens.len());
+
+        // Debug: dump tokenization when TQ_DEBUG_TOKENS=1
+        if std::env::var("TQ_DEBUG_TOKENS").ok().map_or(false, |v| v == "1") {
+            let show = prompt_tokens.len().min(40);
+            eprintln!("[DEBUG-TOK] first {} IDs: {:?}", show, &prompt_tokens[..show]);
+            // Decode each token individually to show what it maps to
+            let mut tok_strs = Vec::new();
+            for &id in &prompt_tokens[..show] {
+                let s = self.tokenizer.decode(&[id], false).unwrap_or_else(|_| format!("?{}", id));
+                tok_strs.push(format!("{}:{:?}", id, s));
+            }
+            eprintln!("[DEBUG-TOK] tokens: {}", tok_strs.join(" | "));
+            // Also show last 10
+            if prompt_tokens.len() > 40 {
+                let tail = &prompt_tokens[prompt_tokens.len()-10..];
+                let mut tail_strs = Vec::new();
+                for &id in tail {
+                    let s = self.tokenizer.decode(&[id], false).unwrap_or_else(|_| format!("?{}", id));
+                    tail_strs.push(format!("{}:{:?}", id, s));
+                }
+                eprintln!("[DEBUG-TOK] last 10: {}", tail_strs.join(" | "));
+            }
+        }
 
         let mut sampler = if params.temperature <= 0.0 {
             Sampler::new(SamplingMode::ArgMax, params.seed)
@@ -376,6 +401,25 @@ impl Engine {
         let logits = self.model.forward(&input, self.position)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         self.position += prompt_tokens.len();
+
+        // Debug: dump top-10 logits after prefill when TQ_DEBUG_TOKENS=1
+        if std::env::var("TQ_DEBUG_TOKENS").ok().map_or(false, |v| v == "1") {
+            let logits_last = extract_last_logits(&logits).ok();
+            let logits_vec: Vec<f32> = logits_last
+                .and_then(|l| l.to_vec1().ok())
+                .unwrap_or_default();
+            if !logits_vec.is_empty() {
+                let mut indexed: Vec<(usize, f32)> = logits_vec.iter().enumerate()
+                    .map(|(i, &v)| (i, v)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top10: Vec<String> = indexed.iter().take(10)
+                    .map(|(id, score)| {
+                        let s = self.tokenizer.decode(&[*id as u32], false).unwrap_or_default();
+                        format!("{}:{:?}({:.2})", id, s, score)
+                    }).collect();
+                eprintln!("[DEBUG-LOGITS] top-10 after prefill: {}", top10.join(" | "));
+            }
+        }
 
         let logits = extract_last_logits(&logits)
             .map_err(|e| anyhow::anyhow!("{}", e))?;

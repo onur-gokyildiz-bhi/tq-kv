@@ -1186,11 +1186,25 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
         }
     };
 
-    // Detect chat template for proper prompt formatting
-    let formatted_prompt = if let Some(entry) = catalog::find(model_name) {
+    // Detect chat template for proper prompt formatting.
+    // TQ_BENCH_SYSTEM=1 adds the system prompt block (disabled by default because
+    // commit 32c2dc5 showed it regressed sentence-completion prompts; worth
+    // re-testing after Bug A/B fixes).
+    let use_system = std::env::var("TQ_BENCH_SYSTEM").ok().map_or(false, |v| v == "1");
+    let raw_prompt = std::env::var("TQ_RAW_PROMPT").ok().map_or(false, |v| v == "1");
+    let formatted_prompt = if raw_prompt {
+        bench_prompt.to_string()
+    } else if let Some(entry) = catalog::find(model_name) {
         let lower = entry.arch.to_lowercase();
         if lower.contains("qwen") {
-            format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", bench_prompt)
+            if use_system {
+                format!(
+                    "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                    bench_prompt
+                )
+            } else {
+                format!("<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", bench_prompt)
+            }
         } else if lower.contains("llama") {
             format!(
                 "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
@@ -1450,9 +1464,12 @@ fn cmd_niah(cli: &Cli) -> Result<()> {
 
     let actual_words = haystack.split_whitespace().count();
 
-    // Plain text completion (chat template tokens cause inference issues)
+    // Cloze-style sentence completion. Plain text (no chat template) — chat
+    // wrapping in greedy mode produces garbage on Qwen2 (see commit 32c2dc5).
+    // The pattern is: state the document, then a sentence whose continuation
+    // is the answer. Model is in pretraining-style next-token mode here.
     let prompt = format!(
-        "{}\n\nBased on the document, the secret project codename is",
+        "{}\n\nThe secret project codename mentioned in the document above is",
         haystack
     );
 
