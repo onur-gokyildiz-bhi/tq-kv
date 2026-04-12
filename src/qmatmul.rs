@@ -438,6 +438,15 @@ impl QMatMul {
         QMatMul::Full(t)
     }
 
+    /// Borrow the inner `QWeight` if this is the `Quantized` variant.
+    /// Used by `LayerSwapManager` to enumerate swappable weights per layer.
+    pub fn as_qweight(&self) -> Option<&QWeight> {
+        match self {
+            QMatMul::Quantized(qw) => Some(qw),
+            QMatMul::Full(_) => None,
+        }
+    }
+
     /// Forward pass: x @ W^T.
     ///
     /// Input x: [batch..., in_features]

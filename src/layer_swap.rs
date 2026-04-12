@@ -47,6 +47,22 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream};
 
 use crate::cuda::{memory::PinnedBuffer, Result, TqError};
 
+/// Send+Sync wrapper around a raw pointer to a `QWeight`.
+///
+/// Needed because the forward loop stashes `*const QWeight` in
+/// `GenericTurboModel::layer_qweight_ptrs`, and the whole `Engine` must be
+/// moveable across threads (e.g. `tokio::task::spawn_blocking` in `serve.rs`).
+/// Pointers are valid as long as the owning `LayerWeights` Vec isn't
+/// reallocated — which never happens after model load.
+#[derive(Copy, Clone)]
+pub struct QWeightPtr(pub *const crate::qmatmul::QWeight);
+
+// SAFETY: QWeight is Sync (SwapCell / OnceLock / UnsafeCell invariants held by
+// single-threaded forward). The raw pointer doesn't add any extra aliasing
+// hazards beyond what a `&QWeight` already has.
+unsafe impl Send for QWeightPtr {}
+unsafe impl Sync for QWeightPtr {}
+
 // ─────────────────────────────────────────────────────────────
 // Per-layer metadata: which bytes (in the host-side source) belong
 // to this layer, and how much GPU space the layer needs.
@@ -98,17 +114,27 @@ pub struct LayerSwapManager {
     transfer_stream: Arc<CudaStream>,
     compute_stream: Arc<CudaStream>,
 
-    /// Double-buffered (or N-buffered) GPU slots.
+    /// Double-buffered (or N-buffered) GPU slots. Reserved for the future
+    /// optimized prefetch path; Phase 5 uses per-weight `clone_htod` instead.
+    #[allow(dead_code)]
     slots: Vec<LayerGpuSlot>,
     /// Staging buffer in pinned host memory. Optional — falls back to pageable.
+    #[allow(dead_code)]
     staging: PinnedBuffer,
 
-    /// Always-resident layers. H2D is performed once at load time; never evicted.
-    pinned: HashMap<usize, Arc<CudaSlice<u8>>>,
+    /// Always-resident layers (never evicted).
+    pinned: std::collections::HashSet<usize>,
 
-    /// Per-layer metadata (indexed by layer_idx).
+    /// Ready events per active (non-pinned) layer — the compute stream waits
+    /// on these before launching that layer's kernels.
+    ready_events: HashMap<usize, CudaEvent>,
+
+    /// Per-layer metadata (indexed by layer_idx). Reserved for the future
+    /// optimized path; the direct-ptr prefetch uses QWeight.raw_data directly.
+    #[allow(dead_code)]
     layer_meta: Vec<LayerMeta>,
     /// Max bytes across all non-pinned layers. Used to size each slot.
+    #[allow(dead_code)]
     bytes_per_layer: usize,
 }
 
@@ -161,8 +187,8 @@ impl LayerSwapManager {
             });
         }
 
-        // Pinned-layer GPU allocations (filled in by `pin_layers`).
-        let pinned = HashMap::with_capacity(pinned_set.len());
+        // Pinned layers tracked by index — QWeights hold their own GPU caches.
+        let pinned = pinned_set;
 
         // Host staging buffer — one layer at a time. Sized to the largest
         // (pinned + non-pinned) layer so either case fits.
@@ -181,182 +207,116 @@ impl LayerSwapManager {
             slots,
             staging,
             pinned,
+            ready_events: HashMap::new(),
             layer_meta,
             bytes_per_layer,
         })
     }
 
-    /// Total bytes pre-allocated in slots (for diagnostics).
-    pub fn slot_footprint_bytes(&self) -> usize {
-        self.slots.len() * self.bytes_per_layer
-    }
-
-    /// Total bytes resident from pinned layers.
-    pub fn pinned_footprint_bytes(&self) -> usize {
-        self.pinned.values().map(|s| s.num_bytes()).sum()
-    }
-
     /// Is this layer always resident?
     pub fn is_pinned(&self, layer_idx: usize) -> bool {
-        self.pinned.contains_key(&layer_idx)
+        self.pinned.contains(&layer_idx)
     }
 
-    /// Copy a single layer's bytes from `src` into a freshly allocated GPU
-    /// buffer on the transfer stream, and store it in `self.pinned`.
+    /// Mark a layer as always resident.
+    pub fn mark_pinned(&mut self, layer_idx: usize) {
+        self.pinned.insert(layer_idx);
+    }
+
+    /// Upload the given layer's QWeight bytes to GPU (via `inject_gpu`) on the
+    /// transfer stream, then block the CPU until the copy completes. Used for
+    /// always-resident ("pinned") layers during model load.
     ///
-    /// `src` must be the whole source buffer (file bytes / mmap). The per-weight
-    /// offsets in `LayerMeta::weights` are interpreted relative to `src`.
-    pub fn pin_layer(&mut self, layer_idx: usize, src: &[u8]) -> Result<()> {
-        let meta = self
-            .layer_meta
-            .iter()
-            .find(|lm| lm.layer_idx == layer_idx)
-            .ok_or_else(|| TqError::Msg(format!("unknown layer {}", layer_idx)))?
-            .clone();
-
-        // Stage into pinned host buffer (ensures one contiguous H2D).
-        self.stage_layer(&meta, src)?;
-
-        // Allocate GPU buffer for this pinned layer.
-        let staging_slice = &self.staging.as_slice()[..meta.total_bytes];
-        let gpu_buf = self
-            .transfer_stream
-            .clone_htod(staging_slice)
-            .map_err(|e| TqError::Msg(format!("pin H2D for layer {}: {}", layer_idx, e)))?;
-
-        // Ensure the copy completes before any forward-stream reads.
+    /// SAFETY: `qweight_ptrs` must remain valid for the duration of this call.
+    /// In practice: pointers into `self.layers[i].qweights()` — valid while
+    /// the model exists.
+    pub unsafe fn pin_layer_direct(
+        &mut self,
+        layer_idx: usize,
+        qweight_ptrs: &[QWeightPtr],
+    ) -> Result<()> {
+        for qw_ptr in qweight_ptrs {
+            let qw = &*qw_ptr.0;
+            let gpu = self
+                .transfer_stream
+                .clone_htod(qw.raw_data.as_slice())
+                .map_err(|e| TqError::Msg(format!("pin H2D layer {}: {}", layer_idx, e)))?;
+            qw.inject_gpu(gpu);
+        }
         self.transfer_stream
             .synchronize()
             .map_err(|e| TqError::Msg(format!("pin sync layer {}: {}", layer_idx, e)))?;
-
-        self.pinned.insert(layer_idx, Arc::new(gpu_buf));
+        self.pinned.insert(layer_idx);
         Ok(())
     }
 
-    /// Kick off an async H2D copy for `layer_idx` into the next free slot.
-    /// Returns immediately; the forward loop must call `wait_for_layer` before
-    /// launching kernels that read the layer's weights.
-    pub fn start_prefetch(&mut self, layer_idx: usize, src: &[u8]) -> Result<()> {
+    /// Async H2D for all QWeights of `layer_idx`. Each weight gets a fresh
+    /// CudaSlice via `clone_htod` (no slot reuse for now). Event recorded on
+    /// the transfer stream; `wait_for_layer` hooks the compute stream on it.
+    ///
+    /// No-op if the layer is pinned.
+    ///
+    /// SAFETY: same as `pin_layer_direct`.
+    pub unsafe fn start_prefetch_direct(
+        &mut self,
+        layer_idx: usize,
+        qweight_ptrs: &[QWeightPtr],
+    ) -> Result<()> {
         if self.is_pinned(layer_idx) {
-            return Ok(()); // already resident, nothing to do
+            return Ok(());
         }
-        let meta = self
-            .layer_meta
-            .iter()
-            .find(|lm| lm.layer_idx == layer_idx)
-            .ok_or_else(|| TqError::Msg(format!("unknown layer {}", layer_idx)))?
-            .clone();
-
-        // Pick a slot: prefer empty, else the least-recently-loaded.
-        let slot_idx = self
-            .slots
-            .iter()
-            .position(|s| s.loaded.is_none())
-            .or_else(|| {
-                // All slots occupied; overwrite slot 0 for now (round-robin
-                // policy to be tuned in Phase 5 based on forward iteration).
-                Some(0)
-            })
-            .unwrap();
-
-        // Stage host bytes.
-        self.stage_layer(&meta, src)?;
-
-        // Async H2D into the slot buffer (memcpy on transfer stream).
-        let staging_slice = &self.staging.as_slice()[..meta.total_bytes];
-        // `buffer` is `Arc<CudaSlice<u8>>`; we need `&mut CudaSlice<u8>` for
-        // memcpy_htod. The Arc here has a single strong count during prefetch
-        // (Phase 5 will share it with QWeights via inject_gpu).
-        {
-            let slot = &mut self.slots[slot_idx];
-            let buf_mut = Arc::get_mut(&mut slot.buffer).ok_or_else(|| {
-                TqError::Msg(format!(
-                    "slot {} buffer still referenced by a prior layer — forgot to evict?",
-                    slot_idx
-                ))
-            })?;
-            self.transfer_stream
-                .memcpy_htod(staging_slice, &mut buf_mut.slice_mut(0..meta.total_bytes))
-                .map_err(|e| TqError::Msg(format!("prefetch H2D layer {}: {}", layer_idx, e)))?;
-
-            // Record event for cross-stream sync.
-            let event = self
+        for qw_ptr in qweight_ptrs {
+            let qw = &*qw_ptr.0;
+            let gpu = self
                 .transfer_stream
-                .record_event(None)
-                .map_err(|e| TqError::Msg(format!("prefetch event layer {}: {}", layer_idx, e)))?;
-            slot.ready = event;
-            slot.loaded = Some(layer_idx);
+                .clone_htod(qw.raw_data.as_slice())
+                .map_err(|e| TqError::Msg(format!("prefetch H2D layer {}: {}", layer_idx, e)))?;
+            qw.inject_gpu(gpu);
         }
+        let event = self
+            .transfer_stream
+            .record_event(None)
+            .map_err(|e| TqError::Msg(format!("prefetch event layer {}: {}", layer_idx, e)))?;
+        self.ready_events.insert(layer_idx, event);
         Ok(())
     }
 
     /// Block the compute stream (not the CPU) on the layer's H2D-ready event.
+    /// Pinned layers are a no-op (already resident).
     pub fn wait_for_layer(&self, layer_idx: usize) -> Result<()> {
         if self.is_pinned(layer_idx) {
             return Ok(());
         }
-        let slot = self
-            .slots
-            .iter()
-            .find(|s| s.loaded == Some(layer_idx))
-            .ok_or_else(|| {
-                TqError::Msg(format!(
-                    "wait_for_layer({}) but no slot holds this layer",
-                    layer_idx
-                ))
-            })?;
-        self.compute_stream
-            .wait(&slot.ready)
-            .map_err(|e| TqError::Msg(format!("wait_for_layer {}: {}", layer_idx, e)))?;
-        Ok(())
-    }
-
-    /// Mark a layer's slot as free (Phase 5 will also call `QWeight::evict_gpu`
-    /// on every QWeight in the layer to drop their `Arc<CudaSlice<u8>>`).
-    pub fn evict_layer(&mut self, layer_idx: usize) {
-        for slot in &mut self.slots {
-            if slot.loaded == Some(layer_idx) {
-                slot.loaded = None;
-            }
+        match self.ready_events.get(&layer_idx) {
+            Some(event) => self
+                .compute_stream
+                .wait(event)
+                .map_err(|e| TqError::Msg(format!("wait_for_layer {}: {}", layer_idx, e))),
+            // No event yet (not prefetched). This is legitimate on first entry
+            // for a non-pinned layer — the forward loop's initial iteration
+            // has no prior prefetch. Skip and rely on the existing
+            // `gpu_cache_or_upload` lazy-init path.
+            None => Ok(()),
         }
     }
 
-    // ─────────────────────────────────────────────────────────
-    // Internals
-    // ─────────────────────────────────────────────────────────
-
-    /// Copy the per-weight byte ranges from `src` into the manager's packed
-    /// staging buffer (pinned, if available).
-    fn stage_layer(&mut self, meta: &LayerMeta, src: &[u8]) -> Result<()> {
-        let dst = self.staging.as_mut_slice();
-        if dst.len() < meta.total_bytes {
-            return Err(TqError::Msg(format!(
-                "staging buffer {} < layer {} bytes",
-                dst.len(),
-                meta.total_bytes
-            )));
+    /// Drop the GPU caches of every QWeight in the layer (swap-mode QWeights
+    /// release their `CudaSlice<u8>`; pinned layers are not evicted).
+    ///
+    /// SAFETY: same as `pin_layer_direct`.
+    pub unsafe fn evict_layer_direct(
+        &mut self,
+        layer_idx: usize,
+        qweight_ptrs: &[QWeightPtr],
+    ) {
+        if self.is_pinned(layer_idx) {
+            return;
         }
-        for w in &meta.weights {
-            let src_end = w.src_offset + w.nbytes;
-            if src_end > src.len() {
-                return Err(TqError::Msg(format!(
-                    "weight {} out of bounds: {}..{} > {}",
-                    w.name,
-                    w.src_offset,
-                    src_end,
-                    src.len()
-                )));
-            }
-            let gpu_end = w.gpu_offset + w.nbytes;
-            if gpu_end > meta.total_bytes {
-                return Err(TqError::Msg(format!(
-                    "weight {} gpu offset {}..{} > layer total {}",
-                    w.name, w.gpu_offset, gpu_end, meta.total_bytes
-                )));
-            }
-            dst[w.gpu_offset..gpu_end].copy_from_slice(&src[w.src_offset..src_end]);
+        for qw_ptr in qweight_ptrs {
+            let qw = &*qw_ptr.0;
+            qw.evict_gpu();
         }
-        Ok(())
+        self.ready_events.remove(&layer_idx);
     }
 }
 

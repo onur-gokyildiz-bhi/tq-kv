@@ -98,6 +98,64 @@ pub(crate) struct LayerWeights {
 }
 
 impl LayerWeights {
+    /// Enumerate every `QWeight` owned by this layer — used by
+    /// `LayerSwapManager` to inject/evict GPU caches per prefetched layer.
+    ///
+    /// Order: attention (q,k,v,o or qkv,o) then MLP (gate,up,down) or
+    /// UpDown (up,down) or MoE (gate_inp,experts…). Biases and RmsNorms
+    /// are small and stay resident — not included here.
+    pub(crate) fn qweights(&self) -> Vec<&crate::qmatmul::QWeight> {
+        let mut out = Vec::with_capacity(8);
+        match &self.qkv {
+            QkvWeights::Separate { wq, wk, wv } => {
+                if let Some(qw) = wq.inner.as_qweight() { out.push(qw); }
+                if let Some(qw) = wk.inner.as_qweight() { out.push(qw); }
+                if let Some(qw) = wv.inner.as_qweight() { out.push(qw); }
+            }
+            QkvWeights::Merged { wqkv } => {
+                if let Some(qw) = wqkv.inner.as_qweight() { out.push(qw); }
+            }
+        }
+        if let Some(qw) = self.attention_wo.inner.as_qweight() { out.push(qw); }
+        match &self.mlp_or_moe {
+            MlpOrMoe::Mlp(m) => {
+                if let Some(qw) = m.feed_forward_w1.inner.as_qweight() { out.push(qw); }
+                if let Some(qw) = m.feed_forward_w2.inner.as_qweight() { out.push(qw); }
+                if let Some(qw) = m.feed_forward_w3.inner.as_qweight() { out.push(qw); }
+            }
+            MlpOrMoe::UpDown(ud) => {
+                if let Some(qw) = ud.ffn_up.inner.as_qweight() { out.push(qw); }
+                if let Some(qw) = ud.ffn_down.inner.as_qweight() { out.push(qw); }
+            }
+            MlpOrMoe::MoE { feed_forward_gate_inp, experts, .. } => {
+                if let Some(qw) = feed_forward_gate_inp.inner.as_qweight() { out.push(qw); }
+                for exp in experts {
+                    if let Some(qw) = exp.feed_forward_w1.inner.as_qweight() { out.push(qw); }
+                    if let Some(qw) = exp.feed_forward_w2.inner.as_qweight() { out.push(qw); }
+                    if let Some(qw) = exp.feed_forward_w3.inner.as_qweight() { out.push(qw); }
+                }
+            }
+        }
+        out
+    }
+
+    /// Same layout as `qweights()` but returns `Send+Sync` raw-pointer wrappers
+    /// (`QWeightPtr`). Used to escape the borrow checker in the forward loop
+    /// when we need to access `self.layers[i+1]`'s QWeights while holding
+    /// `&mut self.layers[i]`, while still permitting the owning `Engine` to
+    /// move across threads (serve.rs' tokio blocking tasks).
+    ///
+    /// SAFETY: caller must ensure the owning `Vec<LayerWeights>` is not
+    /// reallocated while pointers are in use, and only `&self` methods are
+    /// invoked through them.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn qweight_ptrs(&self) -> Vec<crate::layer_swap::QWeightPtr> {
+        self.qweights()
+            .into_iter()
+            .map(|p| crate::layer_swap::QWeightPtr(p as *const _))
+            .collect()
+    }
+
     pub(crate) fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let _enter = self.span_rot.enter();
         let (_b_sz, n_head, seq_len, _head_dim) = x.dims4()?;

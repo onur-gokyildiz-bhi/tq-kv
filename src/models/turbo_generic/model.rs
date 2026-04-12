@@ -65,6 +65,17 @@ pub struct GenericTurboModel {
     /// Pre-allocated scratch buffers for zero-alloc decode (fused kernel path).
     #[cfg(feature = "cuda")]
     pub(crate) decode_scratch: Option<DecodeScratch>,
+    /// Optional layer-swap manager for streaming weights under VRAM pressure.
+    /// `None` = everything pinned at load time (default). Set by engine.rs when
+    /// `TQ_LAYER_SWAP=1|force` is active.
+    #[cfg(feature = "cuda")]
+    pub(crate) layer_swap: Option<crate::layer_swap::LayerSwapManager>,
+    /// Pre-computed QWeight pointers per layer — cached so the forward loop
+    /// can reach layers[i+1]'s weights while holding `&mut layers[i]`.
+    /// `QWeightPtr` is a Send+Sync wrapper so the `Engine` stays `Send`.
+    /// Rebuilt when `layer_swap` is installed.
+    #[cfg(feature = "cuda")]
+    pub(crate) layer_qweight_ptrs: Vec<Vec<crate::layer_swap::QWeightPtr>>,
 }
 
 fn precompute_freqs_cis(
@@ -492,6 +503,10 @@ impl GenericTurboModel {
             arena_decode_count: 0,
             #[cfg(feature = "cuda")]
             decode_scratch: None,
+            #[cfg(feature = "cuda")]
+            layer_swap: None,
+            #[cfg(feature = "cuda")]
+            layer_qweight_ptrs: Vec::new(),
         };
 
         // Allocate DecodeScratch if CUDA is available and model has separate Q4K QKV + standard MLP.
@@ -898,6 +913,15 @@ impl GenericTurboModel {
         #[cfg(not(feature = "cuda"))]
         let graph_replayed = false;
 
+        // Take layer_swap out of self so the inner loop can use it alongside
+        // self.layers.iter_mut().
+        #[cfg(feature = "cuda")]
+        let mut layer_swap = self.layer_swap.take();
+        #[cfg(feature = "cuda")]
+        let layer_qweight_ptrs = std::mem::take(&mut self.layer_qweight_ptrs);
+        #[cfg(feature = "cuda")]
+        let n_layers_total = self.layers.len();
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Hybrid graph replay: skip non-TQ layers (already executed by graph)
             #[cfg(feature = "cuda")]
@@ -906,6 +930,14 @@ impl GenericTurboModel {
                 if !this_is_tq {
                     continue;
                 }
+            }
+
+            // ── Layer-swap wait hook: make compute stream wait for this
+            //    layer's H2D copy (no-op for pinned layers / swap disabled).
+            #[cfg(feature = "cuda")]
+            if let Some(ref sm) = layer_swap {
+                sm.wait_for_layer(layer_idx)
+                    .expect("layer_swap wait_for_layer failed");
             }
 
             let x = layer_in;
@@ -1529,6 +1561,35 @@ impl GenericTurboModel {
                         layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
                 }
             }
+
+            // ── Layer-swap post-hook: evict current, prefetch next.
+            //    For pinned layers these are no-ops. The pointer cache lets us
+            //    reach layers[i+1]'s QWeights without triggering a borrow
+            //    conflict with the ongoing `self.layers.iter_mut()` loop.
+            #[cfg(feature = "cuda")]
+            if let Some(ref mut sm) = layer_swap {
+                if layer_idx < layer_qweight_ptrs.len() {
+                    unsafe {
+                        sm.evict_layer_direct(layer_idx, &layer_qweight_ptrs[layer_idx]);
+                    }
+                }
+                let next = layer_idx + 1;
+                if next < n_layers_total && next < layer_qweight_ptrs.len() {
+                    // SAFETY: pointers valid while self (and hence self.layers) lives.
+                    if let Err(e) = unsafe {
+                        sm.start_prefetch_direct(next, &layer_qweight_ptrs[next])
+                    } {
+                        eprintln!("[layer_swap] prefetch L{} failed: {}", next, e);
+                    }
+                }
+            }
+        }
+
+        // Restore layer_swap + pointer cache after the loop.
+        #[cfg(feature = "cuda")]
+        {
+            self.layer_swap = layer_swap;
+            self.layer_qweight_ptrs = layer_qweight_ptrs;
         }
 
         // Restore scratch buffers back into self after layer loop.

@@ -248,13 +248,32 @@ impl Engine {
         };
         eprintln!("Device: {}", if device.is_cuda() { "CUDA GPU" } else { "CPU" });
 
+        // TQ_LAYER_SWAP: opt-in layer streaming. Must be processed BEFORE weight
+        // construction so SwapCell picks swap mode at QWeight::new time.
+        //   =0 (default) → standard resident weights
+        //   =force       → enable swap; Phase 5 pins all layers (validates plumbing)
+        //   =1           → enable swap; Phase 6 will compute pin_count from VRAM
+        #[cfg(feature = "cuda")]
+        let layer_swap_mode = std::env::var("TQ_LAYER_SWAP").ok();
+        #[cfg(feature = "cuda")]
+        let swap_active = matches!(layer_swap_mode.as_deref(), Some("force") | Some("1"));
+        #[cfg(feature = "cuda")]
+        if swap_active && device.is_cuda() {
+            eprintln!(
+                "Layer-swap mode: {} (note: incompatible with CUDA Graph)",
+                layer_swap_mode.as_deref().unwrap_or("?")
+            );
+            crate::qmatmul::enable_layer_swap();
+        }
+
         eprintln!("Loading model: {}", model_path.display());
 
         // Detect format: safetensors directory or GGUF file
         let is_safetensors = model_path.is_dir()
             || model_path.extension().map_or(false, |ext| ext == "safetensors");
 
-        let model = if is_safetensors {
+        #[allow(unused_mut)]
+        let mut model = if is_safetensors {
             // Safetensors (FP16/BF16) path
             let model_dir = if model_path.is_dir() {
                 model_path.to_path_buf()
@@ -305,6 +324,56 @@ impl Engine {
             ModelWeights(w)
         };
         eprintln!("Model loaded!");
+
+        // Install LayerSwapManager if swap mode was requested.
+        //
+        // Phase 5 MVP: "force" pins EVERY layer — the manager is loaded and
+        // the forward-loop hooks fire, but every layer is resident so no
+        // actual eviction happens. This validates the inject/wait/evict
+        // plumbing end-to-end against a known-good baseline.
+        //
+        // Phase 6 will parse TQ_LAYER_SWAP=1 properly + pick a pin_count based
+        // on VRAM and start leaving the middle layers un-pinned (real swap).
+        #[cfg(feature = "cuda")]
+        if swap_active && device.is_cuda() {
+            let mut inner = model;
+            use crate::layer_swap::{LayerSwapManager, LayerMeta};
+            let ctx = device.cuda_context().clone();
+            let compute_stream = device.cuda_stream()
+                .map_err(|e| anyhow::anyhow!("layer_swap compute stream: {}", e))?;
+            let n_layers = inner.0.layers.len();
+            // Empty layer_meta — the direct-ptr API doesn't consult it.
+            // Pinned = every layer for the MVP path; Phase 6 relaxes this.
+            let pinned_layers: Vec<usize> = (0..n_layers).collect();
+            let layer_meta: Vec<LayerMeta> = Vec::new();
+            let mut manager = LayerSwapManager::new(
+                ctx,
+                compute_stream,
+                layer_meta,
+                &pinned_layers,
+                2, // n_slots (unused by direct-ptr path)
+            ).map_err(|e| anyhow::anyhow!("layer_swap manager: {}", e))?;
+
+            // Pre-compute QWeight pointers per layer (lives as long as `inner`).
+            let qws_per_layer: Vec<Vec<crate::layer_swap::QWeightPtr>> = inner.0
+                .layers
+                .iter()
+                .map(|l| l.qweight_ptrs())
+                .collect();
+
+            // Pin every layer (MVP).
+            for (layer_idx, ptrs) in qws_per_layer.iter().enumerate() {
+                unsafe {
+                    manager.pin_layer_direct(layer_idx, ptrs)
+                        .map_err(|e| anyhow::anyhow!("pin layer {}: {}", layer_idx, e))?;
+                }
+            }
+            eprintln!("  Layer-swap: all {} layers pinned (MVP validation mode)", n_layers);
+
+            inner.0.layer_swap = Some(manager);
+            inner.0.layer_qweight_ptrs = qws_per_layer;
+            model = inner;
+        }
 
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Tokenizer load error: {}", e))?;
