@@ -539,7 +539,11 @@ impl GpuCompressedKv {
 /// the oldest cold tokens can be spilled to the CPU OffloadedKvCache.
 #[cfg(feature = "cuda")]
 pub(crate) struct GpuColdKv {
-    /// Packed indices: [n_kv_head, max_cold, bytes_per_key]
+    /// Post-RoPE decompressed keys: [n_kv_head, max_cold, head_dim].
+    /// Stored as full f32 (not compressed) from decomp_cache at eviction time.
+    /// No decompress or RoPE needed on retrieval — just read and cat.
+    pub(crate) k_data: cudarc::driver::CudaSlice<f32>,
+    /// Packed indices: [n_kv_head, max_cold, bytes_per_key] (kept for fused scoring)
     pub(crate) packed_indices: cudarc::driver::CudaSlice<u8>,
     /// Per-group norms: [n_kv_head, max_cold, n_groups]
     pub(crate) gnorms: cudarc::driver::CudaSlice<f32>,
@@ -574,6 +578,8 @@ impl GpuColdKv {
             head_dim / group_size
         } else { 1 };
 
+        let k_data = stream.alloc_zeros::<f32>(n_kv_head * max_cold * head_dim)
+            .map_err(|e| crate::cuda::TqError::Msg(format!("cold k_data: {}", e)))?;
         let packed = stream.alloc_zeros::<u8>(n_kv_head * max_cold * bytes_per_key)
             .map_err(|e| crate::cuda::TqError::Msg(format!("cold packed: {}", e)))?;
         let gnorms = stream.alloc_zeros::<f32>(n_kv_head * max_cold * n_groups)
@@ -581,12 +587,13 @@ impl GpuColdKv {
         let v_data = stream.alloc_zeros::<f32>(n_kv_head * max_cold * head_dim)
             .map_err(|e| crate::cuda::TqError::Msg(format!("cold v_data: {}", e)))?;
 
-        let cold_mb = (n_kv_head * max_cold * bytes_per_key
-            + n_kv_head * max_cold * n_groups * 4
-            + n_kv_head * max_cold * head_dim * 4) as f64 / (1024.0 * 1024.0);
-        eprintln!("[gpu-cold] allocated {:.1}MB for {} cold slots", cold_mb, max_cold);
+        let cold_mb = (n_kv_head * max_cold * head_dim * 4 * 2  // k_data + v_data
+            + n_kv_head * max_cold * bytes_per_key
+            + n_kv_head * max_cold * n_groups * 4) as f64 / (1024.0 * 1024.0);
+        eprintln!("[gpu-cold] allocated {:.1}MB for {} cold slots (post-RoPE K + V + compressed)", cold_mb, max_cold);
 
         Ok(Self {
+            k_data,
             packed_indices: packed,
             gnorms,
             v_data,
@@ -662,6 +669,34 @@ impl GpuColdKv {
 
         self.seq_positions.push(seq_pos);
         self.count += 1;
+        Ok(())
+    }
+
+    /// D2D copy a post-RoPE decompressed key from hot decomp_cache to cold k_data.
+    /// `hot_decomp` is `[n_kv_head, max_seq_hot, head_dim]` strided buffer.
+    /// This stores the DECOMPRESSED post-RoPE K so retrieval needs zero work.
+    pub(crate) fn push_decomp_key(
+        &mut self,
+        hot_decomp: &cudarc::driver::CudaSlice<f32>,
+        hot_idx: usize,
+        max_seq_hot: usize,
+    ) -> std::result::Result<(), crate::cuda::TqError> {
+        if self.count == 0 { return Ok(()); } // push_from_hot must be called first
+        let cold_pos = self.count - 1; // last pushed position
+        let hd = self.head_dim;
+        let mc = self.max_cold;
+        let raw_stream = self.stream.cu_stream();
+
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use cudarc::driver::sys;
+
+        let (src_base, _) = hot_decomp.device_ptr(self.stream.as_ref());
+        let (dst_base, _) = self.k_data.device_ptr(self.stream.as_ref());
+        for h in 0..self.n_kv_head {
+            let src = src_base + ((h * max_seq_hot + hot_idx) * hd * 4) as u64;
+            let dst = dst_base + ((h * mc + cold_pos) * hd * 4) as u64;
+            unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, hd * 4, raw_stream); }
+        }
         Ok(())
     }
 }

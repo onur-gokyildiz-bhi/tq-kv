@@ -1119,11 +1119,20 @@ impl LayerWeights {
                                             }
 
                                             // D2D copy evicted tokens to cold tier
+                                            // (compressed K+V for fused scoring + post-RoPE K from decomp_cache)
                                             if let Some(ref mut cold) = self.gpu_cold_cache {
+                                                let ms_hot = gpu.max_seq;
+                                                let has_decomp = gpu.decomp_count > 0;
                                                 for &idx in &evicted_indices {
                                                     let seq_pos = cache.tri_key_positions
                                                         .get(sink_n + idx).copied().unwrap_or(0);
                                                     let _ = cold.push_from_hot(gpu, idx, seq_pos);
+                                                    // Also copy post-RoPE decompressed K if available
+                                                    if has_decomp && idx < gpu.decomp_count {
+                                                        let _ = cold.push_decomp_key(
+                                                            &gpu.decomp_cache, idx, ms_hot,
+                                                        );
+                                                    }
                                                 }
                                             }
 
@@ -1640,9 +1649,9 @@ impl LayerWeights {
                             }
                             if let Some(kh) = k_hot { k_parts_gpu.push(kh); }
 
-                            // Sprint F: retrieve from GPU cold tier (D2D, no CPU).
-                            // Decompress cold K on GPU, apply RoPE, include in attention.
-                            // Falls back to CPU offload if no GPU cold cache.
+                            // Sprint F: retrieve from GPU cold tier — ZERO CPU involvement.
+                            // Cold tier stores post-RoPE decompressed K (from decomp_cache
+                            // at eviction time). Just gather contiguously and cat into K_full.
                             let mut n_retrieved = 0usize;
                             #[cfg(feature = "cuda")]
                             if super::kv_cache::get_offload_enabled() {
@@ -1651,46 +1660,19 @@ impl LayerWeights {
                                         let n_cold = cold.count;
                                         let mc = cold.max_cold;
 
-                                        // GPU decompress cold keys → contiguous buffer
+                                        // Gather contiguous K from strided cold.k_data
+                                        // (post-RoPE, no decompress or RoPE needed)
                                         let mut cold_k_buf = reg.stream.alloc_zeros::<f32>(
                                             self.n_kv_head * n_cold * hdim
                                         ).map_err(|e| TqError::Msg(format!("cold k buf: {}", e)))?;
-                                        crate::cuda::kernels::tq_decompress_keys_grouped(
-                                            reg, &cold.packed_indices, &cold.gnorms,
-                                            &gpu.centroids, signs, &mut cold_k_buf,
-                                            self.n_kv_head, n_cold, hdim,
-                                            cold.group_size, cold.bits as usize, mc,
-                                            0, n_cold, // key_offset=0, out_stride=n_cold (contiguous)
-                                        ).map_err(|e| TqError::Msg(format!("cold decompress: {e}")))?;
-
-                                        // Apply RoPE to cold keys (pre-RoPE → post-RoPE)
-                                        if cache.pre_rope && !cold.seq_positions.is_empty() {
-                                            // Upload positions, apply per-token RoPE
-                                            // For now: CPU-side RoPE on downloaded cold K
-                                            // (GPU strided RoPE needs positions array — future)
-                                            let mut cold_k_cpu: Vec<f32> = reg.stream.clone_dtoh(&cold_k_buf)
-                                                .map_err(|e| TqError::Msg(format!("cold k dtoh: {}", e)))?;
-                                            let cos_data = self.cos.as_slice();
-                                            let sin_data = self.sin.as_slice();
-                                            let half = self.rope_dim / 2;
-                                            for h in 0..self.n_kv_head {
-                                                for (ti, &pos) in cold.seq_positions.iter().enumerate() {
-                                                    if pos * half + half > cos_data.len() { continue; }
-                                                    let cos_row = &cos_data[pos * half..pos * half + half];
-                                                    let sin_row = &sin_data[pos * half..pos * half + half];
-                                                    let off = (h * n_cold + ti) * hdim;
-                                                    for i in 0..half {
-                                                        let x0 = cold_k_cpu[off + i];
-                                                        let x1 = cold_k_cpu[off + i + half];
-                                                        cold_k_cpu[off + i] = x0 * cos_row[i] - x1 * sin_row[i];
-                                                        cold_k_cpu[off + i + half] = x0 * sin_row[i] + x1 * cos_row[i];
-                                                    }
-                                                }
-                                            }
-                                            // Re-upload RoPE'd keys
-                                            cold_k_buf = reg.stream.clone_htod(&cold_k_cpu)
-                                                .map_err(|e| TqError::Msg(format!("cold k htod: {}", e)))?;
-                                        }
+                                        crate::cuda::kernels::strided_copy_args(
+                                            reg, &cold.k_data, &mut cold_k_buf,
+                                            self.n_kv_head * n_cold * hdim, 3,
+                                            &[(self.n_kv_head as i32), (n_cold as i32), (hdim as i32)],
+                                            &[((n_cold * hdim) as i32), (hdim as i32), 1],
+                                            &[((mc * hdim) as i32), (hdim as i32), 1],
+                                            0,
+                                        ).map_err(|e| TqError::Msg(format!("cold k gather: {e}")))?;
 
                                         k_parts_gpu.push(Tensor::from_cuda(
                                             cold_k_buf, vec![1, self.n_kv_head, n_cold, hdim], stream.clone(),
