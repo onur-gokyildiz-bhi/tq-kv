@@ -47,6 +47,16 @@ pub const CATALOG: &[CatalogEntry] = &[
     },
     CatalogEntry {
         name: "qwen2",
+        tag: "7b-q6k",
+        display: "Qwen2.5 7B Instruct (Q6_K)",
+        hf_repo: "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        filename: "Qwen2.5-7B-Instruct-Q6_K.gguf",
+        tokenizer_repo: "Qwen/Qwen2.5-7B-Instruct",
+        size_gb: 5.5,
+        arch: "qwen2",
+    },
+    CatalogEntry {
+        name: "qwen2",
         tag: "72b",
         display: "Qwen2.5 72B Instruct",
         hf_repo: "bartowski/Qwen2.5-72B-Instruct-GGUF",

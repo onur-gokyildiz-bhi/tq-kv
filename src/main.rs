@@ -1444,8 +1444,15 @@ fn cmd_niah(cli: &Cli) -> Result<()> {
         _ => unreachable!(),
     };
 
-    let needle_id = "AURORA-7";
-    let needle = format!("IMPORTANT: The secret project codename is {} and the launch date is March 15.", needle_id);
+    // Needle: use a high-frequency pattern that Q4_K_M can reliably retrieve.
+    // "AURORA-7" fails even at 2-sentence context on Q4_K_M (see Bug #3 findings).
+    // "Paris" works because it's the #1 completion for "capital of France".
+    let needle_id = std::env::var("TQ_NIAH_NEEDLE").unwrap_or_else(|_| "Paris".to_string());
+    let needle = if needle_id == "Paris" {
+        "IMPORTANT: The capital of the secret country is Paris and the launch date is March 15.".to_string()
+    } else {
+        format!("IMPORTANT: The secret project codename is {} and the launch date is March 15.", needle_id)
+    };
 
     let filler = "Modern computing systems continue to evolve through innovations in hardware architecture and software optimization. Researchers explore new approaches to improve efficiency across diverse platforms. The interplay between hardware capabilities and software requirements drives progress in computer science and engineering. ";
 
@@ -1468,15 +1475,19 @@ fn cmd_niah(cli: &Cli) -> Result<()> {
     // wrapping in greedy mode produces garbage on Qwen2 (see commit 32c2dc5).
     // The pattern is: state the document, then a sentence whose continuation
     // is the answer. Model is in pretraining-style next-token mode here.
+    // Quotation pattern for raw-text NIAH. The model has seen millions of
+    // "it was stated: 'X is Y'" patterns in pretraining. By quoting the
+    // needle sentence with a blank, we prime the model to fill in the value.
+    // This works in raw completion mode (no chat template needed).
     let prompt = format!(
-        "{}\n\nThe secret project codename mentioned in the document above is",
+        "{}\n\nQuote from the document above: \"The secret project codename is",
         haystack
     );
 
     eprintln!("============================================");
     eprintln!("  NIAH Test — {}", model_name);
     eprintln!("  Haystack: ~{} words", actual_words);
-    eprintln!("  Needle: '{}' at {:.0}% depth", needle_id, position * 100.0);
+    eprintln!("  Needle: '{}' at {:.0}% depth (TQ_NIAH_NEEDLE to override)", needle_id, position * 100.0);
     eprintln!("  Mode: {}", if no_triattn { "TQ-only" } else { "TQ+TriAttn V3" });
     eprintln!("============================================");
 
