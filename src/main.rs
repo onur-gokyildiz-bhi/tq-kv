@@ -8,6 +8,7 @@ pub mod cuda;
 pub mod gguf;
 pub mod quant;
 pub mod qmatmul;
+pub mod safetensors_src;
 pub mod sampling;
 #[allow(dead_code)]
 mod diagnostics;

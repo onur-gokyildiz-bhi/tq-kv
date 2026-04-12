@@ -1762,10 +1762,11 @@ impl GenericTurboModel {
     /// * `device` - Target device
     /// * `tq_config` - TurboQuant configuration
     pub fn from_safetensors(
-        _model_dir: &std::path::Path,
-        _device: &Device,
-        _tq_config: TurboQuantConfig,
+        model_dir: &std::path::Path,
+        device: &Device,
+        tq_config: TurboQuantConfig,
     ) -> Result<Self> {
-        bail!("safetensors loading not yet implemented for tq-cuda backend")
+        let src = crate::safetensors_src::SafetensorsContent::open(model_dir)?;
+        Self::build(&src, device, tq_config)
     }
 }
