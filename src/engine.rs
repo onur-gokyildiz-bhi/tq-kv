@@ -23,6 +23,12 @@ impl ModelWeights {
     fn forward(&mut self, x: &Tensor, pos: usize) -> crate::cuda::Result<Tensor> {
         self.0.forward(x, pos)
     }
+    fn forward_partial(&mut self, x: &Tensor, n_layers: usize, pos: usize) -> crate::cuda::Result<Tensor> {
+        self.0.forward_partial(x, n_layers, pos)
+    }
+    fn truncate_kv_cache(&mut self, target_len: usize) {
+        self.0.truncate_kv_cache(target_len);
+    }
 }
 
 /// Generation parameters.
@@ -509,6 +515,137 @@ impl Engine {
             print!("{}", token);
             let _ = std::io::stdout().flush();
         })
+    }
+
+    /// Self-speculative decoding: first N layers as draft, full model verifies.
+    /// No separate draft model — reuses the same model's early layers.
+    ///
+    /// Draft: forward_partial(draft_layers) produces candidate token at ~25% compute.
+    /// Verify: full forward on candidate. If argmax matches, accept + advance.
+    /// If mismatch: use verify's token, truncate draft KV, retry.
+    ///
+    /// Returns (output_text, avg_accepted_per_step).
+    pub fn self_speculative_generate<F>(
+        &mut self,
+        prompt: &str,
+        params: &GenerationParams,
+        draft_layers: usize,
+        spec_k: usize,
+        mut on_token: F,
+    ) -> Result<(String, f64)>
+    where
+        F: FnMut(&str),
+    {
+        let add_special = !std::env::var("TQ_NO_SPECIAL").ok().map_or(false, |v| v == "1");
+        let encoding = self.tokenizer.encode(prompt, add_special)
+            .map_err(|e| anyhow::anyhow!("Tokenize: {}", e))?;
+        let prompt_tokens = encoding.get_ids().to_vec();
+        if prompt_tokens.is_empty() { anyhow::bail!("Empty prompt"); }
+
+        eprintln!("Self-spec: draft_layers={}, K={}, prompt={} tokens",
+            draft_layers, spec_k, prompt_tokens.len());
+
+        let mut sampler = Sampler::new(SamplingMode::ArgMax, params.seed);
+
+        // Prefill with full model
+        self.position = 0;
+        let input = self.make_input(&prompt_tokens).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let logits = self.model.forward(&input, self.position).map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.position += prompt_tokens.len();
+        let logits = extract_last_logits(&logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut next_token = sampler.sample(&logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let mut output = String::new();
+        let mut all_tokens: Vec<u32> = Vec::new();
+        let mut prev_decoded_len = 0;
+        let mut n_generated = 0u32;
+        let mut total_accepted = 0u64;
+        let mut total_steps = 0u64;
+
+        while n_generated < params.max_tokens {
+            if self.eos_token_ids.contains(&next_token) { break; }
+
+            // Accept the token from previous verify (or prefill)
+            all_tokens.push(next_token);
+            let full_text = self.tokenizer.decode(&all_tokens, true).unwrap_or_default();
+            if full_text.len() > prev_decoded_len {
+                on_token(&full_text[prev_decoded_len..]);
+                output.push_str(&full_text[prev_decoded_len..]);
+            }
+            prev_decoded_len = full_text.len();
+            n_generated += 1;
+
+            // Draft phase: generate spec_k candidates using partial forward
+            let mut draft_tokens = Vec::with_capacity(spec_k);
+            let mut draft_token = next_token;
+            let draft_start_pos = self.position;
+            for _ in 0..spec_k {
+                let input = self.make_input(&[draft_token]).map_err(|e| anyhow::anyhow!("{}", e))?;
+                let logits = self.model.forward_partial(&input, draft_layers, self.position)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                self.position += 1;
+                let logits = extract_last_logits(&logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+                draft_token = sampler.sample(&logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+                draft_tokens.push(draft_token);
+                if self.eos_token_ids.contains(&draft_token) { break; }
+            }
+
+            // Verify phase: run full model on each draft token sequentially
+            // (batch verify would be faster but requires careful KV management)
+            self.position = draft_start_pos;
+            // Truncate draft-layer KV back to draft_start_pos
+            self.model.truncate_kv_cache(draft_start_pos);
+
+            let mut accepted = 0usize;
+            let mut verify_token = next_token; // the already-accepted token
+            for &dt in &draft_tokens {
+                let input = self.make_input(&[verify_token]).map_err(|e| anyhow::anyhow!("{}", e))?;
+                let logits = self.model.forward(&input, self.position)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                self.position += 1;
+                let logits = extract_last_logits(&logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+                let target_token = sampler.sample(&logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                if target_token == dt {
+                    // Match — accept draft token
+                    all_tokens.push(dt);
+                    let full_text = self.tokenizer.decode(&all_tokens, true).unwrap_or_default();
+                    if full_text.len() > prev_decoded_len {
+                        on_token(&full_text[prev_decoded_len..]);
+                        output.push_str(&full_text[prev_decoded_len..]);
+                    }
+                    prev_decoded_len = full_text.len();
+                    n_generated += 1;
+                    accepted += 1;
+                    verify_token = dt;
+                    if self.eos_token_ids.contains(&dt) { break; }
+                } else {
+                    // Mismatch — use target's token, discard remaining drafts
+                    next_token = target_token;
+                    break;
+                }
+            }
+
+            // If all draft tokens accepted, get next from last verify
+            if accepted == draft_tokens.len() {
+                let input = self.make_input(&[verify_token]).map_err(|e| anyhow::anyhow!("{}", e))?;
+                let logits = self.model.forward(&input, self.position)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                self.position += 1;
+                let logits = extract_last_logits(&logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+                next_token = sampler.sample(&logits).map_err(|e| anyhow::anyhow!("{}", e))?;
+            }
+
+            // Truncate KV to current accepted position
+            self.model.truncate_kv_cache(self.position);
+
+            total_accepted += accepted as u64;
+            total_steps += 1;
+        }
+
+        let avg_accepted = if total_steps > 0 { total_accepted as f64 / total_steps as f64 } else { 0.0 };
+        eprintln!("Self-spec: {} tokens, {:.1} accepted/step", n_generated, avg_accepted);
+        Ok((output, avg_accepted))
     }
 
     /// Speculative decoding: draft model proposes K tokens, target model verifies in one pass.

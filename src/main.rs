@@ -1273,6 +1273,31 @@ fn cmd_bench(cli: &Cli) -> Result<()> {
             tri_result.tok_per_sec, tri_result.total_secs, tri_result.ttft_secs);
     }
 
+    // --- Self-speculative decoding (TQ_SELF_SPEC=<n_layers>, e.g. TQ_SELF_SPEC=8) ---
+    if let Ok(draft_layers_str) = std::env::var("TQ_SELF_SPEC") {
+        if let Ok(draft_layers) = draft_layers_str.parse::<usize>() {
+            let spec_k_self = std::env::var("TQ_SPEC_K").ok()
+                .and_then(|v| v.parse().ok()).unwrap_or(3usize);
+            if !json_output {
+                eprintln!("Self-speculative decode: draft_layers={}, K={}...", draft_layers, spec_k_self);
+            }
+            engine_tri.clear_cache();
+            engine_tri.model.0.clear_kv_cache();
+            let t0 = std::time::Instant::now();
+            let (spec_output, avg_accepted) = engine_tri.self_speculative_generate(
+                &formatted_prompt, &gen_params, draft_layers, spec_k_self,
+                |_| {},
+            )?;
+            let elapsed = t0.elapsed().as_secs_f64();
+            let spec_tokens = engine_tri.tokenizer.encode(&*spec_output, false)
+                .map(|e| e.get_ids().len() as u32).unwrap_or(0);
+            if !json_output {
+                eprintln!("  Self-spec (L={}): {:.1} tok/s, {:.1} accepted/step, {} tokens in {:.2}s",
+                    draft_layers, spec_tokens as f64 / elapsed, avg_accepted, spec_tokens, elapsed);
+            }
+        }
+    }
+
     // --- Speculative decoding (optional, uses TQ+TriAttn engine) ---
     let _spec_result = if let Some(draft_name) = draft_model {
         if !json_output {
