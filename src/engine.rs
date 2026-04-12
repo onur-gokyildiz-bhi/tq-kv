@@ -305,10 +305,32 @@ impl Engine {
             if compressed {
                 eprintln!("TurboQuant: {}-bit KV cache", tq.bits);
             }
-            // TQ_MMAP=1: memory-mapped GGUF (zero-copy into GPU, lower RSS).
-            let use_mmap = std::env::var("TQ_MMAP").ok().as_deref() == Some("1");
+            // Memory-mapped GGUF path: zero-copy into GPU, no CPU Vec<u8>.
+            //
+            // Enabled explicitly via TQ_MMAP=1, OR implicitly when layer-swap
+            // is active. Under swap we MUST keep raw_data around (for prefetch
+            // re-upload), and an Owned Vec<u8> costs ~full model size on CPU
+            // RAM — e.g. 18.5 GB for Qwen2.5-32B Q4_K_M, which caused a 40 GB
+            // RSS regression observed on 2026-04-13. The mmap-backed RawBytes
+            // variant keeps raw_data as zero-copy slices into the file, so
+            // the OS pages in/out on demand and peak RSS stays around a few
+            // GB instead of model-size.
+            #[cfg(feature = "cuda")]
+            let swap_active_mmap = matches!(
+                std::env::var("TQ_LAYER_SWAP").ok().as_deref(),
+                Some("1") | Some("force")
+            ) && device.is_cuda();
+            #[cfg(not(feature = "cuda"))]
+            let swap_active_mmap = false;
+
+            let use_mmap = std::env::var("TQ_MMAP").ok().as_deref() == Some("1")
+                || swap_active_mmap;
             let w = if use_mmap {
-                eprintln!("GGUF mmap mode (TQ_MMAP=1)");
+                if std::env::var("TQ_MMAP").ok().as_deref() == Some("1") {
+                    eprintln!("GGUF mmap mode (TQ_MMAP=1)");
+                } else {
+                    eprintln!("GGUF mmap mode (auto-enabled for TQ_LAYER_SWAP)");
+                }
                 let src = crate::gguf::GgufMmapSource::open(model_path)
                     .map_err(|e| anyhow::anyhow!("GGUF mmap error: {}", e))?;
                 turbo_generic::GenericTurboModel::build_from_source(&src, &device, tq)
