@@ -771,6 +771,238 @@ impl GenericTurboModel {
         self.masks_rect.clear();
     }
 
+    /// Compute token embedding (with optional Gemma sqrt-hidden scale),
+    /// upload to GPU for GPU-resident forward, and (when graph capture is
+    /// in progress) snapshot the embedding into a dedicated long-lived
+    /// buffer so the captured graph can replay against the same address.
+    fn prepare_embedding(
+        &mut self,
+        x: &Tensor,
+        backend: &dyn ComputeBackend,
+        #[cfg(feature = "cuda")] capturing: bool,
+        #[cfg(feature = "cuda")] recording: bool,
+    ) -> Result<Tensor> {
+        let mut layer_in = self.tok_embeddings.forward(x)?;
+        // Gemma: scale embeddings by sqrt(hidden_dim).
+        if let Some(scale) = self.embed_scale {
+            let data = layer_in.as_slice();
+            let scaled: Vec<f32> = data.iter().map(|&v| v * scale).collect();
+            layer_in = Tensor::from_vec(scaled, layer_in.shape().to_vec(), layer_in.device())?;
+        }
+
+        // Phase 3: upload embedding to GPU for GPU-resident forward pass.
+        // All subsequent ops auto-dispatch to GPU when tensor is CUDA.
+        #[cfg(feature = "cuda")]
+        if backend.is_gpu() {
+            if let Ok(gpu_tensor) = layer_in.to_device_auto() {
+                layer_in = gpu_tensor;
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = backend;
+
+        // Save input buffer for graph replay. Must be a SEPARATE allocation
+        // (not Arc::clone of layer_in) so graph_input_buffer always has
+        // refcount=1 and Arc::get_mut succeeds on replay without cloning
+        // to a new address.
+        #[cfg(feature = "cuda")]
+        if capturing || recording {
+            if layer_in.is_cuda() {
+                if let Some(reg) = crate::cuda::kernels::global_registry() {
+                    let src = layer_in.cuda_data();
+                    let n = layer_in.elem_count();
+                    if self.graph_input_buffer.is_none() {
+                        if let Ok(buf) = crate::cuda::gpu_alloc_zeros_pub(&reg.stream, n) {
+                            self.graph_input_buffer = Some(std::sync::Arc::new(buf));
+                        }
+                    }
+                    if let Some(ref mut buf) = self.graph_input_buffer {
+                        let dst = std::sync::Arc::get_mut(buf).expect("graph_input_buffer shared");
+                        let _ = reg.stream.memcpy_dtod(src, dst);
+                        layer_in = Tensor::from_cuda_arc(
+                            buf.clone(), layer_in.shape().to_vec(), reg.stream.clone(),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(layer_in)
+    }
+
+    /// Try to replay the captured layer-loop graph for single-token decode.
+    /// Returns `true` if replay happened (caller skips the layer loop body
+    /// for non-TQ layers but still runs norm + lm_head eagerly), `false`
+    /// otherwise. Skipped above kv_len > 256 so flash-decode (split-KV)
+    /// can be used on long contexts where the single-block gqa_decode in
+    /// the captured graph would be too slow.
+    #[cfg(feature = "cuda")]
+    fn try_replay_layer_loop_graph(
+        &mut self,
+        x: &Tensor,
+        index_pos: usize,
+        seq_len: usize,
+    ) -> Result<bool> {
+        let kv_len_for_graph = self.layers.first()
+            .and_then(|l| l.gpu_kv_cache.as_ref())
+            .map(|kv| kv.seq_len)
+            .unwrap_or(0);
+        if !(seq_len == 1 && self.graph_manager.is_ready(1) && kv_len_for_graph <= 256) {
+            return Ok(false);
+        }
+        let reg = crate::cuda::kernels::global_registry().unwrap();
+
+        // Update embedding into dedicated buffer (same GPU address as capture).
+        if let Some(ref mut input_buf) = self.graph_input_buffer {
+            let new_emb = self.tok_embeddings.forward(x)?;
+            let emb_data = new_emb.as_slice();
+            let _ = reg.stream.context().check_err();
+            let buf_mut = std::sync::Arc::get_mut(input_buf)
+                .expect("graph_input_buffer refcount > 1");
+            let _ = reg.stream.memcpy_htod(emb_data, buf_mut);
+        }
+
+        // Update RoPE position GPU scalar.
+        if let Some(ref mut rope_buf) = self.rope_pos_gpu {
+            let _ = reg.stream.memcpy_htod(&[index_pos as i32], rope_buf);
+        }
+
+        // Update KV cache valid_len (pre-append position).
+        for layer in &mut self.layers {
+            if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
+                let _ = reg.stream.memcpy_htod(&[gpu_kv.seq_len as i32], &mut gpu_kv.valid_len_gpu);
+            }
+        }
+
+        // No sync needed: memcpy_htod + graph launch are stream-ordered.
+        if self.graph_manager.replay(&reg.stream, 1).is_ok() {
+            // No post-replay sync: TQ layers launch on same stream after graph.
+            // Post-replay: increment seq_len.
+            for layer in &mut self.layers {
+                if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
+                    gpu_kv.seq_len += 1;
+                }
+            }
+            // DON'T return — caller falls through to norm + lm_head.
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// End the layer-loop CUDA-graph capture and immediately replay it,
+    /// then update `layer_in` to point at the scratch buffer holding the
+    /// final layer's output. Called from `forward` once per prefill when
+    /// graph capture is in progress.
+    #[cfg(feature = "cuda")]
+    fn finalize_layer_loop_capture(&mut self, layer_in: &mut Tensor) {
+        if !matches!(self.graph_manager.status, crate::cuda::graph::GraphStatus::Capturing) {
+            return;
+        }
+        let Some(reg) = crate::cuda::kernels::global_registry() else { return; };
+
+        match self.graph_manager.end_capture(&reg.stream, 1) {
+            Ok(()) => {
+                eprintln!("[cuda-graph] captured layer loop (scratch-based)");
+                // Immediate replay — capture only RECORDS, doesn't execute.
+                let _ = reg.stream.context().check_err();
+                match self.graph_manager.replay(&reg.stream, 1) {
+                    Ok(()) => {
+                        let _ = reg.stream.synchronize();
+                        eprintln!("[cuda-graph] initial replay OK");
+                        // seq_len already incremented by append() in the layer loop.
+                        // Do NOT increment again here. Update layer_in from
+                        // scratch combined buffer.
+                        if let Some(ref scratch) = self.decode_scratch {
+                            let last_ci = (self.layers.len() - 1) & 1;
+                            *layer_in = Tensor::from_cuda_arc(
+                                Arc::clone(&scratch.combined_bufs[last_ci]),
+                                vec![1, 1, scratch.hidden_dim], scratch.stream.clone(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[cuda-graph] initial replay FAILED: {}", e);
+                        self.graph_manager.reset();
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[cuda-graph] end_capture failed: {}", e);
+                self.graph_manager.reset();
+            }
+        }
+    }
+
+    /// Final norm + last-token slice + LM head + softcap. Extracted from
+    /// the tail of `forward` (2026-04-13) to shrink the 1068-line monolith.
+    /// Optional GPU-debug compares CPU vs GPU lm_head logits.
+    fn apply_norm_and_lm_head(
+        &self,
+        layer_in: &Tensor,
+        backend: &dyn ComputeBackend,
+        seq_len: usize,
+        index_pos: usize,
+        gpu_debug: bool,
+        profiling: bool,
+        #[cfg(feature = "cuda")]
+        prof_stream: Option<&std::sync::Arc<cudarc::driver::CudaStream>>,
+    ) -> Result<Tensor> {
+        let x = self.norm.forward(layer_in, backend)?;
+        // Batched verify (seq_len > 1, index_pos > 0): keep ALL positions' logits.
+        // Normal prefill / decode: only last position (next-token prediction).
+        let x = if seq_len > 1 && index_pos > 0 {
+            x.reshape(vec![seq_len, x.shape()[2]])?  // [seq_len, hidden]
+        } else {
+            x.narrow(1, seq_len - 1, 1)?.squeeze(1)?  // [1, hidden]
+        };
+        let _enter = self.span_output.enter();
+
+        #[cfg(feature = "cuda")]
+        let _t_lm = if profiling {
+            if let Some(s) = prof_stream { let _ = s.synchronize(); }
+            Some(std::time::Instant::now())
+        } else { None };
+        #[cfg(not(feature = "cuda"))]
+        let _t_lm: Option<std::time::Instant> = {
+            let _ = profiling;
+            None
+        };
+
+        // Debug: compare GPU vs CPU lm_head output.
+        if gpu_debug {
+            if let Ok(h) = x.to_vec1() {
+                let n = h.len();
+                let l2: f64 = h.iter().map(|&v| (v as f64)*(v as f64)).sum::<f64>().sqrt();
+                eprintln!("[gpu-debug] pre-lm_head: n={} l2={:.4}", n, l2);
+
+                if let qmm::QMatMul::Quantized(ref qw) = self.output.inner {
+                    let cpu_logits = backend.qmatmul(&h, qw, 1, qw.in_features(), qw.out_features());
+                    let (cmn, cmx) = cpu_logits.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+                        |(mn,mx),&v| (mn.min(v), mx.max(v)));
+                    let top_cpu: Vec<(usize, f32)> = {
+                        let mut idx: Vec<(usize,f32)> = cpu_logits.iter().copied().enumerate().collect();
+                        idx.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
+                        idx.into_iter().take(5).collect()
+                    };
+                    eprintln!("[gpu-debug] CPU lm_head: n={} min={:.4} max={:.4} top5={:?}",
+                        cpu_logits.len(), cmn, cmx, top_cpu);
+                }
+            }
+        }
+
+        let output = self.output.forward(&x, backend)?;
+        let output = if let Some(cap) = self.final_logit_softcap {
+            apply_softcap(&output, cap)?
+        } else { output };
+
+        #[cfg(feature = "cuda")]
+        if let Some(t) = _t_lm {
+            if let Some(s) = prof_stream { let _ = s.synchronize(); }
+            eprintln!("[kernel] {:>12}: {:.1}μs", "lm_head", t.elapsed().as_nanos() as f64 / 1000.0);
+        }
+
+        Ok(output)
+    }
+
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
 
@@ -781,55 +1013,8 @@ impl GenericTurboModel {
         }
 
         // ── CUDA Graph replay (layer loop only — norm+lm_head run eagerly after) ──
-        // Skip graph replay when seq_len > 256: fall through to eager mode
-        // so flash_decode can be used (split-KV parallelism for long context).
-        // Graph captures gqa_decode which is single-block — too slow past 256 tokens.
         #[cfg(feature = "cuda")]
-        let mut graph_replayed = false;
-        #[cfg(feature = "cuda")]
-        let kv_len_for_graph = self.layers.first()
-            .and_then(|l| l.gpu_kv_cache.as_ref())
-            .map(|kv| kv.seq_len)
-            .unwrap_or(0);
-        #[cfg(feature = "cuda")]
-        if seq_len == 1 && self.graph_manager.is_ready(1) && kv_len_for_graph <= 256 {
-            let reg = crate::cuda::kernels::global_registry().unwrap();
-
-            // Update embedding into dedicated buffer (same GPU address as capture)
-            if let Some(ref mut input_buf) = self.graph_input_buffer {
-                let new_emb = self.tok_embeddings.forward(x)?;
-                let emb_data = new_emb.as_slice();
-                let _ = reg.stream.context().check_err();
-                let buf_mut = std::sync::Arc::get_mut(input_buf)
-                    .expect("graph_input_buffer refcount > 1");
-                let _ = reg.stream.memcpy_htod(emb_data, buf_mut);
-            }
-
-            // Update RoPE position GPU scalar
-            if let Some(ref mut rope_buf) = self.rope_pos_gpu {
-                let _ = reg.stream.memcpy_htod(&[index_pos as i32], rope_buf);
-            }
-
-            // Update KV cache valid_len (pre-append position)
-            for layer in &mut self.layers {
-                if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
-                    let _ = reg.stream.memcpy_htod(&[gpu_kv.seq_len as i32], &mut gpu_kv.valid_len_gpu);
-                }
-            }
-
-            // No sync needed: memcpy_htod + graph launch are stream-ordered.
-            if let Ok(()) = self.graph_manager.replay(&reg.stream, 1) {
-                // No post-replay sync: TQ layers launch on same stream after graph.
-                // Post-replay: increment seq_len
-                for layer in &mut self.layers {
-                    if let Some(ref mut gpu_kv) = layer.gpu_kv_cache {
-                        gpu_kv.seq_len += 1;
-                    }
-                }
-                graph_replayed = true;
-                // DON'T return — fall through to norm + lm_head
-            }
-        }
+        let graph_replayed = self.try_replay_layer_loop_graph(x, index_pos, seq_len)?;
 
         // ── CUDA Graph capture (scratch-based, no pool recording) ──
         #[cfg(feature = "cuda")]
@@ -863,53 +1048,17 @@ impl GenericTurboModel {
         } else {
             Some(self.mask(seq_len, index_pos, x.device())?)
         };
-        let _enter = self.span.enter();
+        // Clone the span so its enter-guard doesn't pin a self borrow
+        // (we need &mut self downstream for finalize_layer_loop_capture etc.).
+        let span = self.span.clone();
+        let _enter = span.enter();
         let backend = self.backend.clone();
         let backend = backend.as_ref();
-        let mut layer_in = self.tok_embeddings.forward(x)?;
-        // Gemma: scale embeddings by sqrt(hidden_dim)
-        if let Some(scale) = self.embed_scale {
-            let data = layer_in.as_slice();
-            let scaled: Vec<f32> = data.iter().map(|&v| v * scale).collect();
-            layer_in = Tensor::from_vec(scaled, layer_in.shape().to_vec(), layer_in.device())?;
-        }
-
-        // Phase 3: Upload embedding to GPU for GPU-resident forward pass.
-        // All subsequent ops auto-dispatch to GPU when tensor is CUDA.
-        #[cfg(feature = "cuda")]
-        if backend.is_gpu() {
-            if let Ok(gpu_tensor) = layer_in.to_device_auto() {
-                layer_in = gpu_tensor;
-            }
-        }
-
-        // Save input buffer for graph replay. Must be a SEPARATE allocation
-        // (not Arc::clone of layer_in) so graph_input_buffer always has refcount=1
-        // and Arc::get_mut succeeds on replay without cloning to a new address.
-        #[cfg(feature = "cuda")]
-        if capturing || recording {
-            if layer_in.is_cuda() {
-                if let Some(reg) = crate::cuda::kernels::global_registry() {
-                    let src = layer_in.cuda_data();
-                    let n = layer_in.elem_count();
-                    // Allocate dedicated buffer (refcount=1, never shared)
-                    if self.graph_input_buffer.is_none() {
-                        if let Ok(buf) = crate::cuda::gpu_alloc_zeros_pub(&reg.stream, n) {
-                            self.graph_input_buffer = Some(std::sync::Arc::new(buf));
-                        }
-                    }
-                    // Copy embedding data into the dedicated buffer
-                    if let Some(ref mut buf) = self.graph_input_buffer {
-                        let dst = std::sync::Arc::get_mut(buf).expect("graph_input_buffer shared");
-                        let _ = reg.stream.memcpy_dtod(src, dst);
-                        // Replace layer_in with tensor backed by graph_input_buffer
-                        layer_in = Tensor::from_cuda_arc(
-                            buf.clone(), layer_in.shape().to_vec(), reg.stream.clone(),
-                        );
-                    }
-                }
-            }
-        }
+        let mut layer_in = self.prepare_embedding(
+            x, backend,
+            #[cfg(feature = "cuda")] capturing,
+            #[cfg(feature = "cuda")] recording,
+        )?;
 
         // Begin graph capture AFTER embedding upload (H2D copy must be outside capture).
         #[cfg(feature = "cuda")]
@@ -1671,89 +1820,14 @@ impl GenericTurboModel {
         // End graph capture BEFORE norm/lm_head (they allocate → can't be in graph).
         // Graph captures layer loop only. Norm + lm_head run eagerly after replay.
         #[cfg(feature = "cuda")]
-        if capturing && matches!(self.graph_manager.status, crate::cuda::graph::GraphStatus::Capturing) {
-            if let Some(reg) = crate::cuda::kernels::global_registry() {
-                match self.graph_manager.end_capture(&reg.stream, 1) {
-                    Ok(()) => {
-                        eprintln!("[cuda-graph] captured layer loop (scratch-based)");
-                        // Immediate replay — capture only RECORDS, doesn't execute.
-                        let _ = reg.stream.context().check_err();
-                        match self.graph_manager.replay(&reg.stream, 1) {
-                            Ok(()) => {
-                                let _ = reg.stream.synchronize();
-                                eprintln!("[cuda-graph] initial replay OK");
-                                // seq_len already incremented by append() in the layer loop.
-                                // Do NOT increment again here.
-                                // Update layer_in from scratch combined buffer
-                                if let Some(ref scratch) = self.decode_scratch {
-                                    let last_ci = (self.layers.len() - 1) & 1;
-                                    layer_in = Tensor::from_cuda_arc(
-                                        Arc::clone(&scratch.combined_bufs[last_ci]),
-                                        vec![1, 1, scratch.hidden_dim], scratch.stream.clone(),
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[cuda-graph] initial replay FAILED: {}", e);
-                                self.graph_manager.reset();
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[cuda-graph] end_capture failed: {}", e);
-                        self.graph_manager.reset();
-                    }
-                }
-            }
+        if capturing {
+            self.finalize_layer_loop_capture(&mut layer_in);
         }
 
-        let x = self.norm.forward(&layer_in, backend)?;
-        // For batched verify (seq_len > 1, index_pos > 0): keep ALL positions' logits.
-        // For normal prefill/decode: only last position (next-token prediction).
-        let x = if seq_len > 1 && index_pos > 0 {
-            x.reshape(vec![seq_len, x.shape()[2]])?  // [seq_len, hidden]
-        } else {
-            x.narrow(1, seq_len - 1, 1)?.squeeze(1)?  // [1, hidden]
-        };
-        let _enter = self.span_output.enter();
-        #[cfg(feature = "cuda")]
-        let _t_lm = if profiling {
-            if let Some(ref s) = prof_stream { let _ = s.synchronize(); }
-            Some(std::time::Instant::now())
-        } else { None };
-        #[cfg(not(feature = "cuda"))]
-        let _t_lm: Option<std::time::Instant> = None;
-        // Debug: compare GPU vs CPU lm_head output
-        if gpu_debug {
-            if let Ok(h) = x.to_vec1() {
-                let n = h.len();
-                let l2: f64 = h.iter().map(|&v| (v as f64)*(v as f64)).sum::<f64>().sqrt();
-                eprintln!("[gpu-debug] pre-lm_head: n={} l2={:.4}", n, l2);
-
-                // CPU reference matmul for lm_head
-                if let qmm::QMatMul::Quantized(ref qw) = self.output.inner {
-                    let cpu_logits = backend.qmatmul(&h, qw, 1, qw.in_features(), qw.out_features());
-                    let (cmn, cmx) = cpu_logits.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
-                        |(mn,mx),&v| (mn.min(v), mx.max(v)));
-                    let top_cpu: Vec<(usize, f32)> = {
-                        let mut idx: Vec<(usize,f32)> = cpu_logits.iter().copied().enumerate().collect();
-                        idx.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap());
-                        idx.into_iter().take(5).collect()
-                    };
-                    eprintln!("[gpu-debug] CPU lm_head: n={} min={:.4} max={:.4} top5={:?}",
-                        cpu_logits.len(), cmn, cmx, top_cpu);
-                }
-            }
-        }
-        let output = self.output.forward(&x, backend)?;
-        let output = if let Some(cap) = self.final_logit_softcap {
-            apply_softcap(&output, cap)?
-        } else { output };
-        #[cfg(feature = "cuda")]
-        if let Some(t) = _t_lm {
-            if let Some(ref s) = prof_stream { let _ = s.synchronize(); }
-            eprintln!("[kernel] {:>12}: {:.1}μs", "lm_head", t.elapsed().as_nanos() as f64 / 1000.0);
-        }
+        let output = self.apply_norm_and_lm_head(
+            &layer_in, backend, seq_len, index_pos, gpu_debug, profiling,
+            #[cfg(feature = "cuda")] prof_stream.as_ref(),
+        )?;
 
         if profiling && prof.n > 0 {
             let total = prof.norm_ns + prof.attn_ns + prof.mlp_ns + prof.other_ns;
