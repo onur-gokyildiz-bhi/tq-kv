@@ -141,6 +141,179 @@ fn store_tri_keys(
     cache.tri_tokens_since_eviction += seq_len;
 }
 
+/// GPU fused TQ attention (enabled with TQ_GPU_FUSED=1). Pre-rotates
+/// the query, launches a fused-score kernel over compressed K, then
+/// runs softmax + V on CPU using v_raw. Returns `Some(y)` on success
+/// so the caller can skip the rest of the decode paths; returns `None`
+/// when the GPU path isn't eligible (so CPU fallback runs).
+///
+/// Uses `v_raw_flat` for V rather than the GPU's v_data cache — that
+/// path had stale V issues in earlier sprints; sticking with v_raw
+/// matches the behaviour verified against main.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn try_gpu_fused_tq_attention(
+    cache: &CompressedKvCache,
+    gpu_tq_cache: &Option<GpuCompressedKv>,
+    q: &Tensor,
+    q_f32: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    signs: &[f32],
+    rotated_channel_sigma: Option<&[f32]>,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    n_rep: usize,
+    n_past_compressed: usize,
+    n_compressed: usize,
+    total_len: usize,
+    b_sz: usize,
+    seq_len: usize,
+    attn_scale_denom: f64,
+    gpu_fused_ok: bool,
+) -> Result<Option<Tensor>> {
+    if !gpu_fused_ok {
+        return Ok(None);
+    }
+    let (reg, gpu) = match (crate::cuda::kernels::global_registry(), gpu_tq_cache.as_ref()) {
+        (Some(r), Some(g)) => (r, g),
+        _ => return Ok(None),
+    };
+
+    // Pre-rotate query for compressed scores.
+    let q_flat = q_f32.flatten_all()?.to_vec1()?;
+    let mut rotated_q = Vec::with_capacity(n_head * head_dim);
+    for qh in 0..n_head {
+        let qstart = qh * head_dim;
+        let q_vec = &q_flat[qstart..qstart + head_dim];
+        let rq = tq_kv::pre_rotate_query_with_signs(q_vec, signs);
+        rotated_q.extend_from_slice(&rq);
+    }
+
+    // KIVI per-channel: pre-scale rotated query by sigma ratios so the
+    // fused attention centroid lookup accounts for per-dim variance.
+    // score = sum(q[d]*ratio[d] * centroids[idx[d]]) * norm/sqrt(dim) * scale
+    if let Some(pcs) = rotated_channel_sigma {
+        let mean_sigma: f32 = pcs.iter().sum::<f32>() / head_dim as f32;
+        for qh in 0..n_head {
+            let base = qh * head_dim;
+            for d in 0..head_dim {
+                rotated_q[base + d] *= pcs[d] / mean_sigma;
+            }
+        }
+    }
+
+    // Upload rotated query to temp buffer.
+    let rq_gpu = reg.stream.clone_htod(&rotated_q)
+        .map_err(|e| TqError::Msg(format!("rq upload: {}", e)))?;
+
+    // GPU: compute compressed scores [n_heads, n_past_compressed]
+    let mut scores_gpu = reg.stream.alloc_zeros::<f32>(n_head * n_past_compressed)
+        .map_err(|e| TqError::Msg(format!("scores alloc: {}", e)))?;
+    let scale = (1.0 / attn_scale_denom) as f32;
+
+    // Sprint 1C: route to grouped attention launcher when gnorms is
+    // populated. Both per-vector and grouped kernels write the same
+    // scores layout, so downstream softmax/V stays unchanged. When
+    // pre_rope is on the CPU grouped bridge filled gnorms; per-vector
+    // gpu.norms is stale and unsafe to read. Sprint 1D flipped grouped
+    // to default-enabled.
+    let env_grouped = super::kv_cache::get_gpu_grouped_enabled();
+    let use_grouped_attn = (cache.pre_rope || env_grouped)
+        && gpu.gnorms.is_some()
+        && gpu.n_groups > 1;
+    if use_grouped_attn {
+        let gnorms_ref = gpu.gnorms.as_ref().unwrap();
+        crate::cuda::kernels::tq_fused_attention_grouped(
+            reg, &rq_gpu, &gpu.packed_indices, gnorms_ref,
+            &gpu.centroids, &mut scores_gpu,
+            n_head, n_kv_head, n_past_compressed, head_dim,
+            gpu.group_size, gpu.bits as usize, scale,
+        ).map_err(|e| TqError::Msg(format!("tq_fused_attention_grouped: {}", e)))?;
+    } else {
+        crate::cuda::kernels::tq_fused_attention(
+            reg, &rq_gpu, &gpu.packed_indices, &gpu.norms,
+            &gpu.centroids, &mut scores_gpu,
+            n_head, n_kv_head, n_past_compressed, head_dim,
+            gpu.bits as usize, scale, gpu.max_seq,
+        ).map_err(|e| TqError::Msg(format!("tq_fused_attention: {}", e)))?;
+    }
+
+    // Download compressed scores.
+    let comp_scores: Vec<f32> = reg.stream.clone_dtoh(&scores_gpu)
+        .map_err(|e| TqError::Msg(format!("scores download: {}", e)))?;
+
+    // Download V data for compressed keys (historical warmth check —
+    // parity test would flag if we dropped this).
+    let v_gpu_data: Vec<f32> = reg.stream.clone_dtoh(&gpu.v_data)
+        .map_err(|e| TqError::Msg(format!("v download: {}", e)))?;
+
+    // CPU: build full scores and compute attention (using GPU scores
+    // for compressed keys).
+    let sink_k_flat: Vec<f32> = cache.sink_k.as_ref()
+        .map(|sk| sk.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
+        .unwrap_or_default();
+    let sink_v_flat: Vec<f32> = cache.v_raw.as_ref()
+        .and_then(|vr| vr.narrow(2, 0, cache.sink_len).ok())
+        .map(|sv| sv.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
+        .unwrap_or_default();
+    let k_flat: Vec<f32> = k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let v_flat_cur: Vec<f32> = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let _ = (&v_gpu_data, &sink_v_flat, &v_flat_cur); // kept for parity audit
+
+    // Use v_raw directly for V data (avoids GPU cache V issues).
+    let v_raw_flat: Vec<f32> = cache.v_raw.as_ref()
+        .map(|vr| vr.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
+        .unwrap_or_default();
+    let v_raw_len = cache.v_raw.as_ref().map(|vr| vr.dim(2).unwrap_or(0)).unwrap_or(0);
+
+    let mut attn_out = Vec::with_capacity(n_head * head_dim);
+    for qh in 0..n_head {
+        let kv_h = qh / n_rep;
+        let q_vec = &q_flat[qh * head_dim..(qh + 1) * head_dim];
+        let mut scores = Vec::with_capacity(total_len);
+
+        // Sink scores
+        for s in 0..cache.sink_len {
+            let k_off = kv_h * cache.sink_len * head_dim + s * head_dim;
+            let k_vec = &sink_k_flat[k_off..k_off + head_dim];
+            let dot: f32 = q_vec.iter().zip(k_vec).map(|(a,b)| a * b).sum();
+            scores.push(dot * scale);
+        }
+        // Compressed scores from GPU
+        for i in 0..n_past_compressed {
+            scores.push(comp_scores[qh * n_past_compressed + i]);
+        }
+        // Current token (POQ lossless)
+        if n_compressed > 0 {
+            let k_vec = &k_flat[kv_h * head_dim..(kv_h + 1) * head_dim];
+            let dot: f32 = q_vec.iter().zip(k_vec).map(|(a,b)| a * b).sum();
+            scores.push(dot * scale);
+        }
+
+        // Softmax + V weighted sum using v_raw directly.
+        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_s: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
+        let sum_exp: f32 = exp_s.iter().sum();
+
+        let mut out = vec![0.0f32; head_dim];
+        for (si, &w_exp) in exp_s.iter().enumerate() {
+            let w = w_exp / sum_exp;
+            // V position in v_raw: 0..total_len
+            let v_pos = si; // direct position mapping
+            let v_off = kv_h * v_raw_len * head_dim + v_pos * head_dim;
+            if v_off + head_dim <= v_raw_flat.len() {
+                for d in 0..head_dim { out[d] += w * v_raw_flat[v_off + d]; }
+            }
+        }
+        attn_out.extend_from_slice(&out);
+    }
+    let y = Tensor::from_vec(attn_out, vec![1, n_head, 1, head_dim], q.device())?;
+    let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_head * head_dim])?;
+    Ok(Some(y))
+}
+
 /// GPU KV sync after a CPU (or GPU) compress pass. Lazily initializes
 /// the persistent `GpuCompressedKv` (seeding it from whatever CPU
 /// compressed keys already exist in the cache) or, on later calls,
@@ -1786,137 +1959,15 @@ impl LayerWeights {
 
                 // GPU fused attention with CPU V multiply (no online softmax in kernel)
                 #[cfg(feature = "cuda")]
-                if gpu_fused_ok {
-                    if let (Some(reg), Some(ref gpu)) = (crate::cuda::kernels::global_registry(), &self.gpu_tq_cache) {
-                        // Pre-rotate query for compressed scores
-                        let q_flat = q_f32.flatten_all()?.to_vec1()?;
-                        let mut rotated_q = Vec::with_capacity(self.n_head * self.head_dim);
-                        for qh in 0..self.n_head {
-                            let qstart = qh * self.head_dim;
-                            let q_vec = &q_flat[qstart..qstart + self.head_dim];
-                            let rq = tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs);
-                            rotated_q.extend_from_slice(&rq);
-                        }
-
-                        // KIVI per-channel: pre-scale rotated query by sigma ratios
-                        // so fused attention centroid lookup accounts for per-dim variance.
-                        // score = sum(q[d]*ratio[d] * centroids[idx[d]]) * norm/sqrt(dim) * scale
-                        if let Some(ref pcs) = self.tq_config.rotated_channel_sigma {
-                            let mean_sigma: f32 = pcs.iter().sum::<f32>() / self.head_dim as f32;
-                            for qh in 0..self.n_head {
-                                let base = qh * self.head_dim;
-                                for d in 0..self.head_dim {
-                                    rotated_q[base + d] *= pcs[d] / mean_sigma;
-                                }
-                            }
-                        }
-
-                        // Upload rotated query to temp buffer
-                        let rq_gpu = reg.stream.clone_htod(&rotated_q)
-                            .map_err(|e| TqError::Msg(format!("rq upload: {}", e)))?;
-
-                        // GPU: compute compressed scores [n_heads, n_past_compressed]
-                        let mut scores_gpu = reg.stream.alloc_zeros::<f32>(self.n_head * n_past_compressed)
-                            .map_err(|e| TqError::Msg(format!("scores alloc: {}", e)))?;
-                        let scale = (1.0 / self.attn_scale_denom) as f32;
-                        // Sprint 1C: route to grouped attention launcher when
-                        // gnorms is populated. Both per-vector and grouped
-                        // kernels write the same scores layout, so the
-                        // downstream softmax/V path stays unchanged.
-                        // pre_rope on => CPU grouped bridge filled gnorms; per-vector
-                        // gpu.norms is stale and unsafe to read.
-                        // Sprint 1D: flipped grouped to default-enabled.
-                        let env_grouped = super::kv_cache::get_gpu_grouped_enabled();
-                        let use_grouped_attn = (cache.pre_rope || env_grouped)
-                            && gpu.gnorms.is_some()
-                            && gpu.n_groups > 1;
-                        if use_grouped_attn {
-                            let gnorms_ref = gpu.gnorms.as_ref().unwrap();
-                            crate::cuda::kernels::tq_fused_attention_grouped(
-                                reg, &rq_gpu, &gpu.packed_indices, gnorms_ref,
-                                &gpu.centroids, &mut scores_gpu,
-                                self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
-                                gpu.group_size, gpu.bits as usize, scale,
-                            ).map_err(|e| TqError::Msg(format!("tq_fused_attention_grouped: {}", e)))?;
-                        } else {
-                            crate::cuda::kernels::tq_fused_attention(
-                                reg, &rq_gpu, &gpu.packed_indices, &gpu.norms,
-                                &gpu.centroids, &mut scores_gpu,
-                                self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
-                                gpu.bits as usize, scale, gpu.max_seq,
-                            ).map_err(|e| TqError::Msg(format!("tq_fused_attention: {}", e)))?;
-                        }
-
-                        // Download compressed scores
-                        let comp_scores: Vec<f32> = reg.stream.clone_dtoh(&scores_gpu)
-                            .map_err(|e| TqError::Msg(format!("scores download: {}", e)))?;
-
-                        // Download V data for compressed keys
-                        let v_gpu_data: Vec<f32> = reg.stream.clone_dtoh(&gpu.v_data)
-                            .map_err(|e| TqError::Msg(format!("v download: {}", e)))?;
-
-                        // CPU: build full scores and compute attention (using GPU scores for compressed keys)
-                        let sink_k_flat: Vec<f32> = cache.sink_k.as_ref()
-                            .map(|sk| sk.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
-                            .unwrap_or_default();
-                        let sink_v_flat: Vec<f32> = cache.v_raw.as_ref()
-                            .and_then(|vr| vr.narrow(2, 0, cache.sink_len).ok())
-                            .map(|sv| sv.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
-                            .unwrap_or_default();
-                        let k_flat: Vec<f32> = k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                        let v_flat_cur: Vec<f32> = v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-
-                        // Use v_raw directly for V data (avoids GPU cache V issues)
-                        let v_raw_flat: Vec<f32> = cache.v_raw.as_ref()
-                            .map(|vr| vr.to_dtype(DType::F32).unwrap().flatten_all().unwrap().to_vec1().unwrap())
-                            .unwrap_or_default();
-                        let v_raw_len = cache.v_raw.as_ref().map(|vr| vr.dim(2).unwrap_or(0)).unwrap_or(0);
-
-                        let mut attn_out = Vec::with_capacity(self.n_head * self.head_dim);
-                        for qh in 0..self.n_head {
-                            let kv_h = qh / n_rep;
-                            let q_vec = &q_flat[qh * self.head_dim..(qh + 1) * self.head_dim];
-                            let mut scores = Vec::with_capacity(total_len);
-
-                            // Sink scores
-                            for s in 0..cache.sink_len {
-                                let k_off = kv_h * cache.sink_len * self.head_dim + s * self.head_dim;
-                                let k_vec = &sink_k_flat[k_off..k_off + self.head_dim];
-                                let dot: f32 = q_vec.iter().zip(k_vec).map(|(a,b)| a * b).sum();
-                                scores.push(dot * scale);
-                            }
-                            // Compressed scores from GPU
-                            for i in 0..n_past_compressed {
-                                scores.push(comp_scores[qh * n_past_compressed + i]);
-                            }
-                            // Current token (POQ lossless)
-                            if n_compressed > 0 {
-                                let k_vec = &k_flat[kv_h * self.head_dim..(kv_h + 1) * self.head_dim];
-                                let dot: f32 = q_vec.iter().zip(k_vec).map(|(a,b)| a * b).sum();
-                                scores.push(dot * scale);
-                            }
-
-                            // Softmax + V weighted sum using v_raw directly
-                            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                            let exp_s: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
-                            let sum_exp: f32 = exp_s.iter().sum();
-
-                            let mut out = vec![0.0f32; self.head_dim];
-                            for (si, &w_exp) in exp_s.iter().enumerate() {
-                                let w = w_exp / sum_exp;
-                                // V position in v_raw: 0..total_len
-                                let v_pos = si; // direct position mapping
-                                let v_off = kv_h * v_raw_len * self.head_dim + v_pos * self.head_dim;
-                                if v_off + self.head_dim <= v_raw_flat.len() {
-                                    for d in 0..self.head_dim { out[d] += w * v_raw_flat[v_off + d]; }
-                                }
-                            }
-                            attn_out.extend_from_slice(&out);
-                        }
-                        let y = Tensor::from_vec(attn_out, vec![1, self.n_head, 1, self.head_dim], q.device())?;
-                        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
-                        return self.attention_wo.forward(&y, backend);
-                    }
+                if let Some(y) = try_gpu_fused_tq_attention(
+                    cache, &self.gpu_tq_cache, &q, &q_f32, &k, &v, &self.signs,
+                    self.tq_config.rotated_channel_sigma.as_deref(),
+                    self.n_head, self.n_kv_head, self.head_dim,
+                    n_rep, n_past_compressed, n_compressed, total_len,
+                    b_sz, seq_len, self.attn_scale_denom,
+                    gpu_fused_ok,
+                )? {
+                    return self.attention_wo.forward(&y, backend);
                 }
 
                 // ─── ALL-GPU TQ DECOMPRESS ATTENTION ──────────────────
