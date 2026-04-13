@@ -1015,8 +1015,13 @@ impl Engine {
     /// Token-by-token evaluation: at each position, the model predicts the next token.
     /// PPL = exp(average negative log-likelihood).
     pub fn compute_perplexity(&mut self, text: &str) -> Result<f64> {
+        // `add_special_tokens=true` so the tokenizer's TemplateProcessing
+        // (e.g. Gemma 2's <bos> prefix) is honoured. Without BOS, Gemma 2
+        // operates out-of-distribution and PPL explodes (~150k on 52-token
+        // prose). Qwen2 tokenizer has a plain ByteLevel post-processor with
+        // no BOS, so this flag is a no-op there.
         let encoding = self.tokenizer
-            .encode(text, false)
+            .encode(text, true)
             .map_err(|e| anyhow::anyhow!("Tokenize error: {}", e))?;
         let tokens = encoding.get_ids().to_vec();
         let n_tokens = tokens.len();

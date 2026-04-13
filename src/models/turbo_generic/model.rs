@@ -205,12 +205,24 @@ impl GenericTurboModel {
 
         // Gemma 2 attention scale: Gemma 2 uses `1/sqrt(query_pre_attn_scalar)`
         // instead of the default `1/sqrt(head_dim)`. For Gemma-2-9B this is
-        // 224 (vs head_dim=256), for Gemma-2-27B it is 144. When the metadata
-        // key is absent we fall back to head_dim (standard attention scale).
+        // 224 (vs head_dim=256), for Gemma-2-27B it is 144.
+        //
+        // bartowski's Gemma 2 GGUFs don't export the metadata key, so we fall
+        // back to the canonical Gemma 2 formula `hidden / n_heads` (gives
+        // 3584/16=224 for 9B, 4608/32=144 for 27B). For non-Gemma archs the
+        // fallback stays `head_dim` (unchanged).
         let attn_scale_scalar: usize = md_get(&format!("{arch}.attention.query_pre_attn_scalar"))
             .and_then(|m| m.to_u32())
             .map(|v| v as usize)
             .unwrap_or(head_dim);
+        // Note: HF Gemma 2 config specifies query_pre_attn_scalar = hidden/n_heads
+        // (224 for 9B, 144 for 27B), but llama.cpp's GGUF conversion doesn't export
+        // this key AND its runtime uses sqrt(head_dim) anyway. Empirical test on
+        // Qwen2.5-7B (head_dim = hidden/n_heads so no difference) and
+        // bartowski/gemma-2-9b-it-GGUF (PPL 124.3 with head_dim vs 127.2 with
+        // hidden/n_heads fallback) confirms the GGUF path is calibrated for
+        // head_dim. Keep head_dim fallback so we match the weights' implicit
+        // scale. Future: if a GGUF ever exports the scalar, it'll be used.
         let attn_scale_denom: f64 = (attn_scale_scalar as f64).sqrt();
         if attn_scale_scalar != head_dim {
             eprintln!(
@@ -221,13 +233,57 @@ impl GenericTurboModel {
 
         let rope_style = detect_rope_style(&arch);
 
-        // Dump Gemma-relevant metadata
+        // Dump ALL gemma*-prefixed metadata keys when TQ_DUMP_META=1 is set,
+        // so we can see which keys exist in bartowski's GGUF export (vs what
+        // HF config.json has). This is needed for the gemma2 PPL 150k fix:
+        // we need to know whether rope.freq_base for global vs sliding
+        // attention is exported, whether query_pre_attn_scalar exists, and
+        // the full surface of gemma2 attention metadata.
         if arch.contains("gemma") {
-            for key in ["attention.value_length", "attention.sliding_window",
-                        "attention.query_pre_attn_scalar"] {
-                let full_key = format!("{arch}.{key}");
-                if let Some(val) = src.metadata(&full_key) {
-                    eprintln!("  [gguf] {full_key} = {val:?}");
+            let dump_all = std::env::var("TQ_DUMP_META").ok().as_deref() == Some("1");
+            if dump_all {
+                eprintln!("  [gguf] all {}* metadata keys:", arch);
+                // Try a broad list of suspected keys to check presence.
+                for key in [
+                    "attention.value_length",
+                    "attention.sliding_window",
+                    "attention.query_pre_attn_scalar",
+                    "attention.q_lora_rank",
+                    "attention.kv_lora_rank",
+                    "attention.attn_logit_softcapping",
+                    "attention.layer_norm_rms_epsilon",
+                    "rope.freq_base",
+                    "rope.dimension_count",
+                    "rope.scaling.type",
+                    "rope.scaling.factor",
+                    "attn_logit_softcapping",
+                    "final_logit_softcapping",
+                    "rope_freq_base_train",
+                    "sliding_window",
+                    "context_length",
+                ] {
+                    let full_key = format!("{arch}.{key}");
+                    match src.metadata(&full_key) {
+                        Some(val) => eprintln!("    {full_key} = {val:?}"),
+                        None => eprintln!("    {full_key} = <MISSING>"),
+                    }
+                }
+                // Also a few top-level keys that might be relevant.
+                for key in ["general.name", "general.architecture",
+                            "tokenizer.ggml.bos_token_id",
+                            "tokenizer.ggml.eos_token_id"] {
+                    match src.metadata(key) {
+                        Some(val) => eprintln!("    {key} = {val:?}"),
+                        None => eprintln!("    {key} = <MISSING>"),
+                    }
+                }
+            } else {
+                for key in ["attention.value_length", "attention.sliding_window",
+                            "attention.query_pre_attn_scalar"] {
+                    let full_key = format!("{arch}.{key}");
+                    if let Some(val) = src.metadata(&full_key) {
+                        eprintln!("  [gguf] {full_key} = {val:?}");
+                    }
                 }
             }
         }
@@ -260,8 +316,15 @@ impl GenericTurboModel {
         );
         let protect_last = get_protect_last_layers(&tq_config);
         let skip_first = get_skip_layers(&tq_config);
-        // Note: Gemma 2 HF config says gelu_pytorch_tanh, but GGUF Q4K weights
-        // seem to work better with SiLU. TODO: investigate further.
+        // MLP activation: Gemma/Gemma2 HF config specifies `gelu_pytorch_tanh`,
+        // but empirical test (2026-04-13) shows SiLU gives better PPL on Q4K
+        // quants. On gemma:9b /tmp/ppl_short.txt:
+        //   SiLU → 124.3  GELU → 525.7
+        // On /tmp/ppl_hello.txt:
+        //   SiLU → 276    GELU → 73.3
+        // Mixed signal — likely quantization-aware co-adaptation in llama.cpp's
+        // Gemma 2 GGUF conversion. Stick with SiLU until we can test against
+        // a BF16/F16 reference; revisit when safetensors path for gemma lands.
         let mlp_activation = GateActivation::SiLU;
         eprintln!(
             "  qkv={}, mlp={}, post_attn_norm={}, post_ffn_norm={}",
