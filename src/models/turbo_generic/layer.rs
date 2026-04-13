@@ -141,6 +141,438 @@ fn store_tri_keys(
     cache.tri_tokens_since_eviction += seq_len;
 }
 
+/// GPU KV sync after a CPU (or GPU) compress pass. Lazily initializes
+/// the persistent `GpuCompressedKv` (seeding it from whatever CPU
+/// compressed keys already exist in the cache) or, on later calls,
+/// bridges the single newly-compressed token from CPU into the GPU
+/// buffer when the GPU fast path did not run. Also keeps `signs_gpu`
+/// uploaded for the all-GPU decompress attention path.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_append_after_compress(
+    cache: &mut CompressedKvCache,
+    gpu_tq_cache: &mut Option<GpuCompressedKv>,
+    signs_gpu: &mut Option<cudarc::driver::CudaSlice<f32>>,
+    signs: &[f32],
+    q: &Tensor,
+    v: &Tensor,
+    n_kv_head: usize,
+    n_head: usize,
+    head_dim: usize,
+    layer_tq_config: &tq_kv::TurboQuantConfig,
+    gpu_compress_ok: bool,
+) -> Result<()> {
+    let reg = match crate::cuda::kernels::global_registry() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    // Initialize GPU compressed KV on first use.
+    if gpu_tq_cache.is_none() {
+        let head_bits = cache.k_per_head[0].bits;
+        let cal_cb: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
+            .as_ref().map(|cb| cb.centroids.clone());
+        let cb: &[f32] = match cal_cb.as_deref() {
+            Some(cal) => cal,
+            None => tq_kv::codebook::get_centroids(head_bits),
+        };
+        let max_seq = std::env::var("TQ_MAX_SEQ").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(2048usize);
+        // Sprint 1A: pass through layer_tq_config.group_size so the grouped
+        // norms buffer is allocated when grouped mode is on. The grouped
+        // path still has to be flipped on by Sprint 1C (TQ_GPU_GROUPED)
+        // before this buffer is actually written.
+        let group_size = layer_tq_config.group_size;
+        match GpuCompressedKv::new(
+            reg.stream.clone(), n_kv_head, n_head,
+            head_dim, head_bits, max_seq, cb, group_size,
+        ) {
+            Ok(mut gpu) => {
+                // Seed with all existing compressed keys + actual V data.
+                // Detect grouped CPU compression: if cache.k_per_head[h].norms
+                // has count*n_groups entries instead of count, the CPU side
+                // ran the per-group path (compress_single_key_grouped) and
+                // every token contributes n_groups floats to .norms. Reading
+                // .norms[pos] in that case picks the wrong float and silently
+                // ruins the dequant sigma. Bridge through gnorms instead.
+                let existing = cache.k_per_head[0].count;
+                let v_offset = cache.sink_len;
+                let gpu_bpk = gpu.bytes_per_key;
+                let cpu_n_groups = if existing > 0 {
+                    cache.k_per_head[0].norms.len() / existing
+                } else { 1 };
+                let use_grouped_seed = cpu_n_groups > 1
+                    && cpu_n_groups == gpu.n_groups
+                    && gpu.gnorms.is_some();
+
+                for pos in 0..existing {
+                    let mut packed_all = Vec::with_capacity(n_kv_head * gpu_bpk);
+                    let mut norms_all: Vec<f32> = Vec::with_capacity(
+                        n_kv_head * if use_grouped_seed { cpu_n_groups } else { 1 });
+                    for h in 0..n_kv_head {
+                        let h_bpk = cache.k_per_head[h].packed_indices.len() / existing.max(1);
+                        let start = pos * h_bpk;
+                        let end = (start + h_bpk).min(cache.k_per_head[h].packed_indices.len());
+                        let chunk = &cache.k_per_head[h].packed_indices[start..end];
+                        packed_all.extend_from_slice(chunk);
+                        if chunk.len() < gpu_bpk {
+                            packed_all.extend(std::iter::repeat(0u8).take(gpu_bpk - chunk.len()));
+                        }
+                        if use_grouped_seed {
+                            let n_off = pos * cpu_n_groups;
+                            norms_all.extend_from_slice(
+                                &cache.k_per_head[h].norms[n_off..n_off + cpu_n_groups]);
+                        } else {
+                            norms_all.push(cache.k_per_head[h].norms[pos]);
+                        }
+                    }
+                    let v_data = if let Some(ref v_raw) = cache.v_raw {
+                        let v_pos = v_raw.narrow(2, v_offset + pos, 1)
+                            .and_then(|t| t.to_dtype(DType::F32))
+                            .and_then(|t| t.flatten_all())
+                            .and_then(|t| t.to_vec1());
+                        match v_pos {
+                            Ok(d) => d,
+                            Err(_) => vec![0.0f32; n_kv_head * head_dim],
+                        }
+                    } else if let Some(ref v_store) = cache.v_compressed {
+                        // value_bits > 0: decompress V for this position
+                        let v_all = super::kv_cache::decompress_values_store(
+                            v_store, n_kv_head, head_dim,
+                            cache.cached_len, q.device(),
+                        ).ok();
+                        if let Some(ref vt) = v_all {
+                            vt.narrow(2, v_offset + pos, 1)
+                                .and_then(|t| t.to_dtype(DType::F32))
+                                .and_then(|t| t.flatten_all())
+                                .and_then(|t| t.to_vec1())
+                                .unwrap_or_else(|_| vec![0.0f32; n_kv_head * head_dim])
+                        } else {
+                            vec![0.0f32; n_kv_head * head_dim]
+                        }
+                    } else {
+                        vec![0.0f32; n_kv_head * head_dim]
+                    };
+                    if use_grouped_seed {
+                        let _ = gpu.append_grouped(&packed_all, &norms_all, &v_data);
+                    } else {
+                        let _ = gpu.append(&packed_all, &norms_all, &v_data);
+                    }
+                }
+                *gpu_tq_cache = Some(gpu);
+            }
+            Err(e) => eprintln!("[gpu-tq] init failed: {}", e),
+        }
+    }
+    // Append the newly CPU-compressed token to GPU cache.
+    // Skip if GPU compress already appended directly.
+    // `else if`: also skip when GPU cache was just initialized above
+    // (seed already includes all tokens).
+    else if !gpu_compress_ok {
+        if let Some(ref mut gpu) = *gpu_tq_cache {
+            let count = cache.k_per_head[0].count;
+            let gpu_bpk = gpu.bytes_per_key;
+            let pos = count - 1;
+            // Same grouped detection as the seed loop above.
+            let cpu_n_groups = if count > 0 {
+                cache.k_per_head[0].norms.len() / count
+            } else { 1 };
+            let use_grouped_bridge = cpu_n_groups > 1
+                && cpu_n_groups == gpu.n_groups
+                && gpu.gnorms.is_some();
+
+            let mut packed_all = Vec::with_capacity(n_kv_head * gpu_bpk);
+            let mut norms_all: Vec<f32> = Vec::with_capacity(
+                n_kv_head * if use_grouped_bridge { cpu_n_groups } else { 1 });
+            for h in 0..n_kv_head {
+                let h_bpk = cache.k_per_head[h].packed_indices.len() / count.max(1);
+                let start = pos * h_bpk;
+                let end = (start + h_bpk).min(cache.k_per_head[h].packed_indices.len());
+                let chunk = &cache.k_per_head[h].packed_indices[start..end];
+                packed_all.extend_from_slice(chunk);
+                if chunk.len() < gpu_bpk {
+                    packed_all.extend(std::iter::repeat(0u8).take(gpu_bpk - chunk.len()));
+                }
+                if use_grouped_bridge {
+                    let n_off = pos * cpu_n_groups;
+                    norms_all.extend_from_slice(
+                        &cache.k_per_head[h].norms[n_off..n_off + cpu_n_groups]);
+                } else {
+                    norms_all.push(cache.k_per_head[h].norms[pos]);
+                }
+            }
+            // Extract V data: prefer v_raw, fall back to live v tensor.
+            // When value_bits > 0, v_raw is None (V stored in v_compressed).
+            // The live v tensor has the current token's V in fp32.
+            let v_data = if let Some(ref v_raw) = cache.v_raw {
+                let vlen = v_raw.dim(2)?;
+                let last_v = v_raw.narrow(2, vlen - 1, 1)?;
+                last_v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
+            } else {
+                // v_raw is None (value_bits > 0). Use live v tensor directly.
+                v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
+            };
+            if use_grouped_bridge {
+                let _ = gpu.append_grouped(&packed_all, &norms_all, &v_data);
+            } else {
+                let _ = gpu.append(&packed_all, &norms_all, &v_data);
+            }
+        }
+    }
+
+    // Ensure signs are on GPU for all-GPU decompress attention path.
+    // Uploaded here (not in GPU compress block) because GPU compress may
+    // not run on the first compression (gpu_tq_cache was None).
+    if signs_gpu.is_none() {
+        if let Ok(buf) = reg.stream.clone_htod(signs) {
+            *signs_gpu = Some(buf);
+        }
+    }
+    Ok(())
+}
+
+/// GPU fast path for single-token decode compression. Uploads signs /
+/// boundaries / centroids / channel_sigma lazily, runs the grouped or
+/// per-vector tq_compress_key kernel, and appends packed bytes + norms
+/// + raw V into the persistent GpuCompressedKv buffer.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn compress_new_keys_gpu(
+    k: &Tensor,
+    k_pre_rope: Option<&Tensor>,
+    pre_rope_mode: bool,
+    v: &Tensor,
+    signs: &[f32],
+    signs_gpu: &mut Option<cudarc::driver::CudaSlice<f32>>,
+    boundaries_gpu: &mut Option<cudarc::driver::CudaSlice<f32>>,
+    centroids_gpu: &mut Option<cudarc::driver::CudaSlice<f32>>,
+    channel_sigma_gpu: &mut Option<cudarc::driver::CudaSlice<f32>>,
+    rotated_channel_sigma: Option<&[f32]>,
+    gpu_tq_cache: &mut Option<GpuCompressedKv>,
+    n_kv_head: usize,
+    head_dim: usize,
+    bits: u8,
+    center_keys: bool,
+) -> Result<()> {
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(0);
+        if C.fetch_add(1, Ordering::Relaxed) == 0 {
+            eprintln!("[gpu-tq-compress] GPU fast path ACTIVE");
+        }
+    }
+
+    let reg = match crate::cuda::kernels::global_registry() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    // Pre-RoPE bug fix: previously this site always used &k (the post-RoPE
+    // tensor), even when pre_rope_mode was on. The CPU fallback already
+    // honored k_pre_rope; the GPU path didn't, so the GPU TQ cache silently
+    // stored post-RoPE keys regardless of TQ_PRE_ROPE. The all-GPU decode
+    // then re-RoPEd them on read, producing a double rotation that quietly
+    // degraded generation quality.
+    let k_source = if pre_rope_mode {
+        k_pre_rope.expect("pre_rope_mode requires k_pre_rope")
+    } else {
+        k
+    };
+    // K is [1, n_kv_head, 1, head_dim] for decode.
+    let k_flat = k_source.reshape(vec![n_kv_head, head_dim])?;
+    let k_gpu = k_flat.cuda_data();
+
+    let n_centroids = 1usize << bits;
+    let bytes_per_key = (head_dim * bits as usize + 7) / 8;
+
+    // Signs already on GPU? Upload once if not.
+    if signs_gpu.is_none() {
+        *signs_gpu = Some(reg.stream.clone_htod(signs)
+            .map_err(|e| TqError::Msg(format!("signs upload: {}", e)))?);
+    }
+    if boundaries_gpu.is_none() {
+        let boundaries = tq_kv::codebook::get_boundaries(bits);
+        *boundaries_gpu = Some(reg.stream.clone_htod(boundaries)
+            .map_err(|e| TqError::Msg(format!("boundaries upload: {}", e)))?);
+    }
+    if centroids_gpu.is_none() {
+        let centroids = tq_kv::codebook::get_centroids(bits);
+        *centroids_gpu = Some(reg.stream.clone_htod(centroids)
+            .map_err(|e| TqError::Msg(format!("centroids upload: {}", e)))?);
+    }
+    // KIVI per-channel sigma upload (once)
+    if channel_sigma_gpu.is_none() {
+        if let Some(sigma) = rotated_channel_sigma {
+            *channel_sigma_gpu = Some(reg.stream.clone_htod(sigma)
+                .map_err(|e| TqError::Msg(format!("channel_sigma upload: {}", e)))?);
+        }
+    }
+
+    // Sprint 1C: grouped GPU compress path. When GpuCompressedKv was
+    // allocated with n_groups>1, run tq_compress_key_grouped and scatter
+    // to gpu_tq.gnorms instead of the legacy per-vector path. center_keys
+    // and KIVI per-channel sigma are ignored on the grouped path for now
+    // (Sprint 1A), so fall back to per-vector if either is on.
+    // Sprint 1D: flipped to default-enabled after parity verification
+    // (5-prompt suite identical, perf within noise). TQ_GPU_GROUPED=0 disables.
+    let want_grouped = super::kv_cache::get_gpu_grouped_enabled();
+    let gpu_tq_ref = gpu_tq_cache.as_ref().unwrap();
+    let can_grouped = want_grouped
+        && gpu_tq_ref.n_groups > 1
+        && !center_keys
+        && channel_sigma_gpu.is_none();
+
+    // V data: already on GPU in scratch or k tensor.
+    let v_flat = v.reshape(vec![n_kv_head, head_dim])?;
+    let v_gpu = v_flat.cuda_data();
+
+    if can_grouped {
+        let n_groups = gpu_tq_ref.n_groups;
+        let group_size = gpu_tq_ref.group_size;
+        let mut packed_gpu: cudarc::driver::CudaSlice<u8> = reg.stream.alloc_zeros(
+            n_kv_head * bytes_per_key
+        ).map_err(|e| TqError::Msg(format!("packed alloc: {}", e)))?;
+        let mut gnorms_gpu: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+            n_kv_head * n_groups
+        ).map_err(|e| TqError::Msg(format!("gnorms alloc: {}", e)))?;
+
+        crate::cuda::kernels::tq_compress_key_grouped(
+            reg, k_gpu,
+            signs_gpu.as_ref().unwrap(),
+            boundaries_gpu.as_ref().unwrap(),
+            centroids_gpu.as_ref().unwrap(),
+            &mut packed_gpu, &mut gnorms_gpu,
+            n_kv_head, head_dim, group_size,
+            n_centroids, bytes_per_key,
+        ).map_err(|e| TqError::Msg(format!("tq_compress_key_grouped: {}", e)))?;
+
+        let gpu_tq = gpu_tq_cache.as_mut().unwrap();
+        gpu_tq.append_gpu_grouped(&packed_gpu, &gnorms_gpu, v_gpu)?;
+    } else {
+        // Legacy per-vector GPU compress path
+        let mut packed_gpu: cudarc::driver::CudaSlice<u8> = reg.stream.alloc_zeros(
+            n_kv_head * bytes_per_key
+        ).map_err(|e| TqError::Msg(format!("packed alloc: {}", e)))?;
+        let mut norms_gpu: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+            n_kv_head
+        ).map_err(|e| TqError::Msg(format!("norms alloc: {}", e)))?;
+
+        crate::cuda::kernels::tq_compress_key(
+            reg, k_gpu,
+            signs_gpu.as_ref().unwrap(),
+            boundaries_gpu.as_ref().unwrap(),
+            centroids_gpu.as_ref().unwrap(),
+            &mut packed_gpu, &mut norms_gpu,
+            None,
+            channel_sigma_gpu.as_ref(),
+            n_kv_head, head_dim, n_centroids, bytes_per_key,
+            center_keys,
+        ).map_err(|e| TqError::Msg(format!("tq_compress_key: {}", e)))?;
+
+        let gpu_tq = gpu_tq_cache.as_mut().unwrap();
+        gpu_tq.append_gpu(&packed_gpu, &norms_gpu, v_gpu)?;
+    }
+
+    // Don't increment cache.cached_len here — it's incremented after the
+    // compress section in the main forward.
+    //
+    // V raw: only needed for sink token positions (first N tokens). After
+    // sink phase V is stored in GpuCompressedKv.v_data directly. Skip CPU
+    // V cat during decode — eliminates GPU→CPU download overhead. Sink V
+    // was already captured during prefill via CPU compress path.
+    Ok(())
+}
+
+/// CPU compress pass for non-sink keys. Handles the grouped, padded,
+/// and plain variants plus residual/outlier metadata. Runs during
+/// prefill or whenever the GPU fast path is unavailable.
+#[allow(clippy::too_many_arguments)]
+fn compress_new_keys_cpu(
+    cache: &mut CompressedKvCache,
+    k: &Tensor,
+    k_pre_rope: Option<&Tensor>,
+    pre_rope_mode: bool,
+    compress_start: usize,
+    tokens_to_compress: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    padded_head_dim: usize,
+    layer_tq_config: &tq_kv::TurboQuantConfig,
+    per_head_bits: &Option<Vec<u8>>,
+    signs: &[f32],
+) -> Result<()> {
+    // Pre-RoPE mode: compress pre-RoPE keys (position-independent stats).
+    let k_source = if pre_rope_mode {
+        k_pre_rope.unwrap()
+    } else {
+        k
+    };
+    let k_to_compress = k_source.narrow(2, compress_start, tokens_to_compress)?;
+    // Direct download: skip contiguous+to_dtype+flatten chain for decode
+    // (already f32 contiguous).
+    let k_flat: Vec<f32> = if k_to_compress.is_cuda() {
+        k_to_compress.contiguous()?.to_vec1()?
+    } else {
+        k_to_compress.contiguous()?.as_slice().to_vec()
+    };
+    let hdim = head_dim;
+    let use_grouped = layer_tq_config.group_size > 0 && hdim % layer_tq_config.group_size == 0;
+    for h in 0..n_kv_head {
+        // Per-head adaptive bitwidth: use head-specific config if assigned.
+        let head_config = match per_head_bits {
+            Some(phb) if phb[h] != layer_tq_config.bits => {
+                // Clear calibrated codebook if bit width differs — it was
+                // calibrated for layer_tq_config.bits, not this head's bits.
+                tq_kv::TurboQuantConfig {
+                    bits: phb[h],
+                    calibrated_codebook: None,
+                    ..layer_tq_config.clone()
+                }
+            }
+            _ => layer_tq_config.clone(),
+        };
+        for s in 0..tokens_to_compress {
+            let offset = (h * tokens_to_compress + s) * hdim;
+            let key_vec = &k_flat[offset..offset + hdim];
+            if use_grouped {
+                let (packed, gnorms, residual, outliers) = tq_kv::compress_single_key_grouped(
+                    key_vec, hdim, &head_config, signs,
+                );
+                // Set residual/outlier bits on first append.
+                if cache.k_per_head[h].residual_bits == 0 && residual.is_some() {
+                    cache.k_per_head[h].residual_bits = head_config.residual_bits;
+                }
+                if cache.k_per_head[h].outlier_k == 0 && outliers.is_some() {
+                    cache.k_per_head[h].outlier_k = head_config.outlier_k;
+                }
+                // Append outliers.
+                if let Some((oi, ov)) = outliers {
+                    if cache.k_per_head[h].outlier_indices.is_none() {
+                        cache.k_per_head[h].outlier_indices = Some(Vec::new());
+                        cache.k_per_head[h].outlier_values = Some(Vec::new());
+                    }
+                    cache.k_per_head[h].outlier_indices.as_mut().unwrap().extend_from_slice(&oi);
+                    cache.k_per_head[h].outlier_values.as_mut().unwrap().extend_from_slice(&ov);
+                }
+                cache.k_per_head[h].append_raw_grouped(&packed, &gnorms, residual);
+            } else if padded_head_dim > hdim {
+                let mut padded = vec![0.0f32; padded_head_dim];
+                padded[..hdim].copy_from_slice(key_vec);
+                let (packed, norm, _token_mean) = tq_kv::compress_single_key_with_signs(
+                    &padded, padded_head_dim, &head_config, signs,
+                );
+                cache.k_per_head[h].append_raw(&packed, norm);
+            } else {
+                let (packed, norm, _token_mean) = tq_kv::compress_single_key_with_signs(
+                    key_vec, hdim, &head_config, signs,
+                );
+                cache.k_per_head[h].append_raw(&packed, norm);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// TriAttention eviction pass: score per-head pre-RoPE keys, drop the
 /// bottom N by importance, and keep the cache consistent (tri_keys,
 /// tri_key_positions, k_per_head, v_raw, and — under cuda — the GPU hot
@@ -1228,379 +1660,45 @@ impl LayerWeights {
             #[cfg(not(feature = "cuda"))]
             let gpu_compress_ok = false;
 
+            #[cfg(feature = "cuda")]
             if tokens_to_compress > 0 && seq_len == 1 && gpu_compress_ok {
                 // ── GPU fast path: single-token decode compression ──
-                {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static C: AtomicU64 = AtomicU64::new(0);
-                    if C.fetch_add(1, Ordering::Relaxed) == 0 {
-                        eprintln!("[gpu-tq-compress] GPU fast path ACTIVE");
-                    }
-                }
-
-                #[cfg(feature = "cuda")]
-                if gpu_compress_ok {
-                    if let Some(reg) = crate::cuda::kernels::global_registry() {
-                        // Pre-RoPE bug fix: previously this site always used &k
-                        // (the post-RoPE tensor), even when pre_rope_mode was on.
-                        // The CPU fallback at L720+ already honored k_pre_rope;
-                        // the GPU path didn't, so the GPU TQ cache silently stored
-                        // post-RoPE keys regardless of TQ_PRE_ROPE. The all-GPU
-                        // decode then re-RoPEd them on read, producing a double
-                        // rotation that quietly degraded generation quality.
-                        let k_source = if pre_rope_mode {
-                            k_pre_rope.as_ref().expect("pre_rope_mode requires k_pre_rope")
-                        } else {
-                            &k
-                        };
-                        // K is [1, n_kv_head, 1, head_dim] for decode
-                        let k_flat = k_source.reshape(vec![self.n_kv_head, self.head_dim])?;
-                        let k_gpu = k_flat.cuda_data();
-
-                        let bits = layer_tq_config.bits;
-                        let n_centroids = 1usize << bits;
-                        let bytes_per_key = (self.head_dim * bits as usize + 7) / 8;
-
-                        // Signs already on GPU? Upload once if not.
-                        if self.signs_gpu.is_none() {
-                            self.signs_gpu = Some(reg.stream.clone_htod(&self.signs)
-                                .map_err(|e| TqError::Msg(format!("signs upload: {}", e)))?);
-                        }
-                        if self.boundaries_gpu.is_none() {
-                            let boundaries = tq_kv::codebook::get_boundaries(bits);
-                            self.boundaries_gpu = Some(reg.stream.clone_htod(boundaries)
-                                .map_err(|e| TqError::Msg(format!("boundaries upload: {}", e)))?);
-                        }
-                        if self.centroids_gpu.is_none() {
-                            let centroids = tq_kv::codebook::get_centroids(bits);
-                            self.centroids_gpu = Some(reg.stream.clone_htod(centroids)
-                                .map_err(|e| TqError::Msg(format!("centroids upload: {}", e)))?);
-                        }
-                        // KIVI per-channel sigma upload (once)
-                        if self.channel_sigma_gpu.is_none() {
-                            if let Some(ref sigma) = self.tq_config.rotated_channel_sigma {
-                                self.channel_sigma_gpu = Some(reg.stream.clone_htod(sigma)
-                                    .map_err(|e| TqError::Msg(format!("channel_sigma upload: {}", e)))?);
-                            }
-                        }
-
-                        // Sprint 1C: grouped GPU compress path. When the
-                        // GpuCompressedKv was allocated with n_groups>1, run
-                        // tq_compress_key_grouped and scatter to gpu_tq.gnorms
-                        // instead of the legacy per-vector path. center_keys
-                        // + KIVI per-channel sigma are ignored on the grouped
-                        // path for now (see Sprint 1A commit), so we fall back
-                        // to per-vector if either is on.
-                        // Sprint 1D: flipped to default-enabled after parity
-                        // verification (5-prompt suite identical, perf within
-                        // run-to-run noise). TQ_GPU_GROUPED=0 disables it.
-                        let want_grouped = super::kv_cache::get_gpu_grouped_enabled();
-                        let gpu_tq_ref = self.gpu_tq_cache.as_ref().unwrap();
-                        let can_grouped = want_grouped
-                            && gpu_tq_ref.n_groups > 1
-                            && !self.tq_config.center_keys
-                            && self.channel_sigma_gpu.is_none();
-
-                        // V data: already on GPU in scratch or k tensor
-                        let v_flat = v.reshape(vec![self.n_kv_head, self.head_dim])?;
-                        let v_gpu = v_flat.cuda_data();
-
-                        if can_grouped {
-                            let n_groups = gpu_tq_ref.n_groups;
-                            let group_size = gpu_tq_ref.group_size;
-                            // Alloc temp GPU buffers (grouped path)
-                            let mut packed_gpu: cudarc::driver::CudaSlice<u8> = reg.stream.alloc_zeros(
-                                self.n_kv_head * bytes_per_key
-                            ).map_err(|e| TqError::Msg(format!("packed alloc: {}", e)))?;
-                            let mut gnorms_gpu: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
-                                self.n_kv_head * n_groups
-                            ).map_err(|e| TqError::Msg(format!("gnorms alloc: {}", e)))?;
-
-                            crate::cuda::kernels::tq_compress_key_grouped(
-                                reg, k_gpu,
-                                self.signs_gpu.as_ref().unwrap(),
-                                self.boundaries_gpu.as_ref().unwrap(),
-                                self.centroids_gpu.as_ref().unwrap(),
-                                &mut packed_gpu, &mut gnorms_gpu,
-                                self.n_kv_head, self.head_dim, group_size,
-                                n_centroids, bytes_per_key,
-                            ).map_err(|e| TqError::Msg(format!("tq_compress_key_grouped: {}", e)))?;
-
-                            let gpu_tq = self.gpu_tq_cache.as_mut().unwrap();
-                            gpu_tq.append_gpu_grouped(&packed_gpu, &gnorms_gpu, v_gpu)?;
-                        } else {
-                            // Legacy per-vector GPU compress path
-                            let mut packed_gpu: cudarc::driver::CudaSlice<u8> = reg.stream.alloc_zeros(
-                                self.n_kv_head * bytes_per_key
-                            ).map_err(|e| TqError::Msg(format!("packed alloc: {}", e)))?;
-                            let mut norms_gpu: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
-                                self.n_kv_head
-                            ).map_err(|e| TqError::Msg(format!("norms alloc: {}", e)))?;
-
-                            crate::cuda::kernels::tq_compress_key(
-                                reg, k_gpu,
-                                self.signs_gpu.as_ref().unwrap(),
-                                self.boundaries_gpu.as_ref().unwrap(),
-                                self.centroids_gpu.as_ref().unwrap(),
-                                &mut packed_gpu, &mut norms_gpu,
-                                None,
-                                self.channel_sigma_gpu.as_ref(),
-                                self.n_kv_head, self.head_dim, n_centroids, bytes_per_key,
-                                self.tq_config.center_keys,
-                            ).map_err(|e| TqError::Msg(format!("tq_compress_key: {}", e)))?;
-
-                            let gpu_tq = self.gpu_tq_cache.as_mut().unwrap();
-                            gpu_tq.append_gpu(&packed_gpu, &norms_gpu, v_gpu)?;
-                        }
-
-                        // Don't increment cache.cached_len here — it's incremented
-                        // after the compress section at line ~1917.
-
-                        // V raw: only needed for sink token positions (first N tokens).
-                        // After sink phase, V is stored in GpuCompressedKv.v_data directly.
-                        // Skip CPU V cat during decode — eliminates GPU→CPU download overhead.
-                        // (Sink V was already captured during prefill via CPU compress path)
-                    }
-                }
+                compress_new_keys_gpu(
+                    &k, k_pre_rope.as_ref(), pre_rope_mode,
+                    &v, &self.signs,
+                    &mut self.signs_gpu,
+                    &mut self.boundaries_gpu,
+                    &mut self.centroids_gpu,
+                    &mut self.channel_sigma_gpu,
+                    self.tq_config.rotated_channel_sigma.as_deref(),
+                    &mut self.gpu_tq_cache,
+                    self.n_kv_head, self.head_dim,
+                    layer_tq_config.bits, self.tq_config.center_keys,
+                )?;
             }
 
             if tokens_to_compress > 0 && !(seq_len == 1 && gpu_compress_ok) {
                 // ── CPU fallback: original compress path ──
-                // Pre-RoPE mode: compress pre-RoPE keys (position-independent stats).
-                let k_source = if pre_rope_mode {
-                    k_pre_rope.as_ref().unwrap()
-                } else {
-                    &k
-                };
-                let k_to_compress = k_source.narrow(2, compress_start, tokens_to_compress)?;
-                // Direct download: skip contiguous+to_dtype+flatten chain for decode (already f32 contiguous)
-                let k_flat: Vec<f32> = if k_to_compress.is_cuda() {
-                    k_to_compress.contiguous()?.to_vec1()?
-                } else {
-                    k_to_compress.contiguous()?.as_slice().to_vec()
-                };
-                let hdim = self.head_dim;
-                let use_grouped = layer_tq_config.group_size > 0 && hdim % layer_tq_config.group_size == 0;
-                for h in 0..self.n_kv_head {
-                    // Per-head adaptive bitwidth: use head-specific config if assigned
-                    let head_config = match per_head_bits {
-                        Some(ref phb) if phb[h] != layer_tq_config.bits => {
-                            // Clear calibrated codebook if bit width differs — it was
-                            // calibrated for layer_tq_config.bits, not for this head's bits.
-                            tq_kv::TurboQuantConfig {
-                                bits: phb[h],
-                                calibrated_codebook: None,
-                                ..layer_tq_config.clone()
-                            }
-                        }
-                        _ => layer_tq_config.clone(),
-                    };
-                    for s in 0..tokens_to_compress {
-                        let offset = (h * tokens_to_compress + s) * hdim;
-                        let key_vec = &k_flat[offset..offset + hdim];
-                        if use_grouped {
-                            let (packed, gnorms, residual, outliers) = tq_kv::compress_single_key_grouped(
-                                key_vec, hdim, &head_config, &self.signs,
-                            );
-                            // Set residual/outlier bits on first append
-                            if cache.k_per_head[h].residual_bits == 0 && residual.is_some() {
-                                cache.k_per_head[h].residual_bits = head_config.residual_bits;
-                            }
-                            if cache.k_per_head[h].outlier_k == 0 && outliers.is_some() {
-                                cache.k_per_head[h].outlier_k = head_config.outlier_k;
-                            }
-                            // Append outliers
-                            if let Some((oi, ov)) = outliers {
-                                if cache.k_per_head[h].outlier_indices.is_none() {
-                                    cache.k_per_head[h].outlier_indices = Some(Vec::new());
-                                    cache.k_per_head[h].outlier_values = Some(Vec::new());
-                                }
-                                cache.k_per_head[h].outlier_indices.as_mut().unwrap().extend_from_slice(&oi);
-                                cache.k_per_head[h].outlier_values.as_mut().unwrap().extend_from_slice(&ov);
-                            }
-                            cache.k_per_head[h].append_raw_grouped(&packed, &gnorms, residual);
-                        } else if self.padded_head_dim > hdim {
-                            let mut padded = vec![0.0f32; self.padded_head_dim];
-                            padded[..hdim].copy_from_slice(key_vec);
-                            let (packed, norm, _token_mean) = tq_kv::compress_single_key_with_signs(
-                                &padded, self.padded_head_dim, &head_config, &self.signs,
-                            );
-                            cache.k_per_head[h].append_raw(&packed, norm);
-                        } else {
-                            let (packed, norm, _token_mean) = tq_kv::compress_single_key_with_signs(
-                                key_vec, hdim, &head_config, &self.signs,
-                            );
-                            cache.k_per_head[h].append_raw(&packed, norm);
-                        }
-                    }
-                }
+                compress_new_keys_cpu(
+                    cache, &k, k_pre_rope.as_ref(), pre_rope_mode,
+                    compress_start, tokens_to_compress,
+                    self.n_kv_head, self.head_dim, self.padded_head_dim,
+                    &layer_tq_config, &per_head_bits, &self.signs,
+                )?;
             }
 
             // --- GPU append: upload newly compressed tokens to persistent GPU buffers ---
             #[cfg(feature = "cuda")]
             if tokens_to_compress > 0 && seq_len == 1 {
-                if let Some(reg) = crate::cuda::kernels::global_registry() {
-                    // Initialize GPU compressed KV on first use
-                    if self.gpu_tq_cache.is_none() {
-                        let head_bits = cache.k_per_head[0].bits;
-                        let cal_cb: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
-                            .as_ref().map(|cb| cb.centroids.clone());
-                        let cb: &[f32] = match cal_cb.as_deref() {
-                            Some(cal) => cal,
-                            None => tq_kv::codebook::get_centroids(head_bits),
-                        };
-                        let max_seq = std::env::var("TQ_MAX_SEQ").ok()
-                            .and_then(|v| v.parse().ok()).unwrap_or(2048usize);
-                        // Sprint 1A: pass through layer_tq_config.group_size so the
-                        // grouped norms buffer is allocated when grouped mode is on.
-                        // The grouped path still has to be flipped on by Sprint 1C
-                        // (TQ_GPU_GROUPED) before this buffer is actually written.
-                        let group_size = layer_tq_config.group_size;
-                        match GpuCompressedKv::new(
-                            reg.stream.clone(), self.n_kv_head, self.n_head,
-                            self.head_dim, head_bits, max_seq, cb, group_size,
-                        ) {
-                            Ok(mut gpu) => {
-                                // Seed with all existing compressed keys + actual V data.
-                                // Detect grouped CPU compression: if cache.k_per_head[h].norms
-                                // has count*n_groups entries instead of count, the CPU side
-                                // ran the per-group path (compress_single_key_grouped) and
-                                // every token contributes n_groups floats to .norms. Reading
-                                // .norms[pos] in that case picks the wrong float and silently
-                                // ruins the dequant sigma. Bridge through gnorms instead.
-                                let existing = cache.k_per_head[0].count;
-                                let v_offset = cache.sink_len;
-                                let gpu_bpk = gpu.bytes_per_key;
-                                let cpu_n_groups = if existing > 0 {
-                                    cache.k_per_head[0].norms.len() / existing
-                                } else { 1 };
-                                let use_grouped_seed = cpu_n_groups > 1
-                                    && cpu_n_groups == gpu.n_groups
-                                    && gpu.gnorms.is_some();
-
-                                for pos in 0..existing {
-                                    let mut packed_all = Vec::with_capacity(self.n_kv_head * gpu_bpk);
-                                    let mut norms_all: Vec<f32> = Vec::with_capacity(
-                                        self.n_kv_head * if use_grouped_seed { cpu_n_groups } else { 1 });
-                                    for h in 0..self.n_kv_head {
-                                        let h_bpk = cache.k_per_head[h].packed_indices.len() / existing.max(1);
-                                        let start = pos * h_bpk;
-                                        let end = (start + h_bpk).min(cache.k_per_head[h].packed_indices.len());
-                                        let chunk = &cache.k_per_head[h].packed_indices[start..end];
-                                        packed_all.extend_from_slice(chunk);
-                                        if chunk.len() < gpu_bpk {
-                                            packed_all.extend(std::iter::repeat(0u8).take(gpu_bpk - chunk.len()));
-                                        }
-                                        if use_grouped_seed {
-                                            let n_off = pos * cpu_n_groups;
-                                            norms_all.extend_from_slice(
-                                                &cache.k_per_head[h].norms[n_off..n_off + cpu_n_groups]);
-                                        } else {
-                                            norms_all.push(cache.k_per_head[h].norms[pos]);
-                                        }
-                                    }
-                                    let v_data = if let Some(ref v_raw) = cache.v_raw {
-                                        let v_pos = v_raw.narrow(2, v_offset + pos, 1)
-                                            .and_then(|t| t.to_dtype(DType::F32))
-                                            .and_then(|t| t.flatten_all())
-                                            .and_then(|t| t.to_vec1());
-                                        match v_pos {
-                                            Ok(d) => d,
-                                            Err(_) => vec![0.0f32; self.n_kv_head * self.head_dim],
-                                        }
-                                    } else if let Some(ref v_store) = cache.v_compressed {
-                                        // value_bits > 0: decompress V for this position
-                                        let v_all = super::kv_cache::decompress_values_store(
-                                            v_store, self.n_kv_head, self.head_dim,
-                                            cache.cached_len, q.device(),
-                                        ).ok();
-                                        if let Some(ref vt) = v_all {
-                                            vt.narrow(2, v_offset + pos, 1)
-                                                .and_then(|t| t.to_dtype(DType::F32))
-                                                .and_then(|t| t.flatten_all())
-                                                .and_then(|t| t.to_vec1())
-                                                .unwrap_or_else(|_| vec![0.0f32; self.n_kv_head * self.head_dim])
-                                        } else {
-                                            vec![0.0f32; self.n_kv_head * self.head_dim]
-                                        }
-                                    } else {
-                                        vec![0.0f32; self.n_kv_head * self.head_dim]
-                                    };
-                                    if use_grouped_seed {
-                                        let _ = gpu.append_grouped(&packed_all, &norms_all, &v_data);
-                                    } else {
-                                        let _ = gpu.append(&packed_all, &norms_all, &v_data);
-                                    }
-                                }
-                                self.gpu_tq_cache = Some(gpu);
-                            }
-                            Err(e) => eprintln!("[gpu-tq] init failed: {}", e),
-                        }
-                    }
-                    // Append the newly CPU-compressed token(s) to GPU cache.
-                    // Skip if GPU compress already appended directly.
-                    // `else if`: skip when GPU cache was just initialized (seed already includes all tokens).
-                    else if !gpu_compress_ok {
-                        if let Some(ref mut gpu) = self.gpu_tq_cache {
-                            let count = cache.k_per_head[0].count;
-                            let gpu_bpk = gpu.bytes_per_key;
-                            let pos = count - 1;
-                            // Same grouped detection as the seed loop above.
-                            let cpu_n_groups = if count > 0 {
-                                cache.k_per_head[0].norms.len() / count
-                            } else { 1 };
-                            let use_grouped_bridge = cpu_n_groups > 1
-                                && cpu_n_groups == gpu.n_groups
-                                && gpu.gnorms.is_some();
-
-                            let mut packed_all = Vec::with_capacity(self.n_kv_head * gpu_bpk);
-                            let mut norms_all: Vec<f32> = Vec::with_capacity(
-                                self.n_kv_head * if use_grouped_bridge { cpu_n_groups } else { 1 });
-                            for h in 0..self.n_kv_head {
-                                let h_bpk = cache.k_per_head[h].packed_indices.len() / count.max(1);
-                                let start = pos * h_bpk;
-                                let end = (start + h_bpk).min(cache.k_per_head[h].packed_indices.len());
-                                let chunk = &cache.k_per_head[h].packed_indices[start..end];
-                                packed_all.extend_from_slice(chunk);
-                                if chunk.len() < gpu_bpk {
-                                    packed_all.extend(std::iter::repeat(0u8).take(gpu_bpk - chunk.len()));
-                                }
-                                if use_grouped_bridge {
-                                    let n_off = pos * cpu_n_groups;
-                                    norms_all.extend_from_slice(
-                                        &cache.k_per_head[h].norms[n_off..n_off + cpu_n_groups]);
-                                } else {
-                                    norms_all.push(cache.k_per_head[h].norms[pos]);
-                                }
-                            }
-                            // Extract V data: prefer v_raw, fall back to live v tensor.
-                            // When value_bits > 0, v_raw is None (V stored in v_compressed).
-                            // The live v tensor has the current token's V in fp32.
-                            let v_data = if let Some(ref v_raw) = cache.v_raw {
-                                let vlen = v_raw.dim(2)?;
-                                let last_v = v_raw.narrow(2, vlen - 1, 1)?;
-                                last_v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
-                            } else {
-                                // v_raw is None (value_bits > 0). Use live v tensor directly.
-                                v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?
-                            };
-                            if use_grouped_bridge {
-                                let _ = gpu.append_grouped(&packed_all, &norms_all, &v_data);
-                            } else {
-                                let _ = gpu.append(&packed_all, &norms_all, &v_data);
-                            }
-                        }
-                    }
-
-                    // Ensure signs are on GPU for all-GPU decompress attention path.
-                    // Uploaded here (not in GPU compress block) because GPU compress
-                    // may not run on the first compression (gpu_tq_cache was None).
-                    if self.signs_gpu.is_none() {
-                        if let Ok(buf) = reg.stream.clone_htod(&self.signs) {
-                            self.signs_gpu = Some(buf);
-                        }
-                    }
-                }
+                gpu_append_after_compress(
+                    cache,
+                    &mut self.gpu_tq_cache,
+                    &mut self.signs_gpu,
+                    &self.signs,
+                    &q, &v,
+                    self.n_kv_head, self.n_head, self.head_dim,
+                    &layer_tq_config, gpu_compress_ok,
+                )?;
             }
 
             cache.cached_len += seq_len;
