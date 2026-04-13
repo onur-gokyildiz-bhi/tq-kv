@@ -156,6 +156,45 @@ impl LayerWeights {
             .collect()
     }
 
+    /// After warmup has uploaded every per-layer QWeight to GPU, release the
+    /// CPU-side raw bytes for Owned (non-mmap) weights. Saves roughly the
+    /// packed-model size of heap RAM on non-swap runs. Mmap weights are
+    /// already zero-copy and stay. Swap mode is gated off inside
+    /// `release_cpu_after_gpu` itself.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn release_qweight_cpu(&mut self) {
+        use crate::qmatmul as qmm;
+        let process = |qm: &mut QMatMul| {
+            if let qmm::QMatMul::Quantized(qw) = &mut qm.inner {
+                qw.release_cpu_after_gpu();
+            }
+        };
+        match &mut self.qkv {
+            QkvWeights::Separate { wq, wk, wv } => { process(wq); process(wk); process(wv); }
+            QkvWeights::Merged { wqkv } => process(wqkv),
+        }
+        process(&mut self.attention_wo);
+        match &mut self.mlp_or_moe {
+            MlpOrMoe::Mlp(m) => {
+                process(&mut m.feed_forward_w1);
+                process(&mut m.feed_forward_w2);
+                process(&mut m.feed_forward_w3);
+            }
+            MlpOrMoe::UpDown(ud) => {
+                process(&mut ud.ffn_up);
+                process(&mut ud.ffn_down);
+            }
+            MlpOrMoe::MoE { feed_forward_gate_inp, experts, .. } => {
+                process(feed_forward_gate_inp);
+                for e in experts {
+                    process(&mut e.feed_forward_w1);
+                    process(&mut e.feed_forward_w2);
+                    process(&mut e.feed_forward_w3);
+                }
+            }
+        }
+    }
+
     pub(crate) fn apply_rotary_emb(&self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let _enter = self.span_rot.enter();
         let (_b_sz, n_head, seq_len, _head_dim) = x.dims4()?;

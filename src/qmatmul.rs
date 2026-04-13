@@ -349,6 +349,12 @@ impl QWeight {
 
     /// Eagerly upload raw quantized bytes to GPU.
     /// Call during model load to avoid first-forward latency.
+    ///
+    /// For `RawBytes::Owned` weights this takes `&mut self` and releases the
+    /// heap Vec once the GPU copy is in place — otherwise the same bytes sit
+    /// twice (CPU Vec + GPU slice) for the whole run. The mmap variant is
+    /// already zero-copy so no release is needed. Swap mode is also exempt
+    /// (manager may need to re-upload on prefetch).
     #[cfg(feature = "cuda")]
     pub fn upload_to_gpu(&self, device: &TqDevice) -> Result<()> {
         if let TqDevice::Cuda { .. } = device {
@@ -359,6 +365,44 @@ impl QWeight {
                         .expect("QWeight GPU upload failed"),
                 )
             });
+        }
+        Ok(())
+    }
+
+    /// Same as `upload_to_gpu`, but also auto-releases the CPU-side `raw_data`
+    /// heap Vec under the right conditions (non-swap mode, Owned variant,
+    /// successful GPU cache). Used from the warmup path to prevent the
+    /// double-resident state (Vec<u8> + CudaSlice) that was previously
+    /// manual via `release_cpu_after_gpu`.
+    ///
+    /// Mmap-backed raw_data is left alone (zero-copy already). Swap mode is
+    /// skipped — manager needs raw_data for prefetch re-upload.
+    #[cfg(feature = "cuda")]
+    pub fn upload_to_gpu_and_release(&mut self, device: &TqDevice) -> Result<()> {
+        self.upload_to_gpu(device)?;
+        if self.gpu_cache.is_swap() {
+            return Ok(());
+        }
+        if self.gpu_cache.get().is_none() {
+            return Ok(()); // upload didn't happen (e.g. CPU device)
+        }
+        if let RawBytes::Owned(v) = &mut self.raw_data {
+            if !v.is_empty() {
+                let freed = v.len();
+                *v = Vec::new();
+                self.cpu_cache = OnceLock::new();
+                static TOTAL: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let total = TOTAL.fetch_add(freed, std::sync::atomic::Ordering::Relaxed) + freed;
+                if total > 1_000_000
+                    && (total - freed) / 100_000_000 != total / 100_000_000
+                {
+                    eprintln!(
+                        "  Auto-released {:.1} MB CPU weight data (GPU cached)",
+                        total as f64 / 1e6
+                    );
+                }
+            }
         }
         Ok(())
     }

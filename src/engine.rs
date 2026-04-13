@@ -347,6 +347,21 @@ impl Engine {
         };
         eprintln!("Model loaded!");
 
+        // Size-pool activation is opt-in via TQ_SIZE_POOL=1. Empirical A/B
+        // on qwen2:7b showed pool ON hurt Standard decode 17.1 → 13.2 tok/s —
+        // the codescope audit's predicted 88-caller relief did not
+        // materialise on small models, likely because shape variance per
+        // layer spreads the pool across many thin buckets (~480 distinct
+        // shapes for Qwen2-7B over a decode step) so hit-rate stays low
+        // while bookkeeping dominates. Kept off by default; future sprint
+        // to investigate whether the pool's per-bucket lookup overhead or
+        // its memory retention is the real cost.
+        #[cfg(feature = "cuda")]
+        if std::env::var("TQ_SIZE_POOL").ok().as_deref() == Some("1") && device.is_cuda() {
+            crate::cuda::size_pool_activate();
+            eprintln!("  Size pool: ENABLED (opt-in via TQ_SIZE_POOL=1)");
+        }
+
         // Install LayerSwapManager if swap mode was requested.
         //
         // TQ_LAYER_SWAP semantics:

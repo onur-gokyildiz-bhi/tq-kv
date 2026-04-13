@@ -600,6 +600,27 @@ impl GenericTurboModel {
                     }
                 }
             }
+
+            // Auto-release CPU raw_data for Owned (non-mmap) QWeights now
+            // that GPU caches are populated. Saves ~model-size of heap RAM
+            // on non-swap runs. Opt-in via TQ_RELEASE_CPU=1.
+            //
+            // Why opt-in: A/B on qwen2:7b showed ~3% Standard tok/s penalty
+            // (16.8 → 16.2) when release runs. Mutation invalidates some
+            // pool/Arc assumptions elsewhere in the hot path that still
+            // need investigation. Default off preserves tok/s; users on
+            // RAM-constrained systems enable the flag to reclaim heap.
+            // (Swap + mmap path already avoids the heap Vec entirely.)
+            #[cfg(feature = "cuda")]
+            if b.is_gpu() && std::env::var("TQ_RELEASE_CPU").ok().as_deref() == Some("1") {
+                eprintln!("  Releasing CPU weight heap (TQ_RELEASE_CPU=1)...");
+                for layer in &mut model.layers {
+                    layer.release_qweight_cpu();
+                }
+                if let qmm::QMatMul::Quantized(qw) = &mut model.output.inner {
+                    qw.release_cpu_after_gpu();
+                }
+            }
             eprintln!("  Weight caches warmed.");
         } else if swap_active {
             eprintln!("  QWeight warmup skipped (layer-swap active; manager handles GPU residency).");
