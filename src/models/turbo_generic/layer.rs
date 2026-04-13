@@ -45,6 +45,11 @@ pub(crate) struct LayerWeights {
     pub(crate) neg_inf: Tensor,
     /// Gemma2 attention logit soft-capping: cap * tanh(logits / cap)
     pub(crate) attn_logit_softcap: Option<f32>,
+    /// Pre-computed attention denominator. Normally `sqrt(head_dim)`; Gemma 2
+    /// overrides with `sqrt(query_pre_attn_scalar)` (9B = 224, 27B = 144).
+    /// Set at build time from `<arch>.attention.query_pre_attn_scalar` when
+    /// present in GGUF metadata, else defaults to `sqrt(head_dim)`.
+    pub(crate) attn_scale_denom: f64,
     /// Layer index (0-based) — used for selective compression
     pub(crate) layer_idx: usize,
     /// Total number of layers — needed for boundary protection (TQ_PROTECT_LAST)
@@ -412,7 +417,7 @@ impl LayerWeights {
                 let k_full = repeat_kv(k_full, n_rep)?;
                 let v_full = repeat_kv(v_full, n_rep)?;
 
-                let att = (q.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+                let att = (q.matmul(&k_full.t()?)? / self.attn_scale_denom)?;
                 let att = if let Some(cap) = self.attn_logit_softcap {
                     apply_softcap(&att, cap)?
                 } else { att };
@@ -472,7 +477,7 @@ impl LayerWeights {
 
         let k = repeat_kv(k, n_rep)?;
         let v = repeat_kv(v, n_rep)?;
-        let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+        let att = (q.matmul(&k.t()?)? / self.attn_scale_denom)?;
         // Build causal mask from actual attention dimensions (handles batched verify
         // where seq_len < total_kv_len due to existing KV cache).
         let att = if seq_len > 1 {
@@ -1573,7 +1578,7 @@ impl LayerWeights {
                         // GPU: compute compressed scores [n_heads, n_past_compressed]
                         let mut scores_gpu = reg.stream.alloc_zeros::<f32>(self.n_head * n_past_compressed)
                             .map_err(|e| TqError::Msg(format!("scores alloc: {}", e)))?;
-                        let scale = 1.0 / (self.head_dim as f32).sqrt();
+                        let scale = (1.0 / self.attn_scale_denom) as f32;
                         // Sprint 1C: route to grouped attention launcher when
                         // gnorms is populated. Both per-vector and grouped
                         // kernels write the same scores layout, so the
@@ -1969,7 +1974,7 @@ impl LayerWeights {
                     // Scores are computed per query-head using pre-rotated query
                     // and centroid table lookup (AVX2 SIMD when available).
                     let q_flat = q_f32.flatten_all()?.to_vec1()?;
-                    let scale = 1.0 / (self.head_dim as f32).sqrt();
+                    let scale = (1.0 / self.attn_scale_denom) as f32;
                     // Use calibrated centroids if available, else standard Gaussian
                     let cal_centroids_owned: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
                         .as_ref().map(|cb| cb.centroids.clone());
@@ -2221,7 +2226,7 @@ impl LayerWeights {
                         + n_past_compressed + if n_compressed > 0 { 1 } else { 0 };
 
                     let k_full = repeat_kv(k_full, n_rep)?;
-                    let mut att = (q_f32.matmul(&k_full.t()?)? / (self.head_dim as f64).sqrt())?;
+                    let mut att = (q_f32.matmul(&k_full.t()?)? / self.attn_scale_denom)?;
                     if let Some(cap) = self.attn_logit_softcap {
                         att = apply_softcap(&att, cap)?;
                     }
@@ -2367,7 +2372,7 @@ impl LayerWeights {
                 let v_for_attn = repeat_kv(v, n_rep)?;
 
                 {
-                    let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+                    let att = (q.matmul(&k.t()?)? / self.attn_scale_denom)?;
                     let att = if seq_len > 1 {
                         let total_kv_len = att.dim(3)?;
                         let offset = total_kv_len - seq_len;

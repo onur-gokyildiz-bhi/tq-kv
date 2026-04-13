@@ -203,6 +203,22 @@ impl GenericTurboModel {
             .map(|v| v as usize)
             .unwrap_or(head_dim);
 
+        // Gemma 2 attention scale: Gemma 2 uses `1/sqrt(query_pre_attn_scalar)`
+        // instead of the default `1/sqrt(head_dim)`. For Gemma-2-9B this is
+        // 224 (vs head_dim=256), for Gemma-2-27B it is 144. When the metadata
+        // key is absent we fall back to head_dim (standard attention scale).
+        let attn_scale_scalar: usize = md_get(&format!("{arch}.attention.query_pre_attn_scalar"))
+            .and_then(|m| m.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+        let attn_scale_denom: f64 = (attn_scale_scalar as f64).sqrt();
+        if attn_scale_scalar != head_dim {
+            eprintln!(
+                "  Attention scale denominator: sqrt({}) = {:.4} (Gemma override, head_dim={})",
+                attn_scale_scalar, attn_scale_denom, head_dim
+            );
+        }
+
         let rope_style = detect_rope_style(&arch);
 
         // Dump Gemma-relevant metadata
@@ -428,6 +444,7 @@ impl GenericTurboModel {
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
                 attn_logit_softcap,
+                attn_scale_denom,
                 layer_idx,
                 n_layers: block_count,
                 kv_cache: None,
