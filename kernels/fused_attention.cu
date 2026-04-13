@@ -544,8 +544,22 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
     const float* kv_norms = norms + kv_head * max_seq;
     const float* kv_v = V + kv_head * max_seq * head_dim;
 
+    // V double-buffer: cp.async overlaps V[k+1] load with K[k] dot/softmax compute.
+    // 2 × MAX_HEAD_DIM × 4B = 2KB shared (fits comfortably alongside s_q/s_q_raw/s_centroids).
+    __shared__ float s_v_buf[2][MAX_HEAD_DIM];
+    int cur = 0;
+    if (n_keys > 0) {
+        tq_load_tile_f32(&s_v_buf[0][0], &kv_v[0], head_dim);
+    }
+
     for (int k = 0; k < n_keys; ++k) {
         float norm_k = kv_norms[k];
+
+        // Prefetch V[k+1] into the OTHER buffer; load runs in background.
+        const bool has_next = (k + 1 < n_keys);
+        if (has_next) {
+            tq_load_tile_f32(&s_v_buf[1 - cur][0], &kv_v[(k + 1) * head_dim], head_dim);
+        }
 
         // Compute score: thread 0 does full dot product (head_dim is small, ~128)
         // All threads compute the score cooperatively then broadcast.
@@ -582,13 +596,20 @@ extern "C" __global__ void tq_fused_decode_attention_f32(
 
         float w = expf(score - new_max);
 
-        const float* v_row = kv_v + k * head_dim;
+        // Wait for V[k] (cur buffer). wait_one keeps V[k+1] in flight when present
+        // so the next iteration's compute can overlap with it.
+        if (has_next) tq_cp_async_wait_one();
+        else          tq_cp_async_wait_all();
+        __syncthreads();
+
         for (int i = 0; i < n_acc; ++i) {
             int d = tid + i * blockDim.x;
             if (d < head_dim) {
-                acc[i] = acc[i] * r + w * ld_readonly(&v_row[d]);
+                acc[i] = acc[i] * r + w * s_v_buf[cur][d];
             }
         }
+        __syncthreads();  // protect s_v_buf[cur] before next overwrite
+        cur ^= 1;
     }
 
     // --- Final output: acc / sum_exp ---
