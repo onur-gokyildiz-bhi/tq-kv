@@ -141,6 +141,440 @@ fn store_tri_keys(
     cache.tri_tokens_since_eviction += seq_len;
 }
 
+/// Compute attention scores — fused (compressed-indices + centroid
+/// lookup, rayon per head) or decompress (standard Q @ K^T). Handles
+/// compacted beta bias, softmax bias correction, and softcap. Returns
+/// post-softmax `att` with shape [1, n_head, 1, total_len].
+#[allow(clippy::too_many_arguments)]
+fn compute_attention_scores(
+    cache: &CompressedKvCache,
+    q: &Tensor,
+    q_f32: &Tensor,
+    k: &Tensor,
+    #[cfg(feature = "cuda")]
+    gpu_tq_cache: &Option<GpuCompressedKv>,
+    signs: &[f32],
+    cos: &Tensor,
+    sin: &Tensor,
+    layer_tq_config: &tq_kv::TurboQuantConfig,
+    tq_config: &tq_kv::TurboQuantConfig,
+    use_fused: bool,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    padded_head_dim: usize,
+    n_rep: usize,
+    n_past_compressed: usize,
+    n_compressed: usize,
+    total_len: usize,
+    compacted_t: usize,
+    rope_style: RopeStyle,
+    rope_dim: usize,
+    attn_scale_denom: f64,
+    attn_logit_softcap: Option<f32>,
+    backend: &dyn ComputeBackend,
+) -> Result<Tensor> {
+    if use_fused {
+        // FUSED PATH: compute scores directly from compressed indices.
+        // No key decompression — saves memory bandwidth. Scores are
+        // computed per query-head using pre-rotated query and centroid
+        // table lookup (AVX2 SIMD when available).
+        let q_flat = q_f32.flatten_all()?.to_vec1()?;
+        let scale = (1.0 / attn_scale_denom) as f32;
+        // Use calibrated centroids if available, else standard Gaussian.
+        let cal_centroids_owned: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
+            .as_ref().map(|cb| cb.centroids.clone());
+        // Note: cold centroids looked up per-head inside the loop (mixed bits).
+
+        // GPU-accelerated score computation disabled — overhead too high
+        // for benefit. TODO: pre-allocate GPU buffers, batch across layers.
+        #[cfg(feature = "cuda")]
+        let gpu_comp_scores: Option<Vec<f32>> = if false && n_past_compressed >= 8 {
+            if let (Some(reg), Some(gpu)) = (crate::cuda::kernels::global_registry(), gpu_tq_cache.as_ref()) {
+                let mut rotated_q_all = Vec::with_capacity(n_head * head_dim);
+                for qh in 0..n_head {
+                    let qstart = qh * head_dim;
+                    let q_vec = &q_flat[qstart..qstart + head_dim];
+                    let rq = if let Some(ref matrix) = tq_config.rotation_matrix {
+                        tq_kv::pre_rotate_query_with_matrix(q_vec, matrix)
+                    } else {
+                        tq_kv::pre_rotate_query_with_signs(q_vec, signs)
+                    };
+                    rotated_q_all.extend_from_slice(&rq);
+                }
+                let rq_gpu = reg.stream.clone_htod(&rotated_q_all).ok();
+                if let Some(ref rq) = rq_gpu {
+                    let mut scores_gpu = reg.stream.alloc_zeros::<f32>(n_head * n_past_compressed).ok();
+                    if let Some(ref mut sg) = scores_gpu {
+                        let env_grouped = super::kv_cache::get_gpu_grouped_enabled();
+                        let use_grouped_attn = (cache.pre_rope || env_grouped)
+                            && gpu.gnorms.is_some()
+                            && gpu.n_groups > 1;
+                        let ok = if use_grouped_attn {
+                            let gnorms_ref = gpu.gnorms.as_ref().unwrap();
+                            crate::cuda::kernels::tq_fused_attention_grouped(
+                                reg, rq, &gpu.packed_indices, gnorms_ref,
+                                &gpu.centroids, sg,
+                                n_head, n_kv_head, n_past_compressed, head_dim,
+                                gpu.group_size, gpu.bits as usize, scale,
+                            )
+                        } else {
+                            crate::cuda::kernels::tq_fused_attention(
+                                reg, rq, &gpu.packed_indices, &gpu.norms,
+                                &gpu.centroids, sg,
+                                n_head, n_kv_head, n_past_compressed, head_dim,
+                                gpu.bits as usize, scale, gpu.max_seq,
+                            )
+                        };
+                        if ok.is_ok() {
+                            reg.stream.clone_dtoh(sg).ok()
+                        } else { None }
+                    } else { None }
+                } else { None }
+            } else { None }
+        } else { None };
+        #[cfg(not(feature = "cuda"))]
+        let gpu_comp_scores: Option<Vec<f32>> = None;
+
+        use rayon::prelude::*;
+        let head_scores: Vec<Vec<f32>> = (0..n_head)
+            .into_par_iter()
+            .map(|qh| {
+                let kv_h = qh / n_rep;
+                let q_vec = &q_flat[qh * head_dim..(qh + 1) * head_dim];
+                let mut rotated_q = if let Some(ref matrix) = tq_config.rotation_matrix {
+                    tq_kv::pre_rotate_query_with_matrix(q_vec, matrix)
+                } else {
+                    tq_kv::pre_rotate_query_with_signs(q_vec, signs)
+                };
+                // KIVI per-channel: pre-scale rotated query.
+                if let Some(ref pcs) = tq_config.rotated_channel_sigma {
+                    let mean_sigma: f32 = pcs.iter().sum::<f32>() / pcs.len() as f32;
+                    for (d, v) in rotated_q.iter_mut().enumerate() {
+                        *v *= pcs[d] / mean_sigma;
+                    }
+                }
+                let mut scores = Vec::with_capacity(total_len);
+
+                // Segment 1: Sink keys (standard dot product, not compressed).
+                if let Some(ref sink) = cache.sink_k {
+                    let sink_f32 = sink.to_dtype(DType::F32).expect("sink to_dtype");
+                    let sink_flat = sink_f32.flatten_all().expect("sink flatten").to_vec1().expect("sink to_vec1");
+                    let sink_count = cache.sink_len;
+                    for s in 0..sink_count {
+                        let offset = (kv_h * sink_count + s) * head_dim;
+                        let k_vec = &sink_flat[offset..offset + head_dim];
+                        let dot: f32 = q_vec.iter().zip(k_vec.iter())
+                            .map(|(&qi, &ki)| qi * ki).sum();
+                        scores.push(dot * scale);
+                    }
+                }
+
+                // Segment 2: Cold (decayed) keys — fused at cold bit width (per-head).
+                if let Some(ref cold) = cache.k_cold {
+                    let cold_cb = tq_kv::codebook::get_centroids(cold[kv_h].bits);
+                    let cold_scores = tq_kv::fused_attention_scores(
+                        &rotated_q, &cold[kv_h], cold_cb, scale,
+                    );
+                    scores.extend_from_slice(&cold_scores);
+                }
+
+                // Segment 3: Hot compressed keys — GPU-accelerated when available.
+                if n_past_compressed > 0 {
+                    if let Some(ref gpu_scores) = gpu_comp_scores {
+                        let start = qh * n_past_compressed;
+                        scores.extend_from_slice(&gpu_scores[start..start + n_past_compressed]);
+                    } else {
+                        let head_bits = cache.k_per_head[kv_h].bits;
+                        let hot_cb: &[f32] = match cal_centroids_owned.as_deref() {
+                            Some(cal) if head_bits == layer_tq_config.bits => cal,
+                            _ => tq_kv::codebook::get_centroids(head_bits),
+                        };
+                        let hot = &cache.k_per_head[kv_h];
+                        let dim = hot.dim;
+                        let bpv = hot.bytes_per_vector();
+                        let mut idx_buf = vec![0u8; dim];
+                        for pos in 0..n_past_compressed {
+                            let norm = hot.norms[pos];
+                            if norm < 1e-10 {
+                                scores.push(0.0);
+                                continue;
+                            }
+                            let start = pos * bpv;
+                            let end = start + bpv;
+                            tq_kv::codebook::unpack_indices_into(
+                                &hot.packed_indices[start..end], &mut idx_buf, hot.bits,
+                            );
+                            let score = tq_kv::fused_dot_product_with_centroids(
+                                &rotated_q, &idx_buf, norm, hot_cb, dim,
+                            ) * scale;
+                            scores.push(score);
+                        }
+                    }
+                }
+
+                // Segment 4: Current token key (FP16 original — POQ).
+                if n_compressed > 0 {
+                    let k_f32 = k.to_dtype(DType::F32).expect("k to_dtype");
+                    let k_flat = k_f32.flatten_all().expect("k flatten").to_vec1().expect("k to_vec1");
+                    let k_vec = &k_flat[kv_h * head_dim..(kv_h + 1) * head_dim];
+                    let dot: f32 = q_vec.iter().zip(k_vec.iter())
+                        .map(|(&qi, &ki)| qi * ki).sum();
+                    scores.push(dot * scale);
+                }
+
+                scores
+            })
+            .collect();
+
+        let mut all_scores = Vec::with_capacity(n_head * total_len);
+        for s in &head_scores {
+            all_scores.extend_from_slice(s);
+        }
+        let att = Tensor::from_vec(
+            all_scores, vec![1, n_head, 1, total_len], q.device(),
+        )?;
+        return softmax_last_dim(&att, backend);
+    }
+
+    // DECOMPRESS PATH: decompress all keys, standard matmul.
+    let mut k_parts: Vec<Tensor> = Vec::new();
+
+    // Part 1: Sink keys (FP16, lossless — always post-RoPE).
+    if let Some(ref sink) = cache.sink_k {
+        k_parts.push(sink.to_dtype(DType::F32)?);
+    }
+
+    // Part 1.5: Cold (decayed) keys.
+    if let Some(ref cold) = cache.k_cold {
+        if cold[0].count > 0 {
+            let k_cold = if cache.pre_rope {
+                let cold_start = cache.sink_len;
+                decompress_and_apply_rope(
+                    cold, n_kv_head,
+                    padded_head_dim, DType::F32, q.device(), layer_tq_config,
+                    cos, sin, cold_start, rope_style, rope_dim,
+                )?
+            } else {
+                decompress_compressed_keys(
+                    cold, n_kv_head,
+                    padded_head_dim, DType::F32, q.device(), layer_tq_config,
+                )?
+            };
+            let k_cold = if padded_head_dim > head_dim {
+                k_cold.narrow(3, 0, head_dim)?
+            } else {
+                k_cold
+            };
+            k_parts.push(k_cold);
+        }
+    }
+
+    // Part 2: Compacted keys (attention-matching reduced tokens + beta bias).
+    if let Some(ref comp) = cache.compacted {
+        let ct = comp[0].t;
+        let mut comp_data = Vec::with_capacity(n_kv_head * ct * head_dim);
+        for h in 0..n_kv_head {
+            comp_data.extend_from_slice(&comp[h].keys);
+        }
+        let k_comp = Tensor::from_vec(
+            comp_data, vec![1, n_kv_head, ct, head_dim], q.device(),
+        )?;
+        k_parts.push(k_comp);
+    }
+
+    // Part 3: Hot compressed keys (excluding last = current token).
+    if n_past_compressed > 0 {
+        let k_decomp = if cache.pre_rope {
+            let hot_start = cache.sink_len + cache.cold_len + cache.compacted_original_len;
+            decompress_and_apply_rope(
+                &cache.k_per_head, n_kv_head,
+                padded_head_dim, DType::F32, q.device(), layer_tq_config,
+                cos, sin, hot_start, rope_style, rope_dim,
+            )?
+        } else {
+            decompress_compressed_keys(
+                &cache.k_per_head, n_kv_head,
+                padded_head_dim, DType::F32, q.device(), layer_tq_config,
+            )?
+        };
+        let k_decomp = if padded_head_dim > head_dim {
+            k_decomp.narrow(3, 0, head_dim)?
+        } else {
+            k_decomp
+        };
+        let k_past = k_decomp.narrow(2, 0, n_past_compressed)?;
+        k_parts.push(k_past);
+    }
+
+    // Part 4: Current token key (FP16 original — POQ lossless, always post-RoPE).
+    if n_compressed > 0 {
+        k_parts.push(k.to_dtype(DType::F32)?);
+    }
+
+    let k_full = if k_parts.len() == 1 {
+        k_parts.remove(0)
+    } else {
+        let k_refs: Vec<&Tensor> = k_parts.iter().collect();
+        Tensor::cat(&k_refs, 2)?
+    };
+
+    // Effective attention length: sink + cold + compacted_t + hot + current.
+    let attn_len = cache.sink_len + cache.cold_len + compacted_t
+        + n_past_compressed + if n_compressed > 0 { 1 } else { 0 };
+
+    let k_full = repeat_kv(k_full, n_rep)?;
+    let mut att = (q_f32.matmul(&k_full.t()?)? / attn_scale_denom)?;
+    if let Some(cap) = attn_logit_softcap {
+        att = apply_softcap(&att, cap)?;
+    }
+
+    // Apply compaction beta biases to compacted segment logits.
+    if let Some(ref comp) = cache.compacted {
+        let beta_start = cache.sink_len + cache.cold_len;
+        let mut full_bias = vec![0.0f32; attn_len];
+        // Use first head's beta (GQA: same across heads).
+        for (i, &b) in comp[0].beta.iter().enumerate() {
+            full_bias[beta_start + i] = b;
+        }
+        let bias_tensor = Tensor::from_vec(
+            full_bias, vec![1, 1, 1, attn_len], q.device(),
+        )?;
+        att = att.broadcast_add(&bias_tensor)?;
+    }
+
+    // Softmax bias correction: compensate quantization-induced attention drift.
+    if get_bias_correction() && n_past_compressed > 0 {
+        let bias = tq_kv::softmax_bias_correction(
+            &cache.k_per_head[0], head_dim,
+        );
+        let mut full_bias = vec![0.0f32; attn_len];
+        let hot_start = cache.sink_len + cache.cold_len + compacted_t;
+        for (i, &b) in bias.iter().take(n_past_compressed).enumerate() {
+            full_bias[hot_start + i] = b;
+        }
+        let bias_tensor = Tensor::from_vec(
+            full_bias, vec![1, 1, 1, attn_len], q.device(),
+        )?;
+        att = att.broadcast_add(&bias_tensor)?;
+    }
+
+    softmax_last_dim(&att, backend)
+}
+
+/// Attention output pass: `att @ V` with three paths — compacted
+/// (segment-wise V build), sparse-decompress (skip zero att rows when
+/// V is compressed and on CPU), and the plain dense / sparse fallback.
+/// Returns the pre-transpose y in shape [1, n_head, 1, head_dim].
+#[allow(clippy::too_many_arguments)]
+fn compute_attention_output(
+    att: &Tensor,
+    cache: &CompressedKvCache,
+    q: &Tensor,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    n_rep: usize,
+    n_past_compressed: usize,
+    n_compressed: usize,
+    total_len: usize,
+    has_compacted: bool,
+) -> Result<Tensor> {
+    let sparse_thresh = get_sparse_v_threshold();
+
+    // When compaction is active, build value tensor with compacted values spliced in.
+    if has_compacted {
+        let mut v_parts: Vec<Tensor> = Vec::new();
+        let device = q.device();
+
+        // Get original value tensor (all positions including removed ones).
+        let v_all_f32 = if cache.value_bits == 0 {
+            cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?
+        } else {
+            decompress_values_store(
+                cache.v_compressed.as_ref().unwrap(),
+                n_kv_head, head_dim, total_len, device,
+            )?
+        };
+
+        // Sink values: positions [0, sink_len)
+        if cache.sink_len > 0 {
+            v_parts.push(v_all_f32.narrow(2, 0, cache.sink_len)?);
+        }
+        // Cold values: positions [sink_len, sink_len + cold_len)
+        if cache.cold_len > 0 {
+            v_parts.push(v_all_f32.narrow(2, cache.sink_len, cache.cold_len)?);
+        }
+        // Compacted synthetic values
+        let comp = cache.compacted.as_ref().unwrap();
+        let ct = comp[0].t;
+        let mut comp_v_data = Vec::with_capacity(n_kv_head * ct * head_dim);
+        for h in 0..n_kv_head {
+            comp_v_data.extend_from_slice(&comp[h].values);
+        }
+        let v_comp = Tensor::from_vec(
+            comp_v_data, vec![1, n_kv_head, ct, head_dim], device,
+        )?;
+        v_parts.push(v_comp);
+        // Hot values: skip compacted_original_len, take remaining.
+        let hot_v_start = cache.sink_len + cache.cold_len + cache.compacted_original_len;
+        let hot_v_count = n_past_compressed + if n_compressed > 0 { 1 } else { 0 };
+        if hot_v_count > 0 {
+            v_parts.push(v_all_f32.narrow(2, hot_v_start, hot_v_count)?);
+        }
+
+        let v_full = if v_parts.len() == 1 {
+            v_parts.remove(0)
+        } else {
+            let v_refs: Vec<&Tensor> = v_parts.iter().collect();
+            Tensor::cat(&v_refs, 2)?
+        };
+        let v_full = repeat_kv(v_full, n_rep)?;
+        return Ok(att.matmul(&v_full.contiguous()?)?.to_dtype(cache.dtype)?);
+    }
+
+    if sparse_thresh > 0.0 && att.is_cpu() && cache.value_bits > 0 {
+        // Fused sparse-decompress path: decompress only active V rows.
+        let att_flat = att.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let v_store = cache.v_compressed.as_ref().unwrap();
+        let mut output = Vec::with_capacity(n_head * head_dim);
+
+        for h in 0..n_head {
+            let kv_h = h / n_rep; // GQA head mapping
+            let att_row = &att_flat[h * total_len..(h + 1) * total_len];
+
+            let head_out = match v_store {
+                CompressedValueStore::Bits4(ref v) =>
+                    tq_kv::sparse_attn_v_mul_compressed_4bit(att_row, &v[kv_h], sparse_thresh),
+                CompressedValueStore::Bits8(ref v) =>
+                    tq_kv::sparse_attn_v_mul_compressed_8bit(att_row, &v[kv_h], sparse_thresh),
+            };
+            output.extend_from_slice(&head_out);
+        }
+
+        return Ok(Tensor::from_vec(output, vec![1, n_head, 1, head_dim], att.device())?
+            .to_dtype(cache.dtype)?);
+    }
+
+    // Standard path: decompress all values, matmul or sparse multiply.
+    let v_f32 = if cache.value_bits == 0 {
+        repeat_kv(cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?, n_rep)?
+    } else {
+        let v_tensor = decompress_values_store(
+            cache.v_compressed.as_ref().unwrap(),
+            n_kv_head, head_dim, total_len, q.device(),
+        )?;
+        repeat_kv(v_tensor, n_rep)?
+    };
+
+    if sparse_thresh > 0.0 && att.is_cpu() {
+        Ok(sparse_attn_v(att, &v_f32, n_head, head_dim, sparse_thresh)?
+            .to_dtype(cache.dtype)?)
+    } else {
+        Ok(att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)?)
+    }
+}
+
 /// GPU fused TQ attention (enabled with TQ_GPU_FUSED=1). Pre-rotates
 /// the query, launches a fused-score kernel over compressed K, then
 /// runs softmax + V on CPU using v_raw. Returns `Some(y)` on success
@@ -2259,404 +2693,26 @@ impl LayerWeights {
                 }
 
                 // --- Compute attention scores ---
-                let att = if use_fused {
-                    // FUSED PATH: compute scores directly from compressed indices.
-                    // No key decompression — saves memory bandwidth.
-                    // Scores are computed per query-head using pre-rotated query
-                    // and centroid table lookup (AVX2 SIMD when available).
-                    let q_flat = q_f32.flatten_all()?.to_vec1()?;
-                    let scale = (1.0 / self.attn_scale_denom) as f32;
-                    // Use calibrated centroids if available, else standard Gaussian
-                    let cal_centroids_owned: Option<Vec<f32>> = layer_tq_config.calibrated_codebook
-                        .as_ref().map(|cb| cb.centroids.clone());
-                    // Note: cold centroids looked up per-head inside the loop (mixed bits)
-
-                    // GPU-accelerated compressed score computation (if available)
-                    // GPU-accelerated score computation disabled — overhead too high for benefit
-                    // TODO: pre-allocate GPU buffers and batch across layers
-                    #[cfg(feature = "cuda")]
-                    let gpu_comp_scores: Option<Vec<f32>> = if false && n_past_compressed >= 8 {
-                        if let (Some(reg), Some(ref gpu)) = (crate::cuda::kernels::global_registry(), &self.gpu_tq_cache) {
-                            // Upload rotated query
-                            let mut rotated_q_all = Vec::with_capacity(self.n_head * self.head_dim);
-                            for qh in 0..self.n_head {
-                                let qstart = qh * self.head_dim;
-                                let q_vec = &q_flat[qstart..qstart + self.head_dim];
-                                let rq = if let Some(ref matrix) = self.tq_config.rotation_matrix {
-                                    tq_kv::pre_rotate_query_with_matrix(q_vec, matrix)
-                                } else {
-                                    tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs)
-                                };
-                                rotated_q_all.extend_from_slice(&rq);
-                            }
-                            let rq_gpu = reg.stream.clone_htod(&rotated_q_all).ok();
-                            if let Some(ref rq) = rq_gpu {
-                                let mut scores_gpu = reg.stream.alloc_zeros::<f32>(self.n_head * n_past_compressed).ok();
-                                if let Some(ref mut sg) = scores_gpu {
-                                    let env_grouped = super::kv_cache::get_gpu_grouped_enabled();
-                                    let use_grouped_attn = (cache.pre_rope || env_grouped)
-                                        && gpu.gnorms.is_some()
-                                        && gpu.n_groups > 1;
-                                    let ok = if use_grouped_attn {
-                                        let gnorms_ref = gpu.gnorms.as_ref().unwrap();
-                                        crate::cuda::kernels::tq_fused_attention_grouped(
-                                            reg, rq, &gpu.packed_indices, gnorms_ref,
-                                            &gpu.centroids, sg,
-                                            self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
-                                            gpu.group_size, gpu.bits as usize, scale,
-                                        )
-                                    } else {
-                                        crate::cuda::kernels::tq_fused_attention(
-                                            reg, rq, &gpu.packed_indices, &gpu.norms,
-                                            &gpu.centroids, sg,
-                                            self.n_head, self.n_kv_head, n_past_compressed, self.head_dim,
-                                            gpu.bits as usize, scale, gpu.max_seq,
-                                        )
-                                    };
-                                    if ok.is_ok() {
-                                        reg.stream.clone_dtoh(sg).ok()
-                                    } else { None }
-                                } else { None }
-                            } else { None }
-                        } else { None }
-                    } else { None };
-                    #[cfg(not(feature = "cuda"))]
-                    let gpu_comp_scores: Option<Vec<f32>> = None;
-
-                    use rayon::prelude::*;
-                    let head_scores: Vec<Vec<f32>> = (0..self.n_head)
-                        .into_par_iter()
-                        .map(|qh| {
-                            let kv_h = qh / n_rep;
-                            let q_vec = &q_flat[qh * self.head_dim..(qh + 1) * self.head_dim];
-                            let mut rotated_q = if let Some(ref matrix) = self.tq_config.rotation_matrix {
-                                tq_kv::pre_rotate_query_with_matrix(q_vec, matrix)
-                            } else {
-                                tq_kv::pre_rotate_query_with_signs(q_vec, &self.signs)
-                            };
-                            // KIVI per-channel: pre-scale rotated query
-                            if let Some(ref pcs) = self.tq_config.rotated_channel_sigma {
-                                let mean_sigma: f32 = pcs.iter().sum::<f32>() / pcs.len() as f32;
-                                for (d, v) in rotated_q.iter_mut().enumerate() {
-                                    *v *= pcs[d] / mean_sigma;
-                                }
-                            }
-                            let mut scores = Vec::with_capacity(total_len);
-
-                            // Segment 1: Sink keys (standard dot product, not compressed)
-                            if let Some(ref sink) = cache.sink_k {
-                                let sink_f32 = sink.to_dtype(DType::F32).expect("sink to_dtype");
-                                let sink_flat = sink_f32.flatten_all().expect("sink flatten").to_vec1().expect("sink to_vec1");
-                                let sink_count = cache.sink_len;
-                                for s in 0..sink_count {
-                                    let offset = (kv_h * sink_count + s) * self.head_dim;
-                                    let k_vec = &sink_flat[offset..offset + self.head_dim];
-                                    let dot: f32 = q_vec.iter().zip(k_vec.iter())
-                                        .map(|(&qi, &ki)| qi * ki).sum();
-                                    scores.push(dot * scale);
-                                }
-                            }
-
-                            // Segment 2: Cold (decayed) keys — fused at cold bit width (per-head)
-                            if let Some(ref cold) = cache.k_cold {
-                                let cold_cb = tq_kv::codebook::get_centroids(cold[kv_h].bits);
-                                let cold_scores = tq_kv::fused_attention_scores(
-                                    &rotated_q, &cold[kv_h], cold_cb, scale,
-                                );
-                                scores.extend_from_slice(&cold_scores);
-                            }
-
-                            // Segment 3: Hot compressed keys — GPU-accelerated when available
-                            if n_past_compressed > 0 {
-                                if let Some(ref gpu_scores) = gpu_comp_scores {
-                                    // Use pre-computed GPU scores
-                                    let start = qh * n_past_compressed;
-                                    scores.extend_from_slice(&gpu_scores[start..start + n_past_compressed]);
-                                } else {
-                                    // CPU fallback
-                                    let head_bits = cache.k_per_head[kv_h].bits;
-                                    let hot_cb: &[f32] = match cal_centroids_owned.as_deref() {
-                                        Some(cal) if head_bits == layer_tq_config.bits => cal,
-                                        _ => tq_kv::codebook::get_centroids(head_bits),
-                                    };
-                                    let hot = &cache.k_per_head[kv_h];
-                                    let dim = hot.dim;
-                                    let bpv = hot.bytes_per_vector();
-                                    let mut idx_buf = vec![0u8; dim];
-                                    for pos in 0..n_past_compressed {
-                                        let norm = hot.norms[pos];
-                                        if norm < 1e-10 {
-                                            scores.push(0.0);
-                                            continue;
-                                        }
-                                        let start = pos * bpv;
-                                        let end = start + bpv;
-                                        tq_kv::codebook::unpack_indices_into(
-                                            &hot.packed_indices[start..end], &mut idx_buf, hot.bits,
-                                        );
-                                        let score = tq_kv::fused_dot_product_with_centroids(
-                                            &rotated_q, &idx_buf, norm, hot_cb, dim,
-                                        ) * scale;
-                                        scores.push(score);
-                                    }
-                                }
-                            }
-
-                            // Segment 4: Current token key (FP16 original — POQ)
-                            // Only if current token was compressed (not still in sink range)
-                            if n_compressed > 0 {
-                                let k_f32 = k.to_dtype(DType::F32).expect("k to_dtype");
-                                let k_flat = k_f32.flatten_all().expect("k flatten").to_vec1().expect("k to_vec1");
-                                let k_vec = &k_flat[kv_h * self.head_dim..(kv_h + 1) * self.head_dim];
-                                let dot: f32 = q_vec.iter().zip(k_vec.iter())
-                                    .map(|(&qi, &ki)| qi * ki).sum();
-                                scores.push(dot * scale);
-                            }
-
-                            scores
-                        })
-                        .collect();
-
-                    let mut all_scores = Vec::with_capacity(self.n_head * total_len);
-                    for s in &head_scores {
-                        all_scores.extend_from_slice(s);
-                    }
-                    let att = Tensor::from_vec(
-                        all_scores, vec![1, self.n_head, 1, total_len], q.device(),
-                    )?;
-                    softmax_last_dim(&att, backend)?
-                } else {
-                    // DECOMPRESS PATH: decompress all keys, standard matmul
-                    let mut k_parts: Vec<Tensor> = Vec::new();
-
-                    // Part 1: Sink keys (FP16, lossless — always post-RoPE)
-                    if let Some(ref sink) = cache.sink_k {
-                        k_parts.push(sink.to_dtype(DType::F32)?);
-                    }
-
-                    // Part 1.5: Cold (decayed) keys
-                    if let Some(ref cold) = cache.k_cold {
-                        if cold[0].count > 0 {
-                            let k_cold = if cache.pre_rope {
-                                // Pre-RoPE: decompress + apply RoPE dynamically
-                                let cold_start = cache.sink_len;
-                                decompress_and_apply_rope(
-                                    cold, self.n_kv_head,
-                                    self.padded_head_dim, DType::F32, q.device(), &layer_tq_config,
-                                    &self.cos, &self.sin, cold_start, self.rope_style, self.rope_dim,
-                                )?
-                            } else {
-                                decompress_compressed_keys(
-                                    cold, self.n_kv_head,
-                                    self.padded_head_dim, DType::F32, q.device(), &layer_tq_config,
-                                )?
-                            };
-                            let k_cold = if self.padded_head_dim > self.head_dim {
-                                k_cold.narrow(3, 0, self.head_dim)?
-                            } else {
-                                k_cold
-                            };
-                            k_parts.push(k_cold);
-                        }
-                    }
-
-                    // Part 2: Compacted keys (attention-matching reduced tokens + beta bias)
-                    if let Some(ref comp) = cache.compacted {
-                        // Build compacted keys tensor: [1, n_kv_head, compacted_t, head_dim]
-                        let ct = comp[0].t;
-                        let mut comp_data = Vec::with_capacity(self.n_kv_head * ct * self.head_dim);
-                        for h in 0..self.n_kv_head {
-                            comp_data.extend_from_slice(&comp[h].keys);
-                        }
-                        let k_comp = Tensor::from_vec(
-                            comp_data, vec![1, self.n_kv_head, ct, self.head_dim], q.device(),
-                        )?;
-                        k_parts.push(k_comp);
-                    }
-
-                    // Part 3: Hot compressed keys (excluding last = current token)
-                    if n_past_compressed > 0 {
-                        let k_decomp = if cache.pre_rope {
-                            // Pre-RoPE: decompress + apply RoPE dynamically
-                            let hot_start = cache.sink_len + cache.cold_len + cache.compacted_original_len;
-                            decompress_and_apply_rope(
-                                &cache.k_per_head, self.n_kv_head,
-                                self.padded_head_dim, DType::F32, q.device(), &layer_tq_config,
-                                &self.cos, &self.sin, hot_start, self.rope_style, self.rope_dim,
-                            )?
-                        } else {
-                            decompress_compressed_keys(
-                                &cache.k_per_head, self.n_kv_head,
-                                self.padded_head_dim, DType::F32, q.device(), &layer_tq_config,
-                            )?
-                        };
-                        let k_decomp = if self.padded_head_dim > self.head_dim {
-                            k_decomp.narrow(3, 0, self.head_dim)?
-                        } else {
-                            k_decomp
-                        };
-                        let k_past = k_decomp.narrow(2, 0, n_past_compressed)?;
-                        k_parts.push(k_past);
-                    }
-
-                    // Part 4: Current token key (FP16 original — POQ lossless, always post-RoPE)
-                    // Only add if current token was compressed (not still in sink range)
-                    if n_compressed > 0 {
-                        k_parts.push(k.to_dtype(DType::F32)?);
-                    }
-
-                    let k_full = if k_parts.len() == 1 {
-                        k_parts.remove(0)
-                    } else {
-                        let k_refs: Vec<&Tensor> = k_parts.iter().collect();
-                        Tensor::cat(&k_refs, 2)?
-                    };
-
-                    // Effective attention length: sink + cold + compacted_t + hot + current
-                    let attn_len = cache.sink_len + cache.cold_len + compacted_t
-                        + n_past_compressed + if n_compressed > 0 { 1 } else { 0 };
-
-                    let k_full = repeat_kv(k_full, n_rep)?;
-                    let mut att = (q_f32.matmul(&k_full.t()?)? / self.attn_scale_denom)?;
-                    if let Some(cap) = self.attn_logit_softcap {
-                        att = apply_softcap(&att, cap)?;
-                    }
-
-                    // Apply compaction beta biases to compacted segment logits
-                    if let Some(ref comp) = cache.compacted {
-                        let _ct = comp[0].t;
-                        let beta_start = cache.sink_len + cache.cold_len;
-                        // Build bias vector: [sink=0, cold=0, compacted=beta, hot=0, current=0]
-                        let mut full_bias = vec![0.0f32; attn_len];
-                        // For simplicity, use first head's beta (GQA: same across heads)
-                        for (i, &b) in comp[0].beta.iter().enumerate() {
-                            full_bias[beta_start + i] = b;
-                        }
-                        let bias_tensor = Tensor::from_vec(
-                            full_bias, vec![1, 1, 1, attn_len], q.device(),
-                        )?;
-                        att = att.broadcast_add(&bias_tensor)?;
-                    }
-
-                    // Softmax bias correction: compensate quantization-induced attention drift
-                    if get_bias_correction() && n_past_compressed > 0 {
-                        let bias = tq_kv::softmax_bias_correction(
-                            &cache.k_per_head[0], self.head_dim,
-                        );
-                        // Build full bias vector: [..., hot_bias, ...]
-                        let mut full_bias = vec![0.0f32; attn_len];
-                        let hot_start = cache.sink_len + cache.cold_len + compacted_t;
-                        for (i, &b) in bias.iter().take(n_past_compressed).enumerate() {
-                            full_bias[hot_start + i] = b;
-                        }
-                        let bias_tensor = Tensor::from_vec(
-                            full_bias, vec![1, 1, 1, attn_len], q.device(),
-                        )?;
-                        att = att.broadcast_add(&bias_tensor)?;
-                    }
-
-                    softmax_last_dim(&att, backend)?
-                };
+                let att = compute_attention_scores(
+                    cache, &q, &q_f32, &k,
+                    #[cfg(feature = "cuda")] &self.gpu_tq_cache,
+                    &self.signs, &self.cos, &self.sin,
+                    &layer_tq_config, &self.tq_config,
+                    use_fused,
+                    self.n_head, self.n_kv_head, self.head_dim, self.padded_head_dim,
+                    n_rep, n_past_compressed, n_compressed, total_len, compacted_t,
+                    self.rope_style, self.rope_dim,
+                    self.attn_scale_denom, self.attn_logit_softcap,
+                    backend,
+                )?;
 
                 // --- Compute attention output: att @ V ---
-                let sparse_thresh = get_sparse_v_threshold();
-
-                // When compaction is active, build value tensor with compacted values spliced in
-                if has_compacted {
-                    // Build V tensor: [sink_v | cold_v | compacted_v | hot_v | current_v]
-                    let mut v_parts: Vec<Tensor> = Vec::new();
-                    let device = q.device();
-                    let head_dim = self.head_dim;
-
-                    // Get original value tensor (all positions including removed ones)
-                    let v_all_f32 = if cache.value_bits == 0 {
-                        cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?
-                    } else {
-                        decompress_values_store(
-                            cache.v_compressed.as_ref().unwrap(),
-                            self.n_kv_head, head_dim, total_len, device,
-                        )?
-                    };
-
-                    // Sink values: positions [0, sink_len)
-                    if cache.sink_len > 0 {
-                        v_parts.push(v_all_f32.narrow(2, 0, cache.sink_len)?);
-                    }
-
-                    // Cold values: positions [sink_len, sink_len + cold_len)
-                    if cache.cold_len > 0 {
-                        v_parts.push(v_all_f32.narrow(2, cache.sink_len, cache.cold_len)?);
-                    }
-
-                    // Compacted synthetic values
-                    let comp = cache.compacted.as_ref().unwrap();
-                    let ct = comp[0].t;
-                    let mut comp_v_data = Vec::with_capacity(self.n_kv_head * ct * head_dim);
-                    for h in 0..self.n_kv_head {
-                        comp_v_data.extend_from_slice(&comp[h].values);
-                    }
-                    let v_comp = Tensor::from_vec(
-                        comp_v_data, vec![1, self.n_kv_head, ct, head_dim], device,
-                    )?;
-                    v_parts.push(v_comp);
-
-                    // Hot values: skip compacted_original_len, take remaining
-                    let hot_v_start = cache.sink_len + cache.cold_len + cache.compacted_original_len;
-                    let hot_v_count = n_past_compressed + if n_compressed > 0 { 1 } else { 0 };
-                    if hot_v_count > 0 {
-                        v_parts.push(v_all_f32.narrow(2, hot_v_start, hot_v_count)?);
-                    }
-
-                    let v_full = if v_parts.len() == 1 {
-                        v_parts.remove(0)
-                    } else {
-                        let v_refs: Vec<&Tensor> = v_parts.iter().collect();
-                        Tensor::cat(&v_refs, 2)?
-                    };
-                    let v_full = repeat_kv(v_full, n_rep)?;
-                    att.matmul(&v_full.contiguous()?)?.to_dtype(cache.dtype)?
-
-                } else if sparse_thresh > 0.0 && att.is_cpu() && cache.value_bits > 0 {
-                    // Fused sparse-decompress path: decompress only active V rows
-                    let att_flat = att.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                    let v_store = cache.v_compressed.as_ref().unwrap();
-                    let head_dim = self.head_dim;
-                    let mut output = Vec::with_capacity(self.n_head * head_dim);
-
-                    for h in 0..self.n_head {
-                        let kv_h = h / n_rep; // GQA head mapping
-                        let att_row = &att_flat[h * total_len..(h + 1) * total_len];
-
-                        let head_out = match v_store {
-                            CompressedValueStore::Bits4(ref v) =>
-                                tq_kv::sparse_attn_v_mul_compressed_4bit(att_row, &v[kv_h], sparse_thresh),
-                            CompressedValueStore::Bits8(ref v) =>
-                                tq_kv::sparse_attn_v_mul_compressed_8bit(att_row, &v[kv_h], sparse_thresh),
-                        };
-                        output.extend_from_slice(&head_out);
-                    }
-
-                    Tensor::from_vec(output, vec![1, self.n_head, 1, head_dim], att.device())?
-                        .to_dtype(cache.dtype)?
-                } else {
-                    // Standard path: decompress all values, matmul or sparse multiply
-                    let v_f32 = if cache.value_bits == 0 {
-                        repeat_kv(cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?, n_rep)?
-                    } else {
-                        let v_tensor = decompress_values_store(
-                            cache.v_compressed.as_ref().unwrap(),
-                            self.n_kv_head, self.head_dim, total_len, q.device(),
-                        )?;
-                        repeat_kv(v_tensor, n_rep)?
-                    };
-
-                    if sparse_thresh > 0.0 && att.is_cpu() {
-                        sparse_attn_v(&att, &v_f32, self.n_head, self.head_dim, sparse_thresh)?
-                            .to_dtype(cache.dtype)?
-                    } else {
-                        att.matmul(&v_f32.contiguous()?)?.to_dtype(cache.dtype)?
-                    }
-                }
+                compute_attention_output(
+                    &att, cache, &q,
+                    self.n_head, self.n_kv_head, self.head_dim,
+                    n_rep, n_past_compressed, n_compressed, total_len,
+                    has_compacted,
+                )?
             } else {
                 // PREFILL: use original uncompressed keys for attention (standard path)
                 let k = repeat_kv(k, n_rep)?;
