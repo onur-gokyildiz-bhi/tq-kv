@@ -92,6 +92,52 @@ fn detect_rope_style(arch: &str) -> RopeStyle {
     }
 }
 
+/// Hybrid graph helper: end capture + immediately replay when the layer
+/// loop hits the first TQ (compressed) layer, then flip `capturing` off
+/// so subsequent TQ layers run eagerly on the same stream.
+///
+/// Free function, not a method, so the iter_mut() borrow of
+/// `self.layers` can coexist with `&mut self.graph_manager` via
+/// disjoint-field borrows at the call site.
+#[cfg(feature = "cuda")]
+fn maybe_end_hybrid_capture(
+    graph_manager: &mut crate::cuda::graph::CudaGraphManager,
+    capturing: &mut bool,
+    layer_idx: usize,
+    layer_uses_compression: bool,
+) {
+    if !*capturing || !layer_uses_compression {
+        return;
+    }
+    if !matches!(graph_manager.status, crate::cuda::graph::GraphStatus::Capturing) {
+        return;
+    }
+    let Some(reg) = crate::cuda::kernels::global_registry() else { return; };
+
+    match graph_manager.end_capture(&reg.stream, 1) {
+        Ok(()) => {
+            eprintln!("[cuda-graph] hybrid: captured {} non-TQ layers", layer_idx);
+            // Capture only records — replay to actually execute.
+            let _ = reg.stream.context().check_err();
+            match graph_manager.replay(&reg.stream, 1) {
+                Ok(()) => {
+                    let _ = reg.stream.synchronize();
+                    eprintln!("[cuda-graph] hybrid: initial replay OK");
+                }
+                Err(e) => {
+                    eprintln!("[cuda-graph] hybrid: replay FAILED: {}", e);
+                    graph_manager.reset();
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[cuda-graph] hybrid: end_capture failed: {}", e);
+            graph_manager.reset();
+        }
+    }
+    *capturing = false;
+}
+
 impl GenericTurboModel {
     /// Load from a GGUF file (thin wrapper over `build`).
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
@@ -1191,37 +1237,11 @@ impl GenericTurboModel {
             let layer_uses_compression = get_layer_bits(layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers).is_some();
 
             // ── Hybrid graph: end capture at TQ boundary ──
-            // Non-TQ layers are captured in the graph. When we hit the first TQ layer,
-            // end capture and replay immediately. TQ layers run eagerly after.
             #[cfg(feature = "cuda")]
-            if capturing && layer_uses_compression
-                && matches!(self.graph_manager.status, crate::cuda::graph::GraphStatus::Capturing)
-            {
-                if let Some(reg) = crate::cuda::kernels::global_registry() {
-                    match self.graph_manager.end_capture(&reg.stream, 1) {
-                        Ok(()) => {
-                            eprintln!("[cuda-graph] hybrid: captured {} non-TQ layers", layer_idx);
-                            // Capture only records — replay to actually execute
-                            let _ = reg.stream.context().check_err();
-                            match self.graph_manager.replay(&reg.stream, 1) {
-                                Ok(()) => {
-                                    let _ = reg.stream.synchronize();
-                                    eprintln!("[cuda-graph] hybrid: initial replay OK");
-                                }
-                                Err(e) => {
-                                    eprintln!("[cuda-graph] hybrid: replay FAILED: {}", e);
-                                    self.graph_manager.reset();
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[cuda-graph] hybrid: end_capture failed: {}", e);
-                            self.graph_manager.reset();
-                        }
-                    }
-                }
-                capturing = false;
-            }
+            maybe_end_hybrid_capture(
+                &mut self.graph_manager, &mut capturing,
+                layer_idx, layer_uses_compression,
+            );
 
             #[cfg(feature = "cuda")]
             let fused_disabled = {
