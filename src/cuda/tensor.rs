@@ -211,14 +211,6 @@ fn bufs_get_cloned(bufs: &[std::sync::Arc<cudarc::driver::CudaSlice<f32>>], idx:
     bufs.get(idx).cloned()
 }
 
-// Keep graph_retention_start/drain as no-ops for backward compat
-#[cfg(feature = "cuda")]
-pub fn graph_retention_start() {}
-#[cfg(feature = "cuda")]
-pub fn graph_retention_drain() -> Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>> { Vec::new() }
-#[cfg(feature = "cuda")]
-fn graph_retention_keep(_data: &std::sync::Arc<cudarc::driver::CudaSlice<f32>>) {}
-
 /// Public wrapper for gpu_alloc_zeros (used by GpuKvCache).
 #[cfg(feature = "cuda")]
 pub fn gpu_alloc_zeros_pub(
@@ -1220,7 +1212,6 @@ impl TqTensor {
                 let cuda_data = stream.clone_htod(&data)
                     .map_err(|e| TqError::Cuda(e))?;
                 let arc = std::sync::Arc::new(cuda_data);
-                graph_retention_keep(&arc);
                 Ok(Self {
                     storage: TqStorage::Cuda { data: arc, stream },
                     shape,
@@ -1261,7 +1252,6 @@ impl TqTensor {
                 let cuda_data = stream.clone_htod(data)
                     .map_err(|e| TqError::Cuda(e))?;
                 let arc = std::sync::Arc::new(cuda_data);
-                graph_retention_keep(&arc);
                 Ok(Self {
                     storage: TqStorage::Cuda { data: arc, stream },
                     shape: self.shape.clone(),
@@ -1364,7 +1354,6 @@ impl TqTensor {
             TqStorage::Cpu(data) => {
                 let gpu = stream.clone_htod(data).map_err(|e| TqError::Msg(format!("auto-upload: {}", e)))?;
                 let arc = std::sync::Arc::new(gpu);
-                graph_retention_keep(&arc);
                 Ok(Self { storage: TqStorage::Cuda { data: arc, stream }, shape: self.shape.clone(), dtype: self.dtype })
             }
             _ => Ok(self.clone()),
@@ -1445,7 +1434,6 @@ impl TqTensor {
         shape: Vec<usize>,
         stream: std::sync::Arc<cudarc::driver::CudaStream>,
     ) -> Self {
-        graph_retention_keep(&data);
         Self {
             storage: TqStorage::Cuda { data, stream },
             shape,
@@ -1755,7 +1743,7 @@ impl TqTensor {
 
         Ok((
             Self::from_cuda(out, shape.clone(), stream.clone()),
-            { graph_retention_keep(&res_arc); Self { storage: TqStorage::Cuda { data: res_arc, stream: stream.clone() }, shape, dtype: TqDType::F32 } },
+            Self { storage: TqStorage::Cuda { data: res_arc, stream: stream.clone() }, shape, dtype: TqDType::F32 },
         ))
     }
 

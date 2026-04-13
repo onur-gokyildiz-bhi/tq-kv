@@ -323,10 +323,6 @@ impl CalibrationCollector {
         }
     }
 
-    pub fn is_full(&self) -> bool {
-        self.count >= self.max_samples
-    }
-
     /// Collect pre-RoPE Q and K vectors for TriAttention calibration.
     pub fn collect_pre_rope(&mut self, q_flat: &[f32], k_flat: &[f32],
                             n_heads: usize, n_kv_heads: usize,

@@ -41,27 +41,12 @@ pub struct GenericTurboModel {
     /// CUDA Graph manager for decode acceleration.
     #[cfg(feature = "cuda")]
     pub(crate) graph_manager: crate::cuda::graph::CudaGraphManager,
-    /// Cached output tensor from graph capture (for replay).
-    #[cfg(feature = "cuda")]
-    pub(crate) graph_output: Option<Tensor>,
-    /// GPU buffers kept alive for graph replay (prevents ILLEGAL_ADDRESS from freed pointers).
-    #[cfg(feature = "cuda")]
-    pub(crate) graph_retained_buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
-    /// Pre-allocated intermediate buffers for graph capture (DecodeBufferPool).
-    #[cfg(feature = "cuda")]
-    pub(crate) graph_pool_buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
     /// GPU buffer address of the input embedding (for updating before graph replay).
     #[cfg(feature = "cuda")]
     pub(crate) graph_input_buffer: Option<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
     /// GPU scalar for RoPE position offset (updated before graph replay).
     #[cfg(feature = "cuda")]
     pub(crate) rope_pos_gpu: Option<cudarc::driver::CudaSlice<i32>>,
-    /// Arena buffer pool for decode (reuses allocs across decode steps without CUDA Graph).
-    #[cfg(feature = "cuda")]
-    pub(crate) arena_pool_buffers: Vec<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
-    /// Number of decode steps completed (0 = first decode records, 1+ = arena reuse).
-    #[cfg(feature = "cuda")]
-    pub(crate) arena_decode_count: usize,
     /// Pre-allocated scratch buffers for zero-alloc decode (fused kernel path).
     #[cfg(feature = "cuda")]
     pub(crate) decode_scratch: Option<DecodeScratch>,
@@ -581,19 +566,9 @@ impl GenericTurboModel {
                 }
             }),
             #[cfg(feature = "cuda")]
-            graph_output: None,
-            #[cfg(feature = "cuda")]
-            graph_retained_buffers: Vec::new(),
-            #[cfg(feature = "cuda")]
-            graph_pool_buffers: Vec::new(),
-            #[cfg(feature = "cuda")]
             graph_input_buffer: None,
             #[cfg(feature = "cuda")]
             rope_pos_gpu: None,
-            #[cfg(feature = "cuda")]
-            arena_pool_buffers: Vec::new(),
-            #[cfg(feature = "cuda")]
-            arena_decode_count: 0,
             #[cfg(feature = "cuda")]
             decode_scratch: None,
             #[cfg(feature = "cuda")]
@@ -799,15 +774,10 @@ impl GenericTurboModel {
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
 
-        // Reset graph + arena on new sequence (prefill)
+        // Reset graph on new sequence (prefill).
         #[cfg(feature = "cuda")]
         if seq_len > 1 {
             self.graph_manager.reset();
-            self.graph_output = None;
-            self.graph_retained_buffers.clear();
-            self.graph_pool_buffers.clear();
-            self.arena_pool_buffers.clear();
-            self.arena_decode_count = 0;
         }
 
         // ── CUDA Graph replay (layer loop only — norm+lm_head run eagerly after) ──
@@ -884,42 +854,9 @@ impl GenericTurboModel {
             }
         }
 
-        // ── Size-based buffer pool for decode (replaces broken cursor-based arena) ──
-        // Order-independent: buffers matched by size, not cursor position.
-        // Arc::make_mut clones create new pool entries that get reused next token.
-        // Size pool starts from decode step 1+ (step 0 discovers buffer pattern).
-        #[cfg(feature = "cuda")]
-        // Size pool disabled: cudarc CudaSlice internal state breaks on ptr::read.
-        // CUDA's cuMemAllocAsync already uses an internal memory pool.
-        // TODO: Revisit with cudarc raw pointer API or custom allocator.
-        let size_pool_active = false;
-        #[cfg(feature = "cuda")]
-        if size_pool_active {
-            crate::cuda::size_pool_activate();
-        }
-
-        // Legacy arena disabled.
-        #[cfg(feature = "cuda")]
-        let arena_active = false;
-        #[cfg(not(feature = "cuda"))]
-        let arena_active = false;
-        #[cfg(not(feature = "cuda"))]
-        let size_pool_active = false;
-        #[cfg(feature = "cuda")]
-        if arena_active {
-            if self.arena_decode_count == 0 {
-                // First decode: warm-up pass (GpuKvCache creation happens here).
-                // Don't record — alloc pattern differs from steady state.
-            } else if self.arena_decode_count == 1 {
-                // Second decode: record steady-state alloc pattern.
-                crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Recording);
-            } else {
-                // Third+ decode: reuse recorded buffers.
-                crate::cuda::decode_pool_restore(std::mem::take(&mut self.arena_pool_buffers));
-                crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Arena);
-                crate::cuda::decode_pool_reset_cursor();
-            }
-        }
+        // Size-pool activation is a one-shot opt-in handled in engine.rs
+        // when TQ_SIZE_POOL=1 is set. The legacy decode-arena pool path
+        // (hardcoded off for ~3 sprints) was removed 2026-04-13.
 
         let mask = if seq_len == 1 {
             None
@@ -1831,37 +1768,11 @@ impl GenericTurboModel {
             }
         }
 
-        // (End graph capture now handled before norm — see above)
-
-        // After forward pass: deactivate size pool + track decode count
-        #[cfg(feature = "cuda")]
-        if seq_len == 1 && !capturing && !recording {
-            if size_pool_active {
-                crate::cuda::size_pool_deactivate();
-                if self.arena_decode_count % 50 == 0 {
-                    crate::cuda::size_pool_report();
-                }
-            }
-            self.arena_decode_count += 1;
-        }
-
-        // After forward pass: handle arena mode transitions (legacy, disabled)
-        #[cfg(feature = "cuda")]
-        if arena_active {
-            if self.arena_decode_count == 0 {
-                // First decode done: warm-up pass, no recording. Just increment.
-            } else if self.arena_decode_count == 1 {
-                // Second decode done: drain recorded steady-state buffers for reuse.
-                self.arena_pool_buffers = crate::cuda::decode_pool_drain();
-                crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
-                eprintln!("[arena] recording done: {} buffers saved for reuse", self.arena_pool_buffers.len());
-            } else {
-                // Arena reuse done: drain back to self, reset mode.
-                self.arena_pool_buffers = crate::cuda::decode_pool_drain();
-                crate::cuda::decode_pool_set_mode(crate::cuda::PoolMode::Off);
-            }
-            self.arena_decode_count += 1;
-        }
+        // Post-forward cleanup: the legacy size-pool deactivate and arena
+        // mode-transition blocks (both hardcoded off upstream) were
+        // removed 2026-04-13. Size-pool activation, when enabled via
+        // TQ_SIZE_POOL=1, is a one-shot process-lifetime setup from
+        // engine.rs and does not need per-forward teardown.
 
         Ok(output)
     }
