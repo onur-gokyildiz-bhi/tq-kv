@@ -1172,6 +1172,16 @@ pub fn tq_fused_attention_grouped(
     Ok(())
 }
 
+/// Block size for fused decode attention kernels.
+/// Adaptive to head_dim: round up to multiple of 32, cap at 128 (4 warps).
+/// 128 saturates an SM's V-accumulate bandwidth at head_dim=128 (one dim/thread).
+/// Smaller head_dim shrinks the block to avoid dead lanes in the dot-product stride.
+fn decode_attn_block_dim(head_dim: usize) -> u32 {
+    let hd = head_dim as u32;
+    let bd = ((hd.min(128) + 31) / 32) * 32;
+    bd.max(32)
+}
+
 /// Full fused TQ decode attention: compressed score + online softmax + V accumulation.
 /// Single kernel replaces: decompress → matmul → softmax → matmul chain.
 pub fn tq_fused_decode_attention(
@@ -1196,7 +1206,7 @@ pub fn tq_fused_decode_attention(
     n_sink: usize,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("fused_attention", "tq_fused_decode_attention_f32")?;
-    let block_dim = 32u32.min(head_dim as u32);
+    let block_dim = decode_attn_block_dim(head_dim);
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (block_dim, 1, 1),
@@ -1245,7 +1255,7 @@ pub fn gqa_decode_attention_graph(
     window_size: i32,  // sliding window: 0 = global, >0 = attend last N tokens
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("fused_attention", "gqa_decode_attention_graph_f32")?;
-    let block_dim = 32u32.min(head_dim as u32);
+    let block_dim = decode_attn_block_dim(head_dim);
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (block_dim, 1, 1),
@@ -1281,7 +1291,7 @@ pub fn gqa_decode_attention(
     scale: f32,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("fused_attention", "gqa_decode_attention_f32")?;
-    let block_dim = 32u32.min(head_dim as u32);
+    let block_dim = decode_attn_block_dim(head_dim);
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (block_dim, 1, 1),
