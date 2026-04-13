@@ -60,6 +60,9 @@ impl SafetensorsContent {
             .map_err(|e| TqError::Msg(format!("config.json parse error: {}", e)))?;
 
         let arch = detect_arch(&config)?;
+        if arch == "gemma4" || arch == "gemma3" {
+            reject_unsupported_gemma4_features(&config)?;
+        }
         let metadata = synthesise_metadata(&arch, &config)?;
 
         // Determine shard files:
@@ -146,10 +149,58 @@ fn detect_arch(config: &Value) -> Result<String> {
         "mistral" => "llama", // mistral uses llama arch family in GGUF
         "gemma" => "gemma",
         "gemma2" => "gemma2",
+        // Gemma 4 lineage — same family dispatch (arch.contains("gemma") in
+        // the builder catches Gemma-specific handling: with_add_unit norms,
+        // embed_scale=sqrt(hidden), softcap, etc.). Layer-level sliding/full
+        // alternation and partial RoPE are Sprint 1 follow-ups (text-only
+        // path). Vision tower, sparse MoE, multimodal token routing are
+        // Sprints 3-4.
+        "gemma3" => "gemma3",
+        "gemma4" => "gemma4",
         "phi3" => "phi3",
         other => other,
     };
     Ok(arch.to_string())
+}
+
+/// Early-out for features Sprint 1 doesn't support yet. Returns a clean error
+/// instead of a late crash deep in the forward path.
+fn reject_unsupported_gemma4_features(config: &Value) -> Result<()> {
+    if config.get("vision_config").is_some() {
+        return Err(TqError::Msg(
+            "Gemma 4 vision_config detected — multimodal support is Sprint 3-4. \
+             For Sprint 1 use a text-only variant or strip vision weights. \
+             Memory: project_gemma4_backlog.md".into()
+        ));
+    }
+    if config.get("moe_config").is_some() {
+        return Err(TqError::Msg(
+            "Gemma 4 moe_config detected (128 experts × top-8) — sparse MoE \
+             support is Sprint 2. Current MoE path is Mixtral-style dense \
+             loop and won't scale to 128 experts. Memory: \
+             project_gemma4_backlog.md".into()
+        ));
+    }
+    // Partial RoPE: Gemma 4 uses rope_type="proportional" with
+    // partial_rotary_factor=0.25 on the full_attention regime. We don't have a
+    // partial-RoPE kernel yet — warn loudly rather than silently apply full
+    // RoPE and hope for the best.
+    if let Some(rp) = config.get("rope_parameters") {
+        if let Some(full_attn) = rp.get("full_attention") {
+            if let Some(ptype) = full_attn.get("rope_type").and_then(|v| v.as_str()) {
+                if ptype != "default" {
+                    eprintln!(
+                        "[gemma4] WARNING: full_attention rope_type='{}' — \
+                         partial RoPE kernel not yet implemented (Sprint 1 \
+                         TODO). Loading will proceed with default RoPE; \
+                         expect incorrect attention for the global layers.",
+                        ptype
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn synthesise_metadata(arch: &str, c: &Value) -> Result<HashMap<String, GgufValue>> {
@@ -199,6 +250,41 @@ fn synthesise_metadata(arch: &str, c: &Value) -> Result<HashMap<String, GgufValu
     // Optional: rope theta, context length, head_dim, moe counts
     if let Some(theta) = f32_of(c, "rope_theta") {
         m.insert(format!("{arch}.rope.freq_base"), GgufValue::F32(theta));
+    }
+    // Gemma 4 splits rope across attention regimes: full_attention (theta=1e6,
+    // proportional, partial=0.25) vs sliding_attention (theta=1e4, default).
+    // Synthesise both bases so the builder can pick per-layer once the
+    // alternation scheduler lands. For Sprint 1 we emit only the base values;
+    // partial_rotary_factor and sliding alternation are TODO.
+    if let Some(rp) = c.get("rope_parameters") {
+        if let Some(f) = rp.get("full_attention") {
+            if let Some(t) = f.get("rope_theta").and_then(|v| v.as_f64()) {
+                m.insert(
+                    format!("{arch}.rope.freq_base_full"),
+                    GgufValue::F32(t as f32),
+                );
+            }
+            if let Some(pf) = f.get("partial_rotary_factor").and_then(|v| v.as_f64()) {
+                m.insert(
+                    format!("{arch}.rope.partial_factor_full"),
+                    GgufValue::F32(pf as f32),
+                );
+            }
+        }
+        if let Some(f) = rp.get("sliding_attention") {
+            if let Some(t) = f.get("rope_theta").and_then(|v| v.as_f64()) {
+                m.insert(
+                    format!("{arch}.rope.freq_base_sliding"),
+                    GgufValue::F32(t as f32),
+                );
+            }
+        }
+    }
+    if let Some(sw) = u32_of(c, "sliding_window") {
+        m.insert(
+            format!("{arch}.attention.sliding_window"),
+            GgufValue::U32(sw),
+        );
     }
     if let Some(ctx) = u32_of(c, "max_position_embeddings") {
         m.insert(format!("{arch}.context_length"), GgufValue::U32(ctx));
