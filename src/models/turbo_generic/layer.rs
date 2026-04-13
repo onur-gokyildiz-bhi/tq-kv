@@ -502,6 +502,14 @@ impl LayerWeights {
         self.attention_wo.forward(&y, backend)
     }
 
+    /// Entry point: 15-line dispatch to either the compressed (TQ KV cache)
+    /// path or the uncompressed path. The compressed body — previously a
+    /// 1830-line inline block — lives in `forward_attn_compressed`.
+    ///
+    /// Split per codescope audit (2026-04-13): the original monolith had
+    /// 3285 callees and was the #1 structural debt flagged as a prerequisite
+    /// for `gemma2-fix` and `gemma4-support` (both add their own attention
+    /// variants and would otherwise compound the dispatch hell).
     pub(crate) fn forward_attn(
         &mut self,
         x: &Tensor,
@@ -514,11 +522,46 @@ impl LayerWeights {
         let _enter = span.enter();
         let (q, k, v, k_pre_rope, pre_rope_mode, tri_enabled, layer_bits, n_rep, b_sz, seq_len) =
             self.compute_qkv_and_rope(x, pre_qkv, index_pos, backend)?;
-        let use_compression = layer_bits.is_some();
 
-        if use_compression {
-            // Apply per-layer bit width if different from default
-            let effective_bits = layer_bits.unwrap();
+        match layer_bits {
+            Some(effective_bits) => self.forward_attn_compressed(
+                q, k, v, k_pre_rope, pre_rope_mode, tri_enabled,
+                effective_bits, n_rep, b_sz, seq_len,
+                mask, index_pos, backend,
+            ),
+            None => self.uncompressed_attention(&q, k, v, mask, index_pos, n_rep, b_sz, seq_len, backend),
+        }
+    }
+
+    /// TQ-compressed KV cache attention path (sink tokens + past-only
+    /// quantisation + GPU fused compress + grouped / per-head bit variants
+    /// + TriAttention eviction). Extracted from forward_attn on
+    /// 2026-04-13.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attn_compressed(
+        &mut self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        k_pre_rope: Option<Tensor>,
+        pre_rope_mode: bool,
+        tri_enabled: bool,
+        effective_bits: u8,
+        n_rep: usize,
+        b_sz: usize,
+        seq_len: usize,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+        backend: &dyn ComputeBackend,
+    ) -> Result<Tensor> {
+        // Body lifted verbatim from the original forward_attn's
+        // `if use_compression { ... }` branch — locals referenced here
+        // were all either (a) returned from compute_qkv_and_rope (now
+        // parameters), (b) `&mut self` fields, or (c) function parameters.
+        {
+            // Apply per-layer bit width if different from default.
+            // `effective_bits` is now a function parameter (was
+            // `layer_bits.unwrap()` in the original inline block).
             let mut layer_tq_config = if effective_bits != self.tq_config.bits {
                 tq_kv::TurboQuantConfig { bits: effective_bits, ..self.tq_config.clone() }
             } else {
@@ -2350,9 +2393,6 @@ impl LayerWeights {
 
             let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
             self.attention_wo.forward(&y, backend)
-        } else {
-            // UNCOMPRESSED PATH: delegate to helper
-            self.uncompressed_attention(&q, k, v, mask, index_pos, n_rep, b_sz, seq_len, backend)
         }
     }
 }
