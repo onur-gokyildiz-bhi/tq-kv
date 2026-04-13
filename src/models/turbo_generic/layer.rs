@@ -102,6 +102,141 @@ pub(crate) struct LayerWeights {
     pub(crate) span_mlp: tracing::Span,
 }
 
+// ---------------------------------------------------------------------------
+// Free helpers extracted from forward_attn_compressed (2026-04-13).
+// Kept as free functions because they operate on CompressedKvCache directly
+// without needing &mut LayerWeights.
+// ---------------------------------------------------------------------------
+
+/// Temporal decay pass: once per `decay_interval` tokens, move the
+/// oldest hot-tier keys to the lower-bit cold tier. Preserves recent
+/// tokens at full hot-bit precision while compressing aged ones.
+fn apply_temporal_decay(
+    cache: &mut CompressedKvCache,
+    n_kv_head: usize,
+    padded_head_dim: usize,
+    rotation_seed: u64,
+) {
+    let Some(decay_cfg) = cache.decay_config.clone() else { return; };
+    if cache.tokens_since_decay < decay_cfg.decay_interval {
+        return;
+    }
+    cache.tokens_since_decay = 0;
+    // Use the first (and typically only) tier for simplicity.
+    let Some(tier) = decay_cfg.tiers.first() else { return; };
+
+    let hot_count = cache.k_per_head[0].count;
+    // Decay tokens whose age exceeds the tier threshold.
+    let total_compressed = hot_count + cache.cold_len;
+    if total_compressed <= tier.age_threshold || hot_count == 0 {
+        return;
+    }
+    let to_decay = (total_compressed - tier.age_threshold).min(hot_count);
+    if to_decay == 0 {
+        return;
+    }
+
+    // Initialize cold tier on first decay.
+    if cache.k_cold.is_none() {
+        let mut cold = Vec::with_capacity(n_kv_head);
+        for _ in 0..n_kv_head {
+            cold.push(tq_kv::CompressedKeys::new_empty(
+                tier.bits, padded_head_dim, rotation_seed,
+            ));
+        }
+        cache.k_cold = Some(cold);
+    }
+    // Split front of hot, remap to cold bits, append to cold.
+    let cold = cache.k_cold.as_mut().unwrap();
+    for h in 0..n_kv_head {
+        let front = cache.k_per_head[h].split_off_front(to_decay);
+        let remapped = front.remap_bits(tier.bits);
+        cold[h].append_from(&remapped);
+    }
+    cache.cold_len += to_decay;
+}
+
+/// Append the sink portion of the incoming `k` to the uncompressed
+/// `sink_k` tensor. Returns the in-batch offset where compressible
+/// (non-sink) tokens begin.
+fn append_sink_keys(
+    cache: &mut CompressedKvCache,
+    k: &Tensor,
+    global_start: usize,
+    sink_n: usize,
+    seq_len: usize,
+) -> Result<usize> {
+    if global_start >= sink_n {
+        return Ok(0);
+    }
+    let sink_end = sink_n.min(global_start + seq_len);
+    let n_sink_in_batch = sink_end - global_start;
+    // k is [1, n_kv_head, seq_len, head_dim]
+    let sink_k_batch = if n_sink_in_batch < seq_len {
+        k.narrow(2, 0, n_sink_in_batch)?
+    } else {
+        k.clone()
+    };
+    cache.sink_k = Some(match &cache.sink_k {
+        Some(prev) => Tensor::cat(&[prev, &sink_k_batch], 2)?,
+        None => sink_k_batch,
+    });
+    cache.sink_len += n_sink_in_batch;
+    Ok(n_sink_in_batch)
+}
+
+/// Append this batch's value tensor to the cache (either FP16 `v_raw` or
+/// 4/8-bit compressed per-head). Called once per forward pass before
+/// sink/compress key handling.
+fn append_values_to_cache(
+    cache: &mut CompressedKvCache,
+    v: &Tensor,
+    n_kv_head: usize,
+    seq_len: usize,
+    head_dim: usize,
+) -> Result<()> {
+    if cache.value_bits == 0 {
+        // Uncompressed fp16 path
+        if cache.cached_len > 0 {
+            cache.v_raw = Some(match &cache.v_raw {
+                Some(prev) => Tensor::cat(&[prev, v], 2)?,
+                None => v.clone(),
+            });
+        } else {
+            cache.v_raw = Some(v.clone());
+        }
+        return Ok(());
+    }
+
+    // Compressed path: quantize per head × position.
+    // Use as_slice() for CPU or direct download for GPU (avoids extra allocs).
+    let v_f32: Vec<f32> = if v.is_cuda() {
+        v.to_vec1()?
+    } else {
+        v.as_slice().to_vec()
+    };
+    let v_store = cache.v_compressed.as_mut().unwrap();
+    match v_store {
+        CompressedValueStore::Bits8(v_comp) => {
+            for h in 0..n_kv_head {
+                for s in 0..seq_len {
+                    let offset = (h * seq_len + s) * head_dim;
+                    v_comp[h].append(&v_f32[offset..offset + head_dim]);
+                }
+            }
+        }
+        CompressedValueStore::Bits4(v_comp) => {
+            for h in 0..n_kv_head {
+                for s in 0..seq_len {
+                    let offset = (h * seq_len + s) * head_dim;
+                    v_comp[h].append(&v_f32[offset..offset + head_dim]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl LayerWeights {
     /// Enumerate every `QWeight` owned by this layer — used by
     /// `LayerSwapManager` to inject/evict GPU caches per prefetched layer.
@@ -538,6 +673,80 @@ impl LayerWeights {
         }
     }
 
+    /// Lazy first-call init for the TQ compressed KV cache. Called from
+    /// `forward_attn_compressed` once per sequence (gated on
+    /// `self.kv_compressed.is_none()`). Split out 2026-04-13 to shrink
+    /// the 1857-line monolith.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_compressed_cache(
+        &mut self,
+        layer_tq_config: &tq_kv::TurboQuantConfig,
+        per_head_bits: &Option<Vec<u8>>,
+        effective_bits: u8,
+        vbits: u8,
+        cache_dtype: DType,
+        pre_rope_mode: bool,
+    ) {
+        if self.kv_compressed.is_some() {
+            return;
+        }
+
+        let mut k_per_head = Vec::with_capacity(self.n_kv_head);
+        let gs = layer_tq_config.group_size;
+        for h in 0..self.n_kv_head {
+            let hbits = per_head_bits.as_ref()
+                .map(|phb| phb[h])
+                .unwrap_or(effective_bits);
+            k_per_head.push(tq_kv::CompressedKeys::new_empty_grouped(
+                hbits, self.padded_head_dim, layer_tq_config.rotation_seed, gs,
+            ));
+        }
+        let (v_raw, v_compressed) = match vbits {
+            0 => (None, None),
+            4 => {
+                let gs = layer_tq_config.group_size.max(32);
+                let mut v_heads: Vec<tq_kv::CompressedValues4Bit> = Vec::with_capacity(self.n_kv_head);
+                for _ in 0..self.n_kv_head {
+                    v_heads.push(tq_kv::CompressedValues4Bit::new_empty(self.head_dim, gs));
+                }
+                (None, Some(CompressedValueStore::Bits4(v_heads)))
+            }
+            _ => {
+                // 8-bit (default for any non-zero, non-4 value)
+                let mut v_heads: Vec<tq_kv::CompressedValues> = Vec::with_capacity(self.n_kv_head);
+                for _ in 0..self.n_kv_head {
+                    v_heads.push(tq_kv::CompressedValues::new_empty(self.head_dim));
+                }
+                (None, Some(CompressedValueStore::Bits8(v_heads)))
+            }
+        };
+        self.kv_compressed = Some(CompressedKvCache {
+            k_per_head,
+            k_cold: None,
+            cold_len: 0,
+            decay_config: get_decay_config(),
+            tokens_since_decay: 0,
+            sink_k: None,
+            sink_len: 0,
+            compacted: None,
+            compacted_original_len: 0,
+            v_raw,
+            v_compressed,
+            value_bits: vbits,
+            cached_len: 0,
+            dtype: cache_dtype,
+            pre_rope: pre_rope_mode,
+            tri_config: if get_triattention_enabled() {
+                crate::calibrate::TRIATTENTION_CONFIG.get().cloned()
+            } else { None },
+            tri_keys_pre_rope: if get_triattention_enabled() {
+                Some(vec![Vec::new(); self.n_kv_head])
+            } else { None },
+            tri_key_positions: Vec::new(),
+            tri_tokens_since_eviction: 0,
+        });
+    }
+
     /// TQ-compressed KV cache attention path (sink tokens + past-only
     /// quantisation + GPU fused compress + grouped / per-head bit variants
     /// + TriAttention eviction). Extracted from forward_attn on
@@ -598,62 +807,10 @@ impl LayerWeights {
 
             // Initialize cache on first call
             let vbits = get_value_bits();
-            if self.kv_compressed.is_none() {
-                let mut k_per_head = Vec::with_capacity(self.n_kv_head);
-                let gs = layer_tq_config.group_size;
-                for h in 0..self.n_kv_head {
-                    let hbits = per_head_bits.as_ref()
-                        .map(|phb| phb[h])
-                        .unwrap_or(effective_bits);
-                    k_per_head.push(tq_kv::CompressedKeys::new_empty_grouped(
-                        hbits, self.padded_head_dim, layer_tq_config.rotation_seed, gs,
-                    ));
-                }
-                let (v_raw, v_compressed) = match vbits {
-                    0 => (None, None),
-                    4 => {
-                        let gs = layer_tq_config.group_size.max(32);
-                        let mut v_heads: Vec<tq_kv::CompressedValues4Bit> = Vec::with_capacity(self.n_kv_head);
-                        for _ in 0..self.n_kv_head {
-                            v_heads.push(tq_kv::CompressedValues4Bit::new_empty(self.head_dim, gs));
-                        }
-                        (None, Some(CompressedValueStore::Bits4(v_heads)))
-                    }
-                    _ => {
-                        // 8-bit (default for any non-zero, non-4 value)
-                        let mut v_heads: Vec<tq_kv::CompressedValues> = Vec::with_capacity(self.n_kv_head);
-                        for _ in 0..self.n_kv_head {
-                            v_heads.push(tq_kv::CompressedValues::new_empty(self.head_dim));
-                        }
-                        (None, Some(CompressedValueStore::Bits8(v_heads)))
-                    }
-                };
-                self.kv_compressed = Some(CompressedKvCache {
-                    k_per_head,
-                    k_cold: None,
-                    cold_len: 0,
-                    decay_config: get_decay_config(),
-                    tokens_since_decay: 0,
-                    sink_k: None,
-                    sink_len: 0,
-                    compacted: None,
-                    compacted_original_len: 0,
-                    v_raw,
-                    v_compressed,
-                    value_bits: vbits,
-                    cached_len: 0,
-                    dtype: cache_dtype,
-                    pre_rope: pre_rope_mode,
-                    tri_config: if get_triattention_enabled() {
-                        crate::calibrate::TRIATTENTION_CONFIG.get().cloned()
-                    } else { None },
-                    tri_keys_pre_rope: if get_triattention_enabled() {
-                        Some(vec![Vec::new(); self.n_kv_head])
-                    } else { None },
-                    tri_key_positions: Vec::new(),
-                    tri_tokens_since_eviction: 0,
-                });
-            }
+            self.ensure_compressed_cache(
+                &layer_tq_config, &per_head_bits, effective_bits, vbits,
+                cache_dtype, pre_rope_mode,
+            );
 
             let cache = self.kv_compressed.as_mut().unwrap();
             let prev_total = cache.cached_len;
@@ -664,72 +821,18 @@ impl LayerWeights {
             let global_start = prev_total; // first position in this batch
 
             // --- Store values ---
-            if cache.value_bits == 0 {
-                // Uncompressed fp16 path
-                if cache.cached_len > 0 {
-                    cache.v_raw = Some(match &cache.v_raw {
-                        Some(prev) => Tensor::cat(&[prev, &v], 2)?,
-                        None => v.clone(),
-                    });
-                } else {
-                    cache.v_raw = Some(v.clone());
-                }
-            } else {
-                // Compressed path: quantize per head × position.
-                // Use as_slice() for CPU or direct download for GPU (avoids extra allocs).
-                let v_f32: Vec<f32> = if v.is_cuda() {
-                    v.to_vec1()?
-                } else {
-                    v.as_slice().to_vec()
-                };
-                let v_store = cache.v_compressed.as_mut().unwrap();
-                match v_store {
-                    CompressedValueStore::Bits8(v_comp) => {
-                        for h in 0..self.n_kv_head {
-                            for s in 0..seq_len {
-                                let offset = (h * seq_len + s) * self.head_dim;
-                                v_comp[h].append(&v_f32[offset..offset + self.head_dim]);
-                            }
-                        }
-                    }
-                    CompressedValueStore::Bits4(v_comp) => {
-                        for h in 0..self.n_kv_head {
-                            for s in 0..seq_len {
-                                let offset = (h * seq_len + s) * self.head_dim;
-                                v_comp[h].append(&v_f32[offset..offset + self.head_dim]);
-                            }
-                        }
-                    }
-                }
-            }
+            append_values_to_cache(cache, &v, self.n_kv_head, seq_len, self.head_dim)?;
 
             // --- Handle sink tokens (FP16, uncompressed) ---
-            let sink_end = sink_n.min(global_start + seq_len);
-            let _new_sink_count = if global_start < sink_n {
-                // Some tokens in this batch are sink tokens
-                let n_sink_in_batch = sink_end - global_start;
-                // Extract sink portion of k: k is [1, n_kv_head, seq_len, head_dim]
-                let sink_k_batch = if n_sink_in_batch < seq_len {
-                    k.narrow(2, 0, n_sink_in_batch)?
-                } else {
-                    k.clone()
-                };
-                cache.sink_k = Some(match &cache.sink_k {
-                    Some(prev) => Tensor::cat(&[prev, &sink_k_batch], 2)?,
-                    None => sink_k_batch,
-                });
-                cache.sink_len += n_sink_in_batch;
-                n_sink_in_batch
-            } else {
-                0
-            };
+            // Returns the in-batch offset where compressed (non-sink) tokens
+            // begin — i.e. how many of this batch's tokens went into sink_k.
+            let compress_start = append_sink_keys(cache, &k, global_start, sink_n, seq_len)?;
 
             // --- Compress non-sink tokens into cache ---
             // All tokens after sink position get compressed into cache.
             // POQ twist: during generation (seq_len=1), the current token is ALSO
             // compressed into cache, but during attention we use the FP16 original
             // instead of the decompressed version (Fix 2: Past-Only Quantization).
-            let compress_start = if global_start < sink_n { sink_end - global_start } else { 0 };
             let tokens_to_compress = seq_len.saturating_sub(compress_start);
 
             // Check GPU compress eligibility once (used by both compress and skip logic)
@@ -1339,46 +1442,10 @@ impl LayerWeights {
             let total_len = cache.cached_len;
 
             // --- Temporal decay: demote old hot tokens to lower bit width ---
-            if let Some(ref decay_cfg) = cache.decay_config.clone() {
-                if cache.tokens_since_decay >= decay_cfg.decay_interval {
-                    cache.tokens_since_decay = 0;
-                    // Find the lowest tier that applies (smallest bits)
-                    // Use the first (and typically only) tier for simplicity
-                    if let Some(tier) = decay_cfg.tiers.first() {
-                        let hot_count = cache.k_per_head[0].count;
-                        // Tokens eligible for decay: those older than age_threshold
-                        // hot tokens span positions [sink_len .. sink_len + hot_count]
-                        // "age" of the oldest hot token = total_len - sink_len - 0 = hot_count + cold_len
-                        // We want to decay tokens whose age > threshold
-                        // That means the first (hot_count + cold_len - threshold) hot tokens
-                        let total_compressed = hot_count + cache.cold_len;
-                        if total_compressed > tier.age_threshold && hot_count > 0 {
-                            let to_decay = total_compressed - tier.age_threshold;
-                            let to_decay = to_decay.min(hot_count); // can't decay more than we have
-                            if to_decay > 0 {
-                                // Initialize cold tier if needed
-                                if cache.k_cold.is_none() {
-                                    let mut cold = Vec::with_capacity(self.n_kv_head);
-                                    for _ in 0..self.n_kv_head {
-                                        cold.push(tq_kv::CompressedKeys::new_empty(
-                                            tier.bits, self.padded_head_dim, layer_tq_config.rotation_seed,
-                                        ));
-                                    }
-                                    cache.k_cold = Some(cold);
-                                }
-                                // Split front of hot, remap to cold bits, append to cold
-                                let cold = cache.k_cold.as_mut().unwrap();
-                                for h in 0..self.n_kv_head {
-                                    let front = cache.k_per_head[h].split_off_front(to_decay);
-                                    let remapped = front.remap_bits(tier.bits);
-                                    cold[h].append_from(&remapped);
-                                }
-                                cache.cold_len += to_decay;
-                            }
-                        }
-                    }
-                }
-            }
+            apply_temporal_decay(
+                cache, self.n_kv_head, self.padded_head_dim,
+                layer_tq_config.rotation_seed,
+            );
 
             // --- KV Compaction: reduce token count when hot cache exceeds threshold ---
             // Compacts the oldest hot tokens into a smaller set of synthetic tokens
