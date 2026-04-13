@@ -575,6 +575,45 @@ fn compute_attention_output(
     }
 }
 
+/// Prefill attention path (standard, uncompressed K/V). Runs when the
+/// decoder is still building up context — no compressed cache yet, just
+/// plain Q @ K^T with a causal mask. Returns the pre-transpose attention
+/// output in shape [1, n_head, seq_len, head_dim].
+fn prefill_attention(
+    q: &Tensor,
+    k: Tensor,
+    v: Tensor,
+    attn_scale_denom: f64,
+    n_rep: usize,
+    seq_len: usize,
+    backend: &dyn ComputeBackend,
+) -> Result<Tensor> {
+    let k = repeat_kv(k, n_rep)?;
+    let v_for_attn = repeat_kv(v, n_rep)?;
+
+    let att = (q.matmul(&k.t()?)? / attn_scale_denom)?;
+    let att = if seq_len > 1 {
+        let total_kv_len = att.dim(3)?;
+        let offset = total_kv_len - seq_len;
+        let mask_data: Vec<f32> = (0..seq_len)
+            .flat_map(|i| {
+                let qpos = offset + i;
+                (0..total_kv_len).map(move |j| if j <= qpos { 0.0f32 } else { -1e10f32 })
+            })
+            .collect();
+        let mut mask = Tensor::from_slice(&mask_data, vec![seq_len, total_kv_len], &Device::Cpu)?;
+        #[cfg(feature = "cuda")]
+        if att.is_cuda() {
+            if let Ok(gpu) = mask.to_device_auto() { mask = gpu; }
+        }
+        let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
+        let mask4d = mask4d.broadcast_as(att.shape())?;
+        (att + mask4d)?
+    } else { att };
+    let att = softmax_last_dim(&att, backend)?;
+    att.matmul(&v_for_attn.contiguous()?)
+}
+
 /// All-GPU TQ decompress attention path. Two-step decompress (centroid
 /// lookup + Hadamard inverse) on the GPU, then matmul + softmax + V
 /// matmul without any CPU round-trip. Pre-RoPE supported via in-place
@@ -2769,33 +2808,11 @@ impl LayerWeights {
                     has_compacted,
                 )?
             } else {
-                // PREFILL: use original uncompressed keys for attention (standard path)
-                let k = repeat_kv(k, n_rep)?;
-                let v_for_attn = repeat_kv(v, n_rep)?;
-
-                {
-                    let att = (q.matmul(&k.t()?)? / self.attn_scale_denom)?;
-                    let att = if seq_len > 1 {
-                        let total_kv_len = att.dim(3)?;
-                        let offset = total_kv_len - seq_len;
-                        let mask_data: Vec<f32> = (0..seq_len)
-                            .flat_map(|i| {
-                                let qpos = offset + i;
-                                (0..total_kv_len).map(move |j| if j <= qpos { 0.0f32 } else { -1e10f32 })
-                            })
-                            .collect();
-                        let mut mask = Tensor::from_slice(&mask_data, vec![seq_len, total_kv_len], &Device::Cpu)?;
-                        #[cfg(feature = "cuda")]
-                        if att.is_cuda() {
-                            if let Ok(gpu) = mask.to_device_auto() { mask = gpu; }
-                        }
-                        let mask4d = mask.unsqueeze(0)?.unsqueeze(0)?;
-                        let mask4d = mask4d.broadcast_as(att.shape())?;
-                        (att + mask4d)?
-                    } else { att };
-                    let att = softmax_last_dim(&att, backend)?;
-                    att.matmul(&v_for_attn.contiguous()?)?
-                }
+                // PREFILL: use original uncompressed keys for attention.
+                prefill_attention(
+                    &q, k, v, self.attn_scale_denom,
+                    n_rep, seq_len, backend,
+                )?
             };
 
             let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
