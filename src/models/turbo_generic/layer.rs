@@ -575,6 +575,325 @@ fn compute_attention_output(
     }
 }
 
+/// All-GPU TQ decompress attention path. Two-step decompress (centroid
+/// lookup + Hadamard inverse) on the GPU, then matmul + softmax + V
+/// matmul without any CPU round-trip. Pre-RoPE supported via in-place
+/// rope_halved/interleaved_strided on the freshly decompressed rows
+/// (since 2026-04-11). Returns `Ok(Some(y))` on success, `Ok(None)`
+/// when the gate fails (caller falls through to CPU paths), or `Err`
+/// when GPU compress is active but the attention failed — in that case
+/// the CPU fallback has incomplete data so the failure must propagate.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn try_all_gpu_tq_decompress_attention(
+    cache: &CompressedKvCache,
+    gpu_tq_cache: &mut Option<GpuCompressedKv>,
+    gpu_cold_cache: &Option<Box<super::kv_cache::GpuColdKv>>,
+    sink_k_gpu: &mut Option<cudarc::driver::CudaSlice<f32>>,
+    sink_v_gpu: &mut Option<cudarc::driver::CudaSlice<f32>>,
+    signs_gpu: &Option<cudarc::driver::CudaSlice<f32>>,
+    q: &Tensor,
+    q_f32: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    layer_tq_config: &tq_kv::TurboQuantConfig,
+    n_head: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    padded_head_dim: usize,
+    n_rep: usize,
+    n_past_compressed: usize,
+    n_compressed: usize,
+    n_compressed_cpu: usize,
+    has_compacted: bool,
+    seq_len: usize,
+    b_sz: usize,
+    rope_style: RopeStyle,
+    rope_dim: usize,
+    attn_logit_softcap: Option<f32>,
+    backend: &dyn ComputeBackend,
+) -> Result<Option<Tensor>> {
+    // Gate: fall through to CPU if any precondition isn't met.
+    if !(seq_len == 1
+        && !has_compacted
+        && cache.cold_len == 0
+        && n_compressed > 0
+        && padded_head_dim == head_dim
+        && cache.k_per_head[0].qjl_corrections.is_none()
+        && layer_tq_config.channel_scales.is_none()
+        && layer_tq_config.key_channel_bias.is_none()
+        && cos.is_cuda() && sin.is_cuda())
+    {
+        return Ok(None);
+    }
+
+    let (reg, gpu, signs) = match (
+        crate::cuda::kernels::global_registry(),
+        gpu_tq_cache.as_mut(),
+        signs_gpu.as_ref(),
+    ) {
+        (Some(r), Some(g), Some(s)) => (r, g, s),
+        _ => return Ok(None),
+    };
+
+    let gpu_result: Result<Tensor> = (|| {
+        let hdim = head_dim;
+        let stream = reg.stream.clone();
+
+        // Step 1: Incremental GPU decompress + K hot gather
+        let ms = gpu.max_seq;
+        let k_hot = if n_past_compressed > 0 {
+            if gpu.decomp_count < n_past_compressed {
+                let new_start = gpu.decomp_count;
+                let new_count = n_past_compressed - new_start;
+                // Use grouped decompress when:
+                //   (a) cache.pre_rope is on — CPU grouped compress was used and the
+                //       bridge filled gpu.gnorms (gpu.norms is stale in this case), OR
+                //   (b) Sprint 1D default — grouped on by default, TQ_GPU_GROUPED=0 disables.
+                let env_grouped = super::kv_cache::get_gpu_grouped_enabled();
+                let use_grouped_decomp = (cache.pre_rope || env_grouped)
+                    && gpu.gnorms.is_some()
+                    && gpu.n_groups > 1;
+                if use_grouped_decomp {
+                    let gnorms_ref = gpu.gnorms.as_ref().unwrap();
+                    crate::cuda::kernels::tq_decompress_keys_grouped(
+                        reg, &gpu.packed_indices, gnorms_ref,
+                        &gpu.centroids, signs, &mut gpu.decomp_cache,
+                        n_kv_head, new_count, hdim,
+                        gpu.group_size, gpu.bits as usize, ms,
+                        new_start, ms,
+                    ).map_err(|e| TqError::Msg(format!("decompress_grouped: {e}")))?;
+                } else {
+                    crate::cuda::kernels::tq_decompress_keys_range(
+                        reg, &gpu.packed_indices, &gpu.norms,
+                        &gpu.centroids, signs, &mut gpu.decomp_cache,
+                        n_kv_head, new_count, hdim,
+                        gpu.bits as usize, ms,
+                        new_start, ms,
+                    ).map_err(|e| TqError::Msg(format!("decompress_range: {e}")))?;
+                }
+
+                // Pre-RoPE TQ: keys are stored in the cache pre-rotation, so
+                // newly decompressed rows must have RoPE applied in-place
+                // before they enter the gather/matmul. Subsequent decode steps
+                // see them as post-RoPE. Positions are sink_len-relative
+                // because the compressed cache only holds non-sink tokens.
+                if cache.pre_rope {
+                    let pos_offset = cache.sink_len + new_start;
+                    let rope_strided = match rope_style {
+                        RopeStyle::Halved => crate::cuda::kernels::rope_halved_strided,
+                        RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_strided,
+                    };
+                    rope_strided(
+                        reg, &mut gpu.decomp_cache,
+                        cos.cuda_data(), sin.cuda_data(),
+                        n_kv_head, ms, hdim, rope_dim,
+                        new_start, new_count, pos_offset,
+                    ).map_err(|e| TqError::Msg(format!("pre_rope strided: {e}")))?;
+                }
+
+                gpu.decomp_count = n_past_compressed;
+            }
+            // K hot: gather from strided decomp_cache → pre-allocated k_contig
+            {
+                let n_kv = n_kv_head;
+                let count = n_past_compressed;
+                let dst = std::sync::Arc::get_mut(&mut gpu.k_contig)
+                    .expect("k_contig aliased");
+                crate::cuda::kernels::strided_copy_args(
+                    reg, &gpu.decomp_cache, dst,
+                    n_kv * count * hdim, 3,
+                    &[(n_kv as i32), (count as i32), (hdim as i32)],
+                    &[((count * hdim) as i32), (hdim as i32), 1],
+                    &[((ms * hdim) as i32), (hdim as i32), 1],
+                    0,
+                ).map_err(|e| TqError::Msg(format!("k_hot gather: {e}")))?;
+            }
+            Some(Tensor::from_cuda_arc(
+                std::sync::Arc::clone(&gpu.k_contig),
+                vec![1, n_kv_head, n_past_compressed, hdim],
+                stream.clone(),
+            ))
+        } else { None };
+
+        // Cache sink K/V on GPU (upload once)
+        let sink_len = cache.sink_len;
+        if sink_len > 0 && sink_k_gpu.is_none() {
+            if let Some(ref sink_k) = cache.sink_k {
+                let data: Vec<f32> = sink_k.to_dtype(DType::F32)?.to_vec1()?;
+                if let Ok(buf) = stream.clone_htod(&data) {
+                    *sink_k_gpu = Some(buf);
+                }
+            }
+            if let Some(ref v_raw) = cache.v_raw {
+                let data: Vec<f32> = v_raw.narrow(2, 0, sink_len)?.to_dtype(DType::F32)?.to_vec1()?;
+                if let Ok(buf) = stream.clone_htod(&data) {
+                    *sink_v_gpu = Some(buf);
+                }
+            }
+        }
+
+        // Step 2: Build K on GPU [sink | hot | current]
+        let mut k_parts_gpu: Vec<Tensor> = Vec::new();
+        if let Some(ref sk) = *sink_k_gpu {
+            k_parts_gpu.push(Tensor::from_cuda_arc(
+                std::sync::Arc::new(sk.clone()),
+                vec![1, n_kv_head, sink_len, hdim],
+                stream.clone(),
+            ));
+        }
+        if let Some(kh) = k_hot { k_parts_gpu.push(kh); }
+
+        // Sprint F: retrieve from GPU cold tier — ZERO CPU involvement.
+        // Cold tier stores post-RoPE decompressed K (from decomp_cache at
+        // eviction time). Gather contiguously and cat into K_full. V2: cap
+        // at TQ_MAX_RETRIEVE (default 16) most-recent cold tokens. Keeps
+        // attention cost bounded regardless of cold tier size.
+        let mut n_retrieved = 0usize;
+        if super::kv_cache::get_offload_enabled() {
+            if let Some(ref cold) = gpu_cold_cache {
+                if cold.count > 0 {
+                    let max_retrieve = {
+                        static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                        *C.get_or_init(|| std::env::var("TQ_MAX_RETRIEVE")
+                            .ok().and_then(|v| v.parse().ok()).unwrap_or(16))
+                    };
+                    let n_cold = cold.count.min(max_retrieve);
+                    let cold_offset = cold.count.saturating_sub(n_cold);
+                    let mc = cold.max_cold;
+
+                    let cold_k_buf = reg.stream.alloc_zeros::<f32>(
+                        n_kv_head * n_cold * hdim
+                    ).map_err(|e| TqError::Msg(format!("cold k buf: {}", e)))?;
+                    for h in 0..n_kv_head {
+                        let src_off = (h * mc + cold_offset) * hdim;
+                        let dst_off = h * n_cold * hdim;
+                        crate::cuda::kernels::copy_with_offsets(
+                            reg, &cold.k_data, &cold_k_buf,
+                            n_cold * hdim, src_off, dst_off,
+                        ).map_err(|e| TqError::Msg(format!("cold k gather: {e}")))?;
+                    }
+
+                    k_parts_gpu.push(Tensor::from_cuda(
+                        cold_k_buf, vec![1, n_kv_head, n_cold, hdim], stream.clone(),
+                    ));
+                    n_retrieved = n_cold;
+                }
+            }
+        }
+
+        if n_compressed > 0 {
+            let k_cur = k.to_dtype(DType::F32)?;
+            debug_assert!(k_cur.is_cuda(), "current K should be GPU");
+            k_parts_gpu.push(k_cur);
+        }
+
+        let k_full = if k_parts_gpu.len() == 1 {
+            k_parts_gpu.remove(0)
+        } else {
+            let k_refs: Vec<&Tensor> = k_parts_gpu.iter().collect();
+            Tensor::cat(&k_refs, 2)?
+        };
+        let k_full = repeat_kv(k_full, n_rep)?;
+
+        // Step 3: Q @ K^T on GPU. Bug-fix 2026-04-11: was `/ scale` which
+        // is `* sqrt(d)` (off by d=128). Correct logit scaling is
+        // `(q @ k.T) / sqrt(d)`. Wrong since 3888d39; PPL never hit this
+        // path (seq_len > 1) so the bug went unnoticed.
+        debug_assert!(q_f32.is_cuda(), "Q should be GPU in all-GPU path");
+        let mut att = (q_f32.matmul(&k_full.t()?)? / (hdim as f64).sqrt())?;
+        if let Some(cap) = attn_logit_softcap {
+            att = apply_softcap(&att, cap)?;
+        }
+        let att = softmax_last_dim(&att, backend)?;
+
+        // Step 4: V hot from strided gpu.v_data (single strided_copy kernel)
+        let mut v_parts_gpu: Vec<Tensor> = Vec::new();
+        if let Some(ref sv) = *sink_v_gpu {
+            v_parts_gpu.push(Tensor::from_cuda_arc(
+                std::sync::Arc::new(sv.clone()),
+                vec![1, n_kv_head, sink_len, hdim],
+                stream.clone(),
+            ));
+        }
+        if n_past_compressed > 0 {
+            // V hot: gather from strided v_data → pre-allocated v_contig (0 allocs)
+            {
+                let n_kv = n_kv_head;
+                let count = n_past_compressed;
+                let dst = std::sync::Arc::get_mut(&mut gpu.v_contig)
+                    .expect("v_contig aliased");
+                crate::cuda::kernels::strided_copy_args(
+                    reg, &gpu.v_data, dst,
+                    n_kv * count * hdim, 3,
+                    &[(n_kv as i32), (count as i32), (hdim as i32)],
+                    &[((count * hdim) as i32), (hdim as i32), 1],
+                    &[((ms * hdim) as i32), (hdim as i32), 1],
+                    0,
+                ).map_err(|e| TqError::Msg(format!("v_hot gather: {e}")))?;
+            }
+            let v_hot = Tensor::from_cuda_arc(
+                std::sync::Arc::clone(&gpu.v_contig),
+                vec![1, n_kv_head, n_past_compressed, hdim],
+                stream.clone(),
+            );
+            v_parts_gpu.push(v_hot);
+        }
+        // Sprint F: insert cold V (GPU cold tier, strided → contiguous gather)
+        if n_retrieved > 0 {
+            if let Some(ref cold) = gpu_cold_cache {
+                let n_cold = n_retrieved;
+                let mc = cold.max_cold;
+                let cold_offset = cold.count.saturating_sub(n_cold);
+                let cold_v_buf = reg.stream.alloc_zeros::<f32>(
+                    n_kv_head * n_cold * hdim
+                ).map_err(|e| TqError::Msg(format!("cold v buf: {}", e)))?;
+                for h in 0..n_kv_head {
+                    let src_off = (h * mc + cold_offset) * hdim;
+                    let dst_off = h * n_cold * hdim;
+                    crate::cuda::kernels::copy_with_offsets(
+                        reg, &cold.v_data, &cold_v_buf,
+                        n_cold * hdim, src_off, dst_off,
+                    ).map_err(|e| TqError::Msg(format!("cold v gather: {e}")))?;
+                }
+                v_parts_gpu.push(Tensor::from_cuda(
+                    cold_v_buf, vec![1, n_kv_head, n_cold, hdim], stream.clone(),
+                ));
+            }
+        }
+        if n_compressed > 0 {
+            let v_cur = v.to_dtype(DType::F32)?;
+            debug_assert!(v_cur.is_cuda(), "current V should be GPU");
+            v_parts_gpu.push(v_cur);
+        }
+
+        let v_full = if v_parts_gpu.len() == 1 {
+            v_parts_gpu.remove(0)
+        } else {
+            let v_refs: Vec<&Tensor> = v_parts_gpu.iter().collect();
+            Tensor::cat(&v_refs, 2)?
+        };
+        let v_full = repeat_kv(v_full, n_rep)?;
+        att.matmul(&v_full.contiguous()?)?.to_dtype(cache.dtype)
+    })();
+
+    match gpu_result {
+        Ok(y) => {
+            let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_head * head_dim])?;
+            Ok(Some(y))
+        }
+        Err(ref e) if n_compressed > n_compressed_cpu => {
+            // GPU compress active but all-GPU attention failed.
+            // CPU fallback has incomplete data — propagate error.
+            eprintln!("[gpu-tq-attn] FAILED (GPU compress active): {e}");
+            Err(TqError::Msg(format!("all-GPU TQ attn: {e}")))
+        }
+        _ => Ok(None), // Fall through to CPU paths
+    }
+}
+
 /// GPU fused TQ attention (enabled with TQ_GPU_FUSED=1). Pre-rotates
 /// the query, launches a fused-score kernel over compressed K, then
 /// runs softmax + V on CPU using v_raw. Returns `Some(y)` on success
@@ -2405,290 +2724,26 @@ impl LayerWeights {
                 }
 
                 // ─── ALL-GPU TQ DECOMPRESS ATTENTION ──────────────────
-                // GPU decompress keys + GPU matmul + GPU softmax + GPU V matmul.
-                // No CPU round-trip. Uses proven two-step decompress (centroid lookup + hadamard inverse).
-                // Pre-RoPE supported via rope_halved/interleaved_strided applied
-                // in-place to freshly decompressed keys (since 2026-04-11).
-                // Falls through to CPU paths when conditions aren't met.
                 #[cfg(feature = "cuda")]
-                if seq_len == 1
-                    && !has_compacted
-                    && cache.cold_len == 0
-                    && n_compressed > 0
-                    && self.padded_head_dim == self.head_dim
-                    && cache.k_per_head[0].qjl_corrections.is_none()
-                    && layer_tq_config.channel_scales.is_none()
-                    && layer_tq_config.key_channel_bias.is_none()
-                    && self.cos.is_cuda() && self.sin.is_cuda()
                 {
-                    if let (Some(reg), Some(ref mut gpu), Some(ref signs)) = (
-                        crate::cuda::kernels::global_registry(),
+                    match try_all_gpu_tq_decompress_attention(
+                        cache,
                         &mut self.gpu_tq_cache,
+                        &self.gpu_cold_cache,
+                        &mut self.sink_k_gpu,
+                        &mut self.sink_v_gpu,
                         &self.signs_gpu,
-                    ) {
-                        let gpu_result: Result<Tensor> = (|| {
-                            let hdim = self.head_dim;
-                            let stream = reg.stream.clone();
-
-                            // Step 1: Incremental GPU decompress + K hot gather
-                            let ms = gpu.max_seq;
-                            let k_hot = if n_past_compressed > 0 {
-                                if gpu.decomp_count < n_past_compressed {
-                                    let new_start = gpu.decomp_count;
-                                    let new_count = n_past_compressed - new_start;
-                                    // Use grouped decompress when:
-                                    //   (a) cache.pre_rope is on — CPU grouped compress was
-                                    //       used and the bridge filled gpu.gnorms (gpu.norms
-                                    //       is stale in this case), OR
-                                    //   (b) Sprint 1D default — grouped on by default,
-                                    //       TQ_GPU_GROUPED=0 to disable.
-                                    let env_grouped = super::kv_cache::get_gpu_grouped_enabled();
-                                    let use_grouped_decomp = (cache.pre_rope || env_grouped)
-                                        && gpu.gnorms.is_some()
-                                        && gpu.n_groups > 1;
-                                    if use_grouped_decomp {
-                                        let gnorms_ref = gpu.gnorms.as_ref().unwrap();
-                                        crate::cuda::kernels::tq_decompress_keys_grouped(
-                                            reg, &gpu.packed_indices, gnorms_ref,
-                                            &gpu.centroids, signs, &mut gpu.decomp_cache,
-                                            self.n_kv_head, new_count, hdim,
-                                            gpu.group_size, gpu.bits as usize, ms,
-                                            new_start, ms,
-                                        ).map_err(|e| TqError::Msg(format!("decompress_grouped: {e}")))?;
-                                    } else {
-                                        crate::cuda::kernels::tq_decompress_keys_range(
-                                            reg, &gpu.packed_indices, &gpu.norms,
-                                            &gpu.centroids, signs, &mut gpu.decomp_cache,
-                                            self.n_kv_head, new_count, hdim,
-                                            gpu.bits as usize, ms,
-                                            new_start, ms,
-                                        ).map_err(|e| TqError::Msg(format!("decompress_range: {e}")))?;
-                                    }
-
-                                    // Pre-RoPE TQ: keys are stored in the cache pre-rotation,
-                                    // so newly decompressed rows must have RoPE applied in-place
-                                    // before they enter the gather/matmul. Subsequent decode
-                                    // steps see them as post-RoPE. Positions are sink_len-relative
-                                    // because the compressed cache only holds non-sink tokens.
-                                    if cache.pre_rope {
-                                        let pos_offset = cache.sink_len + new_start;
-                                        let rope_strided = match self.rope_style {
-                                            RopeStyle::Halved => crate::cuda::kernels::rope_halved_strided,
-                                            RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_strided,
-                                        };
-                                        rope_strided(
-                                            reg, &mut gpu.decomp_cache,
-                                            self.cos.cuda_data(), self.sin.cuda_data(),
-                                            self.n_kv_head, ms, hdim, self.rope_dim,
-                                            new_start, new_count, pos_offset,
-                                        ).map_err(|e| TqError::Msg(format!("pre_rope strided: {e}")))?;
-                                    }
-
-                                    gpu.decomp_count = n_past_compressed;
-                                }
-                                // K hot: gather from strided decomp_cache → pre-allocated k_contig
-                                {
-                                    let n_kv = self.n_kv_head;
-                                    let count = n_past_compressed;
-                                    let dst = std::sync::Arc::get_mut(&mut gpu.k_contig)
-                                        .expect("k_contig aliased");
-                                    crate::cuda::kernels::strided_copy_args(
-                                        reg, &gpu.decomp_cache, dst,
-                                        n_kv * count * hdim, 3,
-                                        &[(n_kv as i32), (count as i32), (hdim as i32)],
-                                        &[((count * hdim) as i32), (hdim as i32), 1],
-                                        &[((ms * hdim) as i32), (hdim as i32), 1],
-                                        0,
-                                    ).map_err(|e| TqError::Msg(format!("k_hot gather: {e}")))?;
-                                }
-                                Some(Tensor::from_cuda_arc(
-                                    std::sync::Arc::clone(&gpu.k_contig),
-                                    vec![1, self.n_kv_head, n_past_compressed, hdim],
-                                    stream.clone(),
-                                ))
-                            } else { None };
-
-                            // Cache sink K/V on GPU (upload once)
-                            let sink_len = cache.sink_len;
-                            if sink_len > 0 && self.sink_k_gpu.is_none() {
-                                if let Some(ref sink_k) = cache.sink_k {
-                                    let data: Vec<f32> = sink_k.to_dtype(DType::F32)?.to_vec1()?;
-                                    if let Ok(buf) = stream.clone_htod(&data) {
-                                        self.sink_k_gpu = Some(buf);
-                                    }
-                                }
-                                if let Some(ref v_raw) = cache.v_raw {
-                                    let data: Vec<f32> = v_raw.narrow(2, 0, sink_len)?.to_dtype(DType::F32)?.to_vec1()?;
-                                    if let Ok(buf) = stream.clone_htod(&data) {
-                                        self.sink_v_gpu = Some(buf);
-                                    }
-                                }
-                            }
-
-                            // Step 2: Build K on GPU [sink | hot | current]
-                            let mut k_parts_gpu: Vec<Tensor> = Vec::new();
-                            if let Some(ref sk) = self.sink_k_gpu {
-                                k_parts_gpu.push(Tensor::from_cuda_arc(
-                                    std::sync::Arc::new(sk.clone()),
-                                    vec![1, self.n_kv_head, sink_len, hdim],
-                                    stream.clone(),
-                                ));
-                            }
-                            if let Some(kh) = k_hot { k_parts_gpu.push(kh); }
-
-                            // Sprint F: retrieve from GPU cold tier — ZERO CPU involvement.
-                            // Cold tier stores post-RoPE decompressed K (from decomp_cache
-                            // at eviction time). Gather contiguously and cat into K_full.
-                            // V2: cap at TQ_MAX_RETRIEVE (default 16) most-recent cold tokens.
-                            // Keeps attention cost bounded regardless of cold tier size.
-                            let mut n_retrieved = 0usize;
-                            #[cfg(feature = "cuda")]
-                            if super::kv_cache::get_offload_enabled() {
-                                if let Some(ref cold) = self.gpu_cold_cache {
-                                    if cold.count > 0 {
-                                        let max_retrieve = {
-                                            static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                                            *C.get_or_init(|| std::env::var("TQ_MAX_RETRIEVE")
-                                                .ok().and_then(|v| v.parse().ok()).unwrap_or(16))
-                                        };
-                                        // Take the most recent cold tokens (highest seq_pos = most informative)
-                                        let n_cold = cold.count.min(max_retrieve);
-                                        let cold_offset = cold.count.saturating_sub(n_cold);
-                                        let mc = cold.max_cold;
-
-                                        // Gather contiguous K from strided cold.k_data
-                                        // (post-RoPE, no decompress or RoPE needed)
-                                        // cold_offset skips oldest tokens when cold.count > max_retrieve
-                                        let mut cold_k_buf = reg.stream.alloc_zeros::<f32>(
-                                            self.n_kv_head * n_cold * hdim
-                                        ).map_err(|e| TqError::Msg(format!("cold k buf: {}", e)))?;
-                                        for h in 0..self.n_kv_head {
-                                            let src_off = (h * mc + cold_offset) * hdim;
-                                            let dst_off = h * n_cold * hdim;
-                                            crate::cuda::kernels::copy_with_offsets(
-                                                reg, &cold.k_data, &cold_k_buf,
-                                                n_cold * hdim, src_off, dst_off,
-                                            ).map_err(|e| TqError::Msg(format!("cold k gather: {e}")))?;
-                                        }
-
-                                        k_parts_gpu.push(Tensor::from_cuda(
-                                            cold_k_buf, vec![1, self.n_kv_head, n_cold, hdim], stream.clone(),
-                                        ));
-                                        n_retrieved = n_cold;
-                                    }
-                                }
-                            }
-
-                            if n_compressed > 0 {
-                                let k_cur = k.to_dtype(DType::F32)?;
-                                debug_assert!(k_cur.is_cuda(), "current K should be GPU");
-                                k_parts_gpu.push(k_cur);
-                            }
-
-                            let k_full = if k_parts_gpu.len() == 1 {
-                                k_parts_gpu.remove(0)
-                            } else {
-                                let k_refs: Vec<&Tensor> = k_parts_gpu.iter().collect();
-                                Tensor::cat(&k_refs, 2)?
-                            };
-                            let k_full = repeat_kv(k_full, n_rep)?;
-
-                            // Step 3: Q @ K^T on GPU (q_f32 already CUDA from attention_wo)
-                            // BUG fix 2026-04-11: was `/ scale` which is `* sqrt(d)` (off by d=128).
-                            // The correct scaling for attention logits is `(q @ k.T) / sqrt(d)`,
-                            // i.e. multiply by `scale = 1/sqrt(d)`. Has been wrong since 3888d39 —
-                            // PPL never hit this path (seq_len > 1) so the bug went unnoticed.
-                            debug_assert!(q_f32.is_cuda(), "Q should be GPU in all-GPU path");
-                            let mut att = (q_f32.matmul(&k_full.t()?)? / (hdim as f64).sqrt())?;
-                            if let Some(cap) = self.attn_logit_softcap {
-                                att = apply_softcap(&att, cap)?;
-                            }
-                            let att = softmax_last_dim(&att, backend)?;
-
-                            // Step 4: V hot from strided gpu.v_data (single strided_copy kernel)
-                            let mut v_parts_gpu: Vec<Tensor> = Vec::new();
-                            if let Some(ref sv) = self.sink_v_gpu {
-                                v_parts_gpu.push(Tensor::from_cuda_arc(
-                                    std::sync::Arc::new(sv.clone()),
-                                    vec![1, self.n_kv_head, sink_len, hdim],
-                                    stream.clone(),
-                                ));
-                            }
-                            if n_past_compressed > 0 {
-                                // V hot: gather from strided v_data → pre-allocated v_contig (0 allocs)
-                                {
-                                    let n_kv = self.n_kv_head;
-                                    let count = n_past_compressed;
-                                    let dst = std::sync::Arc::get_mut(&mut gpu.v_contig)
-                                        .expect("v_contig aliased");
-                                    crate::cuda::kernels::strided_copy_args(
-                                        reg, &gpu.v_data, dst,
-                                        n_kv * count * hdim, 3,
-                                        &[(n_kv as i32), (count as i32), (hdim as i32)],
-                                        &[((count * hdim) as i32), (hdim as i32), 1],
-                                        &[((ms * hdim) as i32), (hdim as i32), 1],
-                                        0,
-                                    ).map_err(|e| TqError::Msg(format!("v_hot gather: {e}")))?;
-                                }
-                                let v_hot = Tensor::from_cuda_arc(
-                                    std::sync::Arc::clone(&gpu.v_contig),
-                                    vec![1, self.n_kv_head, n_past_compressed, hdim],
-                                    stream.clone(),
-                                );
-                                v_parts_gpu.push(v_hot);
-                            }
-                            // Sprint F: insert cold V (GPU cold tier, strided → contiguous gather)
-                            #[cfg(feature = "cuda")]
-                            if n_retrieved > 0 {
-                                if let Some(ref cold) = self.gpu_cold_cache {
-                                    let n_cold = n_retrieved;
-                                    let mc = cold.max_cold;
-                                    let cold_offset = cold.count.saturating_sub(n_cold);
-                                    let mut cold_v_buf = reg.stream.alloc_zeros::<f32>(
-                                        self.n_kv_head * n_cold * hdim
-                                    ).map_err(|e| TqError::Msg(format!("cold v buf: {}", e)))?;
-                                    for h in 0..self.n_kv_head {
-                                        let src_off = (h * mc + cold_offset) * hdim;
-                                        let dst_off = h * n_cold * hdim;
-                                        crate::cuda::kernels::copy_with_offsets(
-                                            reg, &cold.v_data, &cold_v_buf,
-                                            n_cold * hdim, src_off, dst_off,
-                                        ).map_err(|e| TqError::Msg(format!("cold v gather: {e}")))?;
-                                    }
-                                    v_parts_gpu.push(Tensor::from_cuda(
-                                        cold_v_buf, vec![1, self.n_kv_head, n_cold, hdim], stream.clone(),
-                                    ));
-                                }
-                            }
-                            if n_compressed > 0 {
-                                let v_cur = v.to_dtype(DType::F32)?;
-                                debug_assert!(v_cur.is_cuda(), "current V should be GPU");
-                                v_parts_gpu.push(v_cur);
-                            }
-
-                            let v_full = if v_parts_gpu.len() == 1 {
-                                v_parts_gpu.remove(0)
-                            } else {
-                                let v_refs: Vec<&Tensor> = v_parts_gpu.iter().collect();
-                                Tensor::cat(&v_refs, 2)?
-                            };
-                            let v_full = repeat_kv(v_full, n_rep)?;
-                            att.matmul(&v_full.contiguous()?)?.to_dtype(cache.dtype)
-                        })();
-
-                        match gpu_result {
-                            Ok(y) => {
-                                let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
-                                return self.attention_wo.forward(&y, backend);
-                            }
-                            Err(ref e) if n_compressed > n_compressed_cpu => {
-                                // GPU compress active but all-GPU attention failed.
-                                // CPU fallback has incomplete data — propagate error.
-                                eprintln!("[gpu-tq-attn] FAILED (GPU compress active): {e}");
-                                return Err(TqError::Msg(format!("all-GPU TQ attn: {e}")));
-                            }
-                            _ => {} // Fall through to CPU paths
-                        }
+                        &q, &q_f32, &k, &v, &self.cos, &self.sin,
+                        &layer_tq_config,
+                        self.n_head, self.n_kv_head, self.head_dim, self.padded_head_dim,
+                        n_rep, n_past_compressed, n_compressed, n_compressed_cpu,
+                        has_compacted, seq_len, b_sz,
+                        self.rope_style, self.rope_dim,
+                        self.attn_logit_softcap,
+                        backend,
+                    )? {
+                        Some(y) => return self.attention_wo.forward(&y, backend),
+                        None => {} // Fall through to CPU paths
                     }
                 }
 
