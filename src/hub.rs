@@ -288,6 +288,17 @@ pub fn resolve(query: &str) -> Result<(PathBuf, Option<PathBuf>)> {
         let tok = as_path.parent().map(|p| p.join("tokenizer.json")).filter(|p| p.exists());
         return Ok((as_path.to_path_buf(), tok));
     }
+    // Local safetensors directory (config.json + model*.safetensors)
+    if as_path.exists() && as_path.is_dir() {
+        let has_config = as_path.join("config.json").exists();
+        let has_single = as_path.join("model.safetensors").exists();
+        let has_index = as_path.join("model.safetensors.index.json").exists();
+        if has_config && (has_single || has_index) {
+            let tok = as_path.join("tokenizer.json");
+            let tok_path = if tok.exists() { Some(tok) } else { None };
+            return Ok((as_path.to_path_buf(), tok_path));
+        }
+    }
 
     // Try catalog lookup
     if let Some(entry) = catalog::find(query) {

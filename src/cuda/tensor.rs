@@ -1300,11 +1300,35 @@ impl TqTensor {
 
     /// Get a mutable reference to the underlying CudaSlice (copy-on-write).
     ///
-    /// If the Arc has other references, this clones the GPU buffer first.
+    /// If the Arc has other references, this clones the GPU buffer first —
+    /// a silent D2D copy that the codescope audit (2026-04-13) flagged as
+    /// a likely source of unexplained slowdown. Set `TQ_COW_WARN=1`
+    /// BEFORE program start to emit a one-shot backtrace when CoW fires.
+    /// The env var is read once (OnceLock); hot-path overhead is a single
+    /// boolean load, no extra Arc inspection when warn is off.
+    ///
     /// Panics if the tensor is on CPU.
     pub fn cuda_data_mut(&mut self) -> &mut cudarc::driver::CudaSlice<f32> {
         match &mut self.storage {
-            TqStorage::Cuda { data, .. } => std::sync::Arc::make_mut(data),
+            TqStorage::Cuda { data, .. } => {
+                static COW_WARN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *COW_WARN.get_or_init(|| {
+                    std::env::var("TQ_COW_WARN").ok().as_deref() == Some("1")
+                }) && std::sync::Arc::strong_count(data) > 1 {
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        let bt = std::backtrace::Backtrace::capture();
+                        eprintln!(
+                            "[TQ_COW_WARN] cuda_data_mut: Arc strong_count={} → \
+                             Arc::make_mut will D2D-clone.\n{}",
+                            std::sync::Arc::strong_count(data),
+                            bt,
+                        );
+                    }
+                }
+                std::sync::Arc::make_mut(data)
+            }
             _ => panic!("cuda_data_mut() called on CPU tensor — use to_device() first"),
         }
     }

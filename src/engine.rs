@@ -248,13 +248,32 @@ impl Engine {
         };
         eprintln!("Device: {}", if device.is_cuda() { "CUDA GPU" } else { "CPU" });
 
+        // TQ_LAYER_SWAP: opt-in layer streaming. Must be processed BEFORE weight
+        // construction so SwapCell picks swap mode at QWeight::new time.
+        //   =0 (default) → standard resident weights
+        //   =force       → enable swap; Phase 5 pins all layers (validates plumbing)
+        //   =1           → enable swap; Phase 6 will compute pin_count from VRAM
+        #[cfg(feature = "cuda")]
+        let layer_swap_mode = std::env::var("TQ_LAYER_SWAP").ok();
+        #[cfg(feature = "cuda")]
+        let swap_active = matches!(layer_swap_mode.as_deref(), Some("force") | Some("1"));
+        #[cfg(feature = "cuda")]
+        if swap_active && device.is_cuda() {
+            eprintln!(
+                "Layer-swap mode: {} (note: incompatible with CUDA Graph)",
+                layer_swap_mode.as_deref().unwrap_or("?")
+            );
+            crate::qmatmul::enable_layer_swap();
+        }
+
         eprintln!("Loading model: {}", model_path.display());
 
         // Detect format: safetensors directory or GGUF file
         let is_safetensors = model_path.is_dir()
             || model_path.extension().map_or(false, |ext| ext == "safetensors");
 
-        let model = if is_safetensors {
+        #[allow(unused_mut)]
+        let mut model = if is_safetensors {
             // Safetensors (FP16/BF16) path
             let model_dir = if model_path.is_dir() {
                 model_path.to_path_buf()
@@ -276,12 +295,6 @@ impl Engine {
             ModelWeights(w)
         } else {
             // GGUF path
-            let mut file = std::fs::File::open(model_path)
-                .with_context(|| format!("Cannot open model: {}", model_path.display()))?;
-
-            let content = GgufContent::read(&mut file)
-                .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
-
             let tq = tq_config.unwrap_or_else(|| {
                 let mut cfg = TurboQuantConfig::balanced();
                 cfg.skip_layers = Some(999);
@@ -292,11 +305,204 @@ impl Engine {
             if compressed {
                 eprintln!("TurboQuant: {}-bit KV cache", tq.bits);
             }
-            let w = turbo_generic::GenericTurboModel::from_gguf(content, &mut file, &device, tq)
-                .map_err(|e| anyhow::anyhow!("Model load error: {}", e))?;
+            // Memory-mapped GGUF path: zero-copy into GPU, no CPU Vec<u8>.
+            //
+            // Enabled explicitly via TQ_MMAP=1, OR implicitly when layer-swap
+            // is active. Under swap we MUST keep raw_data around (for prefetch
+            // re-upload), and an Owned Vec<u8> costs ~full model size on CPU
+            // RAM — e.g. 18.5 GB for Qwen2.5-32B Q4_K_M, which caused a 40 GB
+            // RSS regression observed on 2026-04-13. The mmap-backed RawBytes
+            // variant keeps raw_data as zero-copy slices into the file, so
+            // the OS pages in/out on demand and peak RSS stays around a few
+            // GB instead of model-size.
+            #[cfg(feature = "cuda")]
+            let swap_active_mmap = matches!(
+                std::env::var("TQ_LAYER_SWAP").ok().as_deref(),
+                Some("1") | Some("force")
+            ) && device.is_cuda();
+            #[cfg(not(feature = "cuda"))]
+            let swap_active_mmap = false;
+
+            let use_mmap = std::env::var("TQ_MMAP").ok().as_deref() == Some("1")
+                || swap_active_mmap;
+            let w = if use_mmap {
+                if std::env::var("TQ_MMAP").ok().as_deref() == Some("1") {
+                    eprintln!("GGUF mmap mode (TQ_MMAP=1)");
+                } else {
+                    eprintln!("GGUF mmap mode (auto-enabled for TQ_LAYER_SWAP)");
+                }
+                let src = crate::gguf::GgufMmapSource::open(model_path)
+                    .map_err(|e| anyhow::anyhow!("GGUF mmap error: {}", e))?;
+                turbo_generic::GenericTurboModel::build_from_source(&src, &device, tq)
+                    .map_err(|e| anyhow::anyhow!("Model load error: {}", e))?
+            } else {
+                let mut file = std::fs::File::open(model_path)
+                    .with_context(|| format!("Cannot open model: {}", model_path.display()))?;
+                let content = GgufContent::read(&mut file)
+                    .map_err(|e| anyhow::anyhow!("GGUF read error: {}", e))?;
+                turbo_generic::GenericTurboModel::from_gguf(content, &mut file, &device, tq)
+                    .map_err(|e| anyhow::anyhow!("Model load error: {}", e))?
+            };
             ModelWeights(w)
         };
         eprintln!("Model loaded!");
+
+        // Size-pool activation is opt-in via TQ_SIZE_POOL=1. Empirical A/B
+        // on qwen2:7b showed pool ON hurt Standard decode 17.1 → 13.2 tok/s —
+        // the codescope audit's predicted 88-caller relief did not
+        // materialise on small models, likely because shape variance per
+        // layer spreads the pool across many thin buckets (~480 distinct
+        // shapes for Qwen2-7B over a decode step) so hit-rate stays low
+        // while bookkeeping dominates. Kept off by default; future sprint
+        // to investigate whether the pool's per-bucket lookup overhead or
+        // its memory retention is the real cost.
+        #[cfg(feature = "cuda")]
+        if std::env::var("TQ_SIZE_POOL").ok().as_deref() == Some("1") && device.is_cuda() {
+            crate::cuda::size_pool_activate();
+            eprintln!("  Size pool: ENABLED (opt-in via TQ_SIZE_POOL=1)");
+        }
+
+        // Install LayerSwapManager if swap mode was requested.
+        //
+        // TQ_LAYER_SWAP semantics:
+        //   unset / 0 → off (default)
+        //   1         → on only when model doesn't fit in VRAM (opt-in)
+        //   force     → always on, all layers pinned (validation path)
+        //
+        // Per feedback (user preference): swap is NEVER auto-enabled on a
+        // fitting model — the tok/s regression would break the default
+        // experience. `1` turns itself off if the model fits.
+        #[cfg(feature = "cuda")]
+        if swap_active && device.is_cuda() {
+            use crate::auto_tq::{decide_layer_swap, pinned_indices};
+            use crate::layer_swap::LayerSwapManager;
+
+            let mut inner = model;
+            let n_layers = inner.0.layers.len();
+
+            // Estimate model bytes: sum of per-layer QWeight raw_data lengths.
+            let model_bytes: u64 = inner.0
+                .layers
+                .iter()
+                .flat_map(|l| l.qweights())
+                .map(|qw| qw.raw_data.len() as u64)
+                .sum();
+            // output.weight (lm_head) and token_embd are NOT layer weights —
+            // they stay resident for the full run. Account for them in the
+            // kv/fixed side so the layer budget doesn't over-commit.
+            let lm_head_bytes: u64 = match &inner.0.output.inner {
+                crate::qmatmul::QMatMul::Quantized(qw) => qw.raw_data.len() as u64,
+                _ => 0,
+            };
+            // KV per-token-bytes (fp16 K + V across all layers).
+            let kv_per_token_bytes: u64 = if let Some(l0) = inner.0.layers.first() {
+                // 2 = K+V, 2 bytes/element (fp16), × n_kv_head × head_dim
+                2u64 * l0.n_kv_head as u64 * l0.head_dim as u64 * 2 * n_layers as u64
+            } else {
+                0
+            };
+            // Worst-case context: TQ_MAX_SEQ env override, else 32K conservative
+            // default (matches common long-context configs and prevents swap
+            // policy from under-planning VRAM on 27B+ runs).
+            let max_context: usize = std::env::var("TQ_MAX_SEQ")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32_768);
+
+            // Fold lm_head into the "kv/fixed" account so the layer pin budget
+            // leaves headroom for the always-resident lm_head (and its dequant
+            // scratch during logit computation — reserve 2× the packed size
+            // as a conservative estimate for cuBLAS workspace).
+            let fixed_lm_head: u64 = lm_head_bytes * 2;
+            let kv_per_token_bytes_adj = kv_per_token_bytes
+                + (fixed_lm_head / max_context.max(1) as u64);
+
+            let plan = decide_layer_swap(
+                &device, model_bytes, n_layers, kv_per_token_bytes_adj, max_context,
+            );
+            eprintln!("  Layer-swap plan: {}", plan.reason);
+
+            if !plan.enabled {
+                // e.g. TQ_LAYER_SWAP=1 but model fits. Don't install manager.
+                model = inner;
+            } else {
+                let ctx = device.cuda_context().clone();
+                let compute_stream = device.cuda_stream()
+                    .map_err(|e| anyhow::anyhow!("layer_swap compute stream: {}", e))?;
+                let pinned_layers = pinned_indices(n_layers, plan.pin_count);
+                let mut manager = LayerSwapManager::new(
+                    ctx,
+                    compute_stream,
+                    &pinned_layers,
+                ).map_err(|e| anyhow::anyhow!("layer_swap manager: {}", e))?;
+
+                let qws_per_layer: Vec<Vec<crate::layer_swap::QWeightPtr>> = inner.0
+                    .layers
+                    .iter()
+                    .map(|l| l.qweight_ptrs())
+                    .collect();
+
+                // Pin the selected layers at load time (synchronous H2D).
+                for &layer_idx in &pinned_layers {
+                    unsafe {
+                        manager.pin_layer_direct(layer_idx, &qws_per_layer[layer_idx])
+                            .map_err(|e| anyhow::anyhow!("pin layer {}: {}", layer_idx, e))?;
+                    }
+                }
+
+                // Pre-allocate the streaming lane pool once (no per-prefetch
+                // cudaMalloc). Uses the first non-pinned layer as the
+                // structural template — same QWeight count + sizes across
+                // layers holds for all decoder-only transformers we target.
+                if n_layers > pinned_layers.len() {
+                    let template_idx = (0..n_layers)
+                        .find(|i| !manager.is_pinned(*i))
+                        .unwrap_or(0);
+                    let n_lanes: usize = std::env::var("TQ_SWAP_LANES")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(2);
+                    unsafe {
+                        manager.allocate_lanes(n_lanes, &qws_per_layer[template_idx])
+                            .map_err(|e| anyhow::anyhow!("allocate_lanes: {}", e))?;
+                    }
+                }
+
+                // Kick initial prefetch for the first un-pinned layer so the
+                // compute stream has something to wait on at layer 0.
+                for layer_idx in 0..n_layers {
+                    if !manager.is_pinned(layer_idx) {
+                        unsafe {
+                            manager.start_prefetch_direct(
+                                layer_idx,
+                                &qws_per_layer[layer_idx],
+                            ).map_err(|e| anyhow::anyhow!("initial prefetch L{}: {}", layer_idx, e))?;
+                        }
+                        break;
+                    }
+                }
+
+                // Explicitly upload lm_head to GPU now — it's queried lazily
+                // by the final matmul and would otherwise OOM mid-forward on
+                // VRAM-tight models (Qwen2.5-32B's lm_head alone is ~380MB
+                // Q4K + 1-1.5GB dequant scratch at logit time).
+                if let crate::qmatmul::QMatMul::Quantized(qw) = &inner.0.output.inner {
+                    if let Err(e) = qw.upload_to_gpu(&device) {
+                        eprintln!("  Layer-swap: lm_head upload failed: {} — may OOM mid-forward", e);
+                    }
+                }
+
+                eprintln!(
+                    "  Layer-swap installed: {} pinned, {} streamed (lm_head resident)",
+                    pinned_layers.len(),
+                    n_layers.saturating_sub(pinned_layers.len()),
+                );
+
+                inner.0.layer_swap = Some(manager);
+                inner.0.layer_qweight_ptrs = qws_per_layer;
+                model = inner;
+            }
+        }
 
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Tokenizer load error: {}", e))?;

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::backend::ComputeBackend;
 use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
 use crate::cuda::Result;
-use crate::gguf::{GgufContent, GgmlDType};
+use crate::gguf::{GgufContent, GgmlDType, WeightSource, GgufSource};
 use crate::qmatmul as qmm;
 use tq_kv::TurboQuantConfig;
 
@@ -65,6 +65,17 @@ pub struct GenericTurboModel {
     /// Pre-allocated scratch buffers for zero-alloc decode (fused kernel path).
     #[cfg(feature = "cuda")]
     pub(crate) decode_scratch: Option<DecodeScratch>,
+    /// Optional layer-swap manager for streaming weights under VRAM pressure.
+    /// `None` = everything pinned at load time (default). Set by engine.rs when
+    /// `TQ_LAYER_SWAP=1|force` is active.
+    #[cfg(feature = "cuda")]
+    pub(crate) layer_swap: Option<crate::layer_swap::LayerSwapManager>,
+    /// Pre-computed QWeight pointers per layer — cached so the forward loop
+    /// can reach layers[i+1]'s weights while holding `&mut layers[i]`.
+    /// `QWeightPtr` is a Send+Sync wrapper so the `Engine` stays `Send`.
+    /// Rebuilt when `layer_swap` is installed.
+    #[cfg(feature = "cuda")]
+    pub(crate) layer_qweight_ptrs: Vec<Vec<crate::layer_swap::QWeightPtr>>,
 }
 
 fn precompute_freqs_cis(
@@ -97,13 +108,35 @@ fn detect_rope_style(arch: &str) -> RopeStyle {
 }
 
 impl GenericTurboModel {
+    /// Load from a GGUF file (thin wrapper over `build`).
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
         ct: GgufContent,
         reader: &mut R,
         device: &Device,
         tq_config: TurboQuantConfig,
     ) -> Result<Self> {
-        let md_get = |s: &str| match ct.metadata.get(s) {
+        let src = GgufSource::new(&ct, reader);
+        Self::build(&src, device, tq_config)
+    }
+
+    /// Public entry point: construct from any `WeightSource`.
+    /// Used by engine.rs to switch between mmap/non-mmap GGUF paths.
+    pub fn build_from_source<WS: WeightSource>(
+        src: &WS,
+        device: &Device,
+        tq_config: TurboQuantConfig,
+    ) -> Result<Self> {
+        Self::build(src, device, tq_config)
+    }
+
+    /// Format-agnostic model builder. Consumes a `WeightSource`
+    /// (GGUF or safetensors) and constructs a `GenericTurboModel`.
+    pub(crate) fn build<WS: WeightSource>(
+        src: &WS,
+        device: &Device,
+        tq_config: TurboQuantConfig,
+    ) -> Result<Self> {
+        let md_get = |s: &str| match src.metadata(s) {
             None => bail!("cannot find {s} in metadata"),
             Some(v) => Ok(v),
         };
@@ -177,18 +210,18 @@ impl GenericTurboModel {
             for key in ["attention.value_length", "attention.sliding_window",
                         "attention.query_pre_attn_scalar"] {
                 let full_key = format!("{arch}.{key}");
-                if let Some(val) = ct.get(&full_key) {
+                if let Some(val) = src.metadata(&full_key) {
                     eprintln!("  [gguf] {full_key} = {val:?}");
                 }
             }
         }
 
         // Auto-detect features from GGUF tensors
-        let has_bias = ct.tensor(reader, "blk.0.attn_q.bias", device).is_ok();
-        let has_merged_qkv = ct.tensor(reader, "blk.0.attn_qkv.weight", device).is_ok();
-        let has_ffn_gate = ct.tensor(reader, "blk.0.ffn_gate.weight", device).is_ok();
-        let has_post_attn_norm = ct.tensor(reader, "blk.0.post_attention_norm.weight", device).is_ok();
-        let has_post_ffn_norm = ct.tensor(reader, "blk.0.post_ffw_norm.weight", device).is_ok();
+        let has_bias = src.tensor("blk.0.attn_q.bias", device).is_ok();
+        let has_merged_qkv = src.tensor("blk.0.attn_qkv.weight", device).is_ok();
+        let has_ffn_gate = src.tensor("blk.0.ffn_gate.weight", device).is_ok();
+        let has_post_attn_norm = src.tensor("blk.0.post_attention_norm.weight", device).is_ok();
+        let has_post_ffn_norm = src.tensor("blk.0.post_ffw_norm.weight", device).is_ok();
 
         let qkv_style = if has_merged_qkv { "merged" } else { "separate" };
         let mlp_style = if n_expert > 1 {
@@ -231,7 +264,7 @@ impl GenericTurboModel {
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         // Embeddings: lazy dequant on GPU (saves ~2 GB), full dequant on CPU
-        let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", device)?;
+        let tok_embeddings_q = src.tensor("token_embd.weight", device)?;
         let emb_dtype = tok_embeddings_q.dtype;
         let emb_shape = tok_embeddings_q.shape;
         #[cfg(feature = "cuda")]
@@ -243,19 +276,19 @@ impl GenericTurboModel {
         let (emb_raw, emb_full) = if tok_embeddings_lazy {
             (Some(emb_raw_data), None)
         } else {
-            let dequant = crate::quant::dequantize(&emb_raw_data, emb_dtype,
+            let dequant = crate::quant::dequantize(emb_raw_data.as_slice(), emb_dtype,
                 emb_shape.0 * emb_shape.1);
             let tensor = Tensor::from_vec(dequant, vec![emb_shape.0, emb_shape.1], device)?;
             (None, Some(tensor))
         };
         let norm = {
             let n = RmsNorm::from_qtensor(
-                ct.tensor(reader, "output_norm.weight", device)?, rms_norm_eps, device,
+                src.tensor("output_norm.weight", device)?, rms_norm_eps, device,
             )?;
             if arch.contains("gemma") { n.with_add_unit() } else { n }
         };
         // Detect tie_word_embeddings: if output.weight is missing, reuse token embeddings
-        let output = match ct.tensor(reader, "output.weight", device) {
+        let output = match src.tensor("output.weight", device) {
             Ok(tensor) => tensor,
             Err(_) => {
                 eprintln!("  (tie_word_embeddings: reusing token_embd.weight for output)");
@@ -272,12 +305,12 @@ impl GenericTurboModel {
 
             // Attention weights: merged QKV (Phi-3.5) or separate (most models)
             let qkv = if has_merged_qkv {
-                let wqkv = ct.tensor(reader, &format!("{prefix}.attn_qkv.weight"), device)?;
+                let wqkv = src.tensor(&format!("{prefix}.attn_qkv.weight"), device)?;
                 QkvWeights::Merged { wqkv: QMatMul::from_qtensor(wqkv)? }
             } else {
-                let wq = ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?;
-                let wk = ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?;
-                let wv = ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?;
+                let wq = src.tensor(&format!("{prefix}.attn_q.weight"), device)?;
+                let wk = src.tensor(&format!("{prefix}.attn_k.weight"), device)?;
+                let wv = src.tensor(&format!("{prefix}.attn_v.weight"), device)?;
                 if layer_idx == 0 {
                     eprintln!("  [debug] L0 wq=({},{}) wk=({},{}) wv=({},{})",
                         wq.shape.0, wq.shape.1, wk.shape.0, wk.shape.1, wv.shape.0, wv.shape.1);
@@ -288,33 +321,33 @@ impl GenericTurboModel {
                     wv: QMatMul::from_qtensor(wv)?,
                 }
             };
-            let attention_wo = ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?;
+            let attention_wo = src.tensor(&format!("{prefix}.attn_output.weight"), device)?;
 
             // Optional biases (Qwen2 has them, Llama/Phi/Gemma don't)
             let attention_bq = if has_bias {
-                Some(ct.tensor(reader, &format!("{prefix}.attn_q.bias"), device)?.dequantize_to_device(device)?)
+                Some(src.tensor(&format!("{prefix}.attn_q.bias"), device)?.dequantize_to_device(device)?)
             } else {
                 None
             };
             let attention_bk = if has_bias {
-                Some(ct.tensor(reader, &format!("{prefix}.attn_k.bias"), device)?.dequantize_to_device(device)?)
+                Some(src.tensor(&format!("{prefix}.attn_k.bias"), device)?.dequantize_to_device(device)?)
             } else {
                 None
             };
             let attention_bv = if has_bias {
-                Some(ct.tensor(reader, &format!("{prefix}.attn_v.bias"), device)?.dequantize_to_device(device)?)
+                Some(src.tensor(&format!("{prefix}.attn_v.bias"), device)?.dequantize_to_device(device)?)
             } else {
                 None
             };
 
             // MLP: 3-gate (most models), 2-gate up/down (Phi-3.5), or MoE
             let mlp_or_moe = if n_expert > 1 {
-                let gate_inp = ct.tensor(reader, &format!("{prefix}.ffn_gate_inp.weight"), device)?;
+                let gate_inp = src.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
                 let mut experts = Vec::with_capacity(n_expert);
                 for i in 0..n_expert {
-                    let w1 = ct.tensor(reader, &format!("{prefix}.ffn_gate.{i}.weight"), device)?;
-                    let w2 = ct.tensor(reader, &format!("{prefix}.ffn_down.{i}.weight"), device)?;
-                    let w3 = ct.tensor(reader, &format!("{prefix}.ffn_up.{i}.weight"), device)?;
+                    let w1 = src.tensor(&format!("{prefix}.ffn_gate.{i}.weight"), device)?;
+                    let w2 = src.tensor(&format!("{prefix}.ffn_down.{i}.weight"), device)?;
+                    let w3 = src.tensor(&format!("{prefix}.ffn_up.{i}.weight"), device)?;
                     experts.push(Mlp {
                         feed_forward_w1: QMatMul::from_qtensor(w1)?,
                         feed_forward_w2: QMatMul::from_qtensor(w2)?,
@@ -328,9 +361,9 @@ impl GenericTurboModel {
                     experts,
                 }
             } else if has_ffn_gate {
-                let w1 = ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
-                let w2 = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
-                let w3 = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
+                let w1 = src.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
+                let w2 = src.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
+                let w3 = src.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
                 MlpOrMoe::Mlp(Mlp {
                     feed_forward_w1: QMatMul::from_qtensor(w1)?,
                     feed_forward_w2: QMatMul::from_qtensor(w2)?,
@@ -339,26 +372,26 @@ impl GenericTurboModel {
                 })
             } else {
                 // Phi-style: only ffn_up and ffn_down (no ffn_gate)
-                let up = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
-                let down = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
+                let up = src.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
+                let down = src.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
                 MlpOrMoe::UpDown(MlpUpDown {
                     ffn_up: QMatMul::from_qtensor(up)?,
                     ffn_down: QMatMul::from_qtensor(down)?,
                 })
             };
 
-            let attention_norm = ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?;
-            let ffn_norm = ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), device)?;
+            let attention_norm = src.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
+            let ffn_norm = src.tensor(&format!("{prefix}.ffn_norm.weight"), device)?;
 
             // Optional post-norms (Gemma2)
             let post_attention_norm = if has_post_attn_norm {
-                let t = ct.tensor(reader, &format!("{prefix}.post_attention_norm.weight"), device)?;
+                let t = src.tensor(&format!("{prefix}.post_attention_norm.weight"), device)?;
                 Some(RmsNorm::from_qtensor(t, rms_norm_eps, device)?)
             } else {
                 None
             };
             let post_ffn_norm = if has_post_ffn_norm {
-                let t = ct.tensor(reader, &format!("{prefix}.post_ffw_norm.weight"), device)?;
+                let t = src.tensor(&format!("{prefix}.post_ffw_norm.weight"), device)?;
                 Some(RmsNorm::from_qtensor(t, rms_norm_eps, device)?)
             } else {
                 None
@@ -451,9 +484,22 @@ impl GenericTurboModel {
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
             #[cfg(feature = "cuda")]
-            graph_manager: crate::cuda::graph::CudaGraphManager::new(
-                std::env::var("TQ_GRAPH").map(|v| v == "1").unwrap_or(false)
-            ),
+            // CUDA Graph and layer swap are mutually exclusive: graph replay
+            // captures device addresses, which change every prefetch under
+            // swap. If either TQ_LAYER_SWAP=1 or =force is set, disable graph.
+            graph_manager: crate::cuda::graph::CudaGraphManager::new({
+                let graph_wanted = std::env::var("TQ_GRAPH").map(|v| v == "1").unwrap_or(false);
+                let swap_active = matches!(
+                    std::env::var("TQ_LAYER_SWAP").ok().as_deref(),
+                    Some("1") | Some("force")
+                );
+                if graph_wanted && swap_active {
+                    eprintln!("[cuda] TQ_GRAPH disabled (TQ_LAYER_SWAP active)");
+                    false
+                } else {
+                    graph_wanted
+                }
+            }),
             #[cfg(feature = "cuda")]
             graph_output: None,
             #[cfg(feature = "cuda")]
@@ -470,6 +516,10 @@ impl GenericTurboModel {
             arena_decode_count: 0,
             #[cfg(feature = "cuda")]
             decode_scratch: None,
+            #[cfg(feature = "cuda")]
+            layer_swap: None,
+            #[cfg(feature = "cuda")]
+            layer_qweight_ptrs: Vec::new(),
         };
 
         // Allocate DecodeScratch if CUDA is available and model has separate Q4K QKV + standard MLP.
@@ -503,47 +553,82 @@ impl GenericTurboModel {
         }
 
         // Pre-warm weight caches: dequant on CPU + upload to GPU.
-        // Disable with TQ_NO_WARMUP=1 on low-memory systems.
+        // - TQ_NO_WARMUP=1: skip (low-memory systems).
+        // - TQ_LAYER_SWAP=1|force: skip (LayerSwapManager manages QWeight GPU
+        //   residency via pin/prefetch; warmup would double-upload and OOM).
         let do_warmup = std::env::var("TQ_NO_WARMUP").map(|v| v != "1").unwrap_or(true);
-        if do_warmup {
+        let swap_active = matches!(
+            std::env::var("TQ_LAYER_SWAP").ok().as_deref(),
+            Some("1") | Some("force")
+        );
+        let warmup_qweights = do_warmup && !swap_active;
         let b = model.backend.as_ref();
-        eprintln!("  Pre-warming weight caches ({} layers, backend={})...", block_count, b.name());
-        model.output.warmup(b);
-        // Final norm weight
-        b.warmup_f32(model.norm.weight.as_slice());
-        for layer in &model.layers {
-            layer.attention_wo.warmup(b);
-            match &layer.qkv {
-                QkvWeights::Separate { wq, wk, wv } => { wq.warmup(b); wk.warmup(b); wv.warmup(b); }
-                QkvWeights::Merged { wqkv } => { wqkv.warmup(b); }
-            }
-            // Norm weights → GPU cache
-            b.warmup_f32(layer.attention_norm.weight.as_slice());
-            b.warmup_f32(layer.ffn_norm.weight.as_slice());
-            if let Some(ref n) = layer.post_attention_norm {
-                b.warmup_f32(n.weight.as_slice());
-            }
-            if let Some(ref n) = layer.post_ffn_norm {
-                b.warmup_f32(n.weight.as_slice());
-            }
-            match &layer.mlp_or_moe {
-                MlpOrMoe::Mlp(mlp) => {
-                    mlp.feed_forward_w1.warmup(b);
-                    mlp.feed_forward_w2.warmup(b);
-                    mlp.feed_forward_w3.warmup(b);
+
+        if warmup_qweights {
+            eprintln!("  Pre-warming weight caches ({} layers, backend={})...", block_count, b.name());
+            model.output.warmup(b);
+            // Final norm weight
+            b.warmup_f32(model.norm.weight.as_slice());
+            for layer in &model.layers {
+                layer.attention_wo.warmup(b);
+                match &layer.qkv {
+                    QkvWeights::Separate { wq, wk, wv } => { wq.warmup(b); wk.warmup(b); wv.warmup(b); }
+                    QkvWeights::Merged { wqkv } => { wqkv.warmup(b); }
                 }
-                MlpOrMoe::UpDown(ud) => {
-                    ud.ffn_up.warmup(b);
-                    ud.ffn_down.warmup(b);
+                // Norm weights → GPU cache
+                b.warmup_f32(layer.attention_norm.weight.as_slice());
+                b.warmup_f32(layer.ffn_norm.weight.as_slice());
+                if let Some(ref n) = layer.post_attention_norm {
+                    b.warmup_f32(n.weight.as_slice());
                 }
-                MlpOrMoe::MoE { experts, feed_forward_gate_inp, .. } => {
-                    feed_forward_gate_inp.warmup(b);
-                    for exp in experts { exp.feed_forward_w1.warmup(b); exp.feed_forward_w2.warmup(b); exp.feed_forward_w3.warmup(b); }
+                if let Some(ref n) = layer.post_ffn_norm {
+                    b.warmup_f32(n.weight.as_slice());
+                }
+                match &layer.mlp_or_moe {
+                    MlpOrMoe::Mlp(mlp) => {
+                        mlp.feed_forward_w1.warmup(b);
+                        mlp.feed_forward_w2.warmup(b);
+                        mlp.feed_forward_w3.warmup(b);
+                    }
+                    MlpOrMoe::UpDown(ud) => {
+                        ud.ffn_up.warmup(b);
+                        ud.ffn_down.warmup(b);
+                    }
+                    MlpOrMoe::MoE { experts, feed_forward_gate_inp, .. } => {
+                        feed_forward_gate_inp.warmup(b);
+                        for exp in experts { exp.feed_forward_w1.warmup(b); exp.feed_forward_w2.warmup(b); exp.feed_forward_w3.warmup(b); }
+                    }
                 }
             }
+
+            // Auto-release CPU raw_data for Owned (non-mmap) QWeights now
+            // that GPU caches are populated. Saves ~model-size of heap RAM
+            // on non-swap runs. Opt-in via TQ_RELEASE_CPU=1.
+            //
+            // Why opt-in: A/B on qwen2:7b showed ~3% Standard tok/s penalty
+            // (16.8 → 16.2) when release runs. Mutation invalidates some
+            // pool/Arc assumptions elsewhere in the hot path that still
+            // need investigation. Default off preserves tok/s; users on
+            // RAM-constrained systems enable the flag to reclaim heap.
+            // (Swap + mmap path already avoids the heap Vec entirely.)
+            #[cfg(feature = "cuda")]
+            if b.is_gpu() && std::env::var("TQ_RELEASE_CPU").ok().as_deref() == Some("1") {
+                eprintln!("  Releasing CPU weight heap (TQ_RELEASE_CPU=1)...");
+                for layer in &mut model.layers {
+                    layer.release_qweight_cpu();
+                }
+                if let qmm::QMatMul::Quantized(qw) = &mut model.output.inner {
+                    qw.release_cpu_after_gpu();
+                }
+            }
+            eprintln!("  Weight caches warmed.");
+        } else if swap_active {
+            eprintln!("  QWeight warmup skipped (layer-swap active; manager handles GPU residency).");
         }
-        // Upload persistent tensors to GPU (norm weights, cos/sin, biases).
-        // Full broadcast GPU support enables this (stride-based kernels).
+
+        // Persistent tensor upload runs ALWAYS (even with swap / no-warmup) —
+        // these are small (cos/sin/norm weights/biases) and required by the
+        // forward kernels regardless of QWeight residency strategy.
         #[cfg(feature = "cuda")]
         if b.is_gpu() {
             if let Ok(gpu) = model.norm.weight.to_device_auto() { model.norm.weight = gpu; }
@@ -563,13 +648,9 @@ impl GenericTurboModel {
             // Eager warmup would double VRAM usage (f32 + f16 caches).
         }
 
-        eprintln!("  Weight caches warmed.");
-
         // Note: A.2 (raw_data release after GPU upload) was attempted but caused
         // crashes in CPU fallback paths (e.g. Q6K prefill dequant). Deferred until
         // all forward paths are fully GPU-resident with no CPU fallback.
-
-        } // end if do_warmup
 
         Ok(model)
     }
@@ -876,6 +957,15 @@ impl GenericTurboModel {
         #[cfg(not(feature = "cuda"))]
         let graph_replayed = false;
 
+        // Take layer_swap out of self so the inner loop can use it alongside
+        // self.layers.iter_mut().
+        #[cfg(feature = "cuda")]
+        let mut layer_swap = self.layer_swap.take();
+        #[cfg(feature = "cuda")]
+        let layer_qweight_ptrs = std::mem::take(&mut self.layer_qweight_ptrs);
+        #[cfg(feature = "cuda")]
+        let n_layers_total = self.layers.len();
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Hybrid graph replay: skip non-TQ layers (already executed by graph)
             #[cfg(feature = "cuda")]
@@ -884,6 +974,18 @@ impl GenericTurboModel {
                 if !this_is_tq {
                     continue;
                 }
+            }
+
+            // ── Layer-swap pre-hook:
+            //    (1) flush graveyard — drop any CudaSlices whose compute-
+            //        completion event has fired (safe to cuMemFree now).
+            //    (2) wait_for_layer — compute stream waits on the layer's
+            //        H2D-ready event from the prior iteration's prefetch.
+            #[cfg(feature = "cuda")]
+            if let Some(ref mut sm) = layer_swap {
+                sm.flush_graveyard();
+                sm.wait_for_layer(layer_idx)
+                    .expect("layer_swap wait_for_layer failed");
             }
 
             let x = layer_in;
@@ -1507,6 +1609,42 @@ impl GenericTurboModel {
                         layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
                 }
             }
+
+            // ── Layer-swap post-hook: evict current, prefetch next.
+            //    For pinned layers these are no-ops. The pointer cache lets us
+            //    reach layers[i+1]'s QWeights without triggering a borrow
+            //    conflict with the ongoing `self.layers.iter_mut()` loop.
+            #[cfg(feature = "cuda")]
+            if let Some(ref mut sm) = layer_swap {
+                if layer_idx < layer_qweight_ptrs.len() {
+                    unsafe {
+                        sm.evict_layer_direct(layer_idx, &layer_qweight_ptrs[layer_idx]);
+                    }
+                }
+                let next = layer_idx + 1;
+                if next < n_layers_total && next < layer_qweight_ptrs.len() {
+                    // SAFETY: pointers valid while self (and hence self.layers) lives.
+                    if let Err(e) = unsafe {
+                        sm.start_prefetch_direct(next, &layer_qweight_ptrs[next])
+                    } {
+                        eprintln!("[layer_swap] prefetch L{} failed: {}", next, e);
+                    }
+                }
+            }
+        }
+
+        // Drain any remaining graveyard entries so CudaSlices from the last
+        // 1-2 streamed layers don't accumulate across decode steps.
+        #[cfg(feature = "cuda")]
+        if let Some(ref mut sm) = layer_swap {
+            sm.drain_graveyard();
+        }
+
+        // Restore layer_swap + pointer cache after the loop.
+        #[cfg(feature = "cuda")]
+        {
+            self.layer_swap = layer_swap;
+            self.layer_qweight_ptrs = layer_qweight_ptrs;
         }
 
         // Restore scratch buffers back into self after layer loop.
@@ -1750,10 +1888,11 @@ impl GenericTurboModel {
     /// * `device` - Target device
     /// * `tq_config` - TurboQuant configuration
     pub fn from_safetensors(
-        _model_dir: &std::path::Path,
-        _device: &Device,
-        _tq_config: TurboQuantConfig,
+        model_dir: &std::path::Path,
+        device: &Device,
+        tq_config: TurboQuantConfig,
     ) -> Result<Self> {
-        bail!("safetensors loading not yet implemented for tq-cuda backend")
+        let src = crate::safetensors_src::SafetensorsContent::open(model_dir)?;
+        Self::build(&src, device, tq_config)
     }
 }

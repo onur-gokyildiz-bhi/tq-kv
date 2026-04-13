@@ -268,6 +268,64 @@ impl GgufContent {
         })
     }
 
+    /// Parse GGUF header + descriptors directly from a memory-mapped file.
+    ///
+    /// Returns the parsed content plus the `Arc<Mmap>` — callers should keep
+    /// the `Arc` alive and pass it into `tensor_mmap()` to obtain zero-copy
+    /// `QWeight`s whose `raw_data` is a `RawBytes::Mmap` slice.
+    pub fn open_mmap(
+        path: &std::path::Path,
+    ) -> Result<(Self, std::sync::Arc<memmap2::Mmap>)> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| TqError::Msg(format!("open {}: {}", path.display(), e)))?;
+        // SAFETY: mmap is safe as long as the underlying file isn't mutated
+        // while we hold the mapping. GGUF weight files are read-only during
+        // inference.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| TqError::Msg(format!("mmap {}: {}", path.display(), e)))?;
+        let mmap = std::sync::Arc::new(mmap);
+        let mut cursor = std::io::Cursor::new(&mmap[..]);
+        let content = Self::read(&mut cursor)?;
+        Ok((content, mmap))
+    }
+
+    /// Absolute byte range (into the underlying file / mmap) where `name`'s
+    /// tensor bytes live.
+    pub fn tensor_byte_range(&self, name: &str) -> Result<(TensorInfo, std::ops::Range<usize>)> {
+        let info = self
+            .tensor_infos
+            .get(name)
+            .ok_or_else(|| TqError::Msg(format!("tensor not found: {}", name)))?
+            .clone();
+        let start = (self.tensor_data_offset + info.offset) as usize;
+        let end = start + info.data_size_bytes();
+        Ok((info, start..end))
+    }
+
+    /// Zero-copy tensor load from a memory-mapped file.
+    pub fn tensor_mmap(
+        &self,
+        mmap: &std::sync::Arc<memmap2::Mmap>,
+        name: &str,
+        _device: &TqDevice,
+    ) -> Result<QWeight> {
+        let (info, range) = self.tensor_byte_range(name)?;
+        if range.end > mmap.len() {
+            return Err(TqError::Msg(format!(
+                "tensor {} range {}..{} exceeds mmap length {}",
+                name, range.start, range.end, mmap.len()
+            )));
+        }
+        let shape = if info.shape.len() >= 2 {
+            (info.shape[0], info.shape[1])
+        } else if info.shape.len() == 1 {
+            (1, info.shape[0])
+        } else {
+            (1, 1)
+        };
+        Ok(QWeight::new_mmap(mmap.clone(), range, info.dtype, shape))
+    }
+
     /// Load raw tensor bytes from the file.
     pub fn tensor_data<R: Read + Seek>(
         &self,
@@ -322,6 +380,83 @@ impl GgufContent {
     pub fn require(&self, key: &str) -> Result<&GgufValue> {
         self.metadata.get(key)
             .ok_or_else(|| TqError::Msg(format!("missing metadata: {}", key)))
+    }
+}
+
+// ─── WeightSource ────────────────────────────────────────────
+//
+// Abstraction over weight-file formats (GGUF, safetensors) so model
+// construction in `turbo_generic::model::build` can be format-agnostic.
+// The forward-time loading code just asks for named metadata + tensors.
+
+/// Source of weights + metadata. Implemented by GGUF and safetensors backends.
+///
+/// `tensor` is `&self` (not `&mut`); implementations that need mutable state
+/// (e.g. a `Read + Seek` cursor for GGUF) should use interior mutability.
+/// Callers are single-threaded during model construction.
+pub trait WeightSource {
+    /// Look up a metadata value by key.
+    fn metadata(&self, key: &str) -> Option<&GgufValue>;
+
+    /// Load a named tensor as a `QWeight`.
+    fn tensor(&self, name: &str, device: &TqDevice) -> Result<QWeight>;
+}
+
+/// Thin wrapper that adapts `(GgufContent, &mut R)` to `WeightSource`.
+pub struct GgufSource<'a, R: Read + Seek> {
+    content: &'a GgufContent,
+    reader: std::cell::RefCell<&'a mut R>,
+}
+
+impl<'a, R: Read + Seek> GgufSource<'a, R> {
+    pub fn new(content: &'a GgufContent, reader: &'a mut R) -> Self {
+        Self { content, reader: std::cell::RefCell::new(reader) }
+    }
+}
+
+impl<'a, R: Read + Seek> WeightSource for GgufSource<'a, R> {
+    fn metadata(&self, key: &str) -> Option<&GgufValue> {
+        self.content.metadata.get(key)
+    }
+
+    fn tensor(&self, name: &str, device: &TqDevice) -> Result<QWeight> {
+        let mut r = self.reader.borrow_mut();
+        self.content.tensor(&mut **r, name, device)
+    }
+}
+
+/// Memory-mapped GGUF weight source. Constructed via `GgufContent::open_mmap`.
+///
+/// Returns `QWeight` instances with `RawBytes::Mmap` storage — zero copy from
+/// disk to GPU, at the cost of keeping the mapping resident for the full model
+/// lifetime.
+pub struct GgufMmapSource {
+    content: GgufContent,
+    mmap: std::sync::Arc<memmap2::Mmap>,
+}
+
+impl GgufMmapSource {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let (content, mmap) = GgufContent::open_mmap(path)?;
+        Ok(Self { content, mmap })
+    }
+
+    pub fn content(&self) -> &GgufContent {
+        &self.content
+    }
+
+    pub fn mmap(&self) -> &std::sync::Arc<memmap2::Mmap> {
+        &self.mmap
+    }
+}
+
+impl WeightSource for GgufMmapSource {
+    fn metadata(&self, key: &str) -> Option<&GgufValue> {
+        self.content.metadata.get(key)
+    }
+
+    fn tensor(&self, name: &str, device: &TqDevice) -> Result<QWeight> {
+        self.content.tensor_mmap(&self.mmap, name, device)
     }
 }
 

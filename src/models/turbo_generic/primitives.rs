@@ -25,8 +25,9 @@ pub(crate) trait Module {
 pub(crate) struct Embedding {
     /// Full f32 weight (when dequantized at load) or None (lazy mode)
     pub(crate) weight: Option<Tensor>,
-    /// Quantized raw data + dtype for lazy per-row dequant (saves ~2 GB)
-    raw_data: Option<Vec<u8>>,
+    /// Quantized raw data + dtype for lazy per-row dequant (saves ~2 GB).
+    /// Either `Owned` (Vec-backed) or `Mmap` (zero-copy slice into model file).
+    raw_data: Option<crate::qmatmul::RawBytes>,
     raw_dtype: Option<crate::gguf::GgmlDType>,
     pub(crate) hidden_size: usize,
 }
@@ -38,7 +39,7 @@ impl Embedding {
 
     /// Lazy embedding: keep quantized data, dequant only needed rows on lookup.
     /// Saves ~2 GB for Qwen2 7B (151K vocab × 3584 dim × 4 bytes = 2.1 GB).
-    pub(crate) fn new_lazy(raw_data: Vec<u8>, dtype: crate::gguf::GgmlDType, hidden_size: usize) -> Self {
+    pub(crate) fn new_lazy(raw_data: crate::qmatmul::RawBytes, dtype: crate::gguf::GgmlDType, hidden_size: usize) -> Self {
         Self { weight: None, raw_data: Some(raw_data), raw_dtype: Some(dtype), hidden_size }
     }
 
@@ -71,13 +72,14 @@ impl Embedding {
             let blocks_per_row = (self.hidden_size + block_numel - 1) / block_numel;
             let bytes_per_row = blocks_per_row * block_bytes;
 
+            let raw_slice = raw.as_slice();
             let mut output = Vec::with_capacity(n_tokens * self.hidden_size);
             for &id in &ids_flat {
                 let idx = id as usize;
                 let row_start = idx * bytes_per_row;
                 let row_end = row_start + bytes_per_row;
-                if row_end <= raw.len() {
-                    let row_f32 = crate::quant::dequantize(&raw[row_start..row_end], dtype, self.hidden_size);
+                if row_end <= raw_slice.len() {
+                    let row_f32 = crate::quant::dequantize(&raw_slice[row_start..row_end], dtype, self.hidden_size);
                     output.extend_from_slice(&row_f32);
                 } else {
                     output.extend(std::iter::repeat(0.0f32).take(self.hidden_size));
@@ -117,7 +119,7 @@ impl RmsNorm {
     /// Create from QWeight (candle API compat).
     pub(crate) fn from_qtensor(qw: qmm::QWeight, eps: f64, device: &Device) -> Result<Self> {
         let n_elements = qw.shape.0 * qw.shape.1;
-        Self::from_qweight(&qw.raw_data, qw.dtype, n_elements, eps, device)
+        Self::from_qweight(qw.raw_data.as_slice(), qw.dtype, n_elements, eps, device)
     }
 
     /// Set Gemma-style weight offset: bake (1 + w) into stored weight

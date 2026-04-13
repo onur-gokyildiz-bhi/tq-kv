@@ -3,7 +3,7 @@
 //! Replaces candle with direct CUDA control via cudarc.
 //! CPU fallback for all operations.
 
-mod device;
+pub mod device;
 mod dtype;
 mod tensor;
 mod ops;

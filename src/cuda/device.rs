@@ -94,6 +94,24 @@ impl TqDevice {
             _ => panic!("cuda_stream() called on CPU device"),
         }
     }
+
+    /// Create a fresh CUDA stream dedicated to H2D transfers, independent of
+    /// the compute stream. The manager records events on this stream after
+    /// each prefetch so the compute stream can wait before launching the
+    /// corresponding layer's kernels.
+    ///
+    /// Unlike the compute stream (which has event tracking disabled for
+    /// CUDA-Graph replay), this stream keeps event tracking on — the
+    /// `CudaStream::record_event` / `wait` pair depends on it.
+    #[cfg(feature = "cuda")]
+    pub fn new_transfer_stream(&self) -> super::Result<std::sync::Arc<cudarc::driver::CudaStream>> {
+        match self {
+            TqDevice::Cuda { context, .. } => context
+                .new_stream()
+                .map_err(|e| super::TqError::Msg(format!("transfer stream create: {}", e))),
+            _ => Err(super::TqError::Msg("new_transfer_stream on CPU device".into())),
+        }
+    }
 }
 
 impl std::fmt::Debug for TqDevice {
@@ -127,6 +145,29 @@ impl PartialEq for TqDevice {
             _ => false,
         }
     }
+}
+
+/// Query total VRAM on a device via `cuDeviceTotalMem_v2`. Falls back to 0 on
+/// failure — callers should treat 0 as "unknown" and either skip VRAM-based
+/// policies or defer to `TQ_VRAM_MB`.
+#[cfg(feature = "cuda")]
+pub fn total_vram_bytes(ordinal: usize) -> u64 {
+    use cudarc::driver::sys;
+    let mut device: sys::CUdevice = 0;
+    let mut bytes: usize = 0;
+    unsafe {
+        let res = sys::cuDeviceGet(&mut device, ordinal as i32);
+        if res != sys::cudaError_enum::CUDA_SUCCESS {
+            eprintln!("[cuda] cuDeviceGet failed: {:?}", res);
+            return 0;
+        }
+        let res = sys::cuDeviceTotalMem_v2(&mut bytes, device);
+        if res != sys::cudaError_enum::CUDA_SUCCESS {
+            eprintln!("[cuda] cuDeviceTotalMem failed: {:?}", res);
+            return 0;
+        }
+    }
+    bytes as u64
 }
 
 /// Query GPU compute capability via CUDA driver API.

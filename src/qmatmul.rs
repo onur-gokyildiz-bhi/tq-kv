@@ -7,11 +7,36 @@
 //! Future: LoRA adapter support via `output = W*x + alpha * B*A*x`.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::cuda::{TqTensor, TqDevice, Result, TqError};
 use crate::gguf::GgmlDType;
 use crate::quant;
 #[cfg(feature = "cuda")]
 use cudarc::driver::CudaSlice;
+
+// ─── Layer-swap mode ─────────────────────────────────────────
+//
+// When `LAYER_SWAP_MODE` is enabled *before* QWeight construction, each
+// QWeight's `gpu_cache` uses an evictable `SwapCell` instead of the default
+// `OnceLock`. Must be called before any weights are loaded, otherwise the
+// already-constructed `SwapCell`s will have captured swap_mode=false.
+//
+// Default (swap off) path is byte-identical to pre-Phase-3: `OnceLock::get_or_init`.
+
+/// Global flag selecting evictable (`Swap`) vs. immutable (`Fast`) gpu_cache
+/// storage. Sampled once at `SwapCell::new` time.
+pub(crate) static LAYER_SWAP_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable layer-swap mode. Must be called before any `QWeight::new`.
+pub fn enable_layer_swap() {
+    LAYER_SWAP_MODE.store(true, Ordering::Relaxed);
+}
+
+/// True if swap mode was active when this `SwapCell` was constructed.
+#[inline]
+pub fn layer_swap_enabled() -> bool {
+    LAYER_SWAP_MODE.load(Ordering::Relaxed)
+}
 
 /// Reusable GPU scratch buffer for prefill streaming dequant (F32 path / Q6K).
 #[cfg(feature = "cuda")]
@@ -25,13 +50,173 @@ static PREFILL_SCRATCH: std::sync::Mutex<Option<CudaSlice<f32>>> = std::sync::Mu
 #[allow(dead_code)]
 static PREFILL_SCRATCH_F16: std::sync::Mutex<Option<CudaSlice<half::f16>>> = std::sync::Mutex::new(None);
 
+/// Raw weight bytes, either owned (heap `Vec<u8>`) or a zero-copy slice into
+/// a memory-mapped file. `as_slice()` is the unified accessor.
+///
+/// `Mmap` keeps an `Arc<Mmap>` alive so the mapping stays valid for the full
+/// lifetime of the weight, even if the original `GgufContent` is dropped.
+#[derive(Debug)]
+pub enum RawBytes {
+    Owned(Vec<u8>),
+    Mmap {
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        /// Byte range into the mmap (inclusive start, exclusive end).
+        range: std::ops::Range<usize>,
+    },
+}
+
+impl RawBytes {
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            RawBytes::Owned(v) => v.as_slice(),
+            RawBytes::Mmap { mmap, range } => &mmap[range.clone()],
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            RawBytes::Owned(v) => v.len(),
+            RawBytes::Mmap { range, .. } => range.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A cell that holds an optional `T`. In default (fast) mode it is a plain
+/// `OnceLock` — identical to pre-swap behaviour. In swap mode it is backed by
+/// an `UnsafeCell` that supports `evict`/`inject`, for use by the
+/// `LayerSwapManager` to stream weights on/off the GPU.
+///
+/// SAFETY
+/// ------
+/// The swap variant is single-threaded: `LayerSwapManager` is the only code
+/// that calls `inject`/`evict`, and it only does so between layer computations
+/// (never concurrently with a kernel reading `get()`). The existing forward
+/// code path is single-threaded per model instance. This matches the
+/// single-threaded invariant already assumed by `QWeight::raw_data` mutation
+/// in `release_cpu_after_gpu`.
+pub struct SwapCell<T> {
+    fast: OnceLock<T>,
+    /// `true` if constructed while `LAYER_SWAP_MODE` was set.
+    swap_mode: bool,
+    /// Only touched when `swap_mode == true`.
+    swap: std::cell::UnsafeCell<Option<T>>,
+}
+
+// SAFETY: see SwapCell docstring.
+unsafe impl<T: Send> Send for SwapCell<T> {}
+unsafe impl<T: Sync> Sync for SwapCell<T> {}
+
+impl<T> SwapCell<T> {
+    pub fn new() -> Self {
+        Self {
+            fast: OnceLock::new(),
+            swap_mode: LAYER_SWAP_MODE.load(Ordering::Relaxed),
+            swap: std::cell::UnsafeCell::new(None),
+        }
+    }
+
+    #[inline]
+    pub fn is_swap(&self) -> bool {
+        self.swap_mode
+    }
+
+    /// Read the current value (None if uninitialised/evicted).
+    #[inline]
+    pub fn get(&self) -> Option<&T> {
+        if self.swap_mode {
+            // SAFETY: see struct docstring.
+            unsafe { (*self.swap.get()).as_ref() }
+        } else {
+            self.fast.get()
+        }
+    }
+
+    /// Lazy init. In swap mode still supports lazy init (first forward before
+    /// any external inject).
+    #[inline]
+    pub fn get_or_init<F: FnOnce() -> T>(&self, f: F) -> &T {
+        if self.swap_mode {
+            // SAFETY: see struct docstring.
+            unsafe {
+                let slot = &mut *self.swap.get();
+                if slot.is_none() {
+                    *slot = Some(f());
+                }
+                slot.as_ref().unwrap()
+            }
+        } else {
+            self.fast.get_or_init(f)
+        }
+    }
+
+    /// Install a value externally (used by LayerSwapManager on prefetch).
+    /// In fast mode degrades to `set` (no-op if already initialised).
+    pub fn inject(&self, value: T) {
+        if self.swap_mode {
+            // SAFETY: see struct docstring.
+            unsafe {
+                *self.swap.get() = Some(value);
+            }
+        } else {
+            let _ = self.fast.set(value);
+        }
+    }
+
+    /// Drop the stored value. No-op in fast mode (cannot evict `OnceLock`).
+    pub fn evict(&self) {
+        if self.swap_mode {
+            // SAFETY: see struct docstring.
+            unsafe {
+                *self.swap.get() = None;
+            }
+        }
+    }
+
+    /// Take the stored value (moves ownership out; leaves slot empty).
+    /// Fast mode cannot support take (OnceLock is one-shot) — returns None.
+    ///
+    /// Used by `LayerSwapManager` to defer `CudaSlice` drop to a graveyard:
+    /// the slice is kept alive until a compute-stream event confirms that
+    /// all in-flight kernels using that memory have completed. Dropping
+    /// synchronously (via `evict`) would race cuMemFree against the kernel.
+    pub fn take(&self) -> Option<T> {
+        if self.swap_mode {
+            // SAFETY: see struct docstring.
+            unsafe { (*self.swap.get()).take() }
+        } else {
+            None
+        }
+    }
+}
+
+impl Clone for RawBytes {
+    fn clone(&self) -> Self {
+        match self {
+            // Owned clone: allocate + copy (existing behaviour).
+            RawBytes::Owned(v) => RawBytes::Owned(v.clone()),
+            // Mmap clone: Arc refcount bump, no byte copy.
+            RawBytes::Mmap { mmap, range } => RawBytes::Mmap {
+                mmap: mmap.clone(),
+                range: range.clone(),
+            },
+        }
+    }
+}
+
 /// Quantized weight matrix stored in GGML block format.
 ///
 /// When CUDA is enabled, raw weight bytes are lazily uploaded to GPU
 /// on first use and cached for subsequent forward passes.
 pub struct QWeight {
-    /// Raw quantized bytes (GGML block layout).
-    pub raw_data: Vec<u8>,
+    /// Raw quantized bytes (GGML block layout). Either owned or mmap-backed.
+    pub raw_data: RawBytes,
     /// Quantization type (Q4_K_M, Q6_K, Q8_0, F16, F32, ...).
     pub dtype: GgmlDType,
     /// Weight shape: (out_features, in_features) — row-major.
@@ -39,8 +224,12 @@ pub struct QWeight {
     /// Lazily dequantized f32 weight (avoids re-dequant per forward).
     cpu_cache: OnceLock<Vec<f32>>,
     /// Lazily uploaded GPU copy of raw_data (avoids re-upload per forward).
+    /// In swap mode this is evictable (see `SwapCell`). Arc-wrapped so a
+    /// LayerSwapManager lane can share its pre-allocated slot buffer with
+    /// the QWeights of the currently-active layer (zero-alloc prefetch via
+    /// in-place `memcpy_htod`).
     #[cfg(feature = "cuda")]
-    gpu_cache: OnceLock<CudaSlice<u8>>,
+    pub(crate) gpu_cache: SwapCell<std::sync::Arc<CudaSlice<u8>>>,
     /// Lazily dequantized + uploaded f32 weights on GPU (for Q6K and other dtypes
     /// without fused GPU kernels — avoids re-dequant + re-upload per forward).
     #[cfg(feature = "cuda")]
@@ -59,7 +248,7 @@ impl Clone for QWeight {
             shape: self.shape,
             cpu_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
-            gpu_cache: OnceLock::new(),
+            gpu_cache: SwapCell::new(),
             #[cfg(feature = "cuda")]
             gpu_f32_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
@@ -79,13 +268,28 @@ impl std::fmt::Debug for QWeight {
 }
 
 impl QWeight {
-    /// Create from raw GGUF tensor data.
+    /// Create from an owned `Vec<u8>` of GGUF tensor data.
     pub fn new(raw_data: Vec<u8>, dtype: GgmlDType, shape: (usize, usize)) -> Self {
+        Self::new_raw(RawBytes::Owned(raw_data), dtype, shape)
+    }
+
+    /// Create from mmap-backed bytes (zero-copy).
+    pub fn new_mmap(
+        mmap: std::sync::Arc<memmap2::Mmap>,
+        range: std::ops::Range<usize>,
+        dtype: GgmlDType,
+        shape: (usize, usize),
+    ) -> Self {
+        Self::new_raw(RawBytes::Mmap { mmap, range }, dtype, shape)
+    }
+
+    /// Low-level constructor accepting any `RawBytes` variant.
+    pub fn new_raw(raw_data: RawBytes, dtype: GgmlDType, shape: (usize, usize)) -> Self {
         Self {
             raw_data, dtype, shape,
             cpu_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
-            gpu_cache: OnceLock::new(),
+            gpu_cache: SwapCell::new(),
             #[cfg(feature = "cuda")]
             gpu_f32_cache: OnceLock::new(),
             #[cfg(feature = "cuda")]
@@ -96,7 +300,7 @@ impl QWeight {
     /// Dequantize entire weight matrix to f32.
     pub fn dequantize(&self) -> Vec<f32> {
         let n_elements = self.shape.0 * self.shape.1;
-        quant::dequantize(&self.raw_data, self.dtype, n_elements)
+        quant::dequantize(self.raw_data.as_slice(), self.dtype, n_elements)
     }
 
     /// Dequantize to TqTensor.
@@ -110,16 +314,95 @@ impl QWeight {
         self.to_tensor(device)
     }
 
+    /// Drop this weight's GPU cache slot (swap mode only — no-op in fast mode).
+    /// Must be paired with a later `inject_gpu` or forward-time lazy re-upload.
+    ///
+    /// Used by `LayerSwapManager` to free a swap slot after the layer's forward
+    /// completes, so the slot can be reused for the next prefetched layer.
+    #[cfg(feature = "cuda")]
+    pub fn evict_gpu(&self) {
+        self.gpu_cache.evict();
+    }
+
+    /// Move the GPU cache Arc out, leaving the cache empty. Returns
+    /// None in fast mode (OnceLock is one-shot) or when already empty.
+    ///
+    /// `LayerSwapManager` uses this to drop the QWeight's strong reference
+    /// on eviction; the lane retains its own Arc so the slice stays alive
+    /// and the slot buffer is ready for the next in-place prefetch.
+    #[cfg(feature = "cuda")]
+    pub fn take_gpu(&self) -> Option<std::sync::Arc<CudaSlice<u8>>> {
+        self.gpu_cache.take()
+    }
+
+    /// Install an externally-allocated GPU slice (swap mode only — no-op in
+    /// fast mode if already initialised).
+    ///
+    /// Used by `LayerSwapManager` on prefetch: the manager pre-allocates
+    /// lane slot buffers as `Arc<CudaSlice<u8>>`, performs in-place
+    /// `memcpy_htod` to fill them, then `Arc::clone`s each into the
+    /// corresponding QWeight via this method — zero cudaMalloc per prefetch.
+    #[cfg(feature = "cuda")]
+    pub fn inject_gpu(&self, slice: std::sync::Arc<CudaSlice<u8>>) {
+        self.gpu_cache.inject(slice);
+    }
+
     /// Eagerly upload raw quantized bytes to GPU.
     /// Call during model load to avoid first-forward latency.
+    ///
+    /// For `RawBytes::Owned` weights this takes `&mut self` and releases the
+    /// heap Vec once the GPU copy is in place — otherwise the same bytes sit
+    /// twice (CPU Vec + GPU slice) for the whole run. The mmap variant is
+    /// already zero-copy so no release is needed. Swap mode is also exempt
+    /// (manager may need to re-upload on prefetch).
     #[cfg(feature = "cuda")]
     pub fn upload_to_gpu(&self, device: &TqDevice) -> Result<()> {
         if let TqDevice::Cuda { .. } = device {
             let stream = device.cuda_stream()?;
             self.gpu_cache.get_or_init(|| {
-                stream.clone_htod(&self.raw_data)
-                    .expect("QWeight GPU upload failed")
+                std::sync::Arc::new(
+                    stream.clone_htod(self.raw_data.as_slice())
+                        .expect("QWeight GPU upload failed"),
+                )
             });
+        }
+        Ok(())
+    }
+
+    /// Same as `upload_to_gpu`, but also auto-releases the CPU-side `raw_data`
+    /// heap Vec under the right conditions (non-swap mode, Owned variant,
+    /// successful GPU cache). Used from the warmup path to prevent the
+    /// double-resident state (Vec<u8> + CudaSlice) that was previously
+    /// manual via `release_cpu_after_gpu`.
+    ///
+    /// Mmap-backed raw_data is left alone (zero-copy already). Swap mode is
+    /// skipped — manager needs raw_data for prefetch re-upload.
+    #[cfg(feature = "cuda")]
+    pub fn upload_to_gpu_and_release(&mut self, device: &TqDevice) -> Result<()> {
+        self.upload_to_gpu(device)?;
+        if self.gpu_cache.is_swap() {
+            return Ok(());
+        }
+        if self.gpu_cache.get().is_none() {
+            return Ok(()); // upload didn't happen (e.g. CPU device)
+        }
+        if let RawBytes::Owned(v) = &mut self.raw_data {
+            if !v.is_empty() {
+                let freed = v.len();
+                *v = Vec::new();
+                self.cpu_cache = OnceLock::new();
+                static TOTAL: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let total = TOTAL.fetch_add(freed, std::sync::atomic::Ordering::Relaxed) + freed;
+                if total > 1_000_000
+                    && (total - freed) / 100_000_000 != total / 100_000_000
+                {
+                    eprintln!(
+                        "  Auto-released {:.1} MB CPU weight data (GPU cached)",
+                        total as f64 / 1e6
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -152,11 +435,14 @@ impl QWeight {
     /// avoided by returning a fallback empty slice on upload failure.
     #[cfg(feature = "cuda")]
     /// Release CPU raw_data after GPU upload. Saves ~4 GB for 7B model.
+    ///
+    /// Disabled when swap mode is active: `LayerSwapManager` needs `raw_data`
+    /// to re-upload on prefetch after `evict_gpu`.
     pub fn release_cpu_after_gpu(&mut self) {
         #[cfg(feature = "cuda")]
-        if self.gpu_cache.get().is_some() {
+        if !self.gpu_cache.is_swap() && self.gpu_cache.get().is_some() {
             let freed = self.raw_data.len();
-            self.raw_data = Vec::new();
+            self.raw_data = RawBytes::Owned(Vec::new());
             self.cpu_cache = OnceLock::new(); // also drop f32 cache if any
             if freed > 0 {
                 static TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -170,14 +456,14 @@ impl QWeight {
 
     pub fn gpu_cache_or_upload(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> &CudaSlice<u8> {
         self.gpu_cache.get_or_init(|| {
-            match stream.clone_htod(&self.raw_data) {
+            std::sync::Arc::new(match stream.clone_htod(self.raw_data.as_slice()) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("WARNING: QWeight GPU upload failed ({}), using empty placeholder", e);
                     stream.alloc_zeros::<u8>(1).expect("cannot alloc 1 byte on GPU")
                 }
-            }
-        })
+            })
+        }).as_ref()
     }
 
     /// Number of output features (rows).
@@ -227,6 +513,15 @@ impl QMatMul {
     /// Create from a full-precision tensor (non-quantized weights like biases).
     pub fn from_tensor(t: TqTensor) -> Self {
         QMatMul::Full(t)
+    }
+
+    /// Borrow the inner `QWeight` if this is the `Quantized` variant.
+    /// Used by `LayerSwapManager` to enumerate swappable weights per layer.
+    pub fn as_qweight(&self) -> Option<&QWeight> {
+        match self {
+            QMatMul::Quantized(qw) => Some(qw),
+            QMatMul::Full(_) => None,
+        }
     }
 
     /// Forward pass: x @ W^T.
@@ -340,10 +635,13 @@ impl QMatMul {
         let stream = x.cuda_stream();
 
         // Lazy GPU cache: upload weight bytes once, reuse for all subsequent calls
-        let w_gpu = qw.gpu_cache.get_or_init(|| {
-            stream.clone_htod(&qw.raw_data)
-                .expect("QWeight GPU upload failed")
+        let w_gpu_arc = qw.gpu_cache.get_or_init(|| {
+            std::sync::Arc::new(
+                stream.clone_htod(qw.raw_data.as_slice())
+                    .expect("QWeight GPU upload failed"),
+            )
         });
+        let w_gpu: &CudaSlice<u8> = w_gpu_arc.as_ref();
 
         // For decode (batch=1), use fused matvec kernel
         if batch_elements == 1 {
@@ -744,6 +1042,68 @@ mod tests {
     }
 
     #[test]
+    fn test_swap_cell_fast_mode() {
+        // Fast mode (default): SwapCell should behave like OnceLock.
+        // Do NOT enable swap mode globally — that would leak to other tests.
+        let cell: SwapCell<i32> = SwapCell::new();
+        assert!(!cell.is_swap());
+        assert_eq!(cell.get(), None);
+
+        let init_ran = std::sync::atomic::AtomicUsize::new(0);
+        let v = cell.get_or_init(|| {
+            init_ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            42
+        });
+        assert_eq!(*v, 42);
+
+        // Second call returns cached value, init not re-run.
+        let v2 = cell.get_or_init(|| {
+            init_ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            99
+        });
+        assert_eq!(*v2, 42);
+        assert_eq!(init_ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Fast mode: evict is a no-op.
+        cell.evict();
+        assert_eq!(cell.get(), Some(&42));
+    }
+
+    #[test]
+    fn test_swap_cell_swap_mode_inject_evict() {
+        // Construct a swap-mode cell directly (without flipping the global flag,
+        // which would pollute other tests).
+        let cell: SwapCell<i32> = SwapCell {
+            fast: OnceLock::new(),
+            swap_mode: true,
+            swap: std::cell::UnsafeCell::new(None),
+        };
+        assert!(cell.is_swap());
+        assert_eq!(cell.get(), None);
+
+        // Inject: slot becomes Some(7).
+        cell.inject(7);
+        assert_eq!(cell.get(), Some(&7));
+
+        // Evict: slot clears back to None.
+        cell.evict();
+        assert_eq!(cell.get(), None);
+
+        // Re-inject different value.
+        cell.inject(13);
+        assert_eq!(cell.get(), Some(&13));
+
+        // get_or_init should be a no-op since value already present.
+        let v = cell.get_or_init(|| 99);
+        assert_eq!(*v, 13);
+
+        // After evict, get_or_init runs the init.
+        cell.evict();
+        let v2 = cell.get_or_init(|| 99);
+        assert_eq!(*v2, 99);
+    }
+
+    #[test]
     fn test_qweight_clone() {
         let w_data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
             .iter()
@@ -753,7 +1113,7 @@ mod tests {
         let cloned = qw.clone();
         assert_eq!(cloned.dtype, GgmlDType::F32);
         assert_eq!(cloned.shape, (2, 2));
-        assert_eq!(cloned.raw_data, w_data);
+        assert_eq!(cloned.raw_data.as_slice(), w_data.as_slice());
         // Dequantized values should match
         assert_eq!(qw.dequantize(), cloned.dequantize());
     }
