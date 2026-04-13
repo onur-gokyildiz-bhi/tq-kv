@@ -1,0 +1,90 @@
+#!/bin/bash
+# Pre-push gate: if the push touches kernel / model / CUDA code, run the
+# PPL regression check in --quick mode before letting the push through.
+#
+# Enable once per clone: `bash scripts/install-hooks.sh`
+# Bypass a single push:  `git push --no-verify`
+#
+# Why this exists: CLAUDE.md's hard rule is "a single bit of kernel
+# corruption can move PPL from 7 → 30000". There is no remote CUDA CI
+# runner, so the gate has to live locally.
+
+set -u
+
+# Git invokes pre-push as:    .git/hooks/pre-push <remote> <url>
+# And pipes ref updates on stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>
+
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+# Files that, when modified, warrant a PPL check.
+# Kept intentionally broad: we'd rather run a 45s check twice than miss a
+# kernel edit that degrades inference quality.
+RISK_PATTERN='^(kernels/|src/cuda/|src/qmatmul\.rs|src/quant\.rs|src/models/|src/backend\.rs|src/engine\.rs|build\.rs|tq-kv/)'
+
+any_risk=0
+any_ref=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    any_ref=1
+
+    # Deletion: nothing to check.
+    if [ "$local_sha" = "$ZERO_SHA" ]; then
+        continue
+    fi
+
+    # New branch: diff against origin/main to find what this branch introduced.
+    if [ "$remote_sha" = "$ZERO_SHA" ]; then
+        base=$(git merge-base "$local_sha" origin/main 2>/dev/null || echo "")
+        if [ -z "$base" ]; then
+            # No origin/main yet — compare against the empty tree.
+            base=$(git hash-object -t tree /dev/null)
+        fi
+        range="$base..$local_sha"
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    changed=$(git diff --name-only "$range" 2>/dev/null || true)
+    if echo "$changed" | grep -Eq "$RISK_PATTERN"; then
+        any_risk=1
+        break
+    fi
+done
+
+if [ "$any_ref" = "0" ] || [ "$any_risk" = "0" ]; then
+    exit 0
+fi
+
+# Skip silently if there is no CUDA toolchain on this host — the hook
+# should never block pushes from a laptop that cannot run the check.
+if ! command -v nvcc >/dev/null 2>&1; then
+    echo "[pre-push] kernel/model files changed but nvcc not found — skipping PPL gate." >&2
+    exit 0
+fi
+
+# Honor explicit opt-out.
+if [ "${TQ_SKIP_PPL_GATE:-0}" = "1" ]; then
+    echo "[pre-push] TQ_SKIP_PPL_GATE=1 — skipping PPL gate." >&2
+    exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+script="$repo_root/scripts/ppl-check.sh"
+if [ ! -x "$script" ] && [ ! -f "$script" ]; then
+    echo "[pre-push] $script not found — cannot gate, skipping." >&2
+    exit 0
+fi
+
+echo "[pre-push] kernel/model code changed — running PPL regression check (quick mode)..."
+echo "[pre-push]   Bypass once: git push --no-verify"
+echo "[pre-push]   Disable session: TQ_SKIP_PPL_GATE=1 git push"
+echo ""
+
+if bash "$script" --quick; then
+    exit 0
+fi
+
+echo ""
+echo "[pre-push] PPL regression detected — refusing push."
+echo "[pre-push] Investigate before retrying. Override: git push --no-verify"
+exit 1

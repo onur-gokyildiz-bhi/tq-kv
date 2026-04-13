@@ -1,10 +1,20 @@
 #!/bin/bash
 # PPL regression check — 3 model × 3 mode with strict thresholds.
-# Usage: scripts/ppl-check.sh [test_file]
+# Usage: scripts/ppl-check.sh [--quick] [test_file]
+#
+# Modes:
+#   --quick    Only Qwen2 7B Std + TQ (≈45s, used by pre-push hook)
+#   (default)  Full 3×3 suite (≈5-10 min, used manually / pre-release)
 #
 # Thresholds: baseline × 1.10 (max 10% headroom).
 # Exit 1 on any regression. Designed for CI integration.
 set -euo pipefail
+
+QUICK=0
+if [ "${1:-}" = "--quick" ]; then
+    QUICK=1
+    shift
+fi
 
 PPL_FILE="${1:-/tmp/ppl_bench.txt}"
 TQ_BIN="${TQ_BIN:-cargo run --release --features cuda --bin tq --}"
@@ -74,23 +84,30 @@ run_ppl() {
 #   Llama3 8B: Std=6.274, TQ=6.386, TQ+TA=6.386
 #   Mistral 7B: Std=4.828, TQ=5.066, TQ+TA=5.066
 
-echo "--- Qwen2.5 7B ---"
-run_ppl "qwen2:7b" "std"   "4.55"  ""
-run_ppl "qwen2:7b" "tq"    "4.90"  ""
-run_ppl "qwen2:7b" "tq_ta" "4.90"  ""
-echo ""
+if [ "$QUICK" = "1" ]; then
+    echo "--- Qwen2.5 7B (quick: Std + TQ only) ---"
+    run_ppl "qwen2:7b" "std"   "4.55"  ""
+    run_ppl "qwen2:7b" "tq"    "4.90"  ""
+    echo ""
+else
+    echo "--- Qwen2.5 7B ---"
+    run_ppl "qwen2:7b" "std"   "4.55"  ""
+    run_ppl "qwen2:7b" "tq"    "4.90"  ""
+    run_ppl "qwen2:7b" "tq_ta" "4.90"  ""
+    echo ""
 
-echo "--- Llama 3.1 8B ---"
-run_ppl "llama:8b" "std"   "6.90" ""
-run_ppl "llama:8b" "tq"    "7.02" ""
-run_ppl "llama:8b" "tq_ta" "7.02" ""
-echo ""
+    echo "--- Llama 3.1 8B ---"
+    run_ppl "llama:8b" "std"   "6.90" ""
+    run_ppl "llama:8b" "tq"    "7.02" ""
+    run_ppl "llama:8b" "tq_ta" "7.02" ""
+    echo ""
 
-echo "--- Mistral 7B ---"
-run_ppl "mistral:7b" "std"   "5.31" ""
-run_ppl "mistral:7b" "tq"    "5.57" ""
-run_ppl "mistral:7b" "tq_ta" "5.57" ""
-echo ""
+    echo "--- Mistral 7B ---"
+    run_ppl "mistral:7b" "std"   "5.31" ""
+    run_ppl "mistral:7b" "tq"    "5.57" ""
+    run_ppl "mistral:7b" "tq_ta" "5.57" ""
+    echo ""
+fi
 
 echo "============================================"
 if [ "$FAIL" = "0" ]; then
