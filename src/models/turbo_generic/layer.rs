@@ -108,6 +108,246 @@ pub(crate) struct LayerWeights {
 // without needing &mut LayerWeights.
 // ---------------------------------------------------------------------------
 
+/// TriAttention key storage: append this batch's pre-RoPE keys to the
+/// per-head buffer and bump `tri_tokens_since_eviction`. Called at the
+/// start of each forward pass when tri_config is Some.
+fn store_tri_keys(
+    cache: &mut CompressedKvCache,
+    k_pre_rope: Option<&Tensor>,
+    n_kv_head: usize,
+    head_dim: usize,
+    seq_len: usize,
+    index_pos: usize,
+) {
+    if let Some(k_pr) = k_pre_rope {
+        if let Ok(k_pr_flat) = k_pr.to_dtype(DType::F32)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1())
+        {
+            let tri_keys = cache.tri_keys_pre_rope.as_mut().unwrap();
+            for h in 0..n_kv_head {
+                for s in 0..seq_len {
+                    let offset = (h * seq_len + s) * head_dim;
+                    if offset + head_dim <= k_pr_flat.len() {
+                        tri_keys[h].extend_from_slice(&k_pr_flat[offset..offset + head_dim]);
+                    }
+                }
+            }
+            for s in 0..seq_len {
+                cache.tri_key_positions.push(index_pos + s);
+            }
+        }
+    }
+    cache.tri_tokens_since_eviction += seq_len;
+}
+
+/// TriAttention eviction pass: score per-head pre-RoPE keys, drop the
+/// bottom N by importance, and keep the cache consistent (tri_keys,
+/// tri_key_positions, k_per_head, v_raw, and — under cuda — the GPU hot
+/// and cold tiers). Fires only on decode steps (seq_len==1) once the
+/// token count exceeds the effective budget.
+#[allow(clippy::too_many_arguments)]
+fn maybe_evict_tri(
+    cache: &mut CompressedKvCache,
+    #[cfg(feature = "cuda")]
+    gpu_tq_cache: &mut Option<GpuCompressedKv>,
+    #[cfg(feature = "cuda")]
+    gpu_cold_cache: &mut Option<Box<super::kv_cache::GpuColdKv>>,
+    n_kv_head: usize,
+    head_dim: usize,
+    layer_idx: usize,
+    #[cfg(feature = "cuda")]
+    tq_bits: u8,
+    #[cfg(feature = "cuda")]
+    tq_group_size: usize,
+    index_pos: usize,
+    seq_len: usize,
+) {
+    let tri_cfg = match cache.tri_config.clone() {
+        Some(c) => c,
+        None => return,
+    };
+    let n_tri_keys = cache.tri_key_positions.len();
+    // V3: dynamic budget from retention_ratio (overrides fixed budget)
+    let effective_budget = if tri_cfg.retention_ratio > 0.0 && tri_cfg.retention_ratio < 1.0 {
+        (n_tri_keys as f32 * tri_cfg.retention_ratio) as usize
+    } else {
+        tri_cfg.budget
+    };
+    if cache.tri_tokens_since_eviction < tri_cfg.eviction_interval
+        || seq_len != 1
+        || n_tri_keys <= effective_budget
+    {
+        return;
+    }
+
+    let current_pos = index_pos + seq_len;
+    let tri_keys_ref = cache.tri_keys_pre_rope.as_ref().unwrap();
+
+    // Try GPU scoring path, fall back to CPU
+    let retain_per_head = 'scoring: {
+        #[cfg(feature = "cuda")]
+        if let Some(reg) = crate::cuda::kernels::global_registry() {
+            if let Ok(retain) = gpu_tri_score_and_select(
+                reg, tri_keys_ref, &cache.tri_key_positions,
+                current_pos, cache.sink_len, &tri_cfg,
+            ) {
+                break 'scoring retain;
+            }
+        }
+        // CPU fallback
+        let key_refs: Vec<&[f32]> = tri_keys_ref.iter().map(|v| v.as_slice()).collect();
+        tq_kv::triattention::evict_pass(
+            &key_refs, current_pos, &cache.tri_key_positions,
+            cache.sink_len, &tri_cfg,
+        )
+    };
+
+    // #4: Apply eviction — splice tri_keys + compressed cache
+    if let Some(retained) = retain_per_head.first() {
+        if retained.len() < n_tri_keys {
+            let evicted = n_tri_keys - retained.len();
+
+            // Rebuild tri_key_positions (shared)
+            let new_positions: Vec<usize> = retained.iter()
+                .map(|&i| cache.tri_key_positions[i]).collect();
+
+            // Rebuild per-head pre-RoPE keys
+            let tri_keys = cache.tri_keys_pre_rope.as_mut().unwrap();
+            for (h, head_retain) in retain_per_head.iter().enumerate() {
+                if h >= tri_keys.len() { break; }
+                let old = tri_keys[h].clone();
+                let mut new_k = Vec::with_capacity(head_retain.len() * head_dim);
+                for &idx in head_retain {
+                    let start = idx * head_dim;
+                    if start + head_dim <= old.len() {
+                        new_k.extend_from_slice(&old[start..start + head_dim]);
+                    }
+                }
+                tri_keys[h] = new_k;
+            }
+
+            // Splice compressed cache: keep only retained indices in k_per_head
+            // tri positions [0..sink_len) are sink (not in k_per_head)
+            // tri positions [sink_len..] map to k_per_head positions [0..]
+            let sink_n = cache.sink_len;
+            let compressed_retain: Vec<usize> = retained.iter()
+                .filter(|&&i| i >= sink_n)
+                .map(|&i| i - sink_n)
+                .collect();
+            let compressed_count = cache.k_per_head[0].count;
+            if !compressed_retain.is_empty() && compressed_retain.len() < compressed_count {
+                for h in 0..n_kv_head {
+                    cache.k_per_head[h] = cache.k_per_head[h].select_indices(&compressed_retain);
+                }
+                // Splice v_raw if present.
+                // v_raw: [1, n_kv_head, total_len, head_dim]
+                // Rebuild by selecting sink + retained compressed positions
+                if let Some(ref v_tensor) = cache.v_raw {
+                    let total_v_len = v_tensor.dim(2).unwrap_or(0);
+                    if total_v_len > 0 && !compressed_retain.is_empty() {
+                        let mut slices = Vec::new();
+                        if sink_n > 0 {
+                            if let Ok(s) = v_tensor.narrow(2, 0, sink_n) {
+                                slices.push(s);
+                            }
+                        }
+                        for &ci in &compressed_retain {
+                            let vi = ci + sink_n;
+                            if vi < total_v_len {
+                                if let Ok(s) = v_tensor.narrow(2, vi, 1) {
+                                    slices.push(s);
+                                }
+                            }
+                        }
+                        if slices.len() > 1 {
+                            let slice_refs: Vec<&Tensor> = slices.iter().collect();
+                            if let Ok(new_v) = Tensor::cat(&slice_refs, 2) {
+                                cache.v_raw = Some(new_v);
+                            }
+                        } else if slices.len() == 1 {
+                            cache.v_raw = Some(slices.into_iter().next().unwrap());
+                        }
+                    }
+                }
+                // Sprint F: save evicted tokens before GPU compact.
+                // Priority 1: GPU cold tier (D2D, fast, no PCIe).
+                // Priority 2: CPU offload (fallback when GPU cold tier is full).
+                #[cfg(feature = "cuda")]
+                if super::kv_cache::get_offload_enabled() {
+                    if let Some(ref gpu) = *gpu_tq_cache {
+                        let retain_set: std::collections::HashSet<usize> =
+                            compressed_retain.iter().copied().collect();
+                        let evicted_indices: Vec<usize> = (0..compressed_count)
+                            .filter(|i| !retain_set.contains(i))
+                            .collect();
+
+                        if !evicted_indices.is_empty() {
+                            // Lazy-init GPU cold tier
+                            if gpu_cold_cache.is_none() {
+                                let max_cold = std::env::var("TQ_MAX_COLD")
+                                    .ok().and_then(|v| v.parse().ok()).unwrap_or(512usize);
+                                if let Ok(cold) = super::kv_cache::GpuColdKv::new(
+                                    gpu.stream.clone(), n_kv_head,
+                                    head_dim, tq_bits,
+                                    max_cold, tq_group_size,
+                                ) {
+                                    *gpu_cold_cache = Some(Box::new(cold));
+                                }
+                            }
+
+                            // D2D copy evicted tokens to cold tier.
+                            if let Some(ref mut cold) = *gpu_cold_cache {
+                                let ms_hot = gpu.max_seq;
+                                let has_decomp = gpu.decomp_count > 0;
+                                for &idx in &evicted_indices {
+                                    let seq_pos = cache.tri_key_positions
+                                        .get(sink_n + idx).copied().unwrap_or(0);
+                                    let _ = cold.push_from_hot(gpu, idx, seq_pos);
+                                    if has_decomp && idx < gpu.decomp_count {
+                                        let _ = cold.push_decomp_key(
+                                            &gpu.decomp_cache, idx, ms_hot,
+                                        );
+                                    }
+                                }
+                            }
+
+                            {
+                                use std::sync::atomic::{AtomicBool, Ordering};
+                                static COLD_PRINTED: AtomicBool = AtomicBool::new(false);
+                                if !COLD_PRINTED.swap(true, Ordering::Relaxed) {
+                                    let n_cold = gpu_cold_cache.as_ref()
+                                        .map(|c| c.count).unwrap_or(0);
+                                    eprintln!("[gpu-cold] L{}: {} tokens evicted → GPU cold tier ({} total cold)",
+                                        layer_idx, evicted_indices.len(), n_cold);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Compact GPU TQ cache in-place (D2D gather, no re-seed)
+                #[cfg(feature = "cuda")]
+                if let Some(ref mut gpu) = *gpu_tq_cache {
+                    let _ = gpu.compact(&compressed_retain);
+                }
+            }
+
+            cache.tri_key_positions = new_positions;
+
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static EVICT_PRINTED: AtomicBool = AtomicBool::new(false);
+                if !EVICT_PRINTED.swap(true, Ordering::Relaxed) {
+                    eprintln!("[tri-evict] L{}: {}/{} retained (evicted {})",
+                        layer_idx, retained.len(), n_tri_keys, evicted);
+                }
+            }
+        }
+    }
+    cache.tri_tokens_since_eviction = 0;
+}
+
 /// KV Compaction pass: when the hot tier exceeds `TQ_COMPACT_THRESHOLD`,
 /// condense the oldest hot tokens into a smaller set of synthetic keys
 /// + attention biases (beta) to preserve attention behaviour. Fires at
@@ -1369,213 +1609,21 @@ impl LayerWeights {
             // --- TriAttention: accumulate pre-RoPE keys + periodic eviction ---
             if cache.tri_config.is_some() {
                 // #2: Store pre-RoPE keys for scoring
-                if let Some(ref k_pr) = k_pre_rope {
-                    if let Ok(k_pr_flat) = k_pr.to_dtype(DType::F32)
-                        .and_then(|t| t.flatten_all())
-                        .and_then(|t| t.to_vec1())
-                    {
-                        let hdim = self.head_dim;
-                        let tri_keys = cache.tri_keys_pre_rope.as_mut().unwrap();
-                        for h in 0..self.n_kv_head {
-                            for s in 0..seq_len {
-                                let offset = (h * seq_len + s) * hdim;
-                                if offset + hdim <= k_pr_flat.len() {
-                                    tri_keys[h].extend_from_slice(&k_pr_flat[offset..offset + hdim]);
-                                }
-                            }
-                        }
-                        for s in 0..seq_len {
-                            cache.tri_key_positions.push(index_pos + s);
-                        }
-                    }
-                }
-                cache.tri_tokens_since_eviction += seq_len;
+                store_tri_keys(
+                    cache, k_pre_rope.as_ref(),
+                    self.n_kv_head, self.head_dim, seq_len, index_pos,
+                );
 
                 // #3: Periodic eviction — score and remove low-importance tokens
-                let tri_cfg = cache.tri_config.clone().unwrap();
-                let n_tri_keys = cache.tri_key_positions.len();
-                // V3: dynamic budget from retention_ratio (overrides fixed budget)
-                let effective_budget = if tri_cfg.retention_ratio > 0.0 && tri_cfg.retention_ratio < 1.0 {
-                    (n_tri_keys as f32 * tri_cfg.retention_ratio) as usize
-                } else {
-                    tri_cfg.budget
-                };
-                if cache.tri_tokens_since_eviction >= tri_cfg.eviction_interval
-                    && seq_len == 1
-                    && n_tri_keys > effective_budget
-                {
-                    let current_pos = index_pos + seq_len;
-                    let tri_keys_ref = cache.tri_keys_pre_rope.as_ref().unwrap();
-
-                    // Try GPU scoring path, fall back to CPU
-                    let retain_per_head = 'scoring: {
-                        #[cfg(feature = "cuda")]
-                        if let Some(reg) = crate::cuda::kernels::global_registry() {
-                            if let Ok(retain) = gpu_tri_score_and_select(
-                                reg, tri_keys_ref, &cache.tri_key_positions,
-                                current_pos, cache.sink_len, &tri_cfg,
-                            ) {
-                                break 'scoring retain;
-                            }
-                        }
-                        // CPU fallback
-                        let key_refs: Vec<&[f32]> = tri_keys_ref.iter().map(|v| v.as_slice()).collect();
-                        tq_kv::triattention::evict_pass(
-                            &key_refs, current_pos, &cache.tri_key_positions,
-                            cache.sink_len, &tri_cfg,
-                        )
-                    };
-
-                    // #4: Apply eviction — splice tri_keys + compressed cache
-                    if let Some(retained) = retain_per_head.first() {
-                        if retained.len() < n_tri_keys {
-                            let evicted = n_tri_keys - retained.len();
-
-                            // Rebuild tri_key_positions (shared)
-                            let new_positions: Vec<usize> = retained.iter()
-                                .map(|&i| cache.tri_key_positions[i]).collect();
-
-                            // Rebuild per-head pre-RoPE keys
-                            let hdim = self.head_dim;
-                            let tri_keys = cache.tri_keys_pre_rope.as_mut().unwrap();
-                            for (h, head_retain) in retain_per_head.iter().enumerate() {
-                                if h >= tri_keys.len() { break; }
-                                let old = tri_keys[h].clone();
-                                let mut new_k = Vec::with_capacity(head_retain.len() * hdim);
-                                for &idx in head_retain {
-                                    let start = idx * hdim;
-                                    if start + hdim <= old.len() {
-                                        new_k.extend_from_slice(&old[start..start + hdim]);
-                                    }
-                                }
-                                tri_keys[h] = new_k;
-                            }
-
-                            // Splice compressed cache: keep only retained indices in k_per_head
-                            // Map tri indices to compressed cache indices:
-                            // tri positions [0..sink_len) are sink (not in k_per_head)
-                            // tri positions [sink_len..] map to k_per_head positions [0..]
-                            let sink_n = cache.sink_len;
-                            let compressed_retain: Vec<usize> = retained.iter()
-                                .filter(|&&i| i >= sink_n)
-                                .map(|&i| i - sink_n)
-                                .collect();
-                            let compressed_count = cache.k_per_head[0].count;
-                            if !compressed_retain.is_empty() && compressed_retain.len() < compressed_count {
-                                for h in 0..self.n_kv_head {
-                                    cache.k_per_head[h] = cache.k_per_head[h].select_indices(&compressed_retain);
-                                }
-                                // Splice v_raw if present
-                                // v_raw: [1, n_kv_head, total_len, head_dim]
-                                // Rebuild by selecting sink + retained compressed positions
-                                if let Some(ref v_tensor) = cache.v_raw {
-                                    let total_v_len = v_tensor.dim(2).unwrap_or(0);
-                                    if total_v_len > 0 && !compressed_retain.is_empty() {
-                                        let mut slices = Vec::new();
-                                        // Keep all sink tokens
-                                        if sink_n > 0 {
-                                            if let Ok(s) = v_tensor.narrow(2, 0, sink_n) {
-                                                slices.push(s);
-                                            }
-                                        }
-                                        // Keep retained compressed tokens
-                                        for &ci in &compressed_retain {
-                                            let vi = ci + sink_n;
-                                            if vi < total_v_len {
-                                                if let Ok(s) = v_tensor.narrow(2, vi, 1) {
-                                                    slices.push(s);
-                                                }
-                                            }
-                                        }
-                                        if slices.len() > 1 {
-                                            let slice_refs: Vec<&Tensor> = slices.iter().collect();
-                                            if let Ok(new_v) = Tensor::cat(&slice_refs, 2) {
-                                                cache.v_raw = Some(new_v);
-                                            }
-                                        } else if slices.len() == 1 {
-                                            cache.v_raw = Some(slices.into_iter().next().unwrap());
-                                        }
-                                    }
-                                }
-                                // Sprint F: save evicted tokens before GPU compact.
-                                // Priority 1: GPU cold tier (D2D, fast, no PCIe).
-                                // Priority 2: CPU offload (fallback when GPU cold tier is full).
-                                #[cfg(feature = "cuda")]
-                                if super::kv_cache::get_offload_enabled() {
-                                    if let Some(ref gpu) = self.gpu_tq_cache {
-                                        let retain_set: std::collections::HashSet<usize> =
-                                            compressed_retain.iter().copied().collect();
-                                        let evicted_indices: Vec<usize> = (0..compressed_count)
-                                            .filter(|i| !retain_set.contains(i))
-                                            .collect();
-
-                                        if !evicted_indices.is_empty() {
-                                            // Lazy-init GPU cold tier
-                                            if self.gpu_cold_cache.is_none() {
-                                                let max_cold = std::env::var("TQ_MAX_COLD")
-                                                    .ok().and_then(|v| v.parse().ok()).unwrap_or(512usize);
-                                                if let Ok(cold) = super::kv_cache::GpuColdKv::new(
-                                                    gpu.stream.clone(), self.n_kv_head,
-                                                    self.head_dim, self.tq_config.bits,
-                                                    max_cold, self.tq_config.group_size,
-                                                ) {
-                                                    self.gpu_cold_cache = Some(Box::new(cold));
-                                                }
-                                            }
-
-                                            // D2D copy evicted tokens to cold tier
-                                            // (compressed K+V for fused scoring + post-RoPE K from decomp_cache)
-                                            if let Some(ref mut cold) = self.gpu_cold_cache {
-                                                let ms_hot = gpu.max_seq;
-                                                let has_decomp = gpu.decomp_count > 0;
-                                                for &idx in &evicted_indices {
-                                                    let seq_pos = cache.tri_key_positions
-                                                        .get(sink_n + idx).copied().unwrap_or(0);
-                                                    let _ = cold.push_from_hot(gpu, idx, seq_pos);
-                                                    // Also copy post-RoPE decompressed K if available
-                                                    if has_decomp && idx < gpu.decomp_count {
-                                                        let _ = cold.push_decomp_key(
-                                                            &gpu.decomp_cache, idx, ms_hot,
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            {
-                                                use std::sync::atomic::{AtomicBool, Ordering};
-                                                static COLD_PRINTED: AtomicBool = AtomicBool::new(false);
-                                                if !COLD_PRINTED.swap(true, Ordering::Relaxed) {
-                                                    let n_cold = self.gpu_cold_cache.as_ref()
-                                                        .map(|c| c.count).unwrap_or(0);
-                                                    eprintln!("[gpu-cold] L{}: {} tokens evicted → GPU cold tier ({} total cold)",
-                                                        self.layer_idx, evicted_indices.len(), n_cold);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Compact GPU TQ cache in-place (D2D gather, no re-seed)
-                                #[cfg(feature = "cuda")]
-                                if let Some(ref mut gpu) = self.gpu_tq_cache {
-                                    let _ = gpu.compact(&compressed_retain);
-                                }
-                            }
-
-                            cache.tri_key_positions = new_positions;
-
-                            {
-                                use std::sync::atomic::{AtomicBool, Ordering};
-                                static EVICT_PRINTED: AtomicBool = AtomicBool::new(false);
-                                if !EVICT_PRINTED.swap(true, Ordering::Relaxed) {
-                                    eprintln!("[tri-evict] L{}: {}/{} retained (evicted {})",
-                                        self.layer_idx, retained.len(), n_tri_keys, evicted);
-                                }
-                            }
-                        }
-                    }
-                    cache.tri_tokens_since_eviction = 0;
-                }
+                maybe_evict_tri(
+                    cache,
+                    #[cfg(feature = "cuda")] &mut self.gpu_tq_cache,
+                    #[cfg(feature = "cuda")] &mut self.gpu_cold_cache,
+                    self.n_kv_head, self.head_dim, self.layer_idx,
+                    #[cfg(feature = "cuda")] self.tq_config.bits,
+                    #[cfg(feature = "cuda")] self.tq_config.group_size,
+                    index_pos, seq_len,
+                );
             }
 
             let total_len = cache.cached_len;
