@@ -108,6 +108,145 @@ pub(crate) struct LayerWeights {
 // without needing &mut LayerWeights.
 // ---------------------------------------------------------------------------
 
+/// KV Compaction pass: when the hot tier exceeds `TQ_COMPACT_THRESHOLD`,
+/// condense the oldest hot tokens into a smaller set of synthetic keys
+/// + attention biases (beta) to preserve attention behaviour. Fires at
+/// most once per sequence (gated on `cache.compacted.is_none()`) to
+/// avoid cascading quality loss.
+#[allow(clippy::too_many_arguments)]
+fn maybe_compact_cache(
+    cache: &mut CompressedKvCache,
+    q: &Tensor,
+    n_rep: usize,
+    seq_len: usize,
+    total_len: usize,
+    index_pos: usize,
+    n_kv_head: usize,
+    head_dim: usize,
+    padded_head_dim: usize,
+    layer_tq_config: &tq_kv::TurboQuantConfig,
+    cos: &Tensor,
+    sin: &Tensor,
+    rope_style: RopeStyle,
+    rope_dim: usize,
+) -> Result<()> {
+    let compact_threshold = get_compact_threshold();
+    if compact_threshold == 0
+        || cache.k_per_head[0].count <= compact_threshold
+        || seq_len != 1
+        || cache.compacted.is_some()
+    {
+        return Ok(());
+    }
+    let hot_count = cache.k_per_head[0].count;
+    // Keep the most recent compact_threshold/2 tokens uncompacted.
+    let keep_recent = compact_threshold / 2;
+    let to_compact = hot_count.saturating_sub(keep_recent);
+    if to_compact <= 8 {
+        return Ok(());
+    }
+    let ratio = get_compact_ratio();
+    let target_size = (to_compact * ratio / 100).max(4);
+
+    // Decompress hot keys for compaction.
+    // Pre-RoPE mode: decompress + apply RoPE so compaction works on post-RoPE keys.
+    let k_decomp_full = if cache.pre_rope {
+        let hot_start = cache.sink_len + cache.cold_len + cache.compacted_original_len;
+        decompress_and_apply_rope(
+            &cache.k_per_head, n_kv_head,
+            padded_head_dim, DType::F32, q.device(), layer_tq_config,
+            cos, sin, hot_start, rope_style, rope_dim,
+        )?
+    } else {
+        decompress_compressed_keys(
+            &cache.k_per_head, n_kv_head,
+            padded_head_dim, DType::F32, q.device(), layer_tq_config,
+        )?
+    };
+    let k_flat = k_decomp_full.flatten_all()?.to_vec1()?;
+
+    // Use ALL query heads mapped to each KV head as reference queries.
+    // For GQA: n_rep queries share each KV head.
+    let q_flat = q.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let n_ref_queries = n_rep;
+
+    // Get values for compaction
+    let v_for_compact = if cache.value_bits == 0 {
+        let v_tensor = cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?;
+        // v_tensor is [1, n_kv_head, total_len, head_dim]
+        v_tensor.flatten_all()?.to_vec1()?
+    } else {
+        let v_tensor = decompress_values_store(
+            cache.v_compressed.as_ref().unwrap(),
+            n_kv_head, head_dim, total_len, q.device(),
+        )?;
+        v_tensor.flatten_all()?.to_vec1()?
+    };
+
+    let hdim = head_dim;
+    let padded = padded_head_dim;
+    let mut compacted_heads = Vec::with_capacity(n_kv_head);
+    for h in 0..n_kv_head {
+        // Extract this head's oldest keys [to_compact * padded_head_dim]
+        let k_head_offset = h * hot_count * padded;
+        let k_head = &k_flat[k_head_offset..k_head_offset + to_compact * padded];
+        // Trim padding to head_dim
+        let mut k_trimmed = Vec::with_capacity(to_compact * hdim);
+        for i in 0..to_compact {
+            k_trimmed.extend_from_slice(&k_head[i * padded..i * padded + hdim]);
+        }
+
+        // Collect reference queries for this KV head (all n_rep mapped Q heads)
+        let mut q_refs = Vec::with_capacity(n_ref_queries * hdim);
+        for qh_offset in 0..n_rep {
+            let qh = h * n_rep + qh_offset;
+            q_refs.extend_from_slice(&q_flat[qh * hdim..(qh + 1) * hdim]);
+        }
+
+        // Extract values: v_for_compact layout is [n_kv_head, total_len, head_dim]
+        // Hot values start at position (sink_len + cold_len)
+        let v_start = cache.sink_len + cache.cold_len;
+        let v_head_base = h * total_len * hdim;
+        let v_head_offset = v_head_base + v_start * hdim;
+        let v_head = &v_for_compact[v_head_offset..v_head_offset + to_compact * hdim];
+
+        // Use TriAttention scoring for key selection if available,
+        // otherwise fall back to mean-attention scoring.
+        let pruning_method = if let Some(ref tri_cfg) = cache.tri_config {
+            let hot_start = cache.sink_len + cache.cold_len + cache.compacted_original_len;
+            let key_positions: Vec<usize> = (0..to_compact).map(|i| hot_start + i).collect();
+            tq_kv::compaction::PruningMethod::TriAttention {
+                config: tri_cfg.clone(),
+                current_pos: index_pos + seq_len,
+                key_positions,
+                kv_head: h,
+            }
+        } else {
+            tq_kv::compaction::PruningMethod::MeanAttention
+        };
+        let compacted = tq_kv::compaction::compact_head_with_method(
+            &k_trimmed, v_head, &q_refs,
+            to_compact, n_ref_queries, hdim, target_size,
+            &pruning_method,
+        );
+        compacted_heads.push(CompactedCacheHead {
+            keys: compacted.keys,
+            beta: compacted.beta,
+            values: compacted.values,
+            t: compacted.t,
+            head_dim: hdim,
+        });
+    }
+
+    // Remove compacted tokens from hot tier.
+    for h in 0..n_kv_head {
+        let _front = cache.k_per_head[h].split_off_front(to_compact);
+    }
+    cache.compacted = Some(compacted_heads);
+    cache.compacted_original_len += to_compact;
+    Ok(())
+}
+
 /// Temporal decay pass: once per `decay_interval` tokens, move the
 /// oldest hot-tier keys to the lower-bit cold tier. Preserves recent
 /// tokens at full hot-bit precision while compressing aged ones.
@@ -1448,124 +1587,12 @@ impl LayerWeights {
             );
 
             // --- KV Compaction: reduce token count when hot cache exceeds threshold ---
-            // Compacts the oldest hot tokens into a smaller set of synthetic tokens
-            // with attention biases (beta) to preserve attention behavior.
-            // Only triggers once (no repeated compaction) to avoid cascading quality loss.
-            let compact_threshold = get_compact_threshold();
-            if compact_threshold > 0
-                && cache.k_per_head[0].count > compact_threshold
-                && seq_len == 1
-                && cache.compacted.is_none()  // Only compact once
-            {
-                let hot_count = cache.k_per_head[0].count;
-                // Keep the most recent compact_threshold/2 tokens uncompacted
-                let keep_recent = compact_threshold / 2;
-                let to_compact = hot_count.saturating_sub(keep_recent);
-                if to_compact > 8 {
-                    let ratio = get_compact_ratio();
-                    let target_size = (to_compact * ratio / 100).max(4);
-
-                    // Decompress hot keys for compaction.
-                    // Pre-RoPE mode: decompress + apply RoPE so compaction works on post-RoPE keys.
-                    let k_decomp_full = if cache.pre_rope {
-                        let hot_start = cache.sink_len + cache.cold_len + cache.compacted_original_len;
-                        decompress_and_apply_rope(
-                            &cache.k_per_head, self.n_kv_head,
-                            self.padded_head_dim, DType::F32, q.device(), &layer_tq_config,
-                            &self.cos, &self.sin, hot_start, self.rope_style, self.rope_dim,
-                        )?
-                    } else {
-                        decompress_compressed_keys(
-                            &cache.k_per_head, self.n_kv_head,
-                            self.padded_head_dim, DType::F32, q.device(), &layer_tq_config,
-                        )?
-                    };
-                    let k_flat = k_decomp_full.flatten_all()?.to_vec1()?;
-
-                    // Use ALL query heads mapped to each KV head as reference queries.
-                    // More reference queries = better compaction quality.
-                    // For GQA: n_rep queries share each KV head.
-                    let q_flat = q.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-                    // Collect recent queries: use current query (all heads)
-                    // Each KV head gets n_rep reference queries from its mapped Q heads
-                    let n_ref_queries = n_rep;
-
-                    // Get values for compaction
-                    let v_for_compact = if cache.value_bits == 0 {
-                        let v_tensor = cache.v_raw.as_ref().unwrap().to_dtype(DType::F32)?;
-                        // v_tensor is [1, n_kv_head, total_len, head_dim]
-                        v_tensor.flatten_all()?.to_vec1()?
-                    } else {
-                        let v_tensor = decompress_values_store(
-                            cache.v_compressed.as_ref().unwrap(),
-                            self.n_kv_head, self.head_dim, total_len, q.device(),
-                        )?;
-                        v_tensor.flatten_all()?.to_vec1()?
-                    };
-
-                    let hdim = self.head_dim;
-                    let padded = self.padded_head_dim;
-                    let mut compacted_heads = Vec::with_capacity(self.n_kv_head);
-                    for h in 0..self.n_kv_head {
-                        // Extract this head's oldest keys [to_compact * padded_head_dim]
-                        let k_head_offset = h * hot_count * padded;
-                        let k_head = &k_flat[k_head_offset..k_head_offset + to_compact * padded];
-                        // Trim padding to head_dim
-                        let mut k_trimmed = Vec::with_capacity(to_compact * hdim);
-                        for i in 0..to_compact {
-                            k_trimmed.extend_from_slice(&k_head[i * padded..i * padded + hdim]);
-                        }
-
-                        // Collect reference queries for this KV head (all n_rep mapped Q heads)
-                        let mut q_refs = Vec::with_capacity(n_ref_queries * hdim);
-                        for qh_offset in 0..n_rep {
-                            let qh = h * n_rep + qh_offset;
-                            q_refs.extend_from_slice(&q_flat[qh * hdim..(qh + 1) * hdim]);
-                        }
-
-                        // Extract values: v_for_compact layout is [n_kv_head, total_len, head_dim]
-                        // Hot values start at position (sink_len + cold_len)
-                        let v_start = cache.sink_len + cache.cold_len;
-                        let v_head_base = h * total_len * hdim;
-                        let v_head_offset = v_head_base + v_start * hdim;
-                        let v_head = &v_for_compact[v_head_offset..v_head_offset + to_compact * hdim];
-
-                        // Use TriAttention scoring for key selection if available,
-                        // otherwise fall back to mean-attention scoring.
-                        let pruning_method = if let Some(ref tri_cfg) = cache.tri_config {
-                            let hot_start = cache.sink_len + cache.cold_len + cache.compacted_original_len;
-                            let key_positions: Vec<usize> = (0..to_compact).map(|i| hot_start + i).collect();
-                            tq_kv::compaction::PruningMethod::TriAttention {
-                                config: tri_cfg.clone(),
-                                current_pos: index_pos + seq_len,
-                                key_positions,
-                                kv_head: h,
-                            }
-                        } else {
-                            tq_kv::compaction::PruningMethod::MeanAttention
-                        };
-                        let compacted = tq_kv::compaction::compact_head_with_method(
-                            &k_trimmed, v_head, &q_refs,
-                            to_compact, n_ref_queries, hdim, target_size,
-                            &pruning_method,
-                        );
-                        compacted_heads.push(CompactedCacheHead {
-                            keys: compacted.keys,
-                            beta: compacted.beta,
-                            values: compacted.values,
-                            t: compacted.t,
-                            head_dim: hdim,
-                        });
-                    }
-
-                    // Remove compacted tokens from hot tier
-                    for h in 0..self.n_kv_head {
-                        let _front = cache.k_per_head[h].split_off_front(to_compact);
-                    }
-                    cache.compacted = Some(compacted_heads);
-                    cache.compacted_original_len += to_compact;
-                }
-            }
+            maybe_compact_cache(
+                cache, &q, n_rep, seq_len, total_len, index_pos,
+                self.n_kv_head, self.head_dim, self.padded_head_dim,
+                &layer_tq_config, &self.cos, &self.sin,
+                self.rope_style, self.rope_dim,
+            )?;
 
             // --- Build full key tensor for attention ---
             // Concatenate: [sink | cold | compacted | hot | current]
