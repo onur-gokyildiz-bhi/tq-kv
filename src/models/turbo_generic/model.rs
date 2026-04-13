@@ -99,6 +99,11 @@ fn detect_rope_style(arch: &str) -> RopeStyle {
 /// Free function, not a method, so the iter_mut() borrow of
 /// `self.layers` can coexist with `&mut self.graph_manager` via
 /// disjoint-field borrows at the call site.
+///
+/// Per-layer profiling accumulator (TQ_PROFILE=1), also at module
+/// scope so `try_fused_decode_layer` can accept it by &mut ref.
+struct ProfAccum { qkv_ns: u64, rope_ns: u64, attn_ns: u64, mlp_ns: u64, norm_ns: u64, other_ns: u64, n: u32 }
+
 #[cfg(feature = "cuda")]
 fn maybe_end_hybrid_capture(
     graph_manager: &mut crate::cuda::graph::CudaGraphManager,
@@ -138,6 +143,499 @@ fn maybe_end_hybrid_capture(
     *capturing = false;
 }
 
+
+/// Fused decode path: 5 kernel launches replace ~13 per layer.
+/// Gate: CUDA decode (seq_len=1), input on GPU, not TQ-compressed,
+/// Q4K separate QKV, standard MLP, no post-norms. Returns true when
+/// the path handled the layer (caller should `continue`); returns
+/// false when the gate fails or the QKV weights aren't Q4K (caller
+/// falls through to the separate-kernel fallback). Extracted from
+/// forward() layer loop on 2026-04-13.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn try_fused_decode_layer(
+    layer: &mut LayerWeights,
+    layer_idx: usize,
+    layer_in: &mut Tensor,
+    mask: Option<&Tensor>,
+    index_pos: usize,
+    backend: &dyn ComputeBackend,
+    decode_scratch: &mut Option<DecodeScratch>,
+    seq_len: usize,
+    capturing: bool,
+    graph_replayed: bool,
+    layer_uses_compression: bool,
+    gpu_debug: bool,
+    profiling: bool,
+    prof: &mut ProfAccum,
+    prof_stream: Option<&std::sync::Arc<cudarc::driver::CudaStream>>,
+) -> Result<bool> {
+    // Cheap clone (Arc ref-count++ for GPU storage) so the inner body
+    // can read `x` while we also hold `&mut layer_in` for writes.
+    let x = layer_in.clone();
+    let fused_disabled = {
+        static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *C.get_or_init(|| std::env::var("TQ_NO_FUSED").map(|v| v == "1").unwrap_or(false))
+    };
+
+    // Gate: fall through to the original separate-kernel path when any
+    // precondition isn't met.
+    if !(seq_len == 1 && x.is_cuda() && !layer_uses_compression && !fused_disabled
+        && layer.post_attention_norm.is_none()
+        && layer.post_ffn_norm.is_none()
+        && matches!(&layer.qkv, QkvWeights::Separate { .. })
+        && matches!(&layer.mlp_or_moe, MlpOrMoe::Mlp(_)))
+    {
+        return Ok(false);
+    }
+
+                // Phase 1: Compute QKV into scratch buffers (scoped borrow of layer.qkv).
+                // Q and K require Q4K. V can be Q4K or Q6K (fallback to f32_matvec).
+                // When scratch is used: qkv_in_scratch=true, tensors=None.
+                let fused_qkv: Option<(bool, Option<(Tensor, Tensor, Tensor)>, usize)> = {
+                    // Extract Q+K as Q4K, V as Q4K or Q6K fallback
+                    let qk_data = if let QkvWeights::Separate { wq, wk, wv: _ } = &layer.qkv {
+                        match (wq.q4k_gpu_data(), wk.q4k_gpu_data()) {
+                            (Some((wq_g, qo, hd)), Some((wk_g, ko, _))) =>
+                                Some((wq_g, wk_g, qo, ko, hd)),
+                            _ => None,
+                        }
+                    } else { None };
+
+                    if let Some((wq_gpu, wk_gpu, q_out, k_out, hidden_dim)) = qk_data {
+                        let reg = crate::cuda::kernels::global_registry().unwrap();
+                        let input_gpu = x.cuda_data();
+                        let norm_w = layer.attention_norm.weight.cuda_data();
+
+                        if let Some(ref mut scratch) = decode_scratch {
+                            let pdet_qkv = profiling && layer_idx == 0;
+                            let _tqkv = if pdet_qkv { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
+                            let ci = layer_idx & 1;
+                            {
+                                let normed = Arc::get_mut(&mut scratch.combined_bufs[ci])
+                                    .expect("scratch combined aliased in QKV");
+                                crate::cuda::kernels::rms_norm(
+                                    reg, input_gpu, norm_w, normed,
+                                    1, hidden_dim, layer.attention_norm.eps as f32,
+                                ).map_err(|e| TqError::Msg(format!("scratch rms_norm: {}", e)))?;
+                            }
+                            let normed_ptr: &cudarc::driver::CudaSlice<f32> = &*scratch.combined_bufs[ci];
+
+                            // Step 2: Q matvec (Q4K) → scratch.q_buf
+                            {
+                                let oq = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
+                                crate::cuda::kernels::q4km_matvec(
+                                    reg, wq_gpu, normed_ptr, oq, q_out, hidden_dim,
+                                ).map_err(|e| TqError::Msg(format!("scratch Q matvec: {}", e)))?;
+                            }
+                            // Step 3: K matvec (Q4K) → scratch.k_buf
+                            {
+                                let ok = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
+                                crate::cuda::kernels::q4km_matvec(
+                                    reg, wk_gpu, normed_ptr, ok, k_out, hidden_dim,
+                                ).map_err(|e| TqError::Msg(format!("scratch K matvec: {}", e)))?;
+                            }
+                            // Step 4: V matvec (Q4K or Q6K fallback) → scratch.v_buf
+                            {
+                                let ov = Arc::get_mut(&mut scratch.v_buf).expect("v aliased");
+                                let wv = if let QkvWeights::Separate { wv, .. } = &layer.qkv { wv } else { unreachable!() };
+                                if let Some((wv_gpu, v_out, _)) = wv.q4k_gpu_data() {
+                                    crate::cuda::kernels::q4km_matvec(
+                                        reg, wv_gpu, normed_ptr, ov, v_out, hidden_dim,
+                                    ).map_err(|e| TqError::Msg(format!("scratch V Q4K: {}", e)))?;
+                                } else if let qmm::QMatMul::Quantized(qw) = &wv.inner {
+                                    // Q6K: native fused dequant matvec (4.9x less bandwidth than F32)
+                                    let w_raw = qw.gpu_cache_or_upload(&reg.stream);
+                                    crate::cuda::kernels::q6k_matvec(
+                                        reg, w_raw, normed_ptr, ov, qw.out_features(), qw.in_features(),
+                                    ).map_err(|e| TqError::Msg(format!("scratch V Q6K: {}", e)))?;
+                                } else {
+                                    return Err(TqError::Msg("V weight: unsupported format".into()));
+                                }
+                            }
+                            // Step 5: Add biases in-place (Qwen2 has Q/K/V biases)
+                            if let Some(ref bq) = layer.attention_bq {
+                                let oq = Arc::get_mut(&mut scratch.q_buf).expect("q bias");
+                                crate::cuda::kernels::bias_add_inplace(reg, oq, bq.cuda_data(), q_out)
+                                    .map_err(|e| TqError::Msg(format!("Q bias: {}", e)))?;
+                            }
+                            if let Some(ref bk) = layer.attention_bk {
+                                let ok = Arc::get_mut(&mut scratch.k_buf).expect("k bias");
+                                crate::cuda::kernels::bias_add_inplace(reg, ok, bk.cuda_data(), k_out)
+                                    .map_err(|e| TqError::Msg(format!("K bias: {}", e)))?;
+                            }
+                            if let Some(ref bv) = layer.attention_bv {
+                                let ov = Arc::get_mut(&mut scratch.v_buf).expect("v bias");
+                                crate::cuda::kernels::bias_add_inplace(reg, ov, bv.cuda_data(), scratch.v_out)
+                                    .map_err(|e| TqError::Msg(format!("V bias: {}", e)))?;
+                            }
+                            if let Some(t) = _tqkv { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "norm+qkv", t.elapsed().as_nanos() as f64 / 1000.0); }
+                            Some((true, None, hidden_dim))
+                        } else {
+                            // No scratch: compute via forward, wrap as tensors
+                            let normed_x = layer.attention_norm.forward(&x, backend)?;
+                            let (wq_w, wk_w, wv_w) = if let QkvWeights::Separate { wq, wk, wv } = &layer.qkv {
+                                (wq, wk, wv)
+                            } else { unreachable!() };
+                            let q_t = wq_w.forward(&normed_x, backend)?;
+                            let k_t = wk_w.forward(&normed_x, backend)?;
+                            let v_t = wv_w.forward(&normed_x, backend)?;
+                            Some((false, Some((q_t, k_t, v_t)), hidden_dim))
+                        }
+                    } else { None }
+                }; // QKV borrows released
+
+                if let Some((qkv_in_scratch, qkv_tensors, hidden_dim)) = fused_qkv {
+                    let attn = if qkv_in_scratch
+                        && layer.gpu_kv_cache.is_some()
+                        && layer.attention_wo.q4k_gpu_data().is_some()
+                        // (capturing allowed — scratch pointers are stable for graph)
+                    {
+                        let scratch = decode_scratch.as_mut().unwrap();
+                        let reg = crate::cuda::kernels::global_registry().unwrap();
+
+                        // Per-kernel detail profiling (TQ_PROFILE=1, layer 0 only)
+                        let pdet = profiling && layer_idx == 0;
+                        macro_rules! ptime {
+                            ($label:expr, $body:expr) => {{
+                                let _t = if pdet { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
+                                let r = $body;
+                                if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", $label, t.elapsed().as_nanos() as f64 / 1000.0); }
+                                r
+                            }};
+                        }
+
+                        // 1. RoPE in-place (graph-safe: uses rope_pos_gpu when available)
+                        let rope_gpu_pos = super::ROPE_POS_GPU_PTR.with(|p| p.get());
+                        let rope_gpu_ref = if rope_gpu_pos != 0 {
+                            Some(unsafe { &*(rope_gpu_pos as *const cudarc::driver::CudaSlice<i32>) })
+                        } else { None };
+                        ptime!("rope_q", {
+                            let q_mut = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
+                            let rope_fn = match layer.rope_style {
+                                RopeStyle::Halved => crate::cuda::kernels::rope_halved_with_gpu_pos,
+                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_with_gpu_pos,
+                            };
+                            rope_fn(reg, q_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
+                                1, scratch.n_head, scratch.head_dim, layer.rope_dim, index_pos, rope_gpu_ref,
+                            ).map_err(|e| TqError::Msg(format!("scratch RoPE Q: {}", e)))
+                        })?;
+                        ptime!("rope_k", {
+                            let k_mut = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
+                            let rope_fn = match layer.rope_style {
+                                RopeStyle::Halved => crate::cuda::kernels::rope_halved_with_gpu_pos,
+                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_with_gpu_pos,
+                            };
+                            rope_fn(reg, k_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
+                                1, scratch.n_kv_head, scratch.head_dim, layer.rope_dim, index_pos, rope_gpu_ref,
+                            ).map_err(|e| TqError::Msg(format!("scratch RoPE K: {}", e)))
+                        })?;
+
+                        // 2. Append K,V to GpuKvCache
+                        ptime!("kv_append", {
+                            let k_view = Tensor::from_cuda_arc(Arc::clone(&scratch.k_buf),
+                                vec![1, scratch.n_kv_head, 1, scratch.head_dim], scratch.stream.clone());
+                            let v_view = Tensor::from_cuda_arc(Arc::clone(&scratch.v_buf),
+                                vec![1, scratch.n_kv_head, 1, scratch.head_dim], scratch.stream.clone());
+                            layer.gpu_kv_cache.as_mut().unwrap().append(&k_view, &v_view, 1)
+                        })?;
+
+                        // 3. Fused GQA decode attention (graph-safe: reads seq_len from GPU scalar)
+                        // Flash decode for long context (seq_len > 256) in eager mode only.
+                        // CUDA Graph mode always uses gqa_decode (fixed buffer addresses).
+                        ptime!("gqa_attn", {
+                            let gpu_kv = layer.gpu_kv_cache.as_ref().unwrap();
+                            let attn_mut = Arc::get_mut(&mut scratch.attn_out).expect("attn_out aliased");
+                            let use_flash = !capturing && !graph_replayed
+                                && gpu_kv.seq_len > 256;
+
+                            if use_flash {
+                                // Flash decode: split KV across blocks for parallelism
+                                let actual_seq = gpu_kv.seq_len;
+                                let split_size = 256usize;
+                                let n_splits = (actual_seq + split_size - 1) / split_size;
+                                let scale = 1.0 / (scratch.head_dim as f32).sqrt();
+
+                                let mut partial_o: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+                                    scratch.n_head * n_splits * scratch.head_dim
+                                ).map_err(|e| TqError::Msg(format!("flash partial_o: {}", e)))?;
+                                let mut partial_max: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+                                    scratch.n_head * n_splits
+                                ).map_err(|e| TqError::Msg(format!("flash partial_max: {}", e)))?;
+                                let mut partial_sum: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
+                                    scratch.n_head * n_splits
+                                ).map_err(|e| TqError::Msg(format!("flash partial_sum: {}", e)))?;
+
+                                crate::cuda::kernels::flash_decode_partial(
+                                    reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
+                                    &mut partial_o, &mut partial_max, &mut partial_sum,
+                                    1, scratch.n_head, scratch.n_kv_head,
+                                    actual_seq, scratch.head_dim, scale, split_size,
+                                    gpu_kv.max_seq,
+                                    0, // window_size: 0 = global (TODO: per-layer for Gemma 2)
+                                ).map_err(|e| TqError::Msg(format!("flash_decode_partial: {}", e)))?;
+
+                                crate::cuda::kernels::flash_decode_reduce(
+                                    reg, &partial_o, &partial_max, &partial_sum,
+                                    attn_mut,
+                                    scratch.n_head, n_splits, scratch.head_dim, 1,
+                                ).map_err(|e| TqError::Msg(format!("flash_decode_reduce: {}", e)))?;
+                                Ok::<(), TqError>(())
+                            } else {
+                                // Graph-safe single-block attention
+                                let attn_extra = if capturing { 1i32 } else { 0 };
+                                crate::cuda::kernels::gqa_decode_attention_graph(
+                                    reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
+                                    attn_mut, &gpu_kv.valid_len_gpu,
+                                    scratch.n_head, scratch.n_kv_head,
+                                    gpu_kv.max_seq, scratch.head_dim,
+                                    1.0 / (scratch.head_dim as f32).sqrt(),
+                                    attn_extra,
+                                    0, // window_size: 0 = global (TODO: per-layer sliding window for Gemma 2)
+                                ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))?;
+                                Ok(())
+                            }
+                        })?;
+
+                        // 4. Wo projection
+                        ptime!("wo_matvec", {
+                            let (wo_gpu, wo_out_feat, wo_in_feat) = layer.attention_wo.q4k_gpu_data().unwrap();
+                            let wo_mut = Arc::get_mut(&mut scratch.wo_out).expect("wo_out aliased");
+                            crate::cuda::kernels::q4km_matvec(
+                                reg, wo_gpu, &*scratch.attn_out, wo_mut,
+                                wo_out_feat, wo_in_feat,
+                            ).map_err(|e| TqError::Msg(format!("scratch Wo matvec: {}", e)))
+                        })?;
+
+                        Tensor::from_cuda_arc(Arc::clone(&scratch.wo_out),
+                            vec![1, 1, hidden_dim], scratch.stream.clone())
+                    } else {
+                        // Fallback: create tensor views, use forward_attn
+                        let (q_t, k_t, v_t) = if let Some(qkv) = qkv_tensors {
+                            qkv
+                        } else {
+                            // QKV in scratch but can't use ultra-fused → create views now
+                            let scratch = decode_scratch.as_ref().unwrap();
+                            let q_out = scratch.q_out;
+                            let k_out = scratch.k_out;
+                            let v_out = scratch.v_out;
+                            (
+                                Tensor::from_cuda_arc(Arc::clone(&scratch.q_buf), vec![1, 1, q_out], scratch.stream.clone()),
+                                Tensor::from_cuda_arc(Arc::clone(&scratch.k_buf), vec![1, 1, k_out], scratch.stream.clone()),
+                                Tensor::from_cuda_arc(Arc::clone(&scratch.v_buf), vec![1, 1, v_out], scratch.stream.clone()),
+                            )
+                        };
+                        layer.forward_attn(&x, Some((q_t, k_t, v_t)), mask, index_pos, backend)?
+                    };
+
+                    // Phase 3: extract MLP GPU data + launch kernels 2+3 (scoped borrow)
+                    let fused_mlp_result: Result<Tensor> = (|| {
+                        let _mlp_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                            match (
+                                mlp.feed_forward_w1.q4k_gpu_data(),
+                                mlp.feed_forward_w3.q4k_gpu_data(),
+                                mlp.feed_forward_w2.q4k_gpu_data(),
+                            ) {
+                                (Some((g, idim, _)), Some((u, _, _)), Some((d, _, _))) =>
+                                    Some((g, u, d, idim)),
+                                _ => None,
+                            }
+                        } else { None };
+                        // Gate+up must be Q4K for fused gateup kernel.
+                        // Down can be Q6K — handle separately.
+                        let gateup_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                            match (mlp.feed_forward_w1.q4k_gpu_data(), mlp.feed_forward_w3.q4k_gpu_data()) {
+                                (Some((g, idim, _)), Some((u, _, _))) => Some((g, u, idim)),
+                                _ => None,
+                            }
+                        } else { None };
+                        let (wgate_gpu, wup_gpu, intermediate_dim) =
+                            gateup_data.ok_or_else(|| TqError::Msg("fused gateup: not Q4K".into()))?;
+
+                        let reg = crate::cuda::kernels::global_registry().unwrap();
+                        let stream = &reg.stream;
+                        let _enter = layer.span_mlp.enter();
+                        let attn_f32 = attn.to_dtype(DType::F32)?;
+                        let residual_f32 = x.to_dtype(DType::F32)?;
+
+                        // Kernel 2: norm + gate/up + silu*mul
+                        // Kernel 3: down projection + residual add
+                        if let Some(ref mut scratch) = decode_scratch {
+                            let ci = layer_idx & 1;
+                            let pdet = profiling && layer_idx == 0;
+
+                            // 1. combined = residual + attn
+                            let _t = if pdet { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
+                            {
+                                let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
+                                    .expect("scratch combined ping-pong aliased");
+                                crate::cuda::kernels::add(
+                                    reg, residual_f32.cuda_data(), attn_f32.cuda_data(),
+                                    comb, hidden_dim,
+                                ).map_err(|e| TqError::Msg(format!("scratch add: {}", e)))?;
+                            }
+                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "res+attn", t.elapsed().as_nanos() as f64 / 1000.0); }
+
+                            // 2. fused gateup+silu
+                            let _t = if pdet { Some(std::time::Instant::now()) } else { None };
+                            {
+                                let inter = Arc::get_mut(&mut scratch.intermediate_buf)
+                                    .expect("scratch intermediate_buf aliased");
+                                crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
+                                    reg, &*scratch.combined_bufs[ci], layer.ffn_norm.weight.cuda_data(),
+                                    wgate_gpu, wup_gpu,
+                                    inter,
+                                    hidden_dim, intermediate_dim,
+                                    layer.ffn_norm.eps as f32,
+                                ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
+                            }
+                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "gateup", t.elapsed().as_nanos() as f64 / 1000.0); }
+
+                            // 3. down projection + residual add
+                            let _t = if pdet { Some(std::time::Instant::now()) } else { None };
+                            {
+                                let wdown = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                                    &mlp.feed_forward_w2
+                                } else { unreachable!() };
+                                let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
+                                    .expect("scratch combined ping-pong aliased");
+                                if let Some((wd_gpu, _, _)) = wdown.q4k_gpu_data() {
+                                    // Q4K: fused down + residual add
+                                    crate::cuda::kernels::fused_q4km_down_residual(
+                                        reg, wd_gpu, &*scratch.intermediate_buf, comb,
+                                        hidden_dim, intermediate_dim,
+                                    ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+                                } else if let qmm::QMatMul::Quantized(qw) = &wdown.inner {
+                                    // Q6K: native fused dequant matvec (4.9x less bandwidth)
+                                    let w_raw = qw.gpu_cache_or_upload(&reg.stream);
+                                    let wo_tmp = Arc::get_mut(&mut scratch.attn_out)
+                                        .expect("attn_out temp aliased");
+                                    crate::cuda::kernels::q6k_matvec(
+                                        reg, w_raw, &*scratch.intermediate_buf, wo_tmp,
+                                        qw.out_features(), qw.in_features(),
+                                    ).map_err(|e| TqError::Msg(format!("down f32: {}", e)))?;
+                                    // residual += down_out
+                                    crate::cuda::kernels::bias_add_inplace(
+                                        reg, comb, &*scratch.attn_out, hidden_dim,
+                                    ).map_err(|e| TqError::Msg(format!("down+res add: {}", e)))?;
+                                } else {
+                                    return Err(TqError::Msg("down weight: unsupported".into()));
+                                }
+                            }
+                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "down+res", t.elapsed().as_nanos() as f64 / 1000.0); }
+
+                            return Ok(Tensor::from_cuda_arc(Arc::clone(&scratch.combined_bufs[ci]),
+                                vec![1, 1, hidden_dim], scratch.stream.clone()));
+                        }
+                        // Fallback: allocate combined + intermediate (no scratch)
+                        let mut combined = (residual_f32 + attn_f32)?;
+                        let mut intermediate: cudarc::driver::CudaSlice<f32> =
+                            stream.alloc_zeros(intermediate_dim)
+                                .map_err(|e| TqError::Msg(format!("fused MLP alloc: {}", e)))?;
+                        crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
+                            reg, combined.cuda_data(), layer.ffn_norm.weight.cuda_data(),
+                            wgate_gpu, wup_gpu,
+                            &mut intermediate,
+                            hidden_dim, intermediate_dim,
+                            layer.ffn_norm.eps as f32,
+                        ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
+                        // Down projection: Q4K fused or Q6K fallback
+                        let wdown = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                            &mlp.feed_forward_w2
+                        } else { unreachable!() };
+                        if let Some((wd_gpu, _, _)) = wdown.q4k_gpu_data() {
+                            crate::cuda::kernels::fused_q4km_down_residual(
+                                reg, wd_gpu, &intermediate, combined.cuda_data_mut(),
+                                hidden_dim, intermediate_dim,
+                            ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
+                        } else {
+                            // Q6K: separate matvec + add
+                            let down_out = wdown.forward(
+                                &Tensor::from_cuda(intermediate, vec![1, 1, intermediate_dim], stream.clone()),
+                                backend,
+                            )?;
+                            combined = (combined + &down_out)?;
+                        }
+                        Ok(combined)
+                    })(); // MLP borrows released
+
+                    match fused_mlp_result {
+                        Ok(result) => {
+                            *layer_in = result;
+                            // Debug checkpoint: fused path output
+                            if gpu_debug {
+                                if let Ok(data) = layer_in.to_vec1() {
+                                    let n = data.len();
+                                    let sum: f64 = data.iter().map(|&v| v as f64).sum();
+                                    let mean = sum / n as f64;
+                                    let l2: f64 = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+                                    let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+                                        |(mn, mx), &v| (mn.min(v), mx.max(v)));
+                                    eprintln!("[gpu-debug] L{} fused-out: mean={:.6} l2={:.4} min={:.6} max={:.6} first5={:?}",
+                                        layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
+                                }
+                            }
+                            return Ok(true); // fused path completed
+                        }
+                        Err(_) => {
+                            // Fused MLP failed (e.g., Q6K weights).
+                            // Attention already computed; compute residual + norm + MLP below.
+                            let _enter = layer.span_mlp.enter();
+                            let attn_f32 = attn.to_dtype(DType::F32)?;
+                            let residual_f32 = x.to_dtype(DType::F32)?;
+                            #[cfg(feature = "cuda")]
+                            let (mlp_in, residual_owned) = if attn_f32.is_cuda() {
+                                attn_f32.fused_add_rms_norm_gpu(
+                                    &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
+                                )?
+                            } else {
+                                let shape = attn_f32.shape().to_vec();
+                                let hidden = *shape.last().unwrap();
+                                let n_tokens = attn_f32.elem_count() / hidden;
+                                let (normed, new_res) = backend.fused_add_rms_norm(
+                                    attn_f32.as_slice(), residual_f32.as_slice(),
+                                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                                    n_tokens, hidden,
+                                );
+                                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
+                            };
+                            #[cfg(not(feature = "cuda"))]
+                            let (mlp_in, residual_owned) = {
+                                let shape = attn_f32.shape().to_vec();
+                                let hidden = *shape.last().unwrap();
+                                let n_tokens = attn_f32.elem_count() / hidden;
+                                let (normed, new_res) = backend.fused_add_rms_norm(
+                                    attn_f32.as_slice(), residual_f32.as_slice(),
+                                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                                    n_tokens, hidden,
+                                );
+                                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
+                            };
+                            let mlp_out = layer.mlp_or_moe.forward(&mlp_in, backend)?;
+                            *layer_in = (mlp_out + &residual_owned)?;
+                            // Debug checkpoint: fused-QKV + fallback-MLP output
+                            if gpu_debug {
+                                if let Ok(data) = layer_in.to_vec1() {
+                                    let n = data.len();
+                                    let sum: f64 = data.iter().map(|&v| v as f64).sum();
+                                    let mean = sum / n as f64;
+                                    let l2: f64 = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
+                                    let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
+                                        |(mn, mx), &v| (mn.min(v), mx.max(v)));
+                                    eprintln!("[gpu-debug] L{} fused-qkv+fb-mlp: mean={:.6} l2={:.4} min={:.6} max={:.6} first5={:?}",
+                                        layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
+                                }
+                            }
+                            return Ok(true);
+                        }
+                    }
+                }
+
+    // fused_qkv = None means no Q4K weights — caller runs fallback.
+    Ok(false)
+}
 impl GenericTurboModel {
     /// Load from a GGUF file (thin wrapper over `build`).
     pub fn from_gguf<R: std::io::Seek + std::io::Read>(
@@ -1135,7 +1633,6 @@ impl GenericTurboModel {
         let prof_stream = if profiling { crate::cuda::kernels::global_registry().map(|r| r.stream.clone()) } else { None };
         #[cfg(not(feature = "cuda"))]
         let prof_stream: Option<()> = None;
-        struct ProfAccum { qkv_ns: u64, rope_ns: u64, attn_ns: u64, mlp_ns: u64, norm_ns: u64, other_ns: u64, n: u32 }
         let mut prof = ProfAccum { qkv_ns: 0, rope_ns: 0, attn_ns: 0, mlp_ns: 0, norm_ns: 0, other_ns: 0, n: 0 };
         macro_rules! prof_sync {
             ($stream:expr) => {
@@ -1200,7 +1697,10 @@ impl GenericTurboModel {
                     .expect("layer_swap wait_for_layer failed");
             }
 
-            let x = layer_in;
+            // Clone (Arc ref-count++ for GPU storage) so the fallback path
+            // below can still read layer_in after the fused helper may
+            // have rewritten it.
+            let x = layer_in.clone();
             // prof_sync macro defined before loop
 
             // Debug checkpoint: layer input stats
@@ -1244,460 +1744,14 @@ impl GenericTurboModel {
             );
 
             #[cfg(feature = "cuda")]
-            let fused_disabled = {
-                static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *C.get_or_init(|| std::env::var("TQ_NO_FUSED").map(|v| v == "1").unwrap_or(false))
-            };
-            #[cfg(feature = "cuda")]
-            if seq_len == 1 && x.is_cuda() && !layer_uses_compression && !fused_disabled
-                && layer.post_attention_norm.is_none()
-                && layer.post_ffn_norm.is_none()
-                && matches!(&layer.qkv, QkvWeights::Separate { .. })
-                && matches!(&layer.mlp_or_moe, MlpOrMoe::Mlp(_))
-            {
-                // Phase 1: Compute QKV into scratch buffers (scoped borrow of layer.qkv).
-                // Q and K require Q4K. V can be Q4K or Q6K (fallback to f32_matvec).
-                // When scratch is used: qkv_in_scratch=true, tensors=None.
-                let fused_qkv: Option<(bool, Option<(Tensor, Tensor, Tensor)>, usize)> = {
-                    // Extract Q+K as Q4K, V as Q4K or Q6K fallback
-                    let qk_data = if let QkvWeights::Separate { wq, wk, wv: _ } = &layer.qkv {
-                        match (wq.q4k_gpu_data(), wk.q4k_gpu_data()) {
-                            (Some((wq_g, qo, hd)), Some((wk_g, ko, _))) =>
-                                Some((wq_g, wk_g, qo, ko, hd)),
-                            _ => None,
-                        }
-                    } else { None };
-
-                    if let Some((wq_gpu, wk_gpu, q_out, k_out, hidden_dim)) = qk_data {
-                        let reg = crate::cuda::kernels::global_registry().unwrap();
-                        let input_gpu = x.cuda_data();
-                        let norm_w = layer.attention_norm.weight.cuda_data();
-
-                        if let Some(ref mut scratch) = decode_scratch {
-                            let pdet_qkv = profiling && layer_idx == 0;
-                            let _tqkv = if pdet_qkv { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
-                            let ci = layer_idx & 1;
-                            {
-                                let normed = Arc::get_mut(&mut scratch.combined_bufs[ci])
-                                    .expect("scratch combined aliased in QKV");
-                                crate::cuda::kernels::rms_norm(
-                                    reg, input_gpu, norm_w, normed,
-                                    1, hidden_dim, layer.attention_norm.eps as f32,
-                                ).map_err(|e| TqError::Msg(format!("scratch rms_norm: {}", e)))?;
-                            }
-                            let normed_ptr: &cudarc::driver::CudaSlice<f32> = &*scratch.combined_bufs[ci];
-
-                            // Step 2: Q matvec (Q4K) → scratch.q_buf
-                            {
-                                let oq = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
-                                crate::cuda::kernels::q4km_matvec(
-                                    reg, wq_gpu, normed_ptr, oq, q_out, hidden_dim,
-                                ).map_err(|e| TqError::Msg(format!("scratch Q matvec: {}", e)))?;
-                            }
-                            // Step 3: K matvec (Q4K) → scratch.k_buf
-                            {
-                                let ok = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
-                                crate::cuda::kernels::q4km_matvec(
-                                    reg, wk_gpu, normed_ptr, ok, k_out, hidden_dim,
-                                ).map_err(|e| TqError::Msg(format!("scratch K matvec: {}", e)))?;
-                            }
-                            // Step 4: V matvec (Q4K or Q6K fallback) → scratch.v_buf
-                            {
-                                let ov = Arc::get_mut(&mut scratch.v_buf).expect("v aliased");
-                                let wv = if let QkvWeights::Separate { wv, .. } = &layer.qkv { wv } else { unreachable!() };
-                                if let Some((wv_gpu, v_out, _)) = wv.q4k_gpu_data() {
-                                    crate::cuda::kernels::q4km_matvec(
-                                        reg, wv_gpu, normed_ptr, ov, v_out, hidden_dim,
-                                    ).map_err(|e| TqError::Msg(format!("scratch V Q4K: {}", e)))?;
-                                } else if let qmm::QMatMul::Quantized(qw) = &wv.inner {
-                                    // Q6K: native fused dequant matvec (4.9x less bandwidth than F32)
-                                    let w_raw = qw.gpu_cache_or_upload(&reg.stream);
-                                    crate::cuda::kernels::q6k_matvec(
-                                        reg, w_raw, normed_ptr, ov, qw.out_features(), qw.in_features(),
-                                    ).map_err(|e| TqError::Msg(format!("scratch V Q6K: {}", e)))?;
-                                } else {
-                                    return Err(TqError::Msg("V weight: unsupported format".into()));
-                                }
-                            }
-                            // Step 5: Add biases in-place (Qwen2 has Q/K/V biases)
-                            if let Some(ref bq) = layer.attention_bq {
-                                let oq = Arc::get_mut(&mut scratch.q_buf).expect("q bias");
-                                crate::cuda::kernels::bias_add_inplace(reg, oq, bq.cuda_data(), q_out)
-                                    .map_err(|e| TqError::Msg(format!("Q bias: {}", e)))?;
-                            }
-                            if let Some(ref bk) = layer.attention_bk {
-                                let ok = Arc::get_mut(&mut scratch.k_buf).expect("k bias");
-                                crate::cuda::kernels::bias_add_inplace(reg, ok, bk.cuda_data(), k_out)
-                                    .map_err(|e| TqError::Msg(format!("K bias: {}", e)))?;
-                            }
-                            if let Some(ref bv) = layer.attention_bv {
-                                let ov = Arc::get_mut(&mut scratch.v_buf).expect("v bias");
-                                crate::cuda::kernels::bias_add_inplace(reg, ov, bv.cuda_data(), scratch.v_out)
-                                    .map_err(|e| TqError::Msg(format!("V bias: {}", e)))?;
-                            }
-                            if let Some(t) = _tqkv { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "norm+qkv", t.elapsed().as_nanos() as f64 / 1000.0); }
-                            Some((true, None, hidden_dim))
-                        } else {
-                            // No scratch: compute via forward, wrap as tensors
-                            let normed_x = layer.attention_norm.forward(&x, backend)?;
-                            let (wq_w, wk_w, wv_w) = if let QkvWeights::Separate { wq, wk, wv } = &layer.qkv {
-                                (wq, wk, wv)
-                            } else { unreachable!() };
-                            let q_t = wq_w.forward(&normed_x, backend)?;
-                            let k_t = wk_w.forward(&normed_x, backend)?;
-                            let v_t = wv_w.forward(&normed_x, backend)?;
-                            Some((false, Some((q_t, k_t, v_t)), hidden_dim))
-                        }
-                    } else { None }
-                }; // QKV borrows released
-
-                if let Some((qkv_in_scratch, qkv_tensors, hidden_dim)) = fused_qkv {
-                    let attn = if qkv_in_scratch
-                        && layer.gpu_kv_cache.is_some()
-                        && layer.attention_wo.q4k_gpu_data().is_some()
-                        // (capturing allowed — scratch pointers are stable for graph)
-                    {
-                        let scratch = decode_scratch.as_mut().unwrap();
-                        let reg = crate::cuda::kernels::global_registry().unwrap();
-
-                        // Per-kernel detail profiling (TQ_PROFILE=1, layer 0 only)
-                        let pdet = profiling && layer_idx == 0;
-                        macro_rules! ptime {
-                            ($label:expr, $body:expr) => {{
-                                let _t = if pdet { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
-                                let r = $body;
-                                if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", $label, t.elapsed().as_nanos() as f64 / 1000.0); }
-                                r
-                            }};
-                        }
-
-                        // 1. RoPE in-place (graph-safe: uses rope_pos_gpu when available)
-                        let rope_gpu_pos = super::ROPE_POS_GPU_PTR.with(|p| p.get());
-                        let rope_gpu_ref = if rope_gpu_pos != 0 {
-                            Some(unsafe { &*(rope_gpu_pos as *const cudarc::driver::CudaSlice<i32>) })
-                        } else { None };
-                        ptime!("rope_q", {
-                            let q_mut = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
-                            let rope_fn = match layer.rope_style {
-                                RopeStyle::Halved => crate::cuda::kernels::rope_halved_with_gpu_pos,
-                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_with_gpu_pos,
-                            };
-                            rope_fn(reg, q_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
-                                1, scratch.n_head, scratch.head_dim, layer.rope_dim, index_pos, rope_gpu_ref,
-                            ).map_err(|e| TqError::Msg(format!("scratch RoPE Q: {}", e)))
-                        })?;
-                        ptime!("rope_k", {
-                            let k_mut = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
-                            let rope_fn = match layer.rope_style {
-                                RopeStyle::Halved => crate::cuda::kernels::rope_halved_with_gpu_pos,
-                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_with_gpu_pos,
-                            };
-                            rope_fn(reg, k_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
-                                1, scratch.n_kv_head, scratch.head_dim, layer.rope_dim, index_pos, rope_gpu_ref,
-                            ).map_err(|e| TqError::Msg(format!("scratch RoPE K: {}", e)))
-                        })?;
-
-                        // 2. Append K,V to GpuKvCache
-                        ptime!("kv_append", {
-                            let k_view = Tensor::from_cuda_arc(Arc::clone(&scratch.k_buf),
-                                vec![1, scratch.n_kv_head, 1, scratch.head_dim], scratch.stream.clone());
-                            let v_view = Tensor::from_cuda_arc(Arc::clone(&scratch.v_buf),
-                                vec![1, scratch.n_kv_head, 1, scratch.head_dim], scratch.stream.clone());
-                            layer.gpu_kv_cache.as_mut().unwrap().append(&k_view, &v_view, 1)
-                        })?;
-
-                        // 3. Fused GQA decode attention (graph-safe: reads seq_len from GPU scalar)
-                        // Flash decode for long context (seq_len > 256) in eager mode only.
-                        // CUDA Graph mode always uses gqa_decode (fixed buffer addresses).
-                        ptime!("gqa_attn", {
-                            let gpu_kv = layer.gpu_kv_cache.as_ref().unwrap();
-                            let attn_mut = Arc::get_mut(&mut scratch.attn_out).expect("attn_out aliased");
-                            let use_flash = !capturing && !graph_replayed
-                                && gpu_kv.seq_len > 256;
-
-                            if use_flash {
-                                // Flash decode: split KV across blocks for parallelism
-                                let actual_seq = gpu_kv.seq_len;
-                                let split_size = 256usize;
-                                let n_splits = (actual_seq + split_size - 1) / split_size;
-                                let scale = 1.0 / (scratch.head_dim as f32).sqrt();
-
-                                let mut partial_o: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
-                                    scratch.n_head * n_splits * scratch.head_dim
-                                ).map_err(|e| TqError::Msg(format!("flash partial_o: {}", e)))?;
-                                let mut partial_max: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
-                                    scratch.n_head * n_splits
-                                ).map_err(|e| TqError::Msg(format!("flash partial_max: {}", e)))?;
-                                let mut partial_sum: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
-                                    scratch.n_head * n_splits
-                                ).map_err(|e| TqError::Msg(format!("flash partial_sum: {}", e)))?;
-
-                                crate::cuda::kernels::flash_decode_partial(
-                                    reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
-                                    &mut partial_o, &mut partial_max, &mut partial_sum,
-                                    1, scratch.n_head, scratch.n_kv_head,
-                                    actual_seq, scratch.head_dim, scale, split_size,
-                                    gpu_kv.max_seq,
-                                    0, // window_size: 0 = global (TODO: per-layer for Gemma 2)
-                                ).map_err(|e| TqError::Msg(format!("flash_decode_partial: {}", e)))?;
-
-                                crate::cuda::kernels::flash_decode_reduce(
-                                    reg, &partial_o, &partial_max, &partial_sum,
-                                    attn_mut,
-                                    scratch.n_head, n_splits, scratch.head_dim, 1,
-                                ).map_err(|e| TqError::Msg(format!("flash_decode_reduce: {}", e)))?;
-                                Ok::<(), TqError>(())
-                            } else {
-                                // Graph-safe single-block attention
-                                let attn_extra = if capturing { 1i32 } else { 0 };
-                                crate::cuda::kernels::gqa_decode_attention_graph(
-                                    reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
-                                    attn_mut, &gpu_kv.valid_len_gpu,
-                                    scratch.n_head, scratch.n_kv_head,
-                                    gpu_kv.max_seq, scratch.head_dim,
-                                    1.0 / (scratch.head_dim as f32).sqrt(),
-                                    attn_extra,
-                                    0, // window_size: 0 = global (TODO: per-layer sliding window for Gemma 2)
-                                ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))?;
-                                Ok(())
-                            }
-                        })?;
-
-                        // 4. Wo projection
-                        ptime!("wo_matvec", {
-                            let (wo_gpu, wo_out_feat, wo_in_feat) = layer.attention_wo.q4k_gpu_data().unwrap();
-                            let wo_mut = Arc::get_mut(&mut scratch.wo_out).expect("wo_out aliased");
-                            crate::cuda::kernels::q4km_matvec(
-                                reg, wo_gpu, &*scratch.attn_out, wo_mut,
-                                wo_out_feat, wo_in_feat,
-                            ).map_err(|e| TqError::Msg(format!("scratch Wo matvec: {}", e)))
-                        })?;
-
-                        Tensor::from_cuda_arc(Arc::clone(&scratch.wo_out),
-                            vec![1, 1, hidden_dim], scratch.stream.clone())
-                    } else {
-                        // Fallback: create tensor views, use forward_attn
-                        let (q_t, k_t, v_t) = if let Some(qkv) = qkv_tensors {
-                            qkv
-                        } else {
-                            // QKV in scratch but can't use ultra-fused → create views now
-                            let scratch = decode_scratch.as_ref().unwrap();
-                            let q_out = scratch.q_out;
-                            let k_out = scratch.k_out;
-                            let v_out = scratch.v_out;
-                            (
-                                Tensor::from_cuda_arc(Arc::clone(&scratch.q_buf), vec![1, 1, q_out], scratch.stream.clone()),
-                                Tensor::from_cuda_arc(Arc::clone(&scratch.k_buf), vec![1, 1, k_out], scratch.stream.clone()),
-                                Tensor::from_cuda_arc(Arc::clone(&scratch.v_buf), vec![1, 1, v_out], scratch.stream.clone()),
-                            )
-                        };
-                        layer.forward_attn(&x, Some((q_t, k_t, v_t)), mask.as_ref(), index_pos, backend)?
-                    };
-
-                    // Phase 3: extract MLP GPU data + launch kernels 2+3 (scoped borrow)
-                    let fused_mlp_result: Result<Tensor> = (|| {
-                        let _mlp_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
-                            match (
-                                mlp.feed_forward_w1.q4k_gpu_data(),
-                                mlp.feed_forward_w3.q4k_gpu_data(),
-                                mlp.feed_forward_w2.q4k_gpu_data(),
-                            ) {
-                                (Some((g, idim, _)), Some((u, _, _)), Some((d, _, _))) =>
-                                    Some((g, u, d, idim)),
-                                _ => None,
-                            }
-                        } else { None };
-                        // Gate+up must be Q4K for fused gateup kernel.
-                        // Down can be Q6K — handle separately.
-                        let gateup_data = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
-                            match (mlp.feed_forward_w1.q4k_gpu_data(), mlp.feed_forward_w3.q4k_gpu_data()) {
-                                (Some((g, idim, _)), Some((u, _, _))) => Some((g, u, idim)),
-                                _ => None,
-                            }
-                        } else { None };
-                        let (wgate_gpu, wup_gpu, intermediate_dim) =
-                            gateup_data.ok_or_else(|| TqError::Msg("fused gateup: not Q4K".into()))?;
-
-                        let reg = crate::cuda::kernels::global_registry().unwrap();
-                        let stream = &reg.stream;
-                        let _enter = layer.span_mlp.enter();
-                        let attn_f32 = attn.to_dtype(DType::F32)?;
-                        let residual_f32 = x.to_dtype(DType::F32)?;
-
-                        // Kernel 2: norm + gate/up + silu*mul
-                        // Kernel 3: down projection + residual add
-                        if let Some(ref mut scratch) = decode_scratch {
-                            let ci = layer_idx & 1;
-                            let pdet = profiling && layer_idx == 0;
-
-                            // 1. combined = residual + attn
-                            let _t = if pdet { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
-                            {
-                                let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
-                                    .expect("scratch combined ping-pong aliased");
-                                crate::cuda::kernels::add(
-                                    reg, residual_f32.cuda_data(), attn_f32.cuda_data(),
-                                    comb, hidden_dim,
-                                ).map_err(|e| TqError::Msg(format!("scratch add: {}", e)))?;
-                            }
-                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "res+attn", t.elapsed().as_nanos() as f64 / 1000.0); }
-
-                            // 2. fused gateup+silu
-                            let _t = if pdet { Some(std::time::Instant::now()) } else { None };
-                            {
-                                let inter = Arc::get_mut(&mut scratch.intermediate_buf)
-                                    .expect("scratch intermediate_buf aliased");
-                                crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
-                                    reg, &*scratch.combined_bufs[ci], layer.ffn_norm.weight.cuda_data(),
-                                    wgate_gpu, wup_gpu,
-                                    inter,
-                                    hidden_dim, intermediate_dim,
-                                    layer.ffn_norm.eps as f32,
-                                ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
-                            }
-                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "gateup", t.elapsed().as_nanos() as f64 / 1000.0); }
-
-                            // 3. down projection + residual add
-                            let _t = if pdet { Some(std::time::Instant::now()) } else { None };
-                            {
-                                let wdown = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
-                                    &mlp.feed_forward_w2
-                                } else { unreachable!() };
-                                let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
-                                    .expect("scratch combined ping-pong aliased");
-                                if let Some((wd_gpu, _, _)) = wdown.q4k_gpu_data() {
-                                    // Q4K: fused down + residual add
-                                    crate::cuda::kernels::fused_q4km_down_residual(
-                                        reg, wd_gpu, &*scratch.intermediate_buf, comb,
-                                        hidden_dim, intermediate_dim,
-                                    ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
-                                } else if let qmm::QMatMul::Quantized(qw) = &wdown.inner {
-                                    // Q6K: native fused dequant matvec (4.9x less bandwidth)
-                                    let w_raw = qw.gpu_cache_or_upload(&reg.stream);
-                                    let wo_tmp = Arc::get_mut(&mut scratch.attn_out)
-                                        .expect("attn_out temp aliased");
-                                    crate::cuda::kernels::q6k_matvec(
-                                        reg, w_raw, &*scratch.intermediate_buf, wo_tmp,
-                                        qw.out_features(), qw.in_features(),
-                                    ).map_err(|e| TqError::Msg(format!("down f32: {}", e)))?;
-                                    // residual += down_out
-                                    crate::cuda::kernels::bias_add_inplace(
-                                        reg, comb, &*scratch.attn_out, hidden_dim,
-                                    ).map_err(|e| TqError::Msg(format!("down+res add: {}", e)))?;
-                                } else {
-                                    return Err(TqError::Msg("down weight: unsupported".into()));
-                                }
-                            }
-                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "down+res", t.elapsed().as_nanos() as f64 / 1000.0); }
-
-                            return Ok(Tensor::from_cuda_arc(Arc::clone(&scratch.combined_bufs[ci]),
-                                vec![1, 1, hidden_dim], scratch.stream.clone()));
-                        }
-                        // Fallback: allocate combined + intermediate (no scratch)
-                        let mut combined = (residual_f32 + attn_f32)?;
-                        let mut intermediate: cudarc::driver::CudaSlice<f32> =
-                            stream.alloc_zeros(intermediate_dim)
-                                .map_err(|e| TqError::Msg(format!("fused MLP alloc: {}", e)))?;
-                        crate::cuda::kernels::fused_addnorm_q4km_gateup_silu(
-                            reg, combined.cuda_data(), layer.ffn_norm.weight.cuda_data(),
-                            wgate_gpu, wup_gpu,
-                            &mut intermediate,
-                            hidden_dim, intermediate_dim,
-                            layer.ffn_norm.eps as f32,
-                        ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
-                        // Down projection: Q4K fused or Q6K fallback
-                        let wdown = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
-                            &mlp.feed_forward_w2
-                        } else { unreachable!() };
-                        if let Some((wd_gpu, _, _)) = wdown.q4k_gpu_data() {
-                            crate::cuda::kernels::fused_q4km_down_residual(
-                                reg, wd_gpu, &intermediate, combined.cuda_data_mut(),
-                                hidden_dim, intermediate_dim,
-                            ).map_err(|e| TqError::Msg(format!("fused down+res: {}", e)))?;
-                        } else {
-                            // Q6K: separate matvec + add
-                            let down_out = wdown.forward(
-                                &Tensor::from_cuda(intermediate, vec![1, 1, intermediate_dim], stream.clone()),
-                                backend,
-                            )?;
-                            combined = (combined + &down_out)?;
-                        }
-                        Ok(combined)
-                    })(); // MLP borrows released
-
-                    match fused_mlp_result {
-                        Ok(result) => {
-                            layer_in = result;
-                            // Debug checkpoint: fused path output
-                            if gpu_debug {
-                                if let Ok(data) = layer_in.to_vec1() {
-                                    let n = data.len();
-                                    let sum: f64 = data.iter().map(|&v| v as f64).sum();
-                                    let mean = sum / n as f64;
-                                    let l2: f64 = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
-                                    let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
-                                        |(mn, mx), &v| (mn.min(v), mx.max(v)));
-                                    eprintln!("[gpu-debug] L{} fused-out: mean={:.6} l2={:.4} min={:.6} max={:.6} first5={:?}",
-                                        layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
-                                }
-                            }
-                            continue; // skip fallback path
-                        }
-                        Err(_) => {
-                            // Fused MLP failed (e.g., Q6K weights).
-                            // Attention already computed; compute residual + norm + MLP below.
-                            let _enter = layer.span_mlp.enter();
-                            let attn_f32 = attn.to_dtype(DType::F32)?;
-                            let residual_f32 = x.to_dtype(DType::F32)?;
-                            #[cfg(feature = "cuda")]
-                            let (mlp_in, residual_owned) = if attn_f32.is_cuda() {
-                                attn_f32.fused_add_rms_norm_gpu(
-                                    &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
-                                )?
-                            } else {
-                                let shape = attn_f32.shape().to_vec();
-                                let hidden = *shape.last().unwrap();
-                                let n_tokens = attn_f32.elem_count() / hidden;
-                                let (normed, new_res) = backend.fused_add_rms_norm(
-                                    attn_f32.as_slice(), residual_f32.as_slice(),
-                                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
-                                    n_tokens, hidden,
-                                );
-                                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
-                                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
-                            };
-                            #[cfg(not(feature = "cuda"))]
-                            let (mlp_in, residual_owned) = {
-                                let shape = attn_f32.shape().to_vec();
-                                let hidden = *shape.last().unwrap();
-                                let n_tokens = attn_f32.elem_count() / hidden;
-                                let (normed, new_res) = backend.fused_add_rms_norm(
-                                    attn_f32.as_slice(), residual_f32.as_slice(),
-                                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
-                                    n_tokens, hidden,
-                                );
-                                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
-                                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
-                            };
-                            let mlp_out = layer.mlp_or_moe.forward(&mlp_in, backend)?;
-                            layer_in = (mlp_out + &residual_owned)?;
-                            // Debug checkpoint: fused-QKV + fallback-MLP output
-                            if gpu_debug {
-                                if let Ok(data) = layer_in.to_vec1() {
-                                    let n = data.len();
-                                    let sum: f64 = data.iter().map(|&v| v as f64).sum();
-                                    let mean = sum / n as f64;
-                                    let l2: f64 = data.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt();
-                                    let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY),
-                                        |(mn, mx), &v| (mn.min(v), mx.max(v)));
-                                    eprintln!("[gpu-debug] L{} fused-qkv+fb-mlp: mean={:.6} l2={:.4} min={:.6} max={:.6} first5={:?}",
-                                        layer_idx, mean, l2, mn, mx, &data[..5.min(n)]);
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                }
+            if try_fused_decode_layer(
+                layer, layer_idx, &mut layer_in, mask.as_ref(), index_pos,
+                backend, &mut decode_scratch,
+                seq_len, capturing, graph_replayed, layer_uses_compression,
+                gpu_debug, profiling, &mut prof,
+                prof_stream.as_ref(),
+            )? {
+                continue;
             }
 
             // ── Fallback: original separate-kernel path ──
