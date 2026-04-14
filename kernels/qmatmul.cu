@@ -1244,6 +1244,128 @@ extern "C" __global__ void q4km_matvec_dp4a_f32(
     }
 }
 
+// ─── Q4_K_M × q8_1 dp4a Matvec V2 — MMVQ Step 6 ────────────────
+// 1-row-per-block × 4-warp cross-warp reduction.
+//
+// Rationale vs v1 (8-rows/block, 1 warp/row):
+//   v1 grid = ceil(out/8), so small matmuls (e.g. down_proj out=3584) launch
+//   only 448 blocks → SM starvation on RTX 30/40 (≥68 SMs, ≥2 blocks/SM ideal).
+//   v2 grid = out_features, so down_proj launches 3584 blocks → ~8× more
+//   parallelism, saturates DRAM instead of leaving SMs idle.
+//
+// Thread layout (128 threads = 4 warps per block, 1 output row per block):
+//   - All 4 warps cooperate on the same output row.
+//   - Warp `w` (0..3) iterates sb = w, w+4, w+8, ...  (stride-4 superblocks).
+//   - Within a warp: same (sub, slot) decomposition as v1 — lane owns
+//     2 packed int32s of sub-block `lane>>2`, slot `lane&3`.
+//   - Each warp intra-reduces its partial → lane 0 of each warp holds
+//     that warp's contribution.
+//   - 4 partials stored to shmem (tmp_shared[4], 16B).
+//   - Warp 0 reads the 4 partials, sums, writes output[row].
+//
+// Math is BIT-IDENTICAL to v1: same dp4a pattern, same per-sub-block scale
+// application, same FP32 accumulator. Only the *iteration partitioning*
+// changes (sb-stride-4 across warps vs all-in-one-warp).
+//
+// Grid:  out_features blocks
+// Block: 128 threads (4 warps × 32 lanes)
+// Shmem: 16 B static (4 floats — one partial per warp)
+
+extern "C" __global__ void q4km_matvec_dp4a_v2_f32(
+    const uint8_t * __restrict__ W_q4k,      // [out_features * bytes_per_row]
+    const void    * __restrict__ X_q8_1,     // [n_superblocks * 8] q8_1 blocks (36B each)
+    float         * __restrict__ output,     // [out_features]
+    const int      out_features,
+    const int      in_features               // must be multiple of 256 (QK_K)
+) {
+    const int row     = blockIdx.x;
+    if (row >= out_features) return;
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;             // 0..3 → which warp within block
+    const int lane    = tid & 31;             // 0..31
+    const int sub     = lane >> 2;            // 0..7 → sub-block within super-block
+    const int slot    = lane & 3;             // 0..3 → int32 position within half
+
+    const int n_superblocks = in_features / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+
+    // Sub-block → group (0..3) and lo/hi nibble select. Matches v1.
+    const int grp   = sub >> 1;
+    const int is_hi = sub & 1;
+
+    float partial = 0.0f;
+
+    const uint8_t* q8_1_base = reinterpret_cast<const uint8_t*>(X_q8_1);
+    const uint8_t* row_base  = W_q4k + (size_t)row * bytes_per_row;
+
+    // 4-warp stride-4 iteration: warp w takes sb = w, w+4, w+8, ...
+    // Adjacent warps stride through sequential superblocks, so per-CTA L2
+    // reuse on x_q8_1 is preserved (neighbour blocks also touch sb = w±1,
+    // which the SM's L2 slice caches) — no need for shmem staging of x.
+    for (int sb = warp_id; sb < n_superblocks; sb += 4) {
+        const uint8_t* block = row_base + sb * Q4K_BLOCK_SIZE;
+
+        // Q4_K super-block header.
+        uint16_t d_bits  = block[0] | (block[1] << 8);
+        uint16_t dm_bits = block[2] | (block[3] << 8);
+        float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+        float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs     = block + 16;
+
+        uint8_t sc_u8, m_u8;
+        get_scale_min_k4(sub, scales, &sc_u8, &m_u8);
+        const int sc = (int)sc_u8;
+        const int m  = (int)m_u8;
+
+        // 2 int32s of nibbles for this lane's sub-block (group-aligned).
+        const int* qs32 = reinterpret_cast<const int*>(qs + grp * 32);
+        int q4_0 = qs32[slot];
+        int q4_1 = qs32[slot + 4];
+        int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
+        int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
+
+        // Matching q8_1 block.
+        const uint8_t* q8_1_block = q8_1_base + (size_t)(sb * 8 + sub) * Q8_1_BLOCK_SIZE;
+        uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
+        float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+
+        const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+        int u0 = qs8[slot];
+        int u1 = qs8[slot + 4];
+
+        // VDR=2 dp4a: 2 × __dp4a per sub-block.
+        int sumi = __dp4a(v0, u0, 0);
+        sumi     = __dp4a(v1, u1, sumi);
+
+        int sum_u = __dp4a(0x01010101, u0, 0);
+        sum_u     = __dp4a(0x01010101, u1, sum_u);
+
+        float lane_sumf_d = d_w    * (float)sc * (float)sumi  * d8;
+        float lane_sumf_m = dmin_w * (float)m  * (float)sum_u * d8;
+
+        partial += (lane_sumf_d - lane_sumf_m);
+    }
+
+    // Step 1: intra-warp reduce. After this, lane 0 of each warp holds the
+    // full sum over this warp's assigned superblocks (sb = warp_id, +4, ...).
+    float warp_sum = warp_reduce_sum(partial);
+
+    // Step 2: cross-warp reduce via shmem. Only one partial per warp (lane 0).
+    __shared__ float tmp_shared[4];
+    if (lane == 0) {
+        tmp_shared[warp_id] = warp_sum;
+    }
+    __syncthreads();
+
+    // Warp 0 finalizes: 4 floats → single output scalar.
+    if (warp_id == 0 && lane == 0) {
+        float total = tmp_shared[0] + tmp_shared[1] + tmp_shared[2] + tmp_shared[3];
+        output[row] = total;
+    }
+}
+
 extern "C" __global__ void quantize_f32_to_q8_1_f32(
     const float* __restrict__ x,
     uint8_t* __restrict__ y,        // points at array of block_q8_1 (36B each)

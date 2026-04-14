@@ -299,11 +299,20 @@ pub fn q4km_matvec(
     //   dp4a:                 INT8 tensor-pipe via __dp4a (TQ_Q4KM=dp4a)
     //                         — requires on-the-fly q8_1 activation quantize
     //                         — in_features must be multiple of QK8_1 (32)
-    static USE_DP4A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let use_dp4a = *USE_DP4A.get_or_init(||
-        std::env::var("TQ_Q4KM").ok().as_deref() == Some("dp4a")
+    //   dp4a_v2:              INT8 tensor-pipe, 1-row-per-block × 4-warp reduce
+    //                         (TQ_Q4KM=dp4a_v2) — MMVQ Step 6, better SM
+    //                         occupancy on small out_features (e.g. down_proj).
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Dp4aVariant { Off, V1, V2 }
+    static DP4A_VAR: std::sync::OnceLock<Dp4aVariant> = std::sync::OnceLock::new();
+    let dp4a_var = *DP4A_VAR.get_or_init(||
+        match std::env::var("TQ_Q4KM").ok().as_deref() {
+            Some("dp4a")    => Dp4aVariant::V1,
+            Some("dp4a_v2") => Dp4aVariant::V2,
+            _               => Dp4aVariant::Off,
+        }
     );
-    if use_dp4a && in_features % QK8_1 == 0 {
+    if dp4a_var != Dp4aVariant::Off && in_features % QK8_1 == 0 {
         let n_blocks = in_features / QK8_1;
         let bytes_needed = n_blocks * Q8_1_BLOCK_BYTES;
         // Reuse pre-allocated scratch; grow if a larger matvec shows up.
@@ -319,7 +328,11 @@ pub fn q4km_matvec(
         }
         let x_q8_1 = pool.as_mut().unwrap();
         quantize_f32_to_q8_1(reg, x, x_q8_1, in_features)?;
-        return q4km_matvec_dp4a(reg, w_packed, x_q8_1, output, out_features, in_features);
+        return match dp4a_var {
+            Dp4aVariant::V1 => q4km_matvec_dp4a(reg, w_packed, x_q8_1, output, out_features, in_features),
+            Dp4aVariant::V2 => q4km_matvec_dp4a_v2(reg, w_packed, x_q8_1, output, out_features, in_features),
+            Dp4aVariant::Off => unreachable!(),
+        };
     }
     static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let kernel_name = *VARIANT.get_or_init(|| {
@@ -509,6 +522,57 @@ pub fn q4km_matvec_dp4a(
         grid_dim: (n_blocks, 1, 1),
         block_dim: (256, 1, 1),       // 8 warps × 32 lanes
         shared_mem_bytes: 0,
+    };
+    let of = out_features as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_packed)
+            .arg(x_q8_1)
+            .arg(output)
+            .arg(&of)
+            .arg(&inf)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch `q4km_matvec_dp4a_v2_f32`: MMVQ Step 6 — 1-row-per-block × 4-warp
+/// cross-warp reduction variant of the dp4a matvec.
+///
+/// Same math as [`q4km_matvec_dp4a`] (bit-identical output expected), but grid
+/// is `out_features` blocks (vs `out_features/8`), giving 8× more CUDA blocks
+/// and therefore much better SM occupancy on small output dimensions (e.g.
+/// Qwen2-7B down_proj: 3584 blocks vs 448 — hits DRAM roofline).
+pub fn q4km_matvec_dp4a_v2(
+    reg: &KernelRegistry,
+    w_packed: &CudaSlice<u8>,
+    x_q8_1: &CudaSlice<u8>,
+    output: &mut CudaSlice<f32>,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    debug_assert!(
+        in_features % 256 == 0,
+        "q4km_matvec_dp4a_v2: in_features ({}) must be multiple of 256",
+        in_features
+    );
+    let expected_q8_1 = (in_features / QK8_1) * Q8_1_BLOCK_BYTES;
+    debug_assert!(
+        x_q8_1.len() >= expected_q8_1,
+        "q4km_matvec_dp4a_v2: x_q8_1 buffer {} bytes < required {}",
+        x_q8_1.len(), expected_q8_1
+    );
+    debug_assert!(
+        output.len() >= out_features,
+        "q4km_matvec_dp4a_v2: output buffer {} elems < out_features {}",
+        output.len(), out_features
+    );
+    let f = reg.get_fn("qmatmul", "q4km_matvec_dp4a_v2_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (out_features as u32, 1, 1),
+        block_dim: (128, 1, 1),       // 4 warps × 32 lanes
+        shared_mem_bytes: 0,          // 16B tmp_shared[4] declared statically in kernel
     };
     let of = out_features as i32;
     let inf = in_features as i32;
@@ -2423,6 +2487,53 @@ pub fn fused_q4km_down_residual(
         reg.stream.launch_builder(&f)
             .arg(w_down).arg(intermediate).arg(residual)
             .arg(&hd).arg(&id)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+// ─── Tensor-core flash decode (Phase 1 skeleton) ─────────────
+// Feature-gated launcher for `flash_decode_mma_f16_f32` in
+// kernels/flash_decode_mma.cu. The PTX is always compiled (build.rs picks up
+// the .cu file automatically), but this launcher is only built when the
+// `tensor-core-attn` feature is on. NOT wired into dispatch yet — Phase 3 will
+// add env gating (TQ_ATTN=mma) in src/models/turbo_generic/layer.rs.
+//
+// See docs/tensor-core-flash-attn-plan.md for scope.
+#[cfg(feature = "tensor-core-attn")]
+pub fn flash_decode_mma(
+    reg: &KernelRegistry,
+    q: &CudaSlice<f32>,           // [n_heads, head_dim]
+    k: &CudaSlice<f32>,           // [n_kv_heads, max_seq, head_dim]
+    v: &CudaSlice<f32>,           // [n_kv_heads, max_seq, head_dim]
+    output: &mut CudaSlice<f32>,  // [n_heads, head_dim]
+    n_heads: usize,
+    n_kv_heads: usize,
+    seq_len: usize,
+    max_seq: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("flash_decode_mma", "flash_decode_mma_f16_f32")?;
+    // Phase 1: fp32 compute fallback, grid = n_kv_heads (one block per GQA
+    // group). Block = 32 threads to minimize per-thread register pressure
+    // during the skeleton phase; Phase 2 will lift to 128 (4 warps) once the
+    // mma tiles land.
+    let block_dim: u32 = 32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_heads as u32, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let sl = seq_len as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q).arg(k).arg(v).arg(output)
+            .arg(&nh).arg(&nkv).arg(&sl).arg(&ms).arg(&hd).arg(&scale)
             .launch(cfg)?;
     }
     Ok(())
