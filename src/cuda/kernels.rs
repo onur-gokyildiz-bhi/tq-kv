@@ -1428,6 +1428,105 @@ pub fn rope_halved_with_gpu_pos(
     Ok(())
 }
 
+/// Launch rope_halved_qk_f32: fused Q+K halved RoPE (one kernel replaces two).
+/// `q` and `k` each in-place; cos/sin tables shared.
+pub fn rope_halved_qk_with_gpu_pos(
+    reg: &KernelRegistry,
+    q: &mut CudaSlice<f32>,
+    k: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_tokens: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos_offset: usize,
+    pos_offset_gpu: Option<&CudaSlice<i32>>,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("rope", "rope_halved_qk_f32")?;
+    let half = rope_dim / 2;
+    let threads = ((half.max(32) + 31) / 32 * 32).min(256) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_tokens as u32, (n_q_heads + n_kv_heads) as u32, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nt = n_tokens as i32;
+    let nq = n_q_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let hd = head_dim as i32;
+    let rd = rope_dim as i32;
+    let po = pos_offset as i32;
+    let null_positions: u64 = 0;
+    let null_gpu_pos: u64 = 0;
+    unsafe {
+        if let Some(gpu_ptr) = pos_offset_gpu {
+            reg.stream.launch_builder(&f)
+                .arg(q).arg(k).arg(cos).arg(sin).arg(&null_positions)
+                .arg(&nt).arg(&nq).arg(&nkv).arg(&hd).arg(&rd).arg(&po)
+                .arg(gpu_ptr)
+                .launch(cfg)?;
+        } else {
+            reg.stream.launch_builder(&f)
+                .arg(q).arg(k).arg(cos).arg(sin).arg(&null_positions)
+                .arg(&nt).arg(&nq).arg(&nkv).arg(&hd).arg(&rd).arg(&po)
+                .arg(&null_gpu_pos)
+                .launch(cfg)?;
+        }
+    }
+    Ok(())
+}
+
+/// Launch rope_interleaved_qk_f32: fused Q+K interleaved RoPE (Llama style).
+pub fn rope_interleaved_qk_with_gpu_pos(
+    reg: &KernelRegistry,
+    q: &mut CudaSlice<f32>,
+    k: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_tokens: usize,
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    pos_offset: usize,
+    pos_offset_gpu: Option<&CudaSlice<i32>>,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("rope", "rope_interleaved_qk_f32")?;
+    let half = rope_dim / 2;
+    let threads = ((half.max(32) + 31) / 32 * 32).min(256) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_tokens as u32, (n_q_heads + n_kv_heads) as u32, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nt = n_tokens as i32;
+    let nq = n_q_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let hd = head_dim as i32;
+    let rd = rope_dim as i32;
+    let po = pos_offset as i32;
+    let null_positions: u64 = 0;
+    let null_gpu_pos: u64 = 0;
+    unsafe {
+        if let Some(gpu_ptr) = pos_offset_gpu {
+            reg.stream.launch_builder(&f)
+                .arg(q).arg(k).arg(cos).arg(sin).arg(&null_positions)
+                .arg(&nt).arg(&nq).arg(&nkv).arg(&hd).arg(&rd).arg(&po)
+                .arg(gpu_ptr)
+                .launch(cfg)?;
+        } else {
+            reg.stream.launch_builder(&f)
+                .arg(q).arg(k).arg(cos).arg(sin).arg(&null_positions)
+                .arg(&nt).arg(&nq).arg(&nkv).arg(&hd).arg(&rd).arg(&po)
+                .arg(&null_gpu_pos)
+                .launch(cfg)?;
+        }
+    }
+    Ok(())
+}
+
 /// Launch rope_interleaved_f32: in-place interleaved RoPE (Llama).
 pub fn rope_interleaved(
     reg: &KernelRegistry,

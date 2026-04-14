@@ -336,25 +336,23 @@ fn try_fused_decode_layer(
                         let rope_gpu_ref = if rope_gpu_pos != 0 {
                             Some(unsafe { &*(rope_gpu_pos as *const cudarc::driver::CudaSlice<i32>) })
                         } else { None };
-                        ptime!("rope_q", {
-                            let q_mut = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
-                            let rope_fn = match layer.rope_style {
-                                RopeStyle::Halved => crate::cuda::kernels::rope_halved_with_gpu_pos,
-                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_with_gpu_pos,
+                        // Plan #2: fused Q+K RoPE — one launch replaces two.
+                        // Grid covers n_head + n_kv_head; kernel dispatches buffer by blockIdx.y.
+                        ptime!("rope_qk", {
+                            // Disjoint-field borrow on scratch: q_buf and k_buf are separate
+                            // Arc<CudaSlice> fields — Rust 2021 accepts both &mut simultaneously.
+                            let (q_mut, k_mut) = (
+                                Arc::get_mut(&mut scratch.q_buf).expect("q aliased"),
+                                Arc::get_mut(&mut scratch.k_buf).expect("k aliased"),
+                            );
+                            let rope_qk_fn = match layer.rope_style {
+                                RopeStyle::Halved => crate::cuda::kernels::rope_halved_qk_with_gpu_pos,
+                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_qk_with_gpu_pos,
                             };
-                            rope_fn(reg, q_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
-                                1, scratch.n_head, scratch.head_dim, layer.rope_dim, index_pos, rope_gpu_ref,
-                            ).map_err(|e| TqError::Msg(format!("scratch RoPE Q: {}", e)))
-                        })?;
-                        ptime!("rope_k", {
-                            let k_mut = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
-                            let rope_fn = match layer.rope_style {
-                                RopeStyle::Halved => crate::cuda::kernels::rope_halved_with_gpu_pos,
-                                RopeStyle::Interleaved => crate::cuda::kernels::rope_interleaved_with_gpu_pos,
-                            };
-                            rope_fn(reg, k_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
-                                1, scratch.n_kv_head, scratch.head_dim, layer.rope_dim, index_pos, rope_gpu_ref,
-                            ).map_err(|e| TqError::Msg(format!("scratch RoPE K: {}", e)))
+                            rope_qk_fn(reg, q_mut, k_mut, layer.cos.cuda_data(), layer.sin.cuda_data(),
+                                1, scratch.n_head, scratch.n_kv_head, scratch.head_dim,
+                                layer.rope_dim, index_pos, rope_gpu_ref,
+                            ).map_err(|e| TqError::Msg(format!("scratch RoPE QK fused: {}", e)))
                         })?;
 
                         // 2. Append K,V to GpuKvCache

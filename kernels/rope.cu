@@ -95,6 +95,122 @@ extern "C" __global__ void rope_interleaved_f32(
     }
 }
 
+// ─── Fused Q+K RoPE (halved) ─────────────────────────────────
+// One launch applies halved RoPE to Q ([n_tokens, n_q_heads, head_dim]) and
+// K ([n_tokens, n_kv_heads, head_dim]) in place, sharing the cos/sin tables.
+// Grid: (n_tokens, n_q_heads + n_kv_heads, 1). Block: rope_dim/2 threads.
+// Each block picks its target buffer from blockIdx.y: first n_q_heads go to Q,
+// rest go to K with adjusted head offset. Saves one kernel launch per decode
+// step per layer compared to the separate rope_halved_f32 call pair.
+
+extern "C" __global__ void rope_halved_qk_f32(
+    float* __restrict__ q,                // [n_tokens, n_q_heads, head_dim]
+    float* __restrict__ k,                // [n_tokens, n_kv_heads, head_dim]
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    const int* __restrict__ positions,    // [n_tokens] or NULL
+    const int n_tokens,
+    const int n_q_heads,
+    const int n_kv_heads,
+    const int head_dim,
+    const int rope_dim,
+    const int pos_offset,
+    const int* __restrict__ pos_offset_gpu // GPU scalar override (or NULL)
+) {
+    const int token_idx = blockIdx.x;
+    const int head_idx  = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    if (token_idx >= n_tokens) return;
+    const int total_heads = n_q_heads + n_kv_heads;
+    if (head_idx >= total_heads) return;
+
+    const int half = rope_dim / 2;
+    const int effective_offset = pos_offset_gpu ? *pos_offset_gpu : pos_offset;
+    const int pos = positions ? positions[token_idx] : (token_idx + effective_offset);
+
+    // Pick target buffer + per-buffer head index + n_heads stride.
+    float* x;
+    int buf_head_idx;
+    int buf_n_heads;
+    if (head_idx < n_q_heads) {
+        x = q;
+        buf_head_idx = head_idx;
+        buf_n_heads = n_q_heads;
+    } else {
+        x = k;
+        buf_head_idx = head_idx - n_q_heads;
+        buf_n_heads = n_kv_heads;
+    }
+
+    float* head_ptr = x + (token_idx * buf_n_heads + buf_head_idx) * head_dim;
+    const float* cos_ptr = cos_table + pos * half;
+    const float* sin_ptr = sin_table + pos * half;
+
+    for (int i = tid; i < half; i += blockDim.x) {
+        float x0 = head_ptr[i];
+        float x1 = head_ptr[i + half];
+        float c = cos_ptr[i];
+        float s = sin_ptr[i];
+        head_ptr[i]        = x0 * c - x1 * s;
+        head_ptr[i + half] = x0 * s + x1 * c;
+    }
+}
+
+// Interleaved variant of the same fused dispatch.
+extern "C" __global__ void rope_interleaved_qk_f32(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    const int* __restrict__ positions,
+    const int n_tokens,
+    const int n_q_heads,
+    const int n_kv_heads,
+    const int head_dim,
+    const int rope_dim,
+    const int pos_offset,
+    const int* __restrict__ pos_offset_gpu
+) {
+    const int token_idx = blockIdx.x;
+    const int head_idx  = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    if (token_idx >= n_tokens) return;
+    const int total_heads = n_q_heads + n_kv_heads;
+    if (head_idx >= total_heads) return;
+
+    const int n_pairs = rope_dim / 2;
+    const int effective_offset = pos_offset_gpu ? *pos_offset_gpu : pos_offset;
+    const int pos = positions ? positions[token_idx] : (token_idx + effective_offset);
+
+    float* x;
+    int buf_head_idx;
+    int buf_n_heads;
+    if (head_idx < n_q_heads) {
+        x = q;
+        buf_head_idx = head_idx;
+        buf_n_heads = n_q_heads;
+    } else {
+        x = k;
+        buf_head_idx = head_idx - n_q_heads;
+        buf_n_heads = n_kv_heads;
+    }
+
+    float* head_ptr = x + (token_idx * buf_n_heads + buf_head_idx) * head_dim;
+    const float* cos_ptr = cos_table + pos * n_pairs;
+    const float* sin_ptr = sin_table + pos * n_pairs;
+
+    for (int i = tid; i < n_pairs; i += blockDim.x) {
+        float x0 = head_ptr[2 * i];
+        float x1 = head_ptr[2 * i + 1];
+        float c = cos_ptr[i];
+        float s = sin_ptr[i];
+        head_ptr[2 * i]     = x0 * c - x1 * s;
+        head_ptr[2 * i + 1] = x0 * s + x1 * c;
+    }
+}
+
 // ─── Strided Halved RoPE for KV Decompress Cache ─────────────
 // Buffer layout: [n_kv_head, max_seq, head_dim] (head-outer, token-inner).
 // Applies RoPE in-place to a sub-range [start_token .. start_token + n_tokens)
