@@ -262,6 +262,139 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_f32(
     }
 }
 
+// ─── Kernel 1-cpasync: QKV fused with cp.async weight prefetch ──
+// Same math as fused_norm_q4km_qkv_bias_f32 but replaces the
+// q4km_dot_from_shared helper with an inline loop that pre-loads each
+// next Q/K/V super-block (144 B) via cp.async while computing the
+// current super-block's dequant+FMA. X stays in s_normed from RmsNorm.
+//
+// Shared layout: s_normed[hidden_dim] + s_wbuf[2][36] = hidden_dim*4 + 288 B.
+
+extern "C" __global__ void fused_norm_q4km_qkv_bias_cpasync_f32(
+    const float* __restrict__ input,
+    const float* __restrict__ norm_weight,
+    const uint8_t* __restrict__ W_q,
+    const uint8_t* __restrict__ W_k,
+    const uint8_t* __restrict__ W_v,
+    const float* __restrict__ bias_q,
+    const float* __restrict__ bias_k,
+    const float* __restrict__ bias_v,
+    float* __restrict__ out_q,
+    float* __restrict__ out_k,
+    float* __restrict__ out_v,
+    const int hidden_dim,
+    const int q_out,
+    const int k_out,
+    const int v_out,
+    const float eps
+) {
+    extern __shared__ float s_mem[];
+    float* s_normed = s_mem;              // [hidden_dim]
+    float* s_wbuf   = s_mem + hidden_dim; // [2][36] = 288 B
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+
+    // Phase 1: RmsNorm(input) → shared memory (same as baseline)
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float val = input[i];
+        sum_sq += val * val;
+        s_normed[i] = val;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float s_rms_inv;
+    if (tid == 0) {
+        s_rms_inv = rsqrtf(sum_sq / (float)hidden_dim + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        s_normed[i] = s_normed[i] * s_rms_inv * norm_weight[i];
+    }
+    __syncthreads();
+
+    // Pick weight matrix + output slot + bias based on row range.
+    const uint8_t* W_row_base;
+    float* out;
+    const float* bias;
+    int out_row;
+    if (row < q_out) {
+        W_row_base = W_q;
+        out = out_q;
+        bias = bias_q;
+        out_row = row;
+    } else if (row < q_out + k_out) {
+        W_row_base = W_k;
+        out = out_k;
+        bias = bias_k;
+        out_row = row - q_out;
+    } else {
+        W_row_base = W_v;
+        out = out_v;
+        bias = bias_v;
+        out_row = row - q_out - k_out;
+    }
+
+    const int n_superblocks = hidden_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+    const uint8_t* w_row = W_row_base + out_row * bytes_per_row;
+
+    // Thread mapping (identical to q4km_dot_from_shared).
+    const int grp   = tid >> 6;
+    const int pos   = tid & 63;
+    const int is_hi = pos >> 5;
+    const int l     = pos & 31;
+    const int x_idx = grp * 64 + pos;
+
+    auto prefetch_w = [&](int sb) {
+        const float* src =
+            reinterpret_cast<const float*>(w_row + sb * Q4K_BLOCK_SIZE);
+        float* dst = s_wbuf + (sb & 1) * 36;
+        if (tid < 36) {
+            tq_cp_async_f32(&dst[tid], &src[tid]);
+        }
+        tq_cp_async_commit();
+    };
+
+    if (n_superblocks > 0) prefetch_w(0);
+
+    float partial_sum = 0.0f;
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        if (sb + 1 < n_superblocks) {
+            prefetch_w(sb + 1);
+            tq_cp_async_wait_one();
+        } else {
+            tq_cp_async_wait_all();
+        }
+        __syncthreads();
+
+        const uint8_t* block = reinterpret_cast<const uint8_t*>(s_wbuf + (sb & 1) * 36);
+
+        uint16_t d_bits  = block[0] | (block[1] << 8);
+        uint16_t dm_bits = block[2] | (block[3] << 8);
+        float d    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+        float dmin = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs     = block + 16;
+
+        uint8_t sc_val, m_val;
+        get_scale_min_k4(2 * grp + is_hi, scales, &sc_val, &m_val);
+
+        uint8_t q_byte = qs[grp * 32 + l];
+        float nibble = is_hi ? (float)(q_byte >> 4) : (float)(q_byte & 0xF);
+        partial_sum += (d * (float)sc_val * nibble - dmin * (float)m_val) * s_normed[sb * QK_K + x_idx];
+
+        __syncthreads();  // protect buffer before next prefetch
+    }
+
+    float result = block_reduce_sum(partial_sum);
+    if (tid == 0) {
+        out[out_row] = result + (bias ? bias[out_row] : 0.0f);
+    }
+}
+
 // ─── Kernel 3-cpasync: cp.async double-buffered weight pipeline ──
 // Same math as fused_addnorm_q4km_gateup_silu_f32, but pre-loads each
 // next superblock's gate+up weight blocks into shared memory via

@@ -2089,10 +2089,23 @@ pub fn fused_norm_q4km_qkv_bias(
     v_out: usize,
     eps: f32,
 ) -> Result<(), DriverError> {
-    let f = reg.get_fn("fused_layer", "fused_norm_q4km_qkv_bias_f32")?;
+    // QKV kernel dispatch. cpasync W-prefetch variant exists (faster per
+    // kernel call, ~17% on norm+qkv) but end-to-end parity/regression on
+    // Qwen2 7B (2026-04-14 bench: TQ -3% vs baseline). Default stays on the
+    // proven baseline kernel; set TQ_QKV=cpasync to try on other workloads.
+    static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let kernel_name = *VARIANT.get_or_init(|| {
+        match std::env::var("TQ_QKV").ok().as_deref() {
+            Some("cpasync") => "fused_norm_q4km_qkv_bias_cpasync_f32",
+            _               => "fused_norm_q4km_qkv_bias_f32",
+        }
+    });
+    let f = reg.get_fn("fused_layer", kernel_name)?;
     let total_rows = (q_out + k_out + v_out) as u32;
     let block = 256u32;
-    let shmem = (hidden_dim as u32) * 4; // f32 per element
+    // cpasync needs 288 extra bytes for s_wbuf[2][36].
+    let extra_shmem = if *kernel_name == *"fused_norm_q4km_qkv_bias_cpasync_f32" { 288 } else { 0 };
+    let shmem = (hidden_dim as u32) * 4 + extra_shmem;
     let cfg = launch_with_shmem(total_rows, block, shmem);
     let hd = hidden_dim as i32;
     let qo = q_out as i32;
