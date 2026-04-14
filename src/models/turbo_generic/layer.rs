@@ -2581,31 +2581,32 @@ impl LayerWeights {
                 self.kv_compressed = None;
             }
 
-            // H1 hybrid transition safeguard: if TQ_HYBRID_THRESHOLD is set and a
-            // layer flips from Std (uncompressed) to TQ mid-session, the compressed
-            // cache is empty but the Std-path KV stash holds real history — attention
-            // would miss it. Detect the cross and loudly one-shot warn; phase 2
-            // (batch-compress backfill) is tracked separately.
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static WARNED: AtomicBool = AtomicBool::new(false);
+            // H1 hybrid transition: detect a Std→TQ crossing (threshold set, mid-session,
+            // compressed cache empty but Std stash holds history). Extract the history
+            // tensors BEFORE we borrow self.kv_compressed mutably below; we'll feed them
+            // through the normal sink/compress pipeline as a one-shot backfill.
+            #[allow(unused_mut)]
+            let historical_kv: Option<(Tensor, Tensor)> = {
                 let hybrid_threshold = super::kv_cache::get_hybrid_threshold();
-                let has_std_history = self.kv_cache.is_some()
-                    || self.gpu_kv_cache.as_ref().map_or(false, |g| g.seq_len > 0);
-                let compressed_empty = self
-                    .kv_compressed.as_ref().map_or(true, |c| c.cached_len == 0);
-                if hybrid_threshold > 0 && index_pos > 0 && has_std_history && compressed_empty
-                    && !WARNED.swap(true, Ordering::Relaxed)
-                {
-                    eprintln!(
-                        "[tq-hybrid] WARNING layer {}: TQ_HYBRID_THRESHOLD={} crossed \
-                         mid-session; compressed cache is empty but Std history exists. \
-                         Attention will miss pre-threshold tokens. Phase-2 batch-compress \
-                         backfill not yet implemented — see knowledge \"Plan H1 phase 2\".",
-                        self.layer_idx, hybrid_threshold,
-                    );
+                let compressed_empty = self.kv_compressed.as_ref().map_or(true, |c| c.cached_len == 0);
+                if hybrid_threshold == 0 || index_pos == 0 || !compressed_empty {
+                    None
+                } else if let Some((k_hist, v_hist)) = &self.kv_cache {
+                    // CPU stash: already [1, n_kv_head, hist_len, head_dim].
+                    Some((k_hist.clone(), v_hist.clone()))
+                } else {
+                    #[cfg(feature = "cuda")]
+                    {
+                        if let Some(ref g) = self.gpu_kv_cache {
+                            if g.seq_len > 0 {
+                                Some((g.k_tensor_valid()?, g.v_tensor_valid()?))
+                            } else { None }
+                        } else { None }
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    { None }
                 }
-            }
+            };
 
             let cache_dtype = k.dtype();
             let sink_n = get_sink_tokens(&self.tq_config);
@@ -2616,6 +2617,39 @@ impl LayerWeights {
                 &layer_tq_config, &per_head_bits, effective_bits, vbits,
                 cache_dtype, pre_rope_mode,
             );
+
+            // H1 phase 2: backfill pre-threshold history into compressed cache.
+            // Runs once per layer per session, right when get_layer_bits_at first
+            // returns Some after having returned None in earlier calls.
+            if let Some((hist_k, hist_v)) = historical_kv {
+                let hist_len = hist_k.dim(2)?;
+                let cache = self.kv_compressed.as_mut().unwrap();
+                append_values_to_cache(cache, &hist_v, self.n_kv_head, hist_len, self.head_dim)?;
+                let hist_compress_start = append_sink_keys(cache, &hist_k, 0, sink_n, hist_len)?;
+                let hist_to_compress = hist_len.saturating_sub(hist_compress_start);
+                if hist_to_compress > 0 {
+                    compress_new_keys_cpu(
+                        cache, &hist_k, Some(&hist_k), pre_rope_mode,
+                        hist_compress_start, hist_to_compress,
+                        self.n_kv_head, self.head_dim, self.padded_head_dim,
+                        &layer_tq_config, &per_head_bits, &self.signs,
+                    )?;
+                }
+                cache.cached_len += hist_len;
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !LOGGED.swap(true, Ordering::Relaxed) {
+                        eprintln!("[tq-hybrid] layer {}: backfilled {} pre-threshold tokens \
+                            into compressed cache (threshold crossed mid-session)",
+                            self.layer_idx, hist_len);
+                    }
+                }
+                // Free the Std-path stashes now that history lives in compressed cache.
+                self.kv_cache = None;
+                #[cfg(feature = "cuda")]
+                { self.gpu_kv_cache = None; }
+            }
 
             let cache = self.kv_compressed.as_mut().unwrap();
             let prev_total = cache.cached_len;
