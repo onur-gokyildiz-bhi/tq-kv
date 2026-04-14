@@ -329,8 +329,19 @@ pub fn q6k_matvec(
     out_features: usize,
     in_features: usize,
 ) -> Result<(), DriverError> {
-    let f = reg.get_fn("qmatmul", "q6k_matvec_f32")?;
-    let rows_per_block = 4u32;
+    // Q6K matvec variants:
+    //   default:   4 rows/block — best on Llama3 (Q6K dequant heavier than Q4K,
+    //              mrow8 spilled registers and regressed -8..19%)
+    //   mrow8:     8 rows/block (TQ_Q6K=mrow8) — opt-in for future HW
+    static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let kernel_name = *VARIANT.get_or_init(|| {
+        match std::env::var("TQ_Q6K").ok().as_deref() {
+            Some("mrow8") => "q6k_matvec_mrow8_f32",
+            _             => "q6k_matvec_f32",
+        }
+    });
+    let f = reg.get_fn("qmatmul", kernel_name)?;
+    let rows_per_block = if *kernel_name == *"q6k_matvec_mrow8_f32" { 8u32 } else { 4u32 };
     let n_blocks = (out_features as u32 + rows_per_block - 1) / rows_per_block;
     let cfg = LaunchConfig {
         grid_dim: (n_blocks, 1, 1),

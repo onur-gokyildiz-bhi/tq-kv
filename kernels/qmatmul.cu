@@ -331,6 +331,138 @@ extern "C" __global__ void q6k_matvec_f32(
     }
 }
 
+// ─── Q6_K Matvec — 8-row variant ─────────────────────────────
+// Same math as q6k_matvec_f32; 8 output rows per block (vs 4). Grid
+// halves, 8 sums accumulators per thread, shared x reads amortized
+// across 8 dequant chains.
+
+#define MROW8_Q6K 8
+
+extern "C" __global__ void q6k_matvec_mrow8_f32(
+    const uint8_t* __restrict__ W_packed,
+    const float* __restrict__ x,
+    float* __restrict__ output,
+    const int out_features,
+    const int in_features
+) {
+    const int base_row = blockIdx.x * MROW8_Q6K;
+    const int tid = threadIdx.x;
+
+    const int n_superblocks = (in_features + QK_K - 1) / QK_K;
+    const int bytes_per_row = n_superblocks * Q6K_BLOCK_SIZE;
+
+    const int grp = tid >> 7;
+    const int pos = tid & 127;
+    const int sub = pos >> 5;
+    const int l   = pos & 31;
+    const int is  = l >> 4;
+    const int x_idx_q6 = grp * 128 + sub * 32 + l;
+
+    float sums[MROW8_Q6K] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+#if TQ_HAS_CP_ASYNC
+    __shared__ float s_x[2][QK_K];
+    int cur_buf = 0;
+
+    if (n_superblocks > 0) {
+        if (tid < in_features) {
+            tq_cp_async_f32(&s_x[0][tid], &x[tid]);
+        } else {
+            s_x[0][tid] = 0.0f;
+        }
+        tq_cp_async_commit();
+    }
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        tq_cp_async_wait_all();
+        __syncthreads();
+
+        if (sb + 1 < n_superblocks) {
+            const int next_pos = (sb + 1) * QK_K + tid;
+            if (next_pos < in_features) {
+                tq_cp_async_f32(&s_x[1 - cur_buf][tid], &x[next_pos]);
+            } else {
+                s_x[1 - cur_buf][tid] = 0.0f;
+            }
+            tq_cp_async_commit();
+        }
+
+        float x_val = s_x[cur_buf][x_idx_q6];
+
+        #pragma unroll
+        for (int r = 0; r < MROW8_Q6K; ++r) {
+            int row = base_row + r;
+            if (row >= out_features) break;
+
+            const uint8_t* block = W_packed + row * bytes_per_row + sb * Q6K_BLOCK_SIZE;
+            const uint8_t* ql = block;
+            const uint8_t* qh = block + 128;
+            const int8_t* scales = (const int8_t*)(block + 192);
+            float d = __half2float(*reinterpret_cast<const __half*>(block + 208));
+
+            int ql_off = grp * 64;
+            int qh_off = grp * 32;
+            int sc_off = grp * 8;
+
+            uint8_t ql_byte = (sub & 1) ? ql[ql_off + l + 32] : ql[ql_off + l];
+            int q_lo = (sub < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
+
+            uint8_t qh_byte = qh[qh_off + l];
+            int qh_bits = (qh_byte >> (sub * 2)) & 3;
+
+            int q = q_lo | (qh_bits << 4);
+            float sc = (float)scales[sc_off + sub * 2 + is];
+
+            sums[r] += d * sc * (float)(q - 32) * x_val;
+        }
+
+        cur_buf = 1 - cur_buf;
+        __syncthreads();
+    }
+#else
+    __shared__ float s_x[QK_K];
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        const int x_pos = sb * QK_K + tid;
+        s_x[tid] = (x_pos < in_features) ? __ldg(&x[x_pos]) : 0.0f;
+        __syncthreads();
+        float x_val = s_x[x_idx_q6];
+        #pragma unroll
+        for (int r = 0; r < MROW8_Q6K; ++r) {
+            int row = base_row + r;
+            if (row >= out_features) break;
+            const uint8_t* block = W_packed + row * bytes_per_row + sb * Q6K_BLOCK_SIZE;
+            const uint8_t* ql = block;
+            const uint8_t* qh = block + 128;
+            const int8_t* scales = (const int8_t*)(block + 192);
+            float d = __half2float(*reinterpret_cast<const __half*>(block + 208));
+            int ql_off = grp * 64;
+            int qh_off = grp * 32;
+            int sc_off = grp * 8;
+            uint8_t ql_byte = (sub & 1) ? ql[ql_off + l + 32] : ql[ql_off + l];
+            int q_lo = (sub < 2) ? (ql_byte & 0xF) : (ql_byte >> 4);
+            uint8_t qh_byte = qh[qh_off + l];
+            int qh_bits = (qh_byte >> (sub * 2)) & 3;
+            int q = q_lo | (qh_bits << 4);
+            float sc = (float)scales[sc_off + sub * 2 + is];
+            sums[r] += d * sc * (float)(q - 32) * x_val;
+        }
+        __syncthreads();
+    }
+#endif
+
+    #pragma unroll
+    for (int r = 0; r < MROW8_Q6K; ++r) {
+        int row = base_row + r;
+        if (row >= out_features) break;
+        float result = block_reduce_sum(sums[r]);
+        if (tid == 0) {
+            output[row] = result;
+        }
+        if (r < MROW8_Q6K - 1) __syncthreads();
+    }
+}
+#undef MROW8_Q6K
+
 // ─── Q8_0 Fused Matvec ───────────────────────────────────────
 // Simpler: each block is 34 bytes = [f16 d][i8 × 32]
 #define Q8_0_BLOCK_SIZE 34
