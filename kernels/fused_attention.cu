@@ -781,3 +781,106 @@ extern "C" __global__ void gqa_decode_attention_f32(
         }
     }
 }
+
+// ─── GQA Shared-K decode attention (skeleton) ────────────────────────────
+// Owner: attention-researcher  Plan: docs/gqa-shared-k-design.md
+//
+// One block per KV group (instead of one per Q head). Loads all G query
+// vectors of the group into shared mem, streams K/V once per timestep,
+// computes G dot products + G online-softmax states in parallel.
+//
+// STATUS: skeleton only. Compiles. Currently degenerates to a single-head
+// path — equivalent to gqa_decode_attention_f32 for n_qh == 1, and
+// produces only head-0 of each group for n_qh > 1. Multi-head logic is
+// flagged TODO and must be filled in before this kernel is wired into
+// dispatch.
+//
+// Do NOT wire into runtime dispatch yet. Gated behind cargo feature
+// `gqa-shared-k` on the Rust side.
+#define GQA_SHARED_MAX_QH 8     // covers Qwen2 7B (G=7); raise for wider GQA
+extern "C" __global__ void gqa_decode_attention_shared_k_f32(
+    const float* __restrict__ Q,     // [n_heads, head_dim]
+    const float* __restrict__ K,     // [n_kv_heads, max_seq, head_dim]
+    const float* __restrict__ V,     // [n_kv_heads, max_seq, head_dim]
+    float* __restrict__ output,      // [n_heads, head_dim]
+    const int n_heads,
+    const int n_kv_heads,
+    const int seq_len,
+    const int max_seq,
+    const int head_dim,
+    const float scale
+) {
+    const int kv_head = blockIdx.x;
+    if (kv_head >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+
+    const int n_qh = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
+
+    // Skeleton: only the first head of each group is fully implemented.
+    // TODO(multi-head): lift qh_active to min(n_qh, GQA_SHARED_MAX_QH).
+    const int qh_active = 1;
+
+    // Shared Q cache: G rows of head_dim. Static-sized for worst case.
+    __shared__ float s_q[GQA_SHARED_MAX_QH][MAX_HEAD_DIM];
+
+    // Load Q rows for this KV group into shared.
+    for (int qh = 0; qh < qh_active; ++qh) {
+        const int head_idx = kv_head * n_qh + qh;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            s_q[qh][d] = ld_readonly(&Q[head_idx * head_dim + d]);
+        }
+    }
+    __syncthreads();
+
+    // Per-thread V accumulator and online-softmax state — single-head only
+    // for the skeleton. TODO: extend to acc[GQA_SHARED_MAX_QH][n_acc],
+    // running_max[GQA_SHARED_MAX_QH], running_sum[GQA_SHARED_MAX_QH].
+    const int n_acc = (head_dim + blockDim.x - 1) / blockDim.x;
+    float acc[9];   // matches gqa_decode_attention_f32 sizing
+    for (int i = 0; i < n_acc; ++i) acc[i] = 0.0f;
+    float running_max = -1e10f;
+    float running_sum = 0.0f;
+
+    const float* kv_k = K + kv_head * max_seq * head_dim;
+    const float* kv_v = V + kv_head * max_seq * head_dim;
+
+    // Stream K/V — single-head path mirrors gqa_decode_attention_f32.
+    // TODO(multi-head): inner loop must compute G dot products from each
+    // shared K row, maintain G softmax states, and accumulate G V outputs.
+    // See docs/gqa-shared-k-design.md §2 for the full pseudocode.
+    for (int k = 0; k < seq_len; ++k) {
+        const float* k_row = kv_k + k * head_dim;
+        float partial_dot = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            partial_dot += s_q[0][d] * ld_readonly(&k_row[d]);
+        }
+        float score = block_reduce_sum(partial_dot) * scale;
+
+        float old_max = running_max;
+        float new_max = fmaxf(old_max, score);
+        float rf = expf(old_max - new_max);
+        running_sum = running_sum * rf + expf(score - new_max);
+        running_max = new_max;
+
+        float w = expf(score - new_max);
+        const float* v_row = kv_v + k * head_dim;
+        for (int i = 0; i < n_acc; ++i) {
+            int d = tid + i * blockDim.x;
+            if (d < head_dim) {
+                acc[i] = acc[i] * rf + w * ld_readonly(&v_row[d]);
+            }
+        }
+    }
+
+    // Write the (one) active head's output. TODO: loop qh in [0, n_qh).
+    {
+        const int head_idx = kv_head * n_qh + 0;
+        float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
+        for (int i = 0; i < n_acc; ++i) {
+            int d = tid + i * blockDim.x;
+            if (d < head_dim) {
+                output[head_idx * head_dim + d] = acc[i] * inv_sum;
+            }
+        }
+    }
+}
