@@ -2142,8 +2142,9 @@ pub fn fused_addnorm_q4km_gateup_silu(
     intermediate_dim: usize,
     eps: f32,
 ) -> Result<(), DriverError> {
-    // Gateup kernel dispatch. Five variants live in fused_layer.cu:
-    //   default (mrow4):   4 rows/block cpasync variant — best ROI RTX 3080
+    // Gateup kernel dispatch. Six variants live in fused_layer.cu:
+    //   default (mrow8):   8 rows/block cpasync variant — best ROI RTX 3080
+    //   mrow4:             4 rows/block cpasync variant  (TQ_GATEUP=mrow4)
     //   mrow2:             2 rows/block cpasync variant  (TQ_GATEUP=mrow2)
     //   cpasync:           single-row cp.async pipeline  (TQ_GATEUP=cpasync)
     //   baseline:          original no-pipeline version  (TQ_GATEUP=baseline)
@@ -2155,7 +2156,8 @@ pub fn fused_addnorm_q4km_gateup_silu(
             Some("lut")      => "fused_addnorm_q4km_gateup_silu_lut_f32",
             Some("cpasync")  => "fused_addnorm_q4km_gateup_silu_cpasync_f32",
             Some("mrow2")    => "fused_addnorm_q4km_gateup_silu_mrow2_f32",
-            _                => "fused_addnorm_q4km_gateup_silu_mrow4_f32",
+            Some("mrow4")    => "fused_addnorm_q4km_gateup_silu_mrow4_f32",
+            _                => "fused_addnorm_q4km_gateup_silu_mrow8_f32",
         }
     });
     let f = reg.get_fn("fused_layer", kernel_name)?;
@@ -2167,6 +2169,8 @@ pub fn fused_addnorm_q4km_gateup_silu(
         1152
     } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow4_f32" {
         2304
+    } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow8_f32" {
+        4608
     } else {
         0
     };
@@ -2175,6 +2179,8 @@ pub fn fused_addnorm_q4km_gateup_silu(
         (intermediate_dim as u32 + 1) / 2
     } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow4_f32" {
         (intermediate_dim as u32 + 3) / 4
+    } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow8_f32" {
+        (intermediate_dim as u32 + 7) / 8
     } else {
         intermediate_dim as u32
     };

@@ -863,6 +863,143 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_mrow4_f32(
     }
 }
 
+// ─── Kernel 3e: 8-row Fused Gateup ───────────────────────────
+// Pushes mrow pattern to 8 consecutive rows. Grid 18944 → 2368 on Qwen2 7B,
+// 16 accumulators, 16 dequant chains per superblock. Shmem 2 × 2304 B = 4608 B.
+// Register pressure is the key risk — occupancy may drop below mrow4.
+
+extern "C" __global__ void fused_addnorm_q4km_gateup_silu_mrow8_f32(
+    const float* __restrict__ input,
+    const float* __restrict__ _unused,
+    const float* __restrict__ norm_weight,
+    const uint8_t* __restrict__ W_gate,
+    const uint8_t* __restrict__ W_up,
+    float* __restrict__ intermediate_out,
+    const int hidden_dim,
+    const int intermediate_dim,
+    const float eps
+) {
+    extern __shared__ float s_mem[];
+    float* s_normed = s_mem;
+    float* s_wbuf   = s_mem + hidden_dim;   // [2 * 576] = 4608 B
+
+    const int tid   = threadIdx.x;
+    const int row0 = 8 * blockIdx.x;
+    if (row0 >= intermediate_dim) return;
+
+    // Phase 1: RmsNorm
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float val = input[i];
+        sum_sq += val * val;
+        s_normed[i] = val;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float s_rms_inv;
+    if (tid == 0) {
+        s_rms_inv = rsqrtf(sum_sq / (float)hidden_dim + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        s_normed[i] = s_normed[i] * s_rms_inv * norm_weight[i];
+    }
+    __syncthreads();
+
+    const int n_superblocks = hidden_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+    const int FLOATS_PER_BLOCK = Q4K_BLOCK_SIZE / 4;   // 36
+    const int SLOT_FLOATS      = FLOATS_PER_BLOCK * 16; // 576
+
+    const int grp   = tid >> 6;
+    const int pos   = tid & 63;
+    const int is_hi = pos >> 5;
+    const int l     = pos & 31;
+    const int x_idx = grp * 64 + pos;
+    const int j     = 2 * grp + is_hi;
+
+    // Row base pointers (clamped to row0 for out-of-range rows)
+    const uint8_t* gr[8];
+    const uint8_t* ur[8];
+    bool have[8];
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        int rr = row0 + r;
+        have[r] = (rr < intermediate_dim);
+        int safe = have[r] ? rr : row0;
+        gr[r] = W_gate + safe * bytes_per_row;
+        ur[r] = W_up   + safe * bytes_per_row;
+    }
+
+    auto prefetch_sb = [&](int sb) {
+        float* dst = s_wbuf + (sb & 1) * SLOT_FLOATS;
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const float* g_src = reinterpret_cast<const float*>(gr[r] + sb * Q4K_BLOCK_SIZE);
+            const float* u_src = reinterpret_cast<const float*>(ur[r] + sb * Q4K_BLOCK_SIZE);
+            for (int i = tid; i < FLOATS_PER_BLOCK; i += blockDim.x) {
+                tq_cp_async_f32(&dst[(2 * r)     * FLOATS_PER_BLOCK + i], &g_src[i]);
+                tq_cp_async_f32(&dst[(2 * r + 1) * FLOATS_PER_BLOCK + i], &u_src[i]);
+            }
+        }
+        tq_cp_async_commit();
+    };
+
+    if (n_superblocks > 0) prefetch_sb(0);
+
+    float gs[8] = {0,0,0,0,0,0,0,0};
+    float us[8] = {0,0,0,0,0,0,0,0};
+
+    #define Q4K_FMA(blk, accum) do { \
+        uint16_t _d_bits  = (blk)[0] | ((blk)[1] << 8); \
+        uint16_t _dm_bits = (blk)[2] | ((blk)[3] << 8); \
+        float _d    = __half2float(*reinterpret_cast<const __half*>(&_d_bits)); \
+        float _dmin = __half2float(*reinterpret_cast<const __half*>(&_dm_bits)); \
+        uint8_t _sc, _m; get_scale_min_k4(j, (blk) + 4, &_sc, &_m); \
+        uint8_t _byte = (blk)[16 + grp * 32 + l]; \
+        float   _nib  = is_hi ? (float)(_byte >> 4) : (float)(_byte & 0xF); \
+        (accum) += (_d * (float)_sc * _nib - _dmin * (float)_m) * x_val; \
+    } while (0)
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        if (sb + 1 < n_superblocks) {
+            prefetch_sb(sb + 1);
+            tq_cp_async_wait_one();
+        } else {
+            tq_cp_async_wait_all();
+        }
+        __syncthreads();
+
+        const uint8_t* slot = reinterpret_cast<const uint8_t*>(s_wbuf + (sb & 1) * SLOT_FLOATS);
+        float x_val = s_normed[sb * QK_K + x_idx];
+
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            Q4K_FMA(slot + (2 * r)     * Q4K_BLOCK_SIZE, gs[r]);
+            Q4K_FMA(slot + (2 * r + 1) * Q4K_BLOCK_SIZE, us[r]);
+        }
+
+        __syncthreads();
+    }
+    #undef Q4K_FMA
+
+    // Reduce 16 accumulators sequentially
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        gs[r] = block_reduce_sum(gs[r]); __syncthreads();
+        us[r] = block_reduce_sum(us[r]); __syncthreads();
+    }
+
+    if (tid == 0) {
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            if (have[r]) {
+                float s = gs[r] / (1.0f + expf(-gs[r]));
+                intermediate_out[row0 + r] = s * us[r];
+            }
+        }
+    }
+}
+
 // ─── Kernel 3b: Warp-shuffle LUT Fused Gateup ───────────────
 // Uses warp shuffle instead of shared memory for dequant LUT.
 // Each warp (32 threads) is in the same sub-block. Lanes 0-15 compute
