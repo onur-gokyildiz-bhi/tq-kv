@@ -2142,8 +2142,9 @@ pub fn fused_addnorm_q4km_gateup_silu(
     intermediate_dim: usize,
     eps: f32,
 ) -> Result<(), DriverError> {
-    // Gateup kernel dispatch. Four variants live in fused_layer.cu:
-    //   default (mrow2):   2 rows/block cpasync variant — best ROI RTX 3080
+    // Gateup kernel dispatch. Five variants live in fused_layer.cu:
+    //   default (mrow4):   4 rows/block cpasync variant — best ROI RTX 3080
+    //   mrow2:             2 rows/block cpasync variant  (TQ_GATEUP=mrow2)
     //   cpasync:           single-row cp.async pipeline  (TQ_GATEUP=cpasync)
     //   baseline:          original no-pipeline version  (TQ_GATEUP=baseline)
     //   lut:               warp-shuffle dequant LUT       (TQ_GATEUP=lut)
@@ -2153,23 +2154,27 @@ pub fn fused_addnorm_q4km_gateup_silu(
             Some("baseline") => "fused_addnorm_q4km_gateup_silu_f32",
             Some("lut")      => "fused_addnorm_q4km_gateup_silu_lut_f32",
             Some("cpasync")  => "fused_addnorm_q4km_gateup_silu_cpasync_f32",
-            _                => "fused_addnorm_q4km_gateup_silu_mrow2_f32",
+            Some("mrow2")    => "fused_addnorm_q4km_gateup_silu_mrow2_f32",
+            _                => "fused_addnorm_q4km_gateup_silu_mrow4_f32",
         }
     });
     let f = reg.get_fn("fused_layer", kernel_name)?;
     let block = 256u32;
-    // cpasync: 576 B; mrow2: 1152 B (2 rows × gate+up × 2 slots); baseline/lut: 0.
+    // cpasync: 576 B; mrow2: 1152 B; mrow4: 2304 B; baseline/lut: 0.
     let extra_shmem: u32 = if *kernel_name == *"fused_addnorm_q4km_gateup_silu_cpasync_f32" {
         576
     } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow2_f32" {
         1152
+    } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow4_f32" {
+        2304
     } else {
         0
     };
     let shmem = (hidden_dim as u32) * 4 + extra_shmem;
-    // mrow2 halves grid count (2 intermediate_dim outputs per block).
     let grid = if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow2_f32" {
         (intermediate_dim as u32 + 1) / 2
+    } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow4_f32" {
+        (intermediate_dim as u32 + 3) / 4
     } else {
         intermediate_dim as u32
     };
