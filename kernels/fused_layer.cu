@@ -899,6 +899,106 @@ extern "C" __global__ void fused_q4km_down_residual_cpasync_f32(
     }
 }
 
+// ─── Kernel 4b: Multi-row (2 rows/block) Down+Residual ──────
+// Same pattern as gateup mrow2: each block produces TWO consecutive
+// hidden_dim outputs sharing the same intermediate[] reads across both
+// weight rows. Halves grid (3584 → 1792 on Qwen2 7B) while keeping the
+// cooperative cp.async pipeline.
+//
+// Shared memory: s_wbuf[2][72] floats = 576 B (2 slots × [w_a(36) | w_b(36)])
+
+extern "C" __global__ void fused_q4km_down_residual_mrow2_cpasync_f32(
+    const uint8_t* __restrict__ W_down,
+    const float* __restrict__ intermediate,
+    float* __restrict__ residual,
+    const int hidden_dim,
+    const int intermediate_dim
+) {
+    const int row_a = 2 * blockIdx.x;
+    const int row_b = row_a + 1;
+    if (row_a >= hidden_dim) return;
+    const bool have_b = (row_b < hidden_dim);
+    const int tid = threadIdx.x;
+
+    const int n_superblocks = intermediate_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+    const uint8_t* w_row_a = W_down + row_a * bytes_per_row;
+    const uint8_t* w_row_b = have_b ? (W_down + row_b * bytes_per_row) : w_row_a;
+
+    // Thread mapping within a QK_K=256 super-block.
+    const int grp   = tid >> 6;
+    const int pos   = tid & 63;
+    const int is_hi = pos >> 5;
+    const int l     = pos & 31;
+    const int x_idx = grp * 64 + pos;
+    const int j     = 2 * grp + is_hi;
+
+    __shared__ float s_wbuf[2][72];  // 2 slots × (w_a[36] + w_b[36])
+
+    auto prefetch_w = [&](int sb) {
+        const float* src_a = reinterpret_cast<const float*>(w_row_a + sb * Q4K_BLOCK_SIZE);
+        const float* src_b = reinterpret_cast<const float*>(w_row_b + sb * Q4K_BLOCK_SIZE);
+        float* dst = s_wbuf[sb & 1];
+        if (tid < 36) {
+            tq_cp_async_f32(&dst[tid],      &src_a[tid]);
+            tq_cp_async_f32(&dst[36 + tid], &src_b[tid]);
+        }
+        tq_cp_async_commit();
+    };
+
+    if (n_superblocks > 0) prefetch_w(0);
+
+    float partial_a = 0.0f;
+    float partial_b = 0.0f;
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        if (sb + 1 < n_superblocks) {
+            prefetch_w(sb + 1);
+            tq_cp_async_wait_one();
+        } else {
+            tq_cp_async_wait_all();
+        }
+        __syncthreads();
+
+        const uint8_t* slot = reinterpret_cast<const uint8_t*>(s_wbuf[sb & 1]);
+        const uint8_t* blk_a = slot;
+        const uint8_t* blk_b = slot + Q4K_BLOCK_SIZE;
+        const float*   x_sb  = intermediate + sb * QK_K;
+        float x_val = x_sb[x_idx];
+
+        // Row A dequant
+        uint16_t ad_bits  = blk_a[0] | (blk_a[1] << 8);
+        uint16_t adm_bits = blk_a[2] | (blk_a[3] << 8);
+        float ad    = __half2float(*reinterpret_cast<const __half*>(&ad_bits));
+        float admin = __half2float(*reinterpret_cast<const __half*>(&adm_bits));
+        uint8_t a_sc, a_m; get_scale_min_k4(j, blk_a + 4, &a_sc, &a_m);
+        uint8_t a_byte = blk_a[16 + grp * 32 + l];
+        float   a_nib  = is_hi ? (float)(a_byte >> 4) : (float)(a_byte & 0xF);
+        partial_a += (ad * (float)a_sc * a_nib - admin * (float)a_m) * x_val;
+
+        // Row B dequant
+        uint16_t bd_bits  = blk_b[0] | (blk_b[1] << 8);
+        uint16_t bdm_bits = blk_b[2] | (blk_b[3] << 8);
+        float bd    = __half2float(*reinterpret_cast<const __half*>(&bd_bits));
+        float bdmin = __half2float(*reinterpret_cast<const __half*>(&bdm_bits));
+        uint8_t b_sc, b_m; get_scale_min_k4(j, blk_b + 4, &b_sc, &b_m);
+        uint8_t b_byte = blk_b[16 + grp * 32 + l];
+        float   b_nib  = is_hi ? (float)(b_byte >> 4) : (float)(b_byte & 0xF);
+        partial_b += (bd * (float)b_sc * b_nib - bdmin * (float)b_m) * x_val;
+
+        __syncthreads();  // protect slot before next prefetch
+    }
+
+    partial_a = block_reduce_sum(partial_a);
+    __syncthreads();
+    partial_b = block_reduce_sum(partial_b);
+
+    if (tid == 0) {
+        residual[row_a] += partial_a;
+        if (have_b) residual[row_b] += partial_b;
+    }
+}
+
 // ─── Kernel 4: Fused Down Projection + Residual Add ──────────
 // Grid: hidden_dim blocks, 256 threads
 // Thread-per-superblock striding for down projection (intermediate_dim=18944 → 74 sb).
