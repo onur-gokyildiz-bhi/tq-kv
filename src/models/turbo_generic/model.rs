@@ -210,66 +210,92 @@ fn try_fused_decode_layer(
                         if let Some(ref mut scratch) = decode_scratch {
                             let pdet_qkv = profiling && layer_idx == 0;
                             let _tqkv = if pdet_qkv { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
-                            let ci = layer_idx & 1;
-                            {
-                                let normed = Arc::get_mut(&mut scratch.combined_bufs[ci])
-                                    .expect("scratch combined aliased in QKV");
-                                crate::cuda::kernels::rms_norm(
-                                    reg, input_gpu, norm_w, normed,
-                                    1, hidden_dim, layer.attention_norm.eps as f32,
-                                ).map_err(|e| TqError::Msg(format!("scratch rms_norm: {}", e)))?;
-                            }
-                            let normed_ptr: &cudarc::driver::CudaSlice<f32> = &*scratch.combined_bufs[ci];
 
-                            // Step 2: Q matvec (Q4K) → scratch.q_buf
-                            {
-                                let oq = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
-                                crate::cuda::kernels::q4km_matvec(
-                                    reg, wq_gpu, normed_ptr, oq, q_out, hidden_dim,
-                                ).map_err(|e| TqError::Msg(format!("scratch Q matvec: {}", e)))?;
-                            }
-                            // Step 3: K matvec (Q4K) → scratch.k_buf
-                            {
-                                let ok = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
-                                crate::cuda::kernels::q4km_matvec(
-                                    reg, wk_gpu, normed_ptr, ok, k_out, hidden_dim,
-                                ).map_err(|e| TqError::Msg(format!("scratch K matvec: {}", e)))?;
-                            }
-                            // Step 4: V matvec (Q4K or Q6K fallback) → scratch.v_buf
-                            {
-                                let ov = Arc::get_mut(&mut scratch.v_buf).expect("v aliased");
-                                let wv = if let QkvWeights::Separate { wv, .. } = &layer.qkv { wv } else { unreachable!() };
-                                if let Some((wv_gpu, v_out, _)) = wv.q4k_gpu_data() {
+                            // Try fully-fused path: single kernel does RMSNorm + Q/K/V Q4K matvec + biases.
+                            // Requires all three weights to be Q4K (fallback for Q6K V below).
+                            let wv = if let QkvWeights::Separate { wv, .. } = &layer.qkv { wv } else { unreachable!() };
+                            let v_q4k = wv.q4k_gpu_data();
+                            let use_fused = v_q4k.is_some();
+
+                            if let Some((wv_gpu, v_out, _)) = v_q4k {
+                                // Plan #1: fuse rms_norm + 3× q4km_matvec + 3× bias_add → 1 kernel.
+                                // Saves 6 launches per layer. PPL-safe: math is identical, only dispatch fuses.
+                                let bq_ref = layer.attention_bq.as_ref().map(|b| b.cuda_data());
+                                let bk_ref = layer.attention_bk.as_ref().map(|b| b.cuda_data());
+                                let bv_ref = layer.attention_bv.as_ref().map(|b| b.cuda_data());
+                                // Disjoint-field borrow: q_buf, k_buf, v_buf are independent Arc<CudaSlice>
+                                // fields on scratch — borrowck tracks them per-field in Rust 2021.
+                                let (oq, ok, ov) = (
+                                    Arc::get_mut(&mut scratch.q_buf).expect("q aliased"),
+                                    Arc::get_mut(&mut scratch.k_buf).expect("k aliased"),
+                                    Arc::get_mut(&mut scratch.v_buf).expect("v aliased"),
+                                );
+                                crate::cuda::kernels::fused_norm_q4km_qkv_bias(
+                                    reg, input_gpu, norm_w,
+                                    wq_gpu, wk_gpu, wv_gpu,
+                                    bq_ref, bk_ref, bv_ref,
+                                    oq, ok, ov,
+                                    hidden_dim, q_out, k_out, v_out,
+                                    layer.attention_norm.eps as f32,
+                                ).map_err(|e| TqError::Msg(format!("fused_norm_q4km_qkv_bias: {}", e)))?;
+                            } else {
+                                // V is not Q4K (e.g. Q6K) — keep the legacy 4-to-7 kernel path.
+                                let ci = layer_idx & 1;
+                                {
+                                    let normed = Arc::get_mut(&mut scratch.combined_bufs[ci])
+                                        .expect("scratch combined aliased in QKV");
+                                    crate::cuda::kernels::rms_norm(
+                                        reg, input_gpu, norm_w, normed,
+                                        1, hidden_dim, layer.attention_norm.eps as f32,
+                                    ).map_err(|e| TqError::Msg(format!("scratch rms_norm: {}", e)))?;
+                                }
+                                let normed_ptr: &cudarc::driver::CudaSlice<f32> = &*scratch.combined_bufs[ci];
+
+                                {
+                                    let oq = Arc::get_mut(&mut scratch.q_buf).expect("q aliased");
                                     crate::cuda::kernels::q4km_matvec(
-                                        reg, wv_gpu, normed_ptr, ov, v_out, hidden_dim,
-                                    ).map_err(|e| TqError::Msg(format!("scratch V Q4K: {}", e)))?;
-                                } else if let qmm::QMatMul::Quantized(qw) = &wv.inner {
-                                    // Q6K: native fused dequant matvec (4.9x less bandwidth than F32)
-                                    let w_raw = qw.gpu_cache_or_upload(&reg.stream);
-                                    crate::cuda::kernels::q6k_matvec(
-                                        reg, w_raw, normed_ptr, ov, qw.out_features(), qw.in_features(),
-                                    ).map_err(|e| TqError::Msg(format!("scratch V Q6K: {}", e)))?;
-                                } else {
-                                    return Err(TqError::Msg("V weight: unsupported format".into()));
+                                        reg, wq_gpu, normed_ptr, oq, q_out, hidden_dim,
+                                    ).map_err(|e| TqError::Msg(format!("scratch Q matvec: {}", e)))?;
+                                }
+                                {
+                                    let ok = Arc::get_mut(&mut scratch.k_buf).expect("k aliased");
+                                    crate::cuda::kernels::q4km_matvec(
+                                        reg, wk_gpu, normed_ptr, ok, k_out, hidden_dim,
+                                    ).map_err(|e| TqError::Msg(format!("scratch K matvec: {}", e)))?;
+                                }
+                                {
+                                    let ov = Arc::get_mut(&mut scratch.v_buf).expect("v aliased");
+                                    if let qmm::QMatMul::Quantized(qw) = &wv.inner {
+                                        // Q6K: native fused dequant matvec (4.9x less bandwidth than F32)
+                                        let w_raw = qw.gpu_cache_or_upload(&reg.stream);
+                                        crate::cuda::kernels::q6k_matvec(
+                                            reg, w_raw, normed_ptr, ov, qw.out_features(), qw.in_features(),
+                                        ).map_err(|e| TqError::Msg(format!("scratch V Q6K: {}", e)))?;
+                                    } else {
+                                        return Err(TqError::Msg("V weight: unsupported format".into()));
+                                    }
+                                }
+                                if let Some(ref bq) = layer.attention_bq {
+                                    let oq = Arc::get_mut(&mut scratch.q_buf).expect("q bias");
+                                    crate::cuda::kernels::bias_add_inplace(reg, oq, bq.cuda_data(), q_out)
+                                        .map_err(|e| TqError::Msg(format!("Q bias: {}", e)))?;
+                                }
+                                if let Some(ref bk) = layer.attention_bk {
+                                    let ok = Arc::get_mut(&mut scratch.k_buf).expect("k bias");
+                                    crate::cuda::kernels::bias_add_inplace(reg, ok, bk.cuda_data(), k_out)
+                                        .map_err(|e| TqError::Msg(format!("K bias: {}", e)))?;
+                                }
+                                if let Some(ref bv) = layer.attention_bv {
+                                    let ov = Arc::get_mut(&mut scratch.v_buf).expect("v bias");
+                                    crate::cuda::kernels::bias_add_inplace(reg, ov, bv.cuda_data(), scratch.v_out)
+                                        .map_err(|e| TqError::Msg(format!("V bias: {}", e)))?;
                                 }
                             }
-                            // Step 5: Add biases in-place (Qwen2 has Q/K/V biases)
-                            if let Some(ref bq) = layer.attention_bq {
-                                let oq = Arc::get_mut(&mut scratch.q_buf).expect("q bias");
-                                crate::cuda::kernels::bias_add_inplace(reg, oq, bq.cuda_data(), q_out)
-                                    .map_err(|e| TqError::Msg(format!("Q bias: {}", e)))?;
+                            if let Some(t) = _tqkv {
+                                let _ = reg.stream.synchronize();
+                                let label = if use_fused { "fused-qkv" } else { "norm+qkv" };
+                                eprintln!("[kernel] {:>12}: {:.1}μs", label, t.elapsed().as_nanos() as f64 / 1000.0);
                             }
-                            if let Some(ref bk) = layer.attention_bk {
-                                let ok = Arc::get_mut(&mut scratch.k_buf).expect("k bias");
-                                crate::cuda::kernels::bias_add_inplace(reg, ok, bk.cuda_data(), k_out)
-                                    .map_err(|e| TqError::Msg(format!("K bias: {}", e)))?;
-                            }
-                            if let Some(ref bv) = layer.attention_bv {
-                                let ov = Arc::get_mut(&mut scratch.v_buf).expect("v bias");
-                                crate::cuda::kernels::bias_add_inplace(reg, ov, bv.cuda_data(), scratch.v_out)
-                                    .map_err(|e| TqError::Msg(format!("V bias: {}", e)))?;
-                            }
-                            if let Some(t) = _tqkv { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "norm+qkv", t.elapsed().as_nanos() as f64 / 1000.0); }
                             Some((true, None, hidden_dim))
                         } else {
                             // No scratch: compute via forward, wrap as tensors
