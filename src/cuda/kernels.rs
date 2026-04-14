@@ -2119,7 +2119,20 @@ pub fn fused_addnorm_q4km_gateup_silu(
     intermediate_dim: usize,
     eps: f32,
 ) -> Result<(), DriverError> {
-    let f = reg.get_fn("fused_layer", "fused_addnorm_q4km_gateup_silu_f32")?;
+    // LUT (warp-shuffle dequant) variant tested on 2026-04-14: marginally slower
+    // than the baseline on RTX 3080 — the warp-shuffle overhead outweighed the
+    // ~15 instructions/superblock saved. Keep it available behind TQ_GATEUP_LUT=1
+    // for future hardware where the tradeoff may flip; default is the baseline.
+    static USE_LUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let use_lut = *USE_LUT.get_or_init(|| {
+        std::env::var("TQ_GATEUP_LUT").ok().map_or(false, |v| v == "1")
+    });
+    let kernel_name = if use_lut {
+        "fused_addnorm_q4km_gateup_silu_lut_f32"
+    } else {
+        "fused_addnorm_q4km_gateup_silu_f32"
+    };
+    let f = reg.get_fn("fused_layer", kernel_name)?;
     let block = 256u32;
     let shmem = (hidden_dim as u32) * 4;
     let cfg = launch_with_shmem(intermediate_dim as u32, block, shmem);
