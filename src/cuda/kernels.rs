@@ -390,6 +390,54 @@ pub fn q8_0_matvec(
     Ok(())
 }
 
+/// Block size of GGUF q8_1 (must equal sizeof(block_q8_1) in ggml-common.h).
+/// Layout: half2 ds (4B) + int8 qs[32] (32B) = 36 bytes. No padding.
+pub const Q8_1_BLOCK_BYTES: usize = 36;
+pub const QK8_1: usize = 32;
+
+/// Launch quantize_f32_to_q8_1_f32: convert FP32 activations to GGUF q8_1
+/// blocks (prerequisite for the dp4a q4km×q8_1 matvec — MMVQ Step 1).
+///
+/// `n_elements` must be a multiple of `QK8_1` (32). The output buffer must
+/// hold at least `(n_elements / QK8_1) * Q8_1_BLOCK_BYTES` bytes.
+///
+/// One CUDA block = one warp = one q8_1 block (32 elements).
+pub fn quantize_f32_to_q8_1(
+    reg: &KernelRegistry,
+    x: &CudaSlice<f32>,
+    out_q8_1: &mut CudaSlice<u8>,
+    n_elements: usize,
+) -> Result<(), DriverError> {
+    debug_assert!(
+        n_elements % QK8_1 == 0,
+        "quantize_f32_to_q8_1: n_elements ({}) must be multiple of {}",
+        n_elements, QK8_1
+    );
+    let n_blocks = n_elements / QK8_1;
+    debug_assert!(
+        out_q8_1.len() >= n_blocks * Q8_1_BLOCK_BYTES,
+        "quantize_f32_to_q8_1: out buffer {} bytes < required {}",
+        out_q8_1.len(), n_blocks * Q8_1_BLOCK_BYTES
+    );
+    let f = reg.get_fn("qmatmul", "quantize_f32_to_q8_1_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_blocks as u32, 1, 1),
+        block_dim: (32, 1, 1),     // one warp per block
+        shared_mem_bytes: 0,
+    };
+    let n_el = n_elements as i32;
+    let n_bl = n_blocks as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(x)
+            .arg(out_q8_1)
+            .arg(&n_el)
+            .arg(&n_bl)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Launch elementwise add_f32.
 pub fn add(
     reg: &KernelRegistry,
@@ -2264,4 +2312,103 @@ pub fn fused_q4km_down_residual(
             .launch(cfg)?;
     }
     Ok(())
+}
+
+// ─── GPU smoke tests ─────────────────────────────────────────
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+
+    /// MMVQ Step 1 round-trip: f32 → q8_1 → f32, max abs error ≤ d/2 (≈ amax/254).
+    /// Uses a deterministic input so the bound is tight and reproducible.
+    #[test]
+    fn quantize_f32_to_q8_1_roundtrip() {
+        let ctx = match cudarc::driver::CudaContext::new(0) {
+            Ok(c) => c,
+            Err(e) => { eprintln!("[skip] no CUDA device: {:?}", e); return; }
+        };
+        let stream = ctx.default_stream();
+        let (sm_major, sm_minor) = {
+            use cudarc::driver::sys;
+            let mut device: sys::CUdevice = 0;
+            let mut major: i32 = 0;
+            let mut minor: i32 = 0;
+            unsafe {
+                sys::cuDeviceGet(&mut device, 0);
+                sys::cuDeviceGetAttribute(&mut major,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+                sys::cuDeviceGetAttribute(&mut minor,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+            }
+            (major as u32, minor as u32)
+        };
+        let reg = KernelRegistry::new(&ctx, &stream, sm_major, sm_minor)
+            .expect("kernel registry init");
+
+        // 4 blocks × 32 elements; mix of magnitudes so each block has a different scale.
+        const N_BLOCKS: usize = 4;
+        const N: usize = N_BLOCKS * QK8_1;
+        let mut x_host = vec![0.0f32; N];
+        for b in 0..N_BLOCKS {
+            // Per-block amax escalates: 1.0, 2.5, 0.125, 10.0
+            let amax = [1.0_f32, 2.5, 0.125, 10.0][b];
+            for i in 0..QK8_1 {
+                // sawtooth in [-amax, +amax]
+                let t = (i as f32 / (QK8_1 - 1) as f32) * 2.0 - 1.0;
+                x_host[b * QK8_1 + i] = t * amax;
+            }
+        }
+
+        let x_dev = stream.memcpy_stod(&x_host).expect("upload x");
+        let mut out_dev: cudarc::driver::CudaSlice<u8> =
+            stream.alloc_zeros(N_BLOCKS * Q8_1_BLOCK_BYTES).expect("alloc out");
+
+        quantize_f32_to_q8_1(&reg, &x_dev, &mut out_dev, N).expect("launch");
+        stream.synchronize().expect("sync");
+
+        let out_host = stream.memcpy_dtov(&out_dev).expect("download");
+
+        // Decode each block and verify round-trip error ≤ d/2 (with small float slack).
+        for b in 0..N_BLOCKS {
+            let off = b * Q8_1_BLOCK_BYTES;
+            let block = &out_host[off..off + Q8_1_BLOCK_BYTES];
+            // half2 ds
+            let d_bits = u16::from_le_bytes([block[0], block[1]]);
+            let s_bits = u16::from_le_bytes([block[2], block[3]]);
+            let d = half::f16::from_bits(d_bits).to_f32();
+            let _s = half::f16::from_bits(s_bits).to_f32();
+
+            // qs[32]
+            let mut max_err = 0.0f32;
+            let mut sum_q: i32 = 0;
+            for i in 0..QK8_1 {
+                let q = block[4 + i] as i8;
+                sum_q += q as i32;
+                let dq = (q as f32) * d;
+                let err = (dq - x_host[b * QK8_1 + i]).abs();
+                if err > max_err { max_err = err; }
+            }
+
+            // Upper bound: |x - q*d| ≤ d/2 (rounding) + half-precision error on d.
+            // For d up to ~10/127 ≈ 0.079, slack of 1e-3 is generous.
+            let bound = d * 0.5 + 1e-3;
+            assert!(max_err <= bound,
+                "block {}: round-trip max_err {:.6} > bound {:.6} (d={:.6})",
+                b, max_err, bound, d);
+
+            // Also verify max_err < 1/127 of the per-block amax (spec from agent brief).
+            let amax_block = [1.0_f32, 2.5, 0.125, 10.0][b];
+            let per_elem_bound = amax_block / 127.0;
+            assert!(max_err <= per_elem_bound + 1e-4,
+                "block {}: max_err {:.6} > 1/127 * amax = {:.6}",
+                b, max_err, per_elem_bound);
+
+            // s should equal d * sum_q (within fp16 slack).
+            let s_expected = d * (sum_q as f32);
+            let s_stored = _s;
+            assert!((s_stored - s_expected).abs() <= 1e-2 * (s_expected.abs() + 1.0),
+                "block {}: s mismatch — stored {:.6}, expected {:.6}",
+                b, s_stored, s_expected);
+        }
+    }
 }

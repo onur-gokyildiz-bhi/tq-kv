@@ -1093,3 +1093,65 @@ extern "C" __global__ void q4km_dequant_f16(
             out[base + 32 + l] = __float2half(d_hi * (float)(byte >> 4)  - dm_hi);
     }
 }
+
+// ─── FP32 → q8_1 Activation Quantizer (MMVQ Step 1) ─────────────
+// Produces GGUF-compatible block_q8_1 layout for the upcoming dp4a
+// q4km×q8_1 matvec path. Block size = 32 elements; per-block storage:
+//
+//   struct block_q8_1 {
+//       half2  ds;        // d (scale) + s (sum * d), 4 bytes
+//       int8_t qs[32];    // quantized values, 32 bytes
+//   };                    // total 36 bytes — must match ggml-common.h
+//
+// Algorithm per block (matches llama.cpp quantize_q8_1):
+//   d = max(|x|) / 127
+//   q[i] = round(x[i] / d), clamped to [-128, 127]
+//   s = d * sum(q[i])
+//
+// Launch: 1 warp (32 threads) per block, n_blocks = ceil(n / 32).
+// Each thread owns one element; warp reductions compute amax + sum.
+
+#define QK8_1 32
+#define Q8_1_BLOCK_SIZE 36   // sizeof(block_q8_1) — must equal sizeof in ggml-common.h
+
+extern "C" __global__ void quantize_f32_to_q8_1_f32(
+    const float* __restrict__ x,
+    uint8_t* __restrict__ y,        // points at array of block_q8_1 (36B each)
+    const int n_elements,           // total f32 elements (must be multiple of QK8_1)
+    const int n_blocks              // ceil(n_elements / QK8_1)
+) {
+    const int block_id = blockIdx.x;
+    const int lane     = threadIdx.x;       // 0..31 — exactly one warp
+    if (block_id >= n_blocks) return;
+
+    const int idx = block_id * QK8_1 + lane;
+    const float xi = (idx < n_elements) ? x[idx] : 0.0f;
+
+    // Full-warp reductions (warp_reduce_* in common.cuh use mask 0xFFFFFFFF
+    // and butterfly XOR — result broadcast to all 32 lanes).
+    float amax = warp_reduce_max(fabsf(xi));
+
+    const float d     = amax / 127.0f;
+    const float d_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+    // Quantize: round to nearest, clamp to int8 range.
+    int qi = __float2int_rn(xi * d_inv);
+    qi = max(-128, min(127, qi));
+    const int8_t q = (amax == 0.0f) ? (int8_t)0 : (int8_t)qi;
+
+    // s = d * sum(q[i]) — every lane must participate in the reduction.
+    float sum_q = warp_reduce_sum((float)q);
+
+    // Block layout: [half2 ds (4B)][int8 qs[32] (32B)] = 36B
+    uint8_t* block_ptr = y + (size_t)block_id * Q8_1_BLOCK_SIZE;
+    int8_t* qs_ptr = (int8_t*)(block_ptr + 4);
+    qs_ptr[lane] = q;
+
+    if (lane == 0) {
+        const float s = d * sum_q;
+        half2 ds = __floats2half2_rn(d, s);
+        *reinterpret_cast<half2*>(block_ptr) = ds;
+    }
+}
+#undef QK8_1
+#undef Q8_1_BLOCK_SIZE
