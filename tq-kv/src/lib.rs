@@ -341,12 +341,52 @@ impl TurboQuantConfig {
         self
     }
 
+    /// Validate asymmetric K/V overrides.
+    ///
+    /// Per Q2 (knowledge: `unblocks:hadamard-open-q`, 2026-04-14): valid
+    /// `k_bits` / `v_bits` overrides are `Some(2)..=Some(8)`. `Some(0)`,
+    /// `Some(1)`, and values `> 8` are rejected. `None` is always valid (means
+    /// "fall back to `bits` / `value_bits`"). Defer the type-safe `KBits`
+    /// enum to v0.7.0-beta.2.
+    ///
+    /// Returns `Err(&'static str)` with a human-readable reason. Symmetric
+    /// callers (both `None`) always pass.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        fn check(label: &'static str, b: Option<u8>) -> Result<(), &'static str> {
+            match b {
+                None => Ok(()),
+                Some(0) => Err(concat_label(label, "= Some(0): use value_bits or future KBits::Fp16 for uncompressed K/V")),
+                Some(1) => Err(concat_label(label, "= Some(1): 1-bit not supported, valid range is Some(2)..=Some(8)")),
+                Some(v) if v > 8 => Err(concat_label(label, "> 8: valid range is Some(2)..=Some(8)")),
+                Some(_) => Ok(()),
+            }
+        }
+        // Static error strings — pick one of a small fixed set per field.
+        // (Avoids allocating; messages are coarse-grained but actionable.)
+        fn concat_label(label: &'static str, _msg: &'static str) -> &'static str {
+            // We can't format! into &'static str; pick the most specific
+            // static message based on label.
+            match label {
+                "k_bits" => "k_bits invalid: must be None or Some(b) with 2 <= b <= 8",
+                "v_bits" => "v_bits invalid: must be None or Some(b) with 2 <= b <= 8",
+                _ => "k_bits/v_bits invalid: must be None or Some(b) with 2 <= b <= 8",
+            }
+        }
+        check("k_bits", self.k_bits)?;
+        check("v_bits", self.v_bits)?;
+        Ok(())
+    }
+
     /// Effective key bit width.
     ///
     /// Returns `k_bits` if set AND the `asymmetric-kv` feature is active,
     /// otherwise falls back to `self.bits` (symmetric / legacy behavior).
     /// Per-head overrides via [`bits_for_head`] still take precedence at callsites
     /// that use them.
+    ///
+    /// Q1 (knowledge: `unblocks:hadamard-open-q`, 2026-04-14): keep the
+    /// `effective_*` accessor names — the prefix disambiguates from the field
+    /// and signals symmetric-fallback semantics. Do not shorten.
     ///
     /// [`bits_for_head`]: Self::bits_for_head
     #[inline]
@@ -1455,6 +1495,12 @@ pub fn compress_single_key(
 ) -> (Vec<u8>, f32) {
     assert_eq!(key.len(), dim);
 
+    // Asymmetric K/V (Step 2): use effective_k_bits() so callers that opted
+    // into the `asymmetric-kv` feature get the K-side bit width on the hot
+    // incremental path. Falls back to `config.bits` when the feature is off
+    // or when `k_bits` is None — preserving symmetric behavior.
+    let k_bits = config.effective_k_bits();
+
     let mut rotated = key.to_vec();
     if let Some(ref scales) = config.channel_scales {
         for (val, &s) in rotated.iter_mut().zip(scales.iter()) {
@@ -1464,7 +1510,7 @@ pub fn compress_single_key(
     hadamard::randomized_hadamard(&mut rotated, config.rotation_seed);
 
     let norm: f32 = rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let base_cb = codebook::Codebook::new(config.bits, dim);
+    let base_cb = codebook::Codebook::new(k_bits, dim);
 
     let indices: Vec<u8> = if norm < 1e-10 {
         vec![0u8; dim]
@@ -1486,7 +1532,7 @@ pub fn compress_single_key(
         norm
     };
 
-    let packed = codebook::pack_indices(&indices, config.bits);
+    let packed = codebook::pack_indices(&indices, k_bits);
     (packed, corrected_norm)
 }
 
@@ -1542,8 +1588,12 @@ pub fn compress_single_key_with_signs(
         hadamard::randomized_hadamard_with_signs(&mut rotated, signs);
     }
 
+    // Asymmetric K/V (Step 2): codebook + bit-pack use the K-side effective
+    // bit width; with the `asymmetric-kv` feature off this is `config.bits`.
+    let k_bits = config.effective_k_bits();
+
     let norm: f32 = rotated.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let base_cb = codebook::Codebook::new(config.bits, dim);
+    let base_cb = codebook::Codebook::new(k_bits, dim);
 
     let indices: Vec<u8> = if norm < 1e-10 {
         vec![0u8; dim]
@@ -1601,7 +1651,7 @@ pub fn compress_single_key_with_signs(
         norm
     };
 
-    let packed = codebook::pack_indices(&indices, config.bits);
+    let packed = codebook::pack_indices(&indices, k_bits);
     (packed, corrected_norm, token_mean)
 }
 
@@ -1668,7 +1718,13 @@ pub fn compress_single_key_grouped(
         None
     };
 
-    let base_cb = codebook::Codebook::new(config.bits, dim);
+    // Asymmetric K/V (Step 2): grouped K compression honors effective_k_bits()
+    // so `tq_kv::TurboQuantConfig { bits: 4, k_bits: Some(8), .. }` compresses
+    // K at 8-bit while leaving V on its own bit width path. Symmetric callers
+    // (k_bits = None or feature off) fall back to `config.bits`.
+    let k_bits = config.effective_k_bits();
+
+    let base_cb = codebook::Codebook::new(k_bits, dim);
     let n_groups = dim / gs;
     let mut indices = Vec::with_capacity(dim);
     let mut group_norms = Vec::with_capacity(n_groups);
@@ -1710,7 +1766,7 @@ pub fn compress_single_key_grouped(
         }
     }
 
-    let packed = codebook::pack_indices(&indices, config.bits);
+    let packed = codebook::pack_indices(&indices, k_bits);
 
     // Residual quantization: quantize the first-pass error
     let residual = if config.residual_bits > 0 {

@@ -11,6 +11,18 @@ keywords = ["llm", "inference", "turboquant", "kv-cache", "quantization"]
 [features]
 default = []
 cuda = ["cudarc", "half"]
+# Skeleton GQA shared-K kernel launcher. Off by default; the kernel itself
+# always compiles into the PTX (it's pure additive in fused_attention.cu),
+# but the Rust-side launch path is only built when this feature is on.
+# See docs/gqa-shared-k-design.md.
+gqa-shared-k = ["cuda"]
+# Asymmetric K/V bit precision passthrough — forwards to tq-kv. With this
+# feature on, `TurboQuantConfig::effective_k_bits()` / `effective_v_bits()`
+# honor the `k_bits` / `v_bits` overrides; otherwise they fall back to
+# `bits` / `value_bits` (symmetric back-compat). See
+# docs/asymmetric-kv-design.md (internal) and the Hadamard Q1-Q4 knowledge
+# entry (`unblocks:hadamard-open-q`).
+asymmetric-kv = ["tq-kv/asymmetric-kv"]
 
 [dependencies]
 tq-kv = { path = "tq-kv" }

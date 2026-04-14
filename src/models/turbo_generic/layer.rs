@@ -2461,7 +2461,10 @@ impl LayerWeights {
         &mut self,
         layer_tq_config: &tq_kv::TurboQuantConfig,
         per_head_bits: &Option<Vec<u8>>,
-        effective_bits: u8,
+        // Symmetric K bit width — kept as a parameter for ABI parity but no
+        // longer read directly: storage init now uses `effective_k_bits()` so
+        // the asymmetric path can override.
+        _effective_bits: u8,
         vbits: u8,
         cache_dtype: DType,
         pre_rope_mode: bool,
@@ -2472,10 +2475,17 @@ impl LayerWeights {
 
         let mut k_per_head = Vec::with_capacity(self.n_kv_head);
         let gs = layer_tq_config.group_size;
+        // Asymmetric K/V (Step 2): when the `asymmetric-kv` feature is on and
+        // `k_bits` is set, the K-side bit width overrides `effective_bits`
+        // (which still reflects the symmetric `bits` field). This keeps the
+        // storage `CompressedKeys.bits` in sync with what
+        // `compress_single_key_*` actually packs (which now also reads
+        // `effective_k_bits()`). Symmetric callers see no change.
+        let k_storage_bits = layer_tq_config.effective_k_bits();
         for h in 0..self.n_kv_head {
             let hbits = per_head_bits.as_ref()
                 .map(|phb| phb[h])
-                .unwrap_or(effective_bits);
+                .unwrap_or(k_storage_bits);
             k_per_head.push(tq_kv::CompressedKeys::new_empty_grouped(
                 hbits, self.padded_head_dim, layer_tq_config.rotation_seed, gs,
             ));

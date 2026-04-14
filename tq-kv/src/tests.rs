@@ -1272,3 +1272,133 @@
         // vs fp16: 128 × 2 = 256 bytes → ~4.9x ratio
         assert!(vpq.compression_ratio() > 3.5, "3-bit PQ ratio {} too low", vpq.compression_ratio());
     }
+
+    // ========================================
+    // Asymmetric K/V plumbing (Step 2)
+    // Tracking: knowledge `unblocks:hadamard-open-q`
+    // ========================================
+
+    /// `validate()` rejects out-of-range overrides per Q2.
+    #[test]
+    fn test_validate_asymmetric_kv_ranges() {
+        // Symmetric (both None) always passes.
+        let mut cfg = TurboQuantConfig::default();
+        assert!(cfg.validate().is_ok(), "symmetric default must validate");
+
+        // Valid range: Some(2)..=Some(8)
+        for b in 2u8..=8 {
+            cfg.k_bits = Some(b);
+            cfg.v_bits = Some(b);
+            assert!(cfg.validate().is_ok(), "k_bits=v_bits={} should validate", b);
+        }
+
+        // Some(0): rejected (per Q2 — use value_bits or future KBits::Fp16)
+        cfg = TurboQuantConfig::default();
+        cfg.k_bits = Some(0);
+        assert!(cfg.validate().is_err(), "k_bits=Some(0) must be rejected");
+
+        cfg = TurboQuantConfig::default();
+        cfg.v_bits = Some(0);
+        assert!(cfg.validate().is_err(), "v_bits=Some(0) must be rejected");
+
+        // Some(1): rejected (1-bit not supported)
+        cfg = TurboQuantConfig::default();
+        cfg.k_bits = Some(1);
+        assert!(cfg.validate().is_err(), "k_bits=Some(1) must be rejected");
+
+        // Some(>8): rejected
+        cfg = TurboQuantConfig::default();
+        cfg.k_bits = Some(9);
+        assert!(cfg.validate().is_err(), "k_bits=Some(9) must be rejected");
+        cfg = TurboQuantConfig::default();
+        cfg.v_bits = Some(16);
+        assert!(cfg.validate().is_err(), "v_bits=Some(16) must be rejected");
+    }
+
+    /// With the `asymmetric-kv` feature on, the hot incremental K-compression
+    /// path (`compress_single_key_*`) must use the K-side bit width when
+    /// `k_bits` is set — verified by comparing packed byte counts and codebook
+    /// centroid counts between a 4-bit override and a 2-bit baseline.
+    ///
+    /// NOTE: the competitor-style `K=8, V=4` target sits within the Q2 valid
+    /// range `Some(2)..=Some(8)` but the underlying `codebook::Codebook`
+    /// currently only supports 2/3/4-bit Lloyd-Max tables — extending it to
+    /// 8-bit is a separate work item (likely alongside the dp4a kernel).
+    /// This test therefore exercises the plumbing at 2/4 to prove the hot
+    /// path honors `effective_k_bits()` asymmetrically.
+    #[cfg(feature = "asymmetric-kv")]
+    #[test]
+    fn test_compress_single_key_asymmetric_uses_k_bits() {
+        let dim = 64;
+        let key = random_vectors(1, dim, 7);
+        let signs: Vec<f32> = (0..dim).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+
+        // Baseline: bits=2, k_bits=None → effective_k_bits() == 2
+        let cfg_sym = TurboQuantConfig { bits: 2, center_keys: false, ..Default::default() };
+        assert_eq!(cfg_sym.effective_k_bits(), 2);
+
+        // Asymmetric: bits=2, k_bits=Some(4), v_bits=Some(2)
+        //   → effective_k_bits() == 4, effective_v_bits() == 2
+        let cfg_asym = TurboQuantConfig {
+            bits: 2,
+            k_bits: Some(4),
+            v_bits: Some(2),
+            center_keys: false,
+            ..Default::default()
+        };
+        assert_eq!(cfg_asym.effective_k_bits(), 4);
+        assert_eq!(cfg_asym.effective_v_bits(), 2);
+        assert!(cfg_asym.validate().is_ok());
+
+        // compress_single_key_with_signs
+        let (packed_sym, _, _) = compress_single_key_with_signs(&key, dim, &cfg_sym, &signs);
+        let (packed_asym, _, _) = compress_single_key_with_signs(&key, dim, &cfg_asym, &signs);
+        // 2-bit pack: 64 * 2 / 8 = 16 bytes
+        // 4-bit pack: 64 * 4 / 8 = 32 bytes
+        assert_eq!(packed_sym.len(), 16, "sym 2-bit should pack to 16 bytes");
+        assert_eq!(packed_asym.len(), 32, "asym k_bits=Some(4) should pack to 32 bytes");
+
+        // compress_single_key (legacy path without signs)
+        let (p_sym, _) = compress_single_key(&key, dim, &cfg_sym);
+        let (p_asym, _) = compress_single_key(&key, dim, &cfg_asym);
+        assert_eq!(p_sym.len(), 16);
+        assert_eq!(p_asym.len(), 32);
+
+        // compress_single_key_grouped
+        let cfg_sym_g = TurboQuantConfig { bits: 2, group_size: 32, center_keys: false, ..Default::default() };
+        let cfg_asym_g = TurboQuantConfig {
+            bits: 2,
+            k_bits: Some(4),
+            group_size: 32,
+            center_keys: false,
+            ..Default::default()
+        };
+        let (g_sym, _, _, _) = compress_single_key_grouped(&key, dim, &cfg_sym_g, &signs);
+        let (g_asym, _, _, _) = compress_single_key_grouped(&key, dim, &cfg_asym_g, &signs);
+        assert_eq!(g_sym.len(), 16);
+        assert_eq!(g_asym.len(), 32);
+
+        // Codebook centroid-count sanity: 2-bit → 4, 4-bit → 16.
+        let cb_sym = codebook::Codebook::new(cfg_sym.effective_k_bits(), dim);
+        let cb_asym = codebook::Codebook::new(cfg_asym.effective_k_bits(), dim);
+        assert_eq!(cb_sym.centroids.len(), 4);
+        assert_eq!(cb_asym.centroids.len(), 16);
+    }
+
+    /// Without the `asymmetric-kv` feature, `effective_k_bits()` must ignore
+    /// `k_bits` and fall back to `bits` — preserves symmetric back-compat.
+    #[cfg(not(feature = "asymmetric-kv"))]
+    #[test]
+    fn test_compress_single_key_symmetric_fallback() {
+        let dim = 64;
+        let cfg = TurboQuantConfig { bits: 4, k_bits: Some(8), v_bits: Some(4), ..Default::default() };
+        // Without the feature, effective_*_bits returns bits / value_bits.
+        assert_eq!(cfg.effective_k_bits(), 4);
+        assert_eq!(cfg.effective_v_bits(), 0);
+
+        let key = random_vectors(1, dim, 7);
+        let signs: Vec<f32> = (0..dim).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let (packed, _, _) = compress_single_key_with_signs(&key, dim, &cfg, &signs);
+        // Always 4-bit when feature is off.
+        assert_eq!(packed.len(), 32);
+    }
