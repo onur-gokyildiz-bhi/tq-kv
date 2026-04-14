@@ -18,6 +18,31 @@ Now with **Pre-RoPE key quantization** (34-59% less PPL gap), **KV Compaction** 
 
 ---
 
+## Current performance
+
+> RTX 3080 10GB, Qwen2.5-7B-Instruct Q4_K_M, own CUDA kernels, no external inference dependency. Three-run average, warmup discarded, TTFT separated.
+
+| Mode | tok/s | TTFT | PPL (wikitext-2) | KV memory |
+|:---|---:|---:|---:|:---|
+| Standard | **28.0** | 0.19 s | 4.136 | grows linearly |
+| TQ 4-bit | **19.7** | 0.10 s | 4.457 (+7.8%) | 3.8× smaller |
+| TQ 4-bit + TriAttention | **19.4** | 0.11 s | 4.574 (+10.6%) | **constant** |
+
+Full matrix (Llama 3.1 8B, Mistral 7B, multi-context, reproducible CLIs): [BENCHMARKS.md](BENCHMARKS.md).
+
+## What's next (v0.7.0)
+
+Sprint in progress. Targets:
+
+- **dp4a Q4_K matvec** — close the Q4K instruction-efficiency gap against upstream llama.cpp (target ≥70 tok/s Qwen2 7B Standard on RTX 3080).
+- **Sparse V** — skip value rows where softmax weight falls below threshold in the decode attention kernel.
+- **Asymmetric K/V bitwidth** — 4-bit keys, 2-bit values by default; per-layer overrides.
+- **Metal port kickoff** — shared kernel interface, Metal backend skeleton, MPS-only fallbacks for the ops without Metal kernels yet.
+
+Full plan: see the `status:planned` nodes in the project knowledge graph.
+
+---
+
 ## The Compound Error Problem
 
 GGUF quantized models (Q4_K_M) already have weight quantization noise. Compressing KV cache on top introduces compound error through softmax. tq-kv solves this with a multi-stage pipeline:
@@ -343,13 +368,14 @@ scripts/ppl-check.sh                  # Regression CI (9 checks, tight threshold
 
 ## GPU Inference Performance
 
-> RTX 3080 10GB, Qwen 2.5 7B Q4_K_M, own CUDA kernels (no candle/llama.cpp dependency)
+> RTX 3080 10GB, Qwen 2.5 7B Q4_K_M, own CUDA kernels (no candle dependency).
+> Full reproducible matrix in [BENCHMARKS.md](BENCHMARKS.md).
 
 | Mode | tok/s | TTFT | PPL | KV Memory |
 |:-----|------:|-----:|----:|:---------:|
-| **Standard** | **18.0** | 0.19s | 4.136 | grows linearly |
-| **TQ 4-bit** | **16.1** | 0.10s | 4.457 (+8%) | 3.8x smaller |
-| **TQ+TriAttention** | **15.2** | 0.11s | 4.574 (+11%) | **constant** |
+| **Standard** | **28.0** | 0.19s | 4.136 | grows linearly |
+| **TQ 4-bit** | **19.7** | 0.10s | 4.457 (+7.8%) | 3.8x smaller |
+| **TQ+TriAttention** | **19.4** | 0.11s | 4.574 (+10.6%) | **constant** |
 
 4 validated models: Qwen2.5 7B/0.5B, Llama 3.1 8B, Mistral 7B. Auto-calibration on first use.
 
@@ -372,7 +398,9 @@ scripts/ppl-check.sh                  # Regression CI (9 checks, tight threshold
 | Custom CUDA kernels | 1.9 | Own matvec, RoPE, attention |
 | DecodeScratch + fused | 10.1 | Zero-alloc decode, fused kernels |
 | GPU prefill + CUDA Graph | 17.8 | Graph replay, Q6K lm_head |
-| **v2 kernels + multi-arch** | **18.5** | `__ldg`, warp-reduce, cp.async, butterfly reduce |
+| v2 kernels + multi-arch | 18.5 | `__ldg`, warp-reduce, cp.async, butterfly reduce |
+| cp.async weight pipeline | 23.3 | MLP gateup + MLP down + qmatmul cp.async W-prefetch |
+| **mrow ladder (v0.6, shipped 2026-04-14)** | **28.0** | cooperative-per-superblock gateup/down, RoPE Q+K fuse, bias-fused LM head |
 
 ---
 
