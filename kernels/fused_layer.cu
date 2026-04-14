@@ -262,6 +262,140 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_f32(
     }
 }
 
+// ─── Kernel 3-cpasync: cp.async double-buffered weight pipeline ──
+// Same math as fused_addnorm_q4km_gateup_silu_f32, but pre-loads each
+// next superblock's gate+up weight blocks into shared memory via
+// cp.async while computing the current superblock. Targets the MLP
+// gateup bottleneck (~52% of per-layer time on Qwen2 7B).
+//
+// Shared-memory layout (on top of s_normed[hidden_dim]):
+//   s_wbuf[2][72]  double-buffer weights, 72 floats = 288 bytes per
+//                  superblock = gate_block(144B) + up_block(144B)
+// Extra shmem cost: 576 bytes per block.
+
+extern "C" __global__ void fused_addnorm_q4km_gateup_silu_cpasync_f32(
+    const float* __restrict__ input,
+    const float* __restrict__ _unused,
+    const float* __restrict__ norm_weight,
+    const uint8_t* __restrict__ W_gate,
+    const uint8_t* __restrict__ W_up,
+    float* __restrict__ intermediate_out,
+    const int hidden_dim,
+    const int intermediate_dim,
+    const float eps
+) {
+    extern __shared__ float s_mem[];
+    float* s_normed = s_mem;                // [hidden_dim]
+    float* s_wbuf   = s_mem + hidden_dim;   // [2 * 72] = 576 bytes
+
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    if (row >= intermediate_dim) return;
+
+    // Phase 1: RmsNorm(input) → shared memory
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float val = input[i];
+        sum_sq += val * val;
+        s_normed[i] = val;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float s_rms_inv;
+    if (tid == 0) {
+        s_rms_inv = rsqrtf(sum_sq / (float)hidden_dim + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        s_normed[i] = s_normed[i] * s_rms_inv * norm_weight[i];
+    }
+    __syncthreads();
+
+    // Phase 2: gate+up pipelined dot
+    const int n_superblocks = hidden_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+    const int FLOATS_PER_BLOCK = Q4K_BLOCK_SIZE / 4;   // 144/4 = 36 floats per gate/up block
+    const int SB_FLOATS = FLOATS_PER_BLOCK * 2;        // 72 floats = gate + up
+
+    const int grp   = tid >> 6;
+    const int pos   = tid & 63;
+    const int is_hi = pos >> 5;
+    const int l     = pos & 31;
+    const int x_idx = grp * 64 + pos;
+    const int j     = 2 * grp + is_hi;
+
+    const uint8_t* gate_row = W_gate + row * bytes_per_row;
+    const uint8_t* up_row   = W_up   + row * bytes_per_row;
+
+    // Issue prefetch of superblock sb into s_wbuf[(sb & 1) * SB_FLOATS ...].
+    auto prefetch_sb = [&](int sb) {
+        const float* gblk_f = reinterpret_cast<const float*>(gate_row + sb * Q4K_BLOCK_SIZE);
+        const float* ublk_f = reinterpret_cast<const float*>(up_row   + sb * Q4K_BLOCK_SIZE);
+        float* dst = s_wbuf + (sb & 1) * SB_FLOATS;
+        for (int i = tid; i < FLOATS_PER_BLOCK; i += blockDim.x) {
+            tq_cp_async_f32(&dst[i], &gblk_f[i]);
+            tq_cp_async_f32(&dst[FLOATS_PER_BLOCK + i], &ublk_f[i]);
+        }
+        tq_cp_async_commit();
+    };
+
+    // Pre-load sb=0
+    if (n_superblocks > 0) prefetch_sb(0);
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        // Pre-fetch next superblock so its load overlaps with this iter's compute.
+        if (sb + 1 < n_superblocks) {
+            prefetch_sb(sb + 1);
+            tq_cp_async_wait_one();      // keep next in flight, current done
+        } else {
+            tq_cp_async_wait_all();      // last iter: drain
+        }
+        __syncthreads();
+
+        const uint8_t* gblk = reinterpret_cast<const uint8_t*>(s_wbuf + (sb & 1) * SB_FLOATS);
+        const uint8_t* ublk = gblk + Q4K_BLOCK_SIZE;  // up block follows gate in the buffer
+
+        float x_val = s_normed[sb * QK_K + x_idx];
+
+        // Gate dequant
+        uint16_t gd_bits  = gblk[0] | (gblk[1] << 8);
+        uint16_t gdm_bits = gblk[2] | (gblk[3] << 8);
+        float gd    = __half2float(*reinterpret_cast<const __half*>(&gd_bits));
+        float gdmin = __half2float(*reinterpret_cast<const __half*>(&gdm_bits));
+        const uint8_t* gsc = gblk + 4;
+        uint8_t g_sc, g_m;
+        get_scale_min_k4(j, gsc, &g_sc, &g_m);
+        uint8_t g_byte = gblk[16 + grp * 32 + l];
+        float g_nib = is_hi ? (float)(g_byte >> 4) : (float)(g_byte & 0xF);
+        gate_sum += (gd * (float)g_sc * g_nib - gdmin * (float)g_m) * x_val;
+
+        // Up dequant
+        uint16_t ud_bits  = ublk[0] | (ublk[1] << 8);
+        uint16_t udm_bits = ublk[2] | (ublk[3] << 8);
+        float ud    = __half2float(*reinterpret_cast<const __half*>(&ud_bits));
+        float udmin = __half2float(*reinterpret_cast<const __half*>(&udm_bits));
+        const uint8_t* usc = ublk + 4;
+        uint8_t u_sc, u_m;
+        get_scale_min_k4(j, usc, &u_sc, &u_m);
+        uint8_t u_byte = ublk[16 + grp * 32 + l];
+        float u_nib = is_hi ? (float)(u_byte >> 4) : (float)(u_byte & 0xF);
+        up_sum += (ud * (float)u_sc * u_nib - udmin * (float)u_m) * x_val;
+
+        __syncthreads();   // protect buffer before next prefetch overwrites it
+    }
+
+    gate_sum = block_reduce_sum(gate_sum);
+    __syncthreads();
+    up_sum   = block_reduce_sum(up_sum);
+
+    if (tid == 0) {
+        float silu_gate = gate_sum / (1.0f + expf(-gate_sum));
+        intermediate_out[row] = silu_gate * up_sum;
+    }
+}
+
 // ─── Kernel 3b: Warp-shuffle LUT Fused Gateup ───────────────
 // Uses warp shuffle instead of shared memory for dequant LUT.
 // Each warp (32 threads) is in the same sub-block. Lanes 0-15 compute

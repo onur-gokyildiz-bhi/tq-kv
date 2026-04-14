@@ -2119,22 +2119,24 @@ pub fn fused_addnorm_q4km_gateup_silu(
     intermediate_dim: usize,
     eps: f32,
 ) -> Result<(), DriverError> {
-    // LUT (warp-shuffle dequant) variant tested on 2026-04-14: marginally slower
-    // than the baseline on RTX 3080 — the warp-shuffle overhead outweighed the
-    // ~15 instructions/superblock saved. Keep it available behind TQ_GATEUP_LUT=1
-    // for future hardware where the tradeoff may flip; default is the baseline.
-    static USE_LUT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let use_lut = *USE_LUT.get_or_init(|| {
-        std::env::var("TQ_GATEUP_LUT").ok().map_or(false, |v| v == "1")
+    // Gateup kernel dispatch. Three variants live in fused_layer.cu:
+    //   default (cpasync): cp.async double-buffered weight pipeline (Plan #8)
+    //   baseline:          original no-pipeline version  (TQ_GATEUP=baseline)
+    //   lut:               warp-shuffle dequant LUT       (TQ_GATEUP=lut)
+    // Set TQ_GATEUP=baseline to disable cp.async if it regresses on exotic HW.
+    static GATEUP_VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let kernel_name = *GATEUP_VARIANT.get_or_init(|| {
+        match std::env::var("TQ_GATEUP").ok().as_deref() {
+            Some("baseline") => "fused_addnorm_q4km_gateup_silu_f32",
+            Some("lut")      => "fused_addnorm_q4km_gateup_silu_lut_f32",
+            _                => "fused_addnorm_q4km_gateup_silu_cpasync_f32",
+        }
     });
-    let kernel_name = if use_lut {
-        "fused_addnorm_q4km_gateup_silu_lut_f32"
-    } else {
-        "fused_addnorm_q4km_gateup_silu_f32"
-    };
     let f = reg.get_fn("fused_layer", kernel_name)?;
     let block = 256u32;
-    let shmem = (hidden_dim as u32) * 4;
+    // cpasync needs 576 extra bytes for s_wbuf[2][72]; baseline/lut only need s_normed.
+    let extra_shmem = if *kernel_name == *"fused_addnorm_q4km_gateup_silu_cpasync_f32" { 576 } else { 0 };
+    let shmem = (hidden_dim as u32) * 4 + extra_shmem;
     let cfg = launch_with_shmem(intermediate_dim as u32, block, shmem);
     let hd = hidden_dim as i32;
     let id = intermediate_dim as i32;
