@@ -502,6 +502,94 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_lut_f32(
     }
 }
 
+// ─── Kernel 4-cpasync: Down Projection + Residual, Cooperative ──
+// Same math as fused_q4km_down_residual_f32, restructured so all 256
+// threads cooperate on one super-block at a time (vs the baseline's
+// thread-per-super-block pattern that leaves 182/256 threads idle on
+// Qwen2 7B where intermediate_dim=18944 → 74 super-blocks).
+//
+// Also adds cp.async double-buffer for the per-super-block weight read
+// (144 B) so the load overlaps with the previous super-block's dequant+FMA.
+// Intermediate (x) stays in global — it's already laid out contiguously
+// per-super-block and L2 caches the stripe across blocks.
+//
+// Shared memory: s_wbuf[2][36] floats = 288 bytes (just the W buffer).
+
+extern "C" __global__ void fused_q4km_down_residual_cpasync_f32(
+    const uint8_t* __restrict__ W_down,
+    const float* __restrict__ intermediate,
+    float* __restrict__ residual,
+    const int hidden_dim,
+    const int intermediate_dim
+) {
+    const int row = blockIdx.x;
+    if (row >= hidden_dim) return;
+    const int tid = threadIdx.x;
+
+    const int n_superblocks = intermediate_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+    const uint8_t* w_row = W_down + row * bytes_per_row;
+
+    // Thread mapping within a QK_K=256 super-block (matches gateup kernel).
+    const int grp   = tid >> 6;   // 0-3
+    const int pos   = tid & 63;
+    const int is_hi = pos >> 5;   // 0 or 1
+    const int l     = pos & 31;   // 0-31
+    const int x_idx = grp * 64 + pos;
+    const int j     = 2 * grp + is_hi;
+
+    __shared__ float s_wbuf[2][36];  // 2 × 144 B
+
+    auto prefetch_w = [&](int sb) {
+        const float* src =
+            reinterpret_cast<const float*>(w_row + sb * Q4K_BLOCK_SIZE);
+        float* dst = s_wbuf[sb & 1];
+        if (tid < 36) {
+            tq_cp_async_f32(&dst[tid], &src[tid]);
+        }
+        tq_cp_async_commit();
+    };
+
+    if (n_superblocks > 0) prefetch_w(0);
+
+    float partial_sum = 0.0f;
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        if (sb + 1 < n_superblocks) {
+            prefetch_w(sb + 1);
+            tq_cp_async_wait_one();
+        } else {
+            tq_cp_async_wait_all();
+        }
+        __syncthreads();
+
+        const uint8_t* block = reinterpret_cast<const uint8_t*>(s_wbuf[sb & 1]);
+        const float*   x_sb  = intermediate + sb * QK_K;
+
+        uint16_t d_bits  = block[0] | (block[1] << 8);
+        uint16_t dm_bits = block[2] | (block[3] << 8);
+        float d    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+        float dmin = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs     = block + 16;
+
+        uint8_t sc_val, m_val;
+        get_scale_min_k4(j, scales, &sc_val, &m_val);
+
+        uint8_t q_byte = qs[grp * 32 + l];
+        float nibble = is_hi ? (float)(q_byte >> 4) : (float)(q_byte & 0xF);
+        partial_sum += (d * (float)sc_val * nibble - dmin * (float)m_val) * x_sb[x_idx];
+
+        __syncthreads();   // protect buffer before next prefetch overwrites it
+    }
+
+    partial_sum = block_reduce_sum(partial_sum);
+    if (tid == 0) {
+        residual[row] += partial_sum;
+    }
+}
+
 // ─── Kernel 4: Fused Down Projection + Residual Add ──────────
 // Grid: hidden_dim blocks, 256 threads
 // Thread-per-superblock striding for down projection (intermediate_dim=18944 → 74 sb).

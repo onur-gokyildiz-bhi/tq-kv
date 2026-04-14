@@ -2174,7 +2174,16 @@ pub fn fused_q4km_down_residual(
     hidden_dim: usize,
     intermediate_dim: usize,
 ) -> Result<(), DriverError> {
-    let f = reg.get_fn("fused_layer", "fused_q4km_down_residual_f32")?;
+    // Down kernel dispatch: cpasync cooperative pattern (Plan #9) is default;
+    // TQ_DOWN=baseline falls back to the thread-per-superblock original.
+    static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let kernel_name = *VARIANT.get_or_init(|| {
+        match std::env::var("TQ_DOWN").ok().as_deref() {
+            Some("baseline") => "fused_q4km_down_residual_f32",
+            _                => "fused_q4km_down_residual_cpasync_f32",
+        }
+    });
+    let f = reg.get_fn("fused_layer", kernel_name)?;
     let cfg = launch_per_row(hidden_dim, 256);
     let hd = hidden_dim as i32;
     let id = intermediate_dim as i32;
