@@ -17,6 +17,10 @@ default = ["std"]
 std = ["rand", "rand_chacha"]
 ffi = ["std"]
 python = ["std", "pyo3"]
+# Asymmetric K/V bit precision: K at one bit width, V at another.
+# Design-only scaffold in 0.6.x — plumbing + accessors only, no math changes yet.
+# See docs/asymmetric-kv-design.md (internal).
+asymmetric-kv = []
 
 [[bin]]
 name = "tq-kv-bench"

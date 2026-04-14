@@ -191,6 +191,18 @@ pub struct TurboQuantConfig {
     /// Computed from calibration. Length = head_dim. None = use per-vector sigma (legacy).
     pub rotated_channel_sigma: Option<Vec<f32>>,
 
+    /// **Asymmetric K/V**: override key bit width. `None` → fall back to `bits`.
+    /// Only honored when the `asymmetric-kv` feature is enabled; otherwise ignored
+    /// by `effective_k_bits()` for back-compat. Typical: `Some(8)` for q8_0-style K.
+    /// Design doc: docs/asymmetric-kv-design.md.
+    pub k_bits: Option<u8>,
+
+    /// **Asymmetric K/V**: override value bit width. `None` → fall back to `value_bits`
+    /// (which itself defaults to 0 = uncompressed). Only honored when the `asymmetric-kv`
+    /// feature is enabled. Typical: `Some(4)` paired with 8-bit K.
+    /// Design doc: docs/asymmetric-kv-design.md.
+    pub v_bits: Option<u8>,
+
     // Legacy field — use qjl_mode instead
     #[doc(hidden)]
     pub use_qjl: bool,
@@ -222,6 +234,8 @@ impl Default for TurboQuantConfig {
             pre_rope: false,
             center_keys: true,
             rotated_channel_sigma: None,
+            k_bits: None,
+            v_bits: None,
         }
     }
 }
@@ -297,6 +311,68 @@ impl TurboQuantConfig {
             .as_ref()
             .and_then(|phb| phb.get(head_idx).copied())
             .unwrap_or(self.bits)
+    }
+
+    // --- Asymmetric K/V builders (feature: asymmetric-kv) ---
+
+    /// Override the key bit width independently of `bits`.
+    ///
+    /// When the `asymmetric-kv` feature is enabled, [`effective_k_bits`] returns
+    /// this value; otherwise it is stored but ignored (back-compat with symmetric
+    /// callers). Combine with [`with_v_bits`] for the competitor default
+    /// (K=8, V=4). See `docs/asymmetric-kv-design.md`.
+    ///
+    /// [`effective_k_bits`]: Self::effective_k_bits
+    /// [`with_v_bits`]: Self::with_v_bits
+    pub fn with_k_bits(mut self, bits: u8) -> Self {
+        self.k_bits = Some(bits);
+        self
+    }
+
+    /// Override the value bit width independently of `value_bits`.
+    ///
+    /// When the `asymmetric-kv` feature is enabled, [`effective_v_bits`] returns
+    /// this value; otherwise it is stored but ignored. See
+    /// `docs/asymmetric-kv-design.md`.
+    ///
+    /// [`effective_v_bits`]: Self::effective_v_bits
+    pub fn with_v_bits(mut self, bits: u8) -> Self {
+        self.v_bits = Some(bits);
+        self
+    }
+
+    /// Effective key bit width.
+    ///
+    /// Returns `k_bits` if set AND the `asymmetric-kv` feature is active,
+    /// otherwise falls back to `self.bits` (symmetric / legacy behavior).
+    /// Per-head overrides via [`bits_for_head`] still take precedence at callsites
+    /// that use them.
+    ///
+    /// [`bits_for_head`]: Self::bits_for_head
+    #[inline]
+    pub fn effective_k_bits(&self) -> u8 {
+        #[cfg(feature = "asymmetric-kv")]
+        {
+            if let Some(kb) = self.k_bits {
+                return kb;
+            }
+        }
+        self.bits
+    }
+
+    /// Effective value bit width.
+    ///
+    /// Returns `v_bits` if set AND the `asymmetric-kv` feature is active,
+    /// otherwise falls back to `self.value_bits` (0 = fp16 uncompressed).
+    #[inline]
+    pub fn effective_v_bits(&self) -> u8 {
+        #[cfg(feature = "asymmetric-kv")]
+        {
+            if let Some(vb) = self.v_bits {
+                return vb;
+            }
+        }
+        self.value_bits
     }
 
     /// Check if QJL should be active given current cache length.
@@ -1149,6 +1225,10 @@ pub fn compress_keys(
 
     let count = data.len() / dim;
 
+    // Asymmetric K/V: honor `k_bits` override when the feature is enabled.
+    // Defaults to `config.bits` for symmetric / legacy callers.
+    let k_bits = config.effective_k_bits();
+
     // 1. Per-channel scaling + Hadamard rotation
     let mut rotated = data.to_vec();
     if let Some(ref scales) = config.channel_scales {
@@ -1168,7 +1248,7 @@ pub fn compress_keys(
     // Codebook sigma = ||x||/√d per vector (NOT fixed 1/√d)
     let mut all_indices = Vec::with_capacity(count * dim);
     let mut norms = Vec::with_capacity(count);
-    let base_cb = codebook::Codebook::new(config.bits, dim);
+    let base_cb = codebook::Codebook::new(k_bits, dim);
 
     for chunk in rotated.chunks_exact(dim) {
         let norm: f32 = chunk.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1197,8 +1277,8 @@ pub fn compress_keys(
         }
     }
 
-    // 3. Bit-pack indices
-    let packed_indices = codebook::pack_indices(&all_indices, config.bits);
+    // 3. Bit-pack indices (uses effective K bit width)
+    let packed_indices = codebook::pack_indices(&all_indices, k_bits);
 
     // 4. QJL correction on residual (optional)
     let qjl_corrections = if config.use_qjl {
@@ -1241,7 +1321,7 @@ pub fn compress_keys(
         packed_indices,
         norms,
         qjl_corrections,
-        bits: config.bits,
+        bits: k_bits,
         dim,
         count,
         rotation_seed: config.rotation_seed,
