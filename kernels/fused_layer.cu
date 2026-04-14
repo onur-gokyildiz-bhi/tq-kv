@@ -529,6 +529,182 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_cpasync_f32(
     }
 }
 
+// ─── Kernel 3c: Multi-row (2 rows/block) Fused Gateup ───────
+// Each block produces TWO consecutive intermediate_dim outputs
+// (row_a = 2*blockIdx.x, row_b = row_a + 1) sharing the same normalized
+// x values and s_normed layout. Amortizes x_val reads and boosts ILP
+// by interleaving 4 independent dequant chains (gate_a, up_a, gate_b,
+// up_b) per superblock.
+//
+// Halves grid size (18944 → 9472 on Qwen2 7B) → less launch/block-scheduling
+// overhead while keeping the same threads-per-block.
+//
+// Shared-memory layout:
+//   s_normed[hidden_dim]                // same as cpasync variant
+//   s_wbuf[2][144] floats               // 2 × 576 B = 1152 B total
+//                                       // slot layout:
+//                                       //   [ 0..36): gate_a block  (144 B)
+//                                       //   [36..72): up_a   block
+//                                       //   [72..108): gate_b block
+//                                       //   [108..144): up_b  block
+
+extern "C" __global__ void fused_addnorm_q4km_gateup_silu_mrow2_f32(
+    const float* __restrict__ input,
+    const float* __restrict__ _unused,
+    const float* __restrict__ norm_weight,
+    const uint8_t* __restrict__ W_gate,
+    const uint8_t* __restrict__ W_up,
+    float* __restrict__ intermediate_out,
+    const int hidden_dim,
+    const int intermediate_dim,
+    const float eps
+) {
+    extern __shared__ float s_mem[];
+    float* s_normed = s_mem;                   // [hidden_dim]
+    float* s_wbuf   = s_mem + hidden_dim;      // [2 * 144] = 1152 B
+
+    const int tid   = threadIdx.x;
+    const int row_a = 2 * blockIdx.x;
+    const int row_b = row_a + 1;
+    if (row_a >= intermediate_dim) return;
+    const bool have_b = (row_b < intermediate_dim);
+
+    // Phase 1: RmsNorm(input) → shared memory (identical to cpasync variant)
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float val = input[i];
+        sum_sq += val * val;
+        s_normed[i] = val;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float s_rms_inv;
+    if (tid == 0) {
+        s_rms_inv = rsqrtf(sum_sq / (float)hidden_dim + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        s_normed[i] = s_normed[i] * s_rms_inv * norm_weight[i];
+    }
+    __syncthreads();
+
+    // Phase 2: 4-way pipelined dot (gate_a, up_a, gate_b, up_b)
+    const int n_superblocks = hidden_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+    const int FLOATS_PER_BLOCK = Q4K_BLOCK_SIZE / 4;  // 36
+    const int SLOT_FLOATS      = FLOATS_PER_BLOCK * 4; // 144 (gate_a+up_a+gate_b+up_b)
+
+    const int grp   = tid >> 6;
+    const int pos   = tid & 63;
+    const int is_hi = pos >> 5;
+    const int l     = pos & 31;
+    const int x_idx = grp * 64 + pos;
+    const int j     = 2 * grp + is_hi;
+
+    const uint8_t* gate_row_a = W_gate + row_a * bytes_per_row;
+    const uint8_t* up_row_a   = W_up   + row_a * bytes_per_row;
+    const uint8_t* gate_row_b = have_b ? (W_gate + row_b * bytes_per_row) : gate_row_a;
+    const uint8_t* up_row_b   = have_b ? (W_up   + row_b * bytes_per_row) : up_row_a;
+
+    // Prefetch all 4 blocks of superblock sb into s_wbuf[(sb&1) * SLOT_FLOATS ...]
+    auto prefetch_sb = [&](int sb) {
+        const float* ga_f = reinterpret_cast<const float*>(gate_row_a + sb * Q4K_BLOCK_SIZE);
+        const float* ua_f = reinterpret_cast<const float*>(up_row_a   + sb * Q4K_BLOCK_SIZE);
+        const float* gb_f = reinterpret_cast<const float*>(gate_row_b + sb * Q4K_BLOCK_SIZE);
+        const float* ub_f = reinterpret_cast<const float*>(up_row_b   + sb * Q4K_BLOCK_SIZE);
+        float* dst = s_wbuf + (sb & 1) * SLOT_FLOATS;
+        for (int i = tid; i < FLOATS_PER_BLOCK; i += blockDim.x) {
+            tq_cp_async_f32(&dst[i],                         &ga_f[i]);
+            tq_cp_async_f32(&dst[FLOATS_PER_BLOCK + i],      &ua_f[i]);
+            tq_cp_async_f32(&dst[2 * FLOATS_PER_BLOCK + i],  &gb_f[i]);
+            tq_cp_async_f32(&dst[3 * FLOATS_PER_BLOCK + i],  &ub_f[i]);
+        }
+        tq_cp_async_commit();
+    };
+
+    if (n_superblocks > 0) prefetch_sb(0);
+
+    float gate_a = 0.0f, up_a = 0.0f;
+    float gate_b = 0.0f, up_b = 0.0f;
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        if (sb + 1 < n_superblocks) {
+            prefetch_sb(sb + 1);
+            tq_cp_async_wait_one();
+        } else {
+            tq_cp_async_wait_all();
+        }
+        __syncthreads();
+
+        const uint8_t* slot  = reinterpret_cast<const uint8_t*>(s_wbuf + (sb & 1) * SLOT_FLOATS);
+        const uint8_t* gblka = slot;
+        const uint8_t* ublka = slot + Q4K_BLOCK_SIZE;
+        const uint8_t* gblkb = slot + 2 * Q4K_BLOCK_SIZE;
+        const uint8_t* ublkb = slot + 3 * Q4K_BLOCK_SIZE;
+
+        float x_val = s_normed[sb * QK_K + x_idx];
+
+        // Gate_a dequant
+        uint16_t ga_d_bits  = gblka[0] | (gblka[1] << 8);
+        uint16_t ga_dm_bits = gblka[2] | (gblka[3] << 8);
+        float ga_d    = __half2float(*reinterpret_cast<const __half*>(&ga_d_bits));
+        float ga_dmin = __half2float(*reinterpret_cast<const __half*>(&ga_dm_bits));
+        uint8_t ga_sc, ga_m; get_scale_min_k4(j, gblka + 4, &ga_sc, &ga_m);
+        uint8_t ga_byte = gblka[16 + grp * 32 + l];
+        float   ga_nib  = is_hi ? (float)(ga_byte >> 4) : (float)(ga_byte & 0xF);
+        gate_a += (ga_d * (float)ga_sc * ga_nib - ga_dmin * (float)ga_m) * x_val;
+
+        // Up_a dequant
+        uint16_t ua_d_bits  = ublka[0] | (ublka[1] << 8);
+        uint16_t ua_dm_bits = ublka[2] | (ublka[3] << 8);
+        float ua_d    = __half2float(*reinterpret_cast<const __half*>(&ua_d_bits));
+        float ua_dmin = __half2float(*reinterpret_cast<const __half*>(&ua_dm_bits));
+        uint8_t ua_sc, ua_m; get_scale_min_k4(j, ublka + 4, &ua_sc, &ua_m);
+        uint8_t ua_byte = ublka[16 + grp * 32 + l];
+        float   ua_nib  = is_hi ? (float)(ua_byte >> 4) : (float)(ua_byte & 0xF);
+        up_a += (ua_d * (float)ua_sc * ua_nib - ua_dmin * (float)ua_m) * x_val;
+
+        // Gate_b dequant
+        uint16_t gb_d_bits  = gblkb[0] | (gblkb[1] << 8);
+        uint16_t gb_dm_bits = gblkb[2] | (gblkb[3] << 8);
+        float gb_d    = __half2float(*reinterpret_cast<const __half*>(&gb_d_bits));
+        float gb_dmin = __half2float(*reinterpret_cast<const __half*>(&gb_dm_bits));
+        uint8_t gb_sc, gb_m; get_scale_min_k4(j, gblkb + 4, &gb_sc, &gb_m);
+        uint8_t gb_byte = gblkb[16 + grp * 32 + l];
+        float   gb_nib  = is_hi ? (float)(gb_byte >> 4) : (float)(gb_byte & 0xF);
+        gate_b += (gb_d * (float)gb_sc * gb_nib - gb_dmin * (float)gb_m) * x_val;
+
+        // Up_b dequant
+        uint16_t ub_d_bits  = ublkb[0] | (ublkb[1] << 8);
+        uint16_t ub_dm_bits = ublkb[2] | (ublkb[3] << 8);
+        float ub_d    = __half2float(*reinterpret_cast<const __half*>(&ub_d_bits));
+        float ub_dmin = __half2float(*reinterpret_cast<const __half*>(&ub_dm_bits));
+        uint8_t ub_sc, ub_m; get_scale_min_k4(j, ublkb + 4, &ub_sc, &ub_m);
+        uint8_t ub_byte = ublkb[16 + grp * 32 + l];
+        float   ub_nib  = is_hi ? (float)(ub_byte >> 4) : (float)(ub_byte & 0xF);
+        up_b += (ub_d * (float)ub_sc * ub_nib - ub_dmin * (float)ub_m) * x_val;
+
+        __syncthreads();  // protect slot before next prefetch overwrites
+    }
+
+    // Reduce 4 accumulators, emit 2 outputs
+    gate_a = block_reduce_sum(gate_a);
+    __syncthreads();
+    up_a   = block_reduce_sum(up_a);
+    __syncthreads();
+    gate_b = block_reduce_sum(gate_b);
+    __syncthreads();
+    up_b   = block_reduce_sum(up_b);
+
+    if (tid == 0) {
+        float silu_a = gate_a / (1.0f + expf(-gate_a));
+        intermediate_out[row_a] = silu_a * up_a;
+        if (have_b) {
+            float silu_b = gate_b / (1.0f + expf(-gate_b));
+            intermediate_out[row_b] = silu_b * up_b;
+        }
+    }
+}
+
 // ─── Kernel 3b: Warp-shuffle LUT Fused Gateup ───────────────
 // Uses warp shuffle instead of shared memory for dequant LUT.
 // Each warp (32 threads) is in the same sub-block. Lanes 0-15 compute
