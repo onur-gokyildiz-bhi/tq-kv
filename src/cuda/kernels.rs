@@ -294,11 +294,18 @@ pub fn q4km_matvec(
         match std::env::var("TQ_Q4KM").ok().as_deref() {
             Some("baseline") => "q4km_matvec_f32",
             Some("wx")       => "q4km_matvec_wx_cpasync_f32",
+            Some("mrow16")   => "q4km_matvec_mrow16_f32",
             _                => "q4km_matvec_mrow8_f32",
         }
     });
     let f = reg.get_fn("qmatmul", kernel_name)?;
-    let rows_per_block = if *kernel_name == *"q4km_matvec_mrow8_f32" { 8u32 } else { 4u32 };
+    let rows_per_block = if *kernel_name == *"q4km_matvec_mrow8_f32" {
+        8u32
+    } else if *kernel_name == *"q4km_matvec_mrow16_f32" {
+        16u32
+    } else {
+        4u32
+    };
     let n_blocks = (out_features as u32 + rows_per_block - 1) / rows_per_block;
     let cfg = LaunchConfig {
         grid_dim: (n_blocks, 1, 1),

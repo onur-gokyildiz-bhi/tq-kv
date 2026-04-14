@@ -657,6 +657,150 @@ extern "C" __global__ void q4km_matvec_wx_cpasync_f32(
     }
 }
 
+// ─── Q4_K_M Matvec — 16-row variant (register spill edge) ────
+// Push mrow ladder beyond mrow8. Grid halves (mrow8 → 9504, mrow16 → 4752
+// on lm_head=152064). 16 sums accumulators + deeper s_w pipeline.
+// Expected: register spill on SM86 based on gateup mrow16 precedent.
+
+#define MROW16 16
+#define WX_WBUF_FLOATS16 (MROW16 * Q4K_BLOCK_FLOATS)   // 576 floats
+
+extern "C" __global__ void q4km_matvec_mrow16_f32(
+    const uint8_t* __restrict__ W_packed,
+    const float* __restrict__ x,
+    float* __restrict__ output,
+    const int out_features,
+    const int in_features
+) {
+    const int base_row = blockIdx.x * MROW16;
+    const int tid = threadIdx.x;
+
+    const int n_superblocks = (in_features + QK_K - 1) / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+
+    const int grp = tid >> 6;
+    const int pos = tid & 63;
+    const int is_hi = pos >> 5;
+    const int l = pos & 31;
+    const int x_idx = grp * 64 + pos;
+
+    float sums[MROW16];
+    #pragma unroll
+    for (int r = 0; r < MROW16; ++r) sums[r] = 0.0f;
+
+#if TQ_HAS_CP_ASYNC
+    __shared__ float s_x[2][QK_K];
+    __shared__ float s_w[2][WX_WBUF_FLOATS16];
+    int cur_buf = 0;
+
+    auto prefetch_x = [&](int sb) {
+        const int pos_g = sb * QK_K + tid;
+        if (pos_g < in_features) {
+            tq_cp_async_f32(&s_x[sb & 1][tid], &x[pos_g]);
+        } else {
+            s_x[sb & 1][tid] = 0.0f;
+        }
+    };
+    auto prefetch_w = [&](int sb) {
+        float* dst = s_w[sb & 1];
+        #pragma unroll
+        for (int r = 0; r < MROW16; ++r) {
+            int row = base_row + r;
+            if (row >= out_features) break;
+            const float* src =
+                reinterpret_cast<const float*>(W_packed + row * bytes_per_row + sb * Q4K_BLOCK_SIZE);
+            for (int i = tid; i < Q4K_BLOCK_FLOATS; i += blockDim.x) {
+                tq_cp_async_f32(&dst[r * Q4K_BLOCK_FLOATS + i], &src[i]);
+            }
+        }
+    };
+
+    if (n_superblocks > 0) {
+        prefetch_x(0);
+        prefetch_w(0);
+        tq_cp_async_commit();
+    }
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        if (sb + 1 < n_superblocks) {
+            prefetch_x(sb + 1);
+            prefetch_w(sb + 1);
+            tq_cp_async_commit();
+            tq_cp_async_wait_one();
+        } else {
+            tq_cp_async_wait_all();
+        }
+        __syncthreads();
+
+        float x_val = s_x[cur_buf][x_idx];
+
+        #pragma unroll
+        for (int r = 0; r < MROW16; ++r) {
+            int row = base_row + r;
+            if (row >= out_features) break;
+
+            const uint8_t* block =
+                reinterpret_cast<const uint8_t*>(&s_w[cur_buf][r * Q4K_BLOCK_FLOATS]);
+
+            uint16_t d_bits  = block[0] | (block[1] << 8);
+            uint16_t dm_bits = block[2] | (block[3] << 8);
+            float d    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+            float dmin = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+            const uint8_t* scales = block + 4;
+            const uint8_t* qs     = block + 16;
+
+            uint8_t sc_val, m_val;
+            get_scale_min_k4(2 * grp + is_hi, scales, &sc_val, &m_val);
+
+            uint8_t q_byte = qs[grp * 32 + l];
+            float nibble = is_hi ? (float)(q_byte >> 4) : (float)(q_byte & 0xF);
+            sums[r] += (d * (float)sc_val * nibble - dmin * (float)m_val) * x_val;
+        }
+
+        cur_buf = 1 - cur_buf;
+        __syncthreads();
+    }
+#else
+    __shared__ float s_x[QK_K];
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        const int x_pos = sb * QK_K + tid;
+        s_x[tid] = (x_pos < in_features) ? __ldg(&x[x_pos]) : 0.0f;
+        __syncthreads();
+        float x_val = s_x[x_idx];
+        #pragma unroll
+        for (int r = 0; r < MROW16; ++r) {
+            int row = base_row + r;
+            if (row >= out_features) break;
+            const uint8_t* block = W_packed + row * bytes_per_row + sb * Q4K_BLOCK_SIZE;
+            uint16_t d_bits  = block[0] | (block[1] << 8);
+            uint16_t dm_bits = block[2] | (block[3] << 8);
+            float d    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+            float dmin = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+            const uint8_t* scales = block + 4;
+            const uint8_t* qs = block + 16;
+            uint8_t sc_val, m_val;
+            get_scale_min_k4(2 * grp + is_hi, scales, &sc_val, &m_val);
+            uint8_t q_byte = qs[grp * 32 + l];
+            float nibble = is_hi ? (float)(q_byte >> 4) : (float)(q_byte & 0xF);
+            sums[r] += (d * (float)sc_val * nibble - dmin * (float)m_val) * x_val;
+        }
+        __syncthreads();
+    }
+#endif
+
+    #pragma unroll
+    for (int r = 0; r < MROW16; ++r) {
+        int row = base_row + r;
+        if (row >= out_features) break;
+        float result = block_reduce_sum(sums[r]);
+        if (tid == 0) output[row] = result;
+        if (r < MROW16 - 1) __syncthreads();
+    }
+}
+#undef MROW16
+#undef WX_WBUF_FLOATS16
+
 // ─── Q4_K_M Matvec — 8-row variant, X + W cp.async ──────────
 // Stacks on wx_cpasync: 8 rows per block (vs 4). Grid halves, 8 sums
 // accumulators per thread, shmem +1152 B for wider W buffer.
