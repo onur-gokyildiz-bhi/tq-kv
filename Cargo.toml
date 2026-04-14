@@ -23,6 +23,13 @@ gqa-shared-k = ["cuda"]
 # docs/asymmetric-kv-design.md (internal) and the Hadamard Q1-Q4 knowledge
 # entry (`unblocks:hadamard-open-q`).
 asymmetric-kv = ["tq-kv/asymmetric-kv"]
+# Persistent kernel lite (Plan #6). Phase 1 skeleton: megakernel shell with
+# counter-based phase sync. The CUDA kernel itself
+# (`persistent_decode_layer_f32` in kernels/persistent_decode.cu) always
+# compiles into the PTX, but the Rust-side launcher is only built when
+# this feature is enabled. Runtime gate: TQ_PERSISTENT=1.
+# See docs/persistent-kernel-lite-design.md.
+persistent-kernel = ["cuda"]
 
 [dependencies]
 tq-kv = { path = "tq-kv" }

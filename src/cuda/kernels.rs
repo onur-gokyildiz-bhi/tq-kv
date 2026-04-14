@@ -2757,3 +2757,121 @@ pub fn gqa_decode_attention_shared_k(
     Ok(())
 }
 
+// ─── Persistent Kernel Lite (skeleton launcher) ──────────────────────────
+// Owner: Hazy (Fused Kernel Architect)  Plan: docs/persistent-kernel-lite-design.md
+//
+// Phase 1 skeleton. The CUDA kernel itself
+// (`persistent_decode_layer_f32` in kernels/persistent_decode.cu) always
+// compiles into the PTX, but this Rust-side launcher is only built when
+// the `persistent-kernel` cargo feature is enabled. Runtime dispatch
+// additionally requires `TQ_PERSISTENT=1` so that feature-on builds stay
+// opt-in at run time.
+//
+// Grid shape: one block per SM (persistent). Block size 256.
+// All 9 phases share the atomic counter `g_phase_counter` (one i32 slot
+// per concurrent layer, zeroed before launch). See design doc §5.
+//
+// NOT WIRED INTO RUNTIME DISPATCH. Caller code does not exist yet — this
+// signature is the contract Phase 2 implementation targets.
+#[cfg(feature = "persistent-kernel")]
+pub struct PersistentDecodeBuffers<'a> {
+    pub residual: &'a mut CudaSlice<f32>,
+    pub norm_attn_weight: &'a CudaSlice<f32>,
+    pub norm_ffn_weight: &'a CudaSlice<f32>,
+    pub w_q: &'a CudaSlice<u8>,
+    pub w_k: &'a CudaSlice<u8>,
+    pub w_v: &'a CudaSlice<u8>,
+    pub w_o: &'a CudaSlice<u8>,
+    pub w_gate: &'a CudaSlice<u8>,
+    pub w_up: &'a CudaSlice<u8>,
+    pub w_down: &'a CudaSlice<u8>,
+    pub q_buf: &'a mut CudaSlice<f32>,
+    pub k_buf: &'a mut CudaSlice<f32>,
+    pub v_buf: &'a mut CudaSlice<f32>,
+    pub attn_buf: &'a mut CudaSlice<f32>,
+    pub wo_buf: &'a mut CudaSlice<f32>,
+    pub intermediate: &'a mut CudaSlice<f32>,
+    pub k_cache: &'a mut CudaSlice<f32>,
+    pub v_cache: &'a mut CudaSlice<f32>,
+    /// Per-layer phase counter. Must be zeroed before launch.
+    pub phase_counter: &'a mut CudaSlice<i32>,
+}
+
+#[cfg(feature = "persistent-kernel")]
+#[allow(clippy::too_many_arguments)]
+pub fn persistent_decode_layer(
+    reg: &KernelRegistry,
+    bufs: &mut PersistentDecodeBuffers<'_>,
+    hidden_dim: usize,
+    intermediate_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    seq_len: usize,
+    pos: usize,
+    rms_eps: f32,
+    attn_scale: f32,
+) -> Result<(), DriverError> {
+    // Runtime gate: even with the feature on, require TQ_PERSISTENT=1 so
+    // that shipping binaries don't silently switch decode paths.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var("TQ_PERSISTENT").ok().as_deref() == Some("1")
+    });
+    if !enabled {
+        // Skeleton is not callable unless explicitly opted-in. Returning
+        // an invalid-value error keeps accidental invocations loud.
+        return Err(DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+        ));
+    }
+
+    let f = reg.get_fn("persistent_decode", "persistent_decode_layer_f32")?;
+
+    // Grid: one persistent block per SM. Phase 1 hard-codes 68 (RTX 3080
+    // target); Phase 2 will query cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)
+    // at registry init time and stash it alongside the cuBLAS handle.
+    let n_sm: u32 = 68;
+    let block: u32 = 256;
+    let shmem: u32 = 0; // Phase 1: no dynamic shmem. Phase 2: ~24 KB per design doc §4.
+
+    let cfg = LaunchConfig {
+        grid_dim: (n_sm, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: shmem,
+    };
+
+    let hd_i  = hidden_dim as i32;
+    let id_i  = intermediate_dim as i32;
+    let nh_i  = n_heads as i32;
+    let nkv_i = n_kv_heads as i32;
+    let hdm_i = head_dim as i32;
+    let ms_i  = max_seq as i32;
+    let sl_i  = seq_len as i32;
+    let p_i   = pos as i32;
+    let nb_i  = n_sm as i32;
+
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(&mut *bufs.residual)
+            .arg(&*bufs.norm_attn_weight)
+            .arg(&*bufs.norm_ffn_weight)
+            .arg(&*bufs.w_q).arg(&*bufs.w_k).arg(&*bufs.w_v)
+            .arg(&*bufs.w_o)
+            .arg(&*bufs.w_gate).arg(&*bufs.w_up).arg(&*bufs.w_down)
+            .arg(&mut *bufs.q_buf).arg(&mut *bufs.k_buf).arg(&mut *bufs.v_buf)
+            .arg(&mut *bufs.attn_buf).arg(&mut *bufs.wo_buf)
+            .arg(&mut *bufs.intermediate)
+            .arg(&mut *bufs.k_cache).arg(&mut *bufs.v_cache)
+            .arg(&hd_i).arg(&id_i)
+            .arg(&nh_i).arg(&nkv_i).arg(&hdm_i)
+            .arg(&ms_i).arg(&sl_i).arg(&p_i)
+            .arg(&rms_eps).arg(&attn_scale)
+            .arg(&mut *bufs.phase_counter)
+            .arg(&nb_i)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
