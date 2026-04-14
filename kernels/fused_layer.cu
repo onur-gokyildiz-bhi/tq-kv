@@ -1135,6 +1135,198 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_mrow16_f32(
     }
 }
 
+// ─── Kernel 3c: dp4a Fused Gateup (MMVQ Step 3) ─────────────
+// Mirrors mrow8 structure (RMSNorm + 8 rows/block) but replaces the FP32
+// FMA inner loop with INT8 __dp4a ops.
+//
+// Phase 1: RMSNorm (identical to mrow8) → s_normed[hidden_dim] in shmem.
+// Phase 2: Inline quantize s_normed → q8_1 blocks in shmem (36B × n_blocks).
+//          Mirrors quantize_f32_to_q8_1_f32 algorithm. One warp per block,
+//          8 warps × 14 passes to cover hidden_dim=3584 (112 blocks).
+// Phase 3: dp4a matvec — 8 warps, warp w → row (row0+w). Mirrors
+//          q4km_matvec_dp4a_f32 inner loop, but reads q8_1 activations
+//          from shmem instead of global. Computes gate and up in one pass,
+//          then SiLU(gate) × up written to intermediate_out.
+//
+// Thread layout: 256 threads = 8 warps.
+//   - Warp w (0..7) computes output row row0 + w.
+//   - Lane layout within warp: sub = lane >> 2 (0..7), slot = lane & 3.
+//
+// Shmem:
+//   s_normed   : hidden_dim × 4 B
+//   s_x_q8_1   : (hidden_dim / 32) × 36 B       — inline-quantized activations
+//   (no s_wbuf: dp4a reads weights direct from global — mirrors Step 2)
+
+#define Q8_1_BLOCK_SIZE_LOCAL 36
+
+extern "C" __global__ void fused_addnorm_q4km_gateup_silu_dp4a_f32(
+    const float* __restrict__ input,
+    const float* __restrict__ _unused,
+    const float* __restrict__ norm_weight,
+    const uint8_t* __restrict__ W_gate,
+    const uint8_t* __restrict__ W_up,
+    float* __restrict__ intermediate_out,
+    const int hidden_dim,
+    const int intermediate_dim,
+    const float eps
+) {
+    extern __shared__ float s_mem[];
+    float* s_normed = s_mem;                                   // hidden_dim floats
+    uint8_t* s_x_q8_1 = reinterpret_cast<uint8_t*>(s_mem + hidden_dim);
+    // s_x_q8_1 byte size = (hidden_dim / 32) * 36
+
+    const int tid   = threadIdx.x;
+    const int row0  = 8 * blockIdx.x;
+    if (row0 >= intermediate_dim) return;
+
+    // ── Phase 1: RmsNorm (identical to mrow8) ────────────────
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float val = input[i];
+        sum_sq += val * val;
+        s_normed[i] = val;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float s_rms_inv;
+    if (tid == 0) {
+        s_rms_inv = rsqrtf(sum_sq / (float)hidden_dim + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        s_normed[i] = s_normed[i] * s_rms_inv * norm_weight[i];
+    }
+    __syncthreads();
+
+    // ── Phase 2: Inline quantize s_normed → q8_1 blocks in shmem ────
+    // Mirrors quantize_f32_to_q8_1_f32. Each warp (32 lanes) handles one
+    // 32-element block per pass. 8 warps run in parallel → stride 8 blocks.
+    const int n_q8_blocks = hidden_dim / 32;           // e.g. 3584/32 = 112
+    const int warp_id = tid >> 5;                       // 0..7
+    const int lane    = tid & 31;                       // 0..31
+
+    for (int blk = warp_id; blk < n_q8_blocks; blk += 8) {
+        const int idx = blk * 32 + lane;
+        const float xi = (idx < hidden_dim) ? s_normed[idx] : 0.0f;
+
+        // Full-warp amax (butterfly, broadcast to all lanes).
+        float amax = warp_reduce_max(fabsf(xi));
+
+        const float d     = amax / 127.0f;
+        const float d_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+        int qi = __float2int_rn(xi * d_inv);
+        qi = max(-128, min(127, qi));
+        const int8_t q = (amax == 0.0f) ? (int8_t)0 : (int8_t)qi;
+
+        // Need sum over the 32 quantized ints for the s field.
+        float sum_q = warp_reduce_sum((float)q);
+
+        uint8_t* block_ptr = s_x_q8_1 + (size_t)blk * Q8_1_BLOCK_SIZE_LOCAL;
+        int8_t*  qs_ptr    = reinterpret_cast<int8_t*>(block_ptr + 4);
+        qs_ptr[lane] = q;
+
+        if (lane == 0) {
+            const float s = d * sum_q;
+            half2 ds = __floats2half2_rn(d, s);
+            *reinterpret_cast<half2*>(block_ptr) = ds;
+        }
+    }
+    __syncthreads();
+
+    // ── Phase 3: dp4a matvec for gate and up projections ───
+    // Mirror q4km_matvec_dp4a_f32 but with row0 base and dual accumulators.
+    const int sub    = lane >> 2;                       // 0..7
+    const int slot   = lane & 3;                        // 0..3
+    const int grp_w  = sub >> 1;                        // 0..3 → Q4K byte-group
+    const int is_hi  = sub & 1;                         // 0 | 1
+
+    const int row = row0 + warp_id;
+    const bool row_active = (row < intermediate_dim);
+
+    const int n_superblocks = hidden_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+
+    float partial_g = 0.0f;
+    float partial_u = 0.0f;
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        // Weight super-block pointers (dummy read for inactive warps).
+        const uint8_t* blk_g = row_active
+            ? (W_gate + row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
+            : (W_gate);
+        const uint8_t* blk_u = row_active
+            ? (W_up   + row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
+            : (W_up);
+
+        // Gate scales/mins.
+        uint16_t dg_bits  = blk_g[0] | (blk_g[1] << 8);
+        uint16_t dmg_bits = blk_g[2] | (blk_g[3] << 8);
+        float d_g   = __half2float(*reinterpret_cast<const __half*>(&dg_bits));
+        float dm_g  = __half2float(*reinterpret_cast<const __half*>(&dmg_bits));
+        uint8_t sc_g_u8, m_g_u8;
+        get_scale_min_k4(sub, blk_g + 4, &sc_g_u8, &m_g_u8);
+
+        // Up scales/mins.
+        uint16_t du_bits  = blk_u[0] | (blk_u[1] << 8);
+        uint16_t dmu_bits = blk_u[2] | (blk_u[3] << 8);
+        float d_u   = __half2float(*reinterpret_cast<const __half*>(&du_bits));
+        float dm_u  = __half2float(*reinterpret_cast<const __half*>(&dmu_bits));
+        uint8_t sc_u_u8, m_u_u8;
+        get_scale_min_k4(sub, blk_u + 4, &sc_u_u8, &m_u_u8);
+
+        // Q4_K qs lookup (shared byte-group between lo/hi pair).
+        const int* gs32 = reinterpret_cast<const int*>(blk_g + 16 + grp_w * 32);
+        const int* us32 = reinterpret_cast<const int*>(blk_u + 16 + grp_w * 32);
+        int qg_0 = gs32[slot];
+        int qg_1 = gs32[slot + 4];
+        int qu_0 = us32[slot];
+        int qu_1 = us32[slot + 4];
+
+        int vg_0 = is_hi ? ((qg_0 >> 4) & 0x0F0F0F0F) : (qg_0 & 0x0F0F0F0F);
+        int vg_1 = is_hi ? ((qg_1 >> 4) & 0x0F0F0F0F) : (qg_1 & 0x0F0F0F0F);
+        int vu_0 = is_hi ? ((qu_0 >> 4) & 0x0F0F0F0F) : (qu_0 & 0x0F0F0F0F);
+        int vu_1 = is_hi ? ((qu_1 >> 4) & 0x0F0F0F0F) : (qu_1 & 0x0F0F0F0F);
+
+        // q8_1 activation block for this sub-block (shared mem).
+        const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * Q8_1_BLOCK_SIZE_LOCAL;
+        uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
+        float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+
+        const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+        int u0 = qs8[slot];
+        int u1 = qs8[slot + 4];
+
+        // dp4a accumulators.
+        int sumi_g = __dp4a(vg_0, u0, 0);
+        sumi_g     = __dp4a(vg_1, u1, sumi_g);
+        int sumi_u = __dp4a(vu_0, u0, 0);
+        sumi_u     = __dp4a(vu_1, u1, sumi_u);
+
+        // Shared sum of u (same for gate and up — lane owns same 8 u-bytes).
+        int sum_u = __dp4a(0x01010101, u0, 0);
+        sum_u     = __dp4a(0x01010101, u1, sum_u);
+
+        float lane_g_d = d_g  * (float)sc_g_u8 * (float)sumi_g * d8;
+        float lane_g_m = dm_g * (float)m_g_u8  * (float)sum_u  * d8;
+        float lane_u_d = d_u  * (float)sc_u_u8 * (float)sumi_u * d8;
+        float lane_u_m = dm_u * (float)m_u_u8  * (float)sum_u  * d8;
+
+        partial_g += (lane_g_d - lane_g_m);
+        partial_u += (lane_u_d - lane_u_m);
+    }
+
+    // Warp-reduce across 32 lanes → lane 0 owns final row sum.
+    float gate_row = warp_reduce_sum(partial_g);
+    float up_row   = warp_reduce_sum(partial_u);
+
+    if (row_active && lane == 0) {
+        float silu = gate_row / (1.0f + expf(-gate_row));
+        intermediate_out[row] = silu * up_row;
+    }
+}
+
+#undef Q8_1_BLOCK_SIZE_LOCAL
+
 // ─── Kernel 3b: Warp-shuffle LUT Fused Gateup ───────────────
 // Uses warp shuffle instead of shared memory for dequant LUT.
 // Each warp (32 threads) is in the same sub-block. Lanes 0-15 compute

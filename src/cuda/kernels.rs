@@ -2285,6 +2285,7 @@ pub fn fused_addnorm_q4km_gateup_silu(
     //   cpasync:           single-row cp.async pipeline  (TQ_GATEUP=cpasync)
     //   baseline:          original no-pipeline version  (TQ_GATEUP=baseline)
     //   lut:               warp-shuffle dequant LUT       (TQ_GATEUP=lut)
+    //   dp4a:              INT8 dp4a matvec + inline q8_1 quantize (TQ_GATEUP=dp4a)
     static GATEUP_VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let kernel_name = *GATEUP_VARIANT.get_or_init(|| {
         match std::env::var("TQ_GATEUP").ok().as_deref() {
@@ -2294,6 +2295,7 @@ pub fn fused_addnorm_q4km_gateup_silu(
             Some("mrow2")    => "fused_addnorm_q4km_gateup_silu_mrow2_f32",
             Some("mrow4")    => "fused_addnorm_q4km_gateup_silu_mrow4_f32",
             Some("mrow16")   => "fused_addnorm_q4km_gateup_silu_mrow16_f32",
+            Some("dp4a")     => "fused_addnorm_q4km_gateup_silu_dp4a_f32",
             _                => "fused_addnorm_q4km_gateup_silu_mrow8_f32",
         }
     });
@@ -2310,6 +2312,9 @@ pub fn fused_addnorm_q4km_gateup_silu(
         4608
     } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow16_f32" {
         9216
+    } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_dp4a_f32" {
+        // s_x_q8_1: (hidden_dim / 32) * 36 B. e.g. 3584 → 4032 B.
+        ((hidden_dim as u32) / 32) * 36
     } else {
         0
     };
@@ -2322,6 +2327,8 @@ pub fn fused_addnorm_q4km_gateup_silu(
         (intermediate_dim as u32 + 7) / 8
     } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_mrow16_f32" {
         (intermediate_dim as u32 + 15) / 16
+    } else if *kernel_name == *"fused_addnorm_q4km_gateup_silu_dp4a_f32" {
+        (intermediate_dim as u32 + 7) / 8
     } else {
         intermediate_dim as u32
     };
