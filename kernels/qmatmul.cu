@@ -1114,6 +1114,136 @@ extern "C" __global__ void q4km_dequant_f16(
 #define QK8_1 32
 #define Q8_1_BLOCK_SIZE 36   // sizeof(block_q8_1) — must equal sizeof in ggml-common.h
 
+// ─── Q4_K_M × q8_1 dp4a Matvec — MMVQ Step 2 ────────────────
+// INT8 tensor-pipe: activation pre-quantized to q8_1 (36B blocks), weights kept
+// in native Q4_K super-block layout (144B). Uses __dp4a (sm_61+) to compute
+// 4×int8 dot products in a single instruction.
+//
+// For each super-block (256 elements):
+//   - 8 sub-blocks × 32 int8s each, aligned 1:1 with 8 consecutive q8_1 blocks
+//   - Within a sub-block: 8 int32s (32 int8s) decoded from Q4_K nibbles
+//
+// Thread layout (per CUDA block, 256 threads = 8 warps):
+//   - Warp `w` (0..7) computes output row `base_row + w` entirely.
+//   - Within a warp: lane = (sub << 2) | slot, where sub ∈ 0..7 and slot ∈ 0..3.
+//     Each lane owns 2 packed int32s (slot and slot+4) of one sub-block.
+//   - Per lane: sumi1 = dp4a(v0,u0) + dp4a(v1,u1), sumi2 = sum-of-u helper.
+//     Scale with sc[sub], m[sub], d8[sub]; warp-reduce across all 32 lanes.
+//
+// Mirrors ggml/cuda vec_dot_q4_K_q8_1_impl_vmmq but reimplemented from scratch
+// with FP32 accumulator (GGML uses FP32 too; we match for stability).
+//
+// Grid: ceil(out_features / 8) blocks, 256 threads each, no shmem (pure regs).
+
+extern "C" __global__ void q4km_matvec_dp4a_f32(
+    const uint8_t * __restrict__ W_q4k,      // [out_features * bytes_per_row]
+    const void    * __restrict__ X_q8_1,     // [n_superblocks * 8] q8_1 blocks (36B each)
+    float         * __restrict__ output,     // [out_features]
+    const int      out_features,
+    const int      in_features               // must be multiple of 256 (QK_K)
+) {
+    const int base_row = blockIdx.x * 8;
+    const int tid      = threadIdx.x;
+    const int warp_id  = tid >> 5;            // 0..7 → which output row (within block)
+    const int lane     = tid & 31;            // 0..31 within warp
+    const int sub      = lane >> 2;           // 0..7 → sub-block index
+    const int slot     = lane & 3;            // 0..3 → int32 position within 16-byte half
+
+    const int row = base_row + warp_id;
+    const bool row_active = (row < out_features);
+
+    const int n_superblocks = in_features / QK_K;  // requires QK_K alignment
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+
+    // Derived from sub: which group & which nibble (lo vs hi).
+    // Group layout in qs: group `g` = 32 bytes starting at qs[g*32].
+    //   - lo nibbles (byte & 0x0F) → sub-block (2*g)
+    //   - hi nibbles (byte >> 4)   → sub-block (2*g+1)
+    const int grp   = sub >> 1;               // 0..3
+    const int is_hi = sub & 1;                // 0 or 1
+
+    float partial = 0.0f;  // only warp lane 0 will own the final sum after reduction
+
+    // q8_1 blocks: 8 per super-block, indexed contiguously.
+    // Layout of block_q8_1 (36B): half2 ds (4B) + int8 qs[32] (32B).
+    const uint8_t* q8_1_base = reinterpret_cast<const uint8_t*>(X_q8_1);
+
+    for (int sb = 0; sb < n_superblocks; ++sb) {
+        // ── Q4_K super-block layout ──────────────────────────────
+        // Only proceed if this warp's row is valid; inactive warps still run
+        // the loop to keep warp-uniform control flow and avoid divergence,
+        // but their partial stays 0.
+        const uint8_t* block = row_active
+            ? (W_q4k + row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
+            : (W_q4k);  // dummy read base; contributions masked at end
+
+        // block[0..2]  : d     (fp16)
+        // block[2..4]  : dmin  (fp16)
+        // block[4..16] : 12B packed scales/mins
+        // block[16..144]: 128B qs (4 groups × 32 bytes)
+        uint16_t d_bits  = block[0] | (block[1] << 8);
+        uint16_t dm_bits = block[2] | (block[3] << 8);
+        float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+        float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+        const uint8_t* scales = block + 4;
+        const uint8_t* qs     = block + 16;
+
+        uint8_t sc_u8, m_u8;
+        get_scale_min_k4(sub, scales, &sc_u8, &m_u8);
+        const int sc = (int)sc_u8;
+        const int m  = (int)m_u8;
+
+        // Load 2 int32s from Q4K qs (within this sub-block's group).
+        // Group `grp` has 32 bytes = 8 int32s at qs + grp*32.
+        // We read slot (0..3) and slot+4.
+        const int* qs32 = reinterpret_cast<const int*>(qs + grp * 32);
+        int q4_0 = qs32[slot];
+        int q4_1 = qs32[slot + 4];
+
+        // Extract this sub-block's nibbles: lo mask for is_hi=0, hi shift for is_hi=1.
+        // Result: each byte of v0/v1 is an int8 in range [0, 15].
+        int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
+        int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
+
+        // Load matching 2 int32s from q8_1 block `sub` (32 int8s = 8 int32s).
+        const uint8_t* q8_1_block = q8_1_base + (size_t)(sb * 8 + sub) * Q8_1_BLOCK_SIZE;
+        uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
+        float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+        // s8 (block[2..4]) encodes d8 * Σq8 aggregated over all 32 elements — not
+        // usable per-lane since each lane owns only 8 of the 32 values. We
+        // recompute the sum via dp4a(0x01010101, u, ...) below.
+
+        const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+        int u0 = qs8[slot];
+        int u1 = qs8[slot + 4];
+
+        // dp4a: 4×int8 dot, accumulate into int32.
+        int sumi = __dp4a(v0, u0, 0);
+        sumi     = __dp4a(v1, u1, sumi);
+
+        // FP32 accumulator (mirror reference's sumf_d / sumf_m split):
+        //   row_sum = d_w*sc*d8*Σ(nibble*q8) - dmin_w*m*d8*Σ(q8)    per sub-block
+        // Per lane owns 8 elements of the sub-block; warp-reduce at the end sums
+        // (a) lane partials within each sub-block (4 lanes) AND
+        // (b) across all 8 sub-blocks, since warp_reduce_sum uses a 32-lane mask.
+        int sum_u = __dp4a(0x01010101, u0, 0);
+        sum_u     = __dp4a(0x01010101, u1, sum_u);
+
+        // Per-lane partials (scaled by this lane's sub-block constants).
+        float lane_sumf_d = d_w    * (float)sc * (float)sumi  * d8;
+        float lane_sumf_m = dmin_w * (float)m  * (float)sum_u * d8;
+
+        partial += (lane_sumf_d - lane_sumf_m);
+    }
+
+    // Warp-reduce across all 32 lanes → lane 0 holds the final row sum.
+    float result = warp_reduce_sum(partial);
+
+    if (row_active && lane == 0) {
+        output[row] = result;
+    }
+}
+
 extern "C" __global__ void quantize_f32_to_q8_1_f32(
     const float* __restrict__ x,
     uint8_t* __restrict__ y,        // points at array of block_q8_1 (36B each)

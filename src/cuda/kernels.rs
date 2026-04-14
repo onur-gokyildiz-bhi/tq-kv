@@ -289,6 +289,20 @@ pub fn q4km_matvec(
     //   default (mrow8):      8 rows/block cpasync X+W pipeline
     //   wx_cpasync:           4 rows/block cpasync X+W (TQ_Q4KM=wx)
     //   baseline:             original (X cp.async only)  (TQ_Q4KM=baseline)
+    //   dp4a:                 INT8 tensor-pipe via __dp4a (TQ_Q4KM=dp4a)
+    //                         — requires on-the-fly q8_1 activation quantize
+    //                         — in_features must be multiple of QK8_1 (32)
+    static USE_DP4A: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let use_dp4a = *USE_DP4A.get_or_init(||
+        std::env::var("TQ_Q4KM").ok().as_deref() == Some("dp4a")
+    );
+    if use_dp4a && in_features % QK8_1 == 0 {
+        let n_blocks = in_features / QK8_1;
+        let bytes_needed = n_blocks * Q8_1_BLOCK_BYTES;
+        let mut x_q8_1: CudaSlice<u8> = reg.stream.alloc_zeros::<u8>(bytes_needed)?;
+        quantize_f32_to_q8_1(reg, x, &mut x_q8_1, in_features)?;
+        return q4km_matvec_dp4a(reg, w_packed, &x_q8_1, output, out_features, in_features);
+    }
     static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let kernel_name = *VARIANT.get_or_init(|| {
         match std::env::var("TQ_Q4KM").ok().as_deref() {
@@ -433,6 +447,60 @@ pub fn quantize_f32_to_q8_1(
             .arg(out_q8_1)
             .arg(&n_el)
             .arg(&n_bl)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch `q4km_matvec_dp4a_f32`: Q4_K_M × q8_1 matvec using `__dp4a`.
+///
+/// MMVQ Step 2 — INT8 tensor-pipe decode path. Pre-quantize the activation to
+/// q8_1 via [`quantize_f32_to_q8_1`] first, then call this launcher. Requires
+/// sm_61+ (Pascal) for the `__dp4a` intrinsic; assumed available on Ampere+.
+/// No env-gate: main session decides when to flip the default.
+///
+/// `in_features` must be a multiple of 256 (QK_K). The `x_q8_1` buffer must
+/// hold `(in_features / 32) * Q8_1_BLOCK_BYTES` bytes.
+pub fn q4km_matvec_dp4a(
+    reg: &KernelRegistry,
+    w_packed: &CudaSlice<u8>,
+    x_q8_1: &CudaSlice<u8>,
+    output: &mut CudaSlice<f32>,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    debug_assert!(
+        in_features % 256 == 0,
+        "q4km_matvec_dp4a: in_features ({}) must be multiple of 256",
+        in_features
+    );
+    let expected_q8_1 = (in_features / QK8_1) * Q8_1_BLOCK_BYTES;
+    debug_assert!(
+        x_q8_1.len() >= expected_q8_1,
+        "q4km_matvec_dp4a: x_q8_1 buffer {} bytes < required {}",
+        x_q8_1.len(), expected_q8_1
+    );
+    debug_assert!(
+        output.len() >= out_features,
+        "q4km_matvec_dp4a: output buffer {} elems < out_features {}",
+        output.len(), out_features
+    );
+    let f = reg.get_fn("qmatmul", "q4km_matvec_dp4a_f32")?;
+    let n_blocks = ((out_features as u32) + 7) / 8;
+    let cfg = LaunchConfig {
+        grid_dim: (n_blocks, 1, 1),
+        block_dim: (256, 1, 1),       // 8 warps × 32 lanes
+        shared_mem_bytes: 0,
+    };
+    let of = out_features as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_packed)
+            .arg(x_q8_1)
+            .arg(output)
+            .arg(&of)
+            .arg(&inf)
             .launch(cfg)?;
     }
     Ok(())
@@ -2411,4 +2479,253 @@ mod tests {
                 b, s_stored, s_expected);
         }
     }
+
+    /// MMVQ Step 2: q4km_matvec_dp4a_f32 (INT8 pipe) vs. q4km_matvec_mrow8_f32
+    /// (FP32 pipe) on synthetic data. Both should agree within INT8 activation
+    /// quantization tolerance (|diff|/|ref| ≤ 3%).
+    ///
+    /// We fabricate Q4_K super-blocks with known (d, dmin, scales, nibbles) and
+    /// a deterministic FP32 activation, then run both kernels and compare.
+    #[test]
+    fn q4km_matvec_dp4a_vs_fp32_reference() {
+        const OUT_FEATURES: usize = 16;
+        const IN_FEATURES:  usize = 256;   // exactly 1 super-block per row
+        const N_SB:         usize = IN_FEATURES / 256;
+        const Q4K_BYTES:    usize = 144;
+        const BYTES_PER_ROW: usize = N_SB * Q4K_BYTES;
+
+        let ctx = match cudarc::driver::CudaContext::new(0) {
+            Ok(c) => c,
+            Err(e) => { eprintln!("[skip] no CUDA device: {:?}", e); return; }
+        };
+        let stream = ctx.default_stream();
+        let (sm_major, sm_minor) = {
+            use cudarc::driver::sys;
+            let mut device: sys::CUdevice = 0;
+            let mut major: i32 = 0;
+            let mut minor: i32 = 0;
+            unsafe {
+                sys::cuDeviceGet(&mut device, 0);
+                sys::cuDeviceGetAttribute(&mut major,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+                sys::cuDeviceGetAttribute(&mut minor,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+            }
+            (major as u32, minor as u32)
+        };
+        if sm_major < 6 || (sm_major == 6 && sm_minor < 1) {
+            eprintln!("[skip] dp4a requires sm_61+, have sm_{}{}", sm_major, sm_minor);
+            return;
+        }
+        let reg = KernelRegistry::new(&ctx, &stream, sm_major, sm_minor)
+            .expect("kernel registry init");
+
+        // ── Build synthetic Q4_K weights: [OUT_FEATURES × BYTES_PER_ROW] ──
+        // Seeded LCG for reproducibility; each row uses its own d/dmin/scales
+        // so we exercise the full scale/min unpack path.
+        let mut w_bytes = vec![0u8; OUT_FEATURES * BYTES_PER_ROW];
+        let mut state: u32 = 0xC0DE_FACE;
+        let mut next = || -> u32 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state
+        };
+
+        // Helper: write fp16 from f32.
+        fn f32_to_f16_bits(x: f32) -> u16 { half::f16::from_f32(x).to_bits() }
+
+        for row in 0..OUT_FEATURES {
+            for sb in 0..N_SB {
+                let off = row * BYTES_PER_ROW + sb * Q4K_BYTES;
+                let block = &mut w_bytes[off..off + Q4K_BYTES];
+                // d ∈ [0.002, 0.01], dmin ∈ [0.001, 0.004] — small scales keep
+                // dequantized values bounded so FP32 math stays well-behaved.
+                let d_f    = 0.002_f32 + ((next() & 0xFF) as f32 / 255.0) * 0.008;
+                let dmin_f = 0.001_f32 + ((next() & 0xFF) as f32 / 255.0) * 0.003;
+                let d_bits  = f32_to_f16_bits(d_f).to_le_bytes();
+                let dm_bits = f32_to_f16_bits(dmin_f).to_le_bytes();
+                block[0] = d_bits[0]; block[1] = d_bits[1];
+                block[2] = dm_bits[0]; block[3] = dm_bits[1];
+                // Scales: 8 sub-blocks. Use the j<4 packing for simplicity:
+                //   scales[0..4] = sc[0..4] (6-bit, top 2 bits zero)
+                //   scales[4..8] = m[0..4]
+                //   scales[8..12]: sub-blocks 4..7 packed. We'll set sc4..7 and m4..7 all
+                //   to small values via the secondary packing.
+                // To make get_scale_min_k4 decode cleanly for j >= 4 we must respect its layout.
+                // Easiest: write a compatible 12-byte scales array by encoding all 8 sub-block
+                // pairs via the inverse of get_scale_min_k4.
+                let mut sc = [0u8; 8];
+                let mut mn = [0u8; 8];
+                for i in 0..8 {
+                    sc[i] = ((next() & 0x1F) as u8) + 1; // 1..32 (fits 6-bit)
+                    mn[i] = ((next() & 0x1F) as u8) + 1;
+                }
+                // Encode (j<4) directly.
+                for j in 0..4 {
+                    block[4 + j]     = sc[j] & 0x3F;
+                    block[4 + 4 + j] = mn[j] & 0x3F;
+                }
+                // Encode (j>=4): scales[j+4] low nibble = sc[j] low 4, top 2 bits of
+                // scales[j-4] and scales[j] hold high 2 bits of sc[j+4] and mn[j+4].
+                // Following inverse of get_scale_min_k4:
+                //   scales[j+4]&0x0F = sc[j]&0x0F
+                //   scales[j-4]>>6   = sc[j]>>4
+                //   scales[j+4]>>4   = mn[j]&0x0F
+                //   scales[j]>>6     = mn[j]>>4
+                for j in 4..8 {
+                    let s = sc[j];
+                    let m = mn[j];
+                    // scales[j+4] byte = (mn[j]&0x0F)<<4 | (sc[j]&0x0F)
+                    block[4 + (j + 4)] = ((m & 0x0F) << 4) | (s & 0x0F);
+                    // Need to set top 2 bits of scales[j-4] and scales[j].
+                    let lo_idx = 4 + (j - 4);  // scales[j-4]
+                    let hi_idx = 4 + j;        // scales[j]
+                    block[lo_idx] = (block[lo_idx] & 0x3F) | ((s >> 4) << 6);
+                    block[hi_idx] = (block[hi_idx] & 0x3F) | ((m >> 4) << 6);
+                }
+                // qs: 128 bytes of packed nibbles. Deterministic pattern.
+                for l in 0..128 {
+                    let lo = (next() & 0x0F) as u8;
+                    let hi = (next() & 0x0F) as u8;
+                    block[16 + l] = lo | (hi << 4);
+                }
+            }
+        }
+
+        // ── Build FP32 activation ──
+        let mut x_f32 = vec![0f32; IN_FEATURES];
+        for i in 0..IN_FEATURES {
+            let t = (i as f32) * 0.0123;
+            x_f32[i] = t.sin() * 1.5 + (t * 0.37).cos() * 0.5;
+        }
+
+        // ── Dequantize weights on CPU for FP32 reference path AND for ground-truth ──
+        // Use crate::quant::dequantize_q4k to get the exact same weight values the
+        // FP32 kernel would see after unpacking.
+        let w_f32_all = crate::quant::dequantize_q4k(&w_bytes, OUT_FEATURES * IN_FEATURES);
+
+        // CPU ground-truth: plain FP32 matmul.
+        let mut ref_host = vec![0f32; OUT_FEATURES];
+        for row in 0..OUT_FEATURES {
+            let mut acc = 0.0f32;
+            let row_w = &w_f32_all[row * IN_FEATURES..(row + 1) * IN_FEATURES];
+            for k in 0..IN_FEATURES {
+                acc += row_w[k] * x_f32[k];
+            }
+            ref_host[row] = acc;
+        }
+
+        // ── GPU: FP32 path (q4km_matvec_mrow8_f32 via q4km_matvec launcher) ──
+        let w_dev = stream.memcpy_stod(&w_bytes).expect("upload w");
+        let x_dev_f32 = stream.memcpy_stod(&x_f32).expect("upload x_f32");
+        let mut out_fp32: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(OUT_FEATURES).expect("alloc out_fp32");
+        // Force the default (mrow8) variant — no env manipulation needed, it's
+        // the default selected when TQ_Q4KM is unset.
+        super::q4km_matvec(&reg, &w_dev, &x_dev_f32, &mut out_fp32, OUT_FEATURES, IN_FEATURES)
+            .expect("launch fp32");
+        stream.synchronize().expect("sync fp32");
+        let out_fp32_host = stream.memcpy_dtov(&out_fp32).expect("download fp32");
+
+        // ── GPU: dp4a path (activation → q8_1 → dp4a matvec) ──
+        let n_q8_1_blocks = IN_FEATURES / QK8_1;
+        let mut x_q8_1: cudarc::driver::CudaSlice<u8> =
+            stream.alloc_zeros(n_q8_1_blocks * Q8_1_BLOCK_BYTES).expect("alloc x_q8_1");
+        super::quantize_f32_to_q8_1(&reg, &x_dev_f32, &mut x_q8_1, IN_FEATURES)
+            .expect("launch q8_1 quantize");
+        let mut out_dp4a: cudarc::driver::CudaSlice<f32> =
+            stream.alloc_zeros(OUT_FEATURES).expect("alloc out_dp4a");
+        super::q4km_matvec_dp4a(&reg, &w_dev, &x_q8_1, &mut out_dp4a, OUT_FEATURES, IN_FEATURES)
+            .expect("launch dp4a");
+        stream.synchronize().expect("sync dp4a");
+        let out_dp4a_host = stream.memcpy_dtov(&out_dp4a).expect("download dp4a");
+
+        // ── Compare ──
+        let mut max_diff = 0.0f32;
+        let mut sum_diff = 0.0f32;
+        let mut max_rel  = 0.0f32;
+        for row in 0..OUT_FEATURES {
+            let r  = ref_host[row];
+            let f  = out_fp32_host[row];
+            let dq = out_dp4a_host[row];
+
+            // Sanity: FP32 GPU path must agree with CPU reference closely.
+            let fp32_err = (f - r).abs();
+            assert!(fp32_err <= 1e-3 * (r.abs() + 1.0),
+                "row {}: FP32 GPU mismatches CPU — gpu {:.6}, cpu {:.6}",
+                row, f, r);
+
+            let diff = (dq - r).abs();
+            let rel  = diff / (r.abs() + 1e-6);
+            if diff > max_diff { max_diff = diff; }
+            sum_diff += diff;
+            if rel > max_rel { max_rel = rel; }
+        }
+        let mean_diff = sum_diff / (OUT_FEATURES as f32);
+
+        eprintln!(
+            "[dp4a-vs-fp32] max_abs={:.6}, mean_abs={:.6}, max_rel={:.4}",
+            max_diff, mean_diff, max_rel
+        );
+
+        let verdict = if max_rel <= 0.03 { "PASS" } else { "FAIL" };
+        eprintln!("[dp4a-vs-fp32] verdict: {} (tol 3%)", verdict);
+
+        assert!(max_rel <= 0.03,
+            "dp4a vs fp32 reference: max rel error {:.4} > 0.03 (max_abs={:.6})",
+            max_rel, max_diff);
+    }
 }
+
+// ─── GQA Shared-K decode attention (skeleton launcher) ───────────────────
+// Owner: attention-researcher  Plan: docs/gqa-shared-k-design.md
+//
+// Feature-gated stub. The CUDA kernel itself
+// (`gqa_decode_attention_shared_k_f32` in kernels/fused_attention.cu)
+// always compiles into the PTX, but this Rust-side launcher is only built
+// when the `gqa-shared-k` cargo feature is enabled. That keeps the default
+// build surface unchanged while letting CI exercise the new path on
+// demand.
+//
+// Grid shape: one block per KV group (down from one per Q head). See the
+// design doc for the full algorithm + register-pressure analysis.
+//
+// NOT WIRED INTO RUNTIME DISPATCH. Caller code does not exist yet — this
+// signature is the contract that future implementation work targets.
+#[cfg(feature = "gqa-shared-k")]
+pub fn gqa_decode_attention_shared_k(
+    reg: &KernelRegistry,
+    q: &CudaSlice<f32>,           // [n_heads, head_dim]
+    k: &CudaSlice<f32>,           // [n_kv_heads, max_seq, head_dim]
+    v: &CudaSlice<f32>,           // [n_kv_heads, max_seq, head_dim]
+    output: &mut CudaSlice<f32>,  // [n_heads, head_dim]
+    n_heads: usize,
+    n_kv_heads: usize,
+    seq_len: usize,
+    max_seq: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_attention", "gqa_decode_attention_shared_k_f32")?;
+    // Per design doc §3: 128 threads/block keeps register pressure under
+    // the spill threshold for n_qh up to 7 (Qwen2 7B). Larger groups will
+    // need warp-chunking — revisit when we hit that case.
+    let block_dim: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (n_kv_heads as u32, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0, // static __shared__ in the kernel
+    };
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let sl = seq_len as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q).arg(k).arg(v).arg(output)
+            .arg(&nh).arg(&nkv).arg(&sl).arg(&ms).arg(&hd).arg(&scale)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
