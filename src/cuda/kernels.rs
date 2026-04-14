@@ -285,7 +285,17 @@ pub fn q4km_matvec(
     out_features: usize,
     in_features: usize,
 ) -> Result<(), DriverError> {
-    let f = reg.get_fn("qmatmul", "q4km_matvec_f32")?;
+    // Q4_K_M matvec variants:
+    //   default (wx_cpasync): cp.async double-pipeline for both X and W
+    //   baseline:             original (X cp.async only)         TQ_Q4KM=baseline
+    static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let kernel_name = *VARIANT.get_or_init(|| {
+        match std::env::var("TQ_Q4KM").ok().as_deref() {
+            Some("baseline") => "q4km_matvec_f32",
+            _                => "q4km_matvec_wx_cpasync_f32",
+        }
+    });
+    let f = reg.get_fn("qmatmul", kernel_name)?;
     // Multi-row: 4 rows per block → ceil(out_features / 4) blocks
     let rows_per_block = 4u32;
     let n_blocks = (out_features as u32 + rows_per_block - 1) / rows_per_block;
