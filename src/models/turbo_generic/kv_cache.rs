@@ -1115,6 +1115,17 @@ pub(crate) fn parse_layer_bits() -> &'static Vec<(usize, usize, u8)> {
     })
 }
 
+/// H1 Hybrid: TQ_HYBRID_THRESHOLD=N — below N total KV tokens, run all
+/// normally-compressed layers as uncompressed (Std path). Above, normal TQ.
+/// Default 0 = hybrid disabled (existing behavior, pure TQ as configured).
+/// Typical value: 1024 (short-context ≤ 1024 tokens stays Std-fast).
+pub(crate) fn get_hybrid_threshold() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TQ_HYBRID_THRESHOLD").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
+}
+
 /// Calibrated per-layer bits (Sprint 3). Set from CalibrationData.auto_layer_bits
 /// at model load time. 0 = uncompressed (skip/protect), 2/3/4 = bit width.
 pub(crate) static AUTO_LAYER_BITS: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
@@ -1130,6 +1141,20 @@ pub(crate) fn set_auto_layer_bits(bits: Vec<u8>) {
 /// TQ_PROTECT_LAST of the final layer are uncompressed (fp16).
 /// Override with TQ_LAYER_BITS env var.
 pub(crate) fn get_layer_bits(layer_idx: usize, default_bits: u8, config: &tq_kv::TurboQuantConfig, n_layers: usize) -> Option<u8> {
+    get_layer_bits_at(layer_idx, default_bits, config, n_layers, usize::MAX)
+}
+
+/// H1 variant: considers `total_kv_len` for hybrid threshold. When hybrid
+/// threshold is set AND total_kv_len is below it, returns None for layers
+/// that would otherwise be compressed (full Std regime until threshold).
+/// Pass usize::MAX to disable the hybrid check (existing callers).
+pub(crate) fn get_layer_bits_at(
+    layer_idx: usize,
+    default_bits: u8,
+    config: &tq_kv::TurboQuantConfig,
+    n_layers: usize,
+    total_kv_len: usize,
+) -> Option<u8> {
     let skip = get_skip_layers(config);
     if layer_idx < skip {
         return None; // uncompressed — boundary protection (first N)
@@ -1138,6 +1163,13 @@ pub(crate) fn get_layer_bits(layer_idx: usize, default_bits: u8, config: &tq_kv:
     let protect_last = get_protect_last_layers(config);
     if protect_last > 0 && n_layers > 0 && layer_idx >= n_layers - protect_last {
         return None; // uncompressed — boundary protection (last M)
+    }
+
+    // H1 hybrid: below threshold, non-boundary layers also stay uncompressed.
+    // Boundary (skip/protect) layers already returned None above.
+    let hybrid_threshold = get_hybrid_threshold();
+    if hybrid_threshold > 0 && total_kv_len < hybrid_threshold {
+        return None;
     }
 
     // Priority 1: explicit TQ_LAYER_BITS env var (manual override)

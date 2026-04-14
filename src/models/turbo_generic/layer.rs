@@ -2263,7 +2263,10 @@ impl LayerWeights {
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
-        let layer_bits = get_layer_bits(self.layer_idx, self.tq_config.bits, &self.tq_config, self.n_layers);
+        let layer_bits = get_layer_bits_at(
+            self.layer_idx, self.tq_config.bits, &self.tq_config, self.n_layers,
+            index_pos + seq_len,
+        );
         let n_rep = self.n_head / self.n_kv_head;
 
         Ok((q, k, v, k_pre_rope, pre_rope_mode, tri_enabled, layer_bits, n_rep, b_sz, seq_len))
@@ -2576,6 +2579,32 @@ impl LayerWeights {
             // Reset cache on new sequence
             if index_pos == 0 {
                 self.kv_compressed = None;
+            }
+
+            // H1 hybrid transition safeguard: if TQ_HYBRID_THRESHOLD is set and a
+            // layer flips from Std (uncompressed) to TQ mid-session, the compressed
+            // cache is empty but the Std-path KV stash holds real history — attention
+            // would miss it. Detect the cross and loudly one-shot warn; phase 2
+            // (batch-compress backfill) is tracked separately.
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                let hybrid_threshold = super::kv_cache::get_hybrid_threshold();
+                let has_std_history = self.kv_cache.is_some()
+                    || self.gpu_kv_cache.as_ref().map_or(false, |g| g.seq_len > 0);
+                let compressed_empty = self
+                    .kv_compressed.as_ref().map_or(true, |c| c.cached_len == 0);
+                if hybrid_threshold > 0 && index_pos > 0 && has_std_history && compressed_empty
+                    && !WARNED.swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "[tq-hybrid] WARNING layer {}: TQ_HYBRID_THRESHOLD={} crossed \
+                         mid-session; compressed cache is empty but Std history exists. \
+                         Attention will miss pre-threshold tokens. Phase-2 batch-compress \
+                         backfill not yet implemented — see knowledge \"Plan H1 phase 2\".",
+                        self.layer_idx, hybrid_threshold,
+                    );
+                }
             }
 
             let cache_dtype = k.dtype();

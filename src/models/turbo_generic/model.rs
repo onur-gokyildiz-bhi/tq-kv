@@ -1705,7 +1705,10 @@ impl GenericTurboModel {
             // Hybrid graph replay: skip non-TQ layers (already executed by graph)
             #[cfg(feature = "cuda")]
             if graph_replayed {
-                let this_is_tq = get_layer_bits(layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers).is_some();
+                let this_is_tq = get_layer_bits_at(
+                    layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers,
+                    index_pos + seq_len,
+                ).is_some();
                 if !this_is_tq {
                     continue;
                 }
@@ -1760,7 +1763,10 @@ impl GenericTurboModel {
             // Skip for compressed layers (TQ KV path has CPU-side operations).
             // Phases are scoped to avoid borrow conflicts with &mut self in forward_attn.
             #[cfg(feature = "cuda")]
-            let layer_uses_compression = get_layer_bits(layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers).is_some();
+            let layer_uses_compression = get_layer_bits_at(
+                layer_idx, layer.tq_config.bits, &layer.tq_config, layer.n_layers,
+                index_pos + seq_len,
+            ).is_some();
 
             // ── Hybrid graph: end capture at TQ boundary ──
             #[cfg(feature = "cuda")]
