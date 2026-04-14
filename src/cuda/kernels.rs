@@ -2362,22 +2362,32 @@ pub fn fused_q4km_down_residual(
     // Down kernel dispatch:
     //   default (cpasync): single-row cp.async cooperative (Plan #9)
     //   mrow2:             2 rows/block (Std +4% but TQ -3% on RTX 3080 — opt-in)
+    //   dp4a:              MMVQ Step 4: inline q8_1 quantize + INT8 dp4a matvec (opt-in)
     //   baseline:          thread-per-superblock original
     static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let kernel_name = *VARIANT.get_or_init(|| {
         match std::env::var("TQ_DOWN").ok().as_deref() {
             Some("baseline") => "fused_q4km_down_residual_f32",
             Some("mrow2")    => "fused_q4km_down_residual_mrow2_cpasync_f32",
+            Some("dp4a")     => "fused_q4km_down_residual_dp4a_f32",
             _                => "fused_q4km_down_residual_cpasync_f32",
         }
     });
     let f = reg.get_fn("fused_layer", kernel_name)?;
     let grid = if *kernel_name == *"fused_q4km_down_residual_mrow2_cpasync_f32" {
         (hidden_dim as u32 + 1) / 2
+    } else if *kernel_name == *"fused_q4km_down_residual_dp4a_f32" {
+        (hidden_dim as u32 + 7) / 8
     } else {
         hidden_dim as u32
     };
-    let cfg = launch_per_row(grid as usize, 256);
+    let cfg = if *kernel_name == *"fused_q4km_down_residual_dp4a_f32" {
+        // s_x_q8_1: (intermediate_dim / 32) × 36 B. Qwen2 7B: 18944/32 * 36 = 21312 B.
+        let shmem = ((intermediate_dim as u32) / 32) * 36;
+        launch_with_shmem(grid, 256, shmem)
+    } else {
+        launch_per_row(grid as usize, 256)
+    };
     let hd = hidden_dim as i32;
     let id = intermediate_dim as i32;
     unsafe {
