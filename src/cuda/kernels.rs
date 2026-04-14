@@ -41,6 +41,12 @@ pub struct KernelRegistry {
     modules: std::collections::HashMap<&'static str, Arc<CudaModule>>,
     /// Cached cuBLAS handle (expensive to create, reuse across all matmul calls).
     pub cublas: std::sync::OnceLock<cudarc::cublas::CudaBlas>,
+    /// Reusable q8_1 scratch buffer for TQ_Q4KM=dp4a dispatch path.
+    /// Lazily allocated; grown on demand. Avoids per-call alloc_zeros
+    /// in `q4km_matvec` dp4a branch (~33 calls/token on Qwen2 7B decode).
+    /// Mutex-wrapped because `KernelRegistry` is shared via `Arc` globally
+    /// even though decode is single-threaded in practice.
+    pub q8_1_pool: std::sync::Mutex<Option<CudaSlice<u8>>>,
 }
 
 impl KernelRegistry {
@@ -51,6 +57,7 @@ impl KernelRegistry {
             stream: stream.clone(),
             modules: std::collections::HashMap::new(),
             cublas: std::sync::OnceLock::new(),
+            q8_1_pool: std::sync::Mutex::new(None),
         };
         reg.load_all_ptx(sm_major, sm_minor)?;
         Ok(reg)
@@ -299,9 +306,20 @@ pub fn q4km_matvec(
     if use_dp4a && in_features % QK8_1 == 0 {
         let n_blocks = in_features / QK8_1;
         let bytes_needed = n_blocks * Q8_1_BLOCK_BYTES;
-        let mut x_q8_1: CudaSlice<u8> = reg.stream.alloc_zeros::<u8>(bytes_needed)?;
-        quantize_f32_to_q8_1(reg, x, &mut x_q8_1, in_features)?;
-        return q4km_matvec_dp4a(reg, w_packed, &x_q8_1, output, out_features, in_features);
+        // Reuse pre-allocated scratch; grow if a larger matvec shows up.
+        // `quantize_f32_to_q8_1` fully overwrites every block (scale+sum+32 int8s
+        // per warp/block), so stale contents from a prior call are harmless.
+        let mut pool = reg.q8_1_pool.lock().unwrap();
+        let need_grow = match pool.as_ref() {
+            Some(buf) => buf.len() < bytes_needed,
+            None => true,
+        };
+        if need_grow {
+            *pool = Some(reg.stream.alloc_zeros::<u8>(bytes_needed)?);
+        }
+        let x_q8_1 = pool.as_mut().unwrap();
+        quantize_f32_to_q8_1(reg, x, x_q8_1, in_features)?;
+        return q4km_matvec_dp4a(reg, w_packed, x_q8_1, output, out_features, in_features);
     }
     static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let kernel_name = *VARIANT.get_or_init(|| {
@@ -2781,10 +2799,18 @@ pub struct PersistentDecodeBuffers<'a> {
     pub w_q: &'a CudaSlice<u8>,
     pub w_k: &'a CudaSlice<u8>,
     pub w_v: &'a CudaSlice<u8>,
+    /// Optional QKV biases. NULL-equivalent = pass an empty slice and have
+    /// the caller route through the no-bias standalone path instead.
+    pub bias_q: Option<&'a CudaSlice<f32>>,
+    pub bias_k: Option<&'a CudaSlice<f32>>,
+    pub bias_v: Option<&'a CudaSlice<f32>>,
     pub w_o: &'a CudaSlice<u8>,
     pub w_gate: &'a CudaSlice<u8>,
     pub w_up: &'a CudaSlice<u8>,
     pub w_down: &'a CudaSlice<u8>,
+    /// RoPE cos/sin tables — [max_seq, rope_dim/2].
+    pub cos_table: &'a CudaSlice<f32>,
+    pub sin_table: &'a CudaSlice<f32>,
     pub q_buf: &'a mut CudaSlice<f32>,
     pub k_buf: &'a mut CudaSlice<f32>,
     pub v_buf: &'a mut CudaSlice<f32>,
@@ -2807,9 +2833,11 @@ pub fn persistent_decode_layer(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    rope_dim: usize,
     max_seq: usize,
     seq_len: usize,
     pos: usize,
+    rope_interleaved: bool,
     rms_eps: f32,
     attn_scale: f32,
 ) -> Result<(), DriverError> {
@@ -2829,12 +2857,15 @@ pub fn persistent_decode_layer(
 
     let f = reg.get_fn("persistent_decode", "persistent_decode_layer_f32")?;
 
-    // Grid: one persistent block per SM. Phase 1 hard-codes 68 (RTX 3080
-    // target); Phase 2 will query cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)
-    // at registry init time and stash it alongside the cuBLAS handle.
+    // Grid: one persistent block per SM. Phase 2 still hard-codes 68
+    // (RTX 3080 target). Phase 4 will query cuDeviceGetAttribute.
     let n_sm: u32 = 68;
     let block: u32 = 256;
-    let shmem: u32 = 0; // Phase 1: no dynamic shmem. Phase 2: ~24 KB per design doc §4.
+    // Dynamic shmem (per design doc §4): hidden_dim*4 (s_normed) +
+    // (hidden_dim/32)*36 (s_x_q8_1). For Qwen2 7B hidden=3584 →
+    // 14336 + 4032 = 18368 bytes.
+    let shmem: u32 =
+        (hidden_dim * 4 + (hidden_dim / 32) * 36) as u32;
 
     let cfg = LaunchConfig {
         grid_dim: (n_sm, 1, 1),
@@ -2842,31 +2873,41 @@ pub fn persistent_decode_layer(
         shared_mem_bytes: shmem,
     };
 
-    let hd_i  = hidden_dim as i32;
-    let id_i  = intermediate_dim as i32;
-    let nh_i  = n_heads as i32;
-    let nkv_i = n_kv_heads as i32;
-    let hdm_i = head_dim as i32;
-    let ms_i  = max_seq as i32;
-    let sl_i  = seq_len as i32;
-    let p_i   = pos as i32;
-    let nb_i  = n_sm as i32;
+    let hd_i   = hidden_dim as i32;
+    let id_i   = intermediate_dim as i32;
+    let nh_i   = n_heads as i32;
+    let nkv_i  = n_kv_heads as i32;
+    let hdm_i  = head_dim as i32;
+    let rpd_i  = rope_dim as i32;
+    let ms_i   = max_seq as i32;
+    let sl_i   = seq_len as i32;
+    let p_i    = pos as i32;
+    let ril_i  = if rope_interleaved { 1_i32 } else { 0_i32 };
+    let nb_i   = n_sm as i32;
+    let null_ptr: u64 = 0;
 
     unsafe {
-        reg.stream.launch_builder(&f)
+        let mut builder = reg.stream.launch_builder(&f);
+        builder
             .arg(&mut *bufs.residual)
             .arg(&*bufs.norm_attn_weight)
             .arg(&*bufs.norm_ffn_weight)
-            .arg(&*bufs.w_q).arg(&*bufs.w_k).arg(&*bufs.w_v)
+            .arg(&*bufs.w_q).arg(&*bufs.w_k).arg(&*bufs.w_v);
+        if let Some(b) = bufs.bias_q { builder.arg(b); } else { builder.arg(&null_ptr); }
+        if let Some(b) = bufs.bias_k { builder.arg(b); } else { builder.arg(&null_ptr); }
+        if let Some(b) = bufs.bias_v { builder.arg(b); } else { builder.arg(&null_ptr); }
+        builder
             .arg(&*bufs.w_o)
             .arg(&*bufs.w_gate).arg(&*bufs.w_up).arg(&*bufs.w_down)
+            .arg(&*bufs.cos_table).arg(&*bufs.sin_table)
             .arg(&mut *bufs.q_buf).arg(&mut *bufs.k_buf).arg(&mut *bufs.v_buf)
             .arg(&mut *bufs.attn_buf).arg(&mut *bufs.wo_buf)
             .arg(&mut *bufs.intermediate)
             .arg(&mut *bufs.k_cache).arg(&mut *bufs.v_cache)
             .arg(&hd_i).arg(&id_i)
-            .arg(&nh_i).arg(&nkv_i).arg(&hdm_i)
+            .arg(&nh_i).arg(&nkv_i).arg(&hdm_i).arg(&rpd_i)
             .arg(&ms_i).arg(&sl_i).arg(&p_i)
+            .arg(&ril_i)
             .arg(&rms_eps).arg(&attn_scale)
             .arg(&mut *bufs.phase_counter)
             .arg(&nb_i)
