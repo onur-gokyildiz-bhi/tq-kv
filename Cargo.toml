@@ -30,6 +30,20 @@ asymmetric-kv = ["tq-kv/asymmetric-kv"]
 # this feature is enabled. Runtime gate: TQ_PERSISTENT=1.
 # See docs/persistent-kernel-lite-design.md.
 persistent-kernel = ["cuda"]
+# Sparse-V attention gating (Hadamard, Phase 1: uncompressed V). The CUDA
+# kernel `gqa_decode_attention_sparse_v_f32` in kernels/fused_attention.cu
+# is pure-additive and always compiles into the PTX; this feature only
+# gates the Rust-side launcher. Not wired into dispatch yet — follow-up
+# session owns forward_attn wiring + NIAH validation.
+# See docs/sparse-v-design.md.
+sparse-v = ["cuda"]
+# Tensor-core flash attention (Sprint G / Volta). Phase 1 skeleton: the
+# kernel `flash_decode_mma_f16_f32` in kernels/flash_decode_mma.cu always
+# compiles into the PTX (pure additive, no mma.sync yet — that is Phase 2).
+# This feature only gates the Rust-side launcher. Not wired into dispatch.
+# Future runtime gate: TQ_ATTN=mma.
+# See docs/tensor-core-flash-attn-plan.md.
+tensor-core-attn = ["cuda"]
 
 [dependencies]
 tq-kv = { path = "tq-kv" }

@@ -1538,6 +1538,52 @@ pub fn gqa_decode_attention(
     Ok(())
 }
 
+/// Launch `gqa_decode_attention_sparse_v_f32` — attention-gated V skipping
+/// during decode. Mirrors `gqa_decode_attention` but takes a fractional-of-
+/// max `threshold`: positions whose softmax weight (relative to running max)
+/// is below the threshold skip the V read.
+///
+/// Phase 1: uncompressed V only (Std path). TQ-compressed V path deferred.
+/// Not wired into dispatch — follow-up session owns forward_attn wiring.
+///
+/// Feature-gated behind `sparse-v`. See docs/sparse-v-design.md.
+#[cfg(feature = "sparse-v")]
+pub fn gqa_decode_attention_sparse_v(
+    reg: &KernelRegistry,
+    q: &CudaSlice<f32>,           // [n_heads, head_dim]
+    k: &CudaSlice<f32>,           // [n_kv_heads, max_seq, head_dim]
+    v: &CudaSlice<f32>,           // [n_kv_heads, max_seq, head_dim]
+    output: &mut CudaSlice<f32>,  // [n_heads, head_dim]
+    n_heads: usize,
+    n_kv_heads: usize,
+    seq_len: usize,
+    max_seq: usize,
+    head_dim: usize,
+    scale: f32,
+    threshold: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_attention", "gqa_decode_attention_sparse_v_f32")?;
+    let block_dim = decode_attn_block_dim(head_dim);
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let sl = seq_len as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q).arg(k).arg(v).arg(output)
+            .arg(&nh).arg(&nkv).arg(&sl).arg(&ms).arg(&hd).arg(&scale)
+            .arg(&threshold)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Launch hadamard_inverse_batch_f32 for key decompression.
 pub fn hadamard_inverse_batch(
     reg: &KernelRegistry,
@@ -2456,6 +2502,7 @@ pub fn fused_q4km_down_residual(
     //   default (cpasync): single-row cp.async cooperative (Plan #9)
     //   mrow2:             2 rows/block (Std +4% but TQ -3% on RTX 3080 — opt-in)
     //   dp4a:              MMVQ Step 4: inline q8_1 quantize + INT8 dp4a matvec (opt-in)
+    //   dp4a_v2:           MMVQ Step 8: 1-row × 4-warp DP4A (128 threads, grid = hidden_dim)
     //   baseline:          thread-per-superblock original
     static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let kernel_name = *VARIANT.get_or_init(|| {
@@ -2463,6 +2510,7 @@ pub fn fused_q4km_down_residual(
             Some("baseline") => "fused_q4km_down_residual_f32",
             Some("mrow2")    => "fused_q4km_down_residual_mrow2_cpasync_f32",
             Some("dp4a")     => "fused_q4km_down_residual_dp4a_f32",
+            Some("dp4a_v2")  => "fused_q4km_down_residual_dp4a_v2_f32",
             _                => "fused_q4km_down_residual_cpasync_f32",
         }
     });
@@ -2472,12 +2520,18 @@ pub fn fused_q4km_down_residual(
     } else if *kernel_name == *"fused_q4km_down_residual_dp4a_f32" {
         (hidden_dim as u32 + 7) / 8
     } else {
+        // cpasync, baseline, dp4a_v2 → one block per output row
         hidden_dim as u32
     };
     let cfg = if *kernel_name == *"fused_q4km_down_residual_dp4a_f32" {
         // s_x_q8_1: (intermediate_dim / 32) × 36 B. Qwen2 7B: 18944/32 * 36 = 21312 B.
         let shmem = ((intermediate_dim as u32) / 32) * 36;
         launch_with_shmem(grid, 256, shmem)
+    } else if *kernel_name == *"fused_q4km_down_residual_dp4a_v2_f32" {
+        // Same shmem as dp4a (s_x_q8_1 is the only dynamic alloc; tmp_shared[4]
+        // is static). 128 threads = 4 warps.
+        let shmem = ((intermediate_dim as u32) / 32) * 36;
+        launch_with_shmem(grid, 128, shmem)
     } else {
         launch_per_row(grid as usize, 256)
     };

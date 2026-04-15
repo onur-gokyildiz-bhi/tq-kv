@@ -1818,6 +1818,161 @@ extern "C" __global__ void fused_q4km_down_residual_dp4a_f32(
     }
 }
 
+// ─── Kernel 4-dp4a-v2: down_proj + residual, 1-row × 4-warp DP4A ──
+//
+// Mirror of q4km_matvec_dp4a_v2_f32 (kernels/qmatmul.cu, a613e1d) applied to
+// the fused down+residual kernel. Rationale:
+//
+// v1 (fused_q4km_down_residual_dp4a_f32) = 8 rows/block × 1 warp/row, 256
+//   threads. For Qwen2 7B (hidden_dim=3584) grid = 448 blocks. With ~68 SMs
+//   on RTX 3080 and ~4-6 blocks resident each, the DRAM pipeline is only
+//   partially saturated (Scout analysis: ~14% of peak DRAM BW).
+//
+// v2 = 1 row/block × 4 warps/row, 128 threads. Grid = hidden_dim (3584)
+//   → ~8× more CTAs. Each SM queues ~18 blocks → full DRAM pipeline fill.
+//   Math BIT-IDENTICAL to v1 (same dp4a pattern, same per-sub-block scale,
+//   same FP32 accumulator). Only the *iteration partitioning* changes:
+//   warps cooperate on ONE output row via sb-stride-4 instead of each warp
+//   taking a separate row.
+//
+// Phase 1 (inline quantize intermediate[] → q8_1 in shmem):
+//   128 threads = 4 warps. Warp w (0..3) handles q8_1 blocks w, w+4, w+8, ...
+//   For Qwen2 7B (intermediate_dim=18944, n_q8_blocks=592) each warp does
+//   ~148 blocks. Same shmem layout as v1 (s_x_q8_1 = (interm/32) × 36B).
+//
+// Phase 2 (dp4a matvec W_down × q8_1):
+//   All 4 warps cooperate on THE row = blockIdx.x. Warp w iterates
+//   sb = w, w+4, w+8, ... (stride-4 superblocks). Within warp: same
+//   (sub = lane>>2, slot = lane&3) decomposition as v1.
+//
+// Phase 3 (reduce + residual add):
+//   Intra-warp warp_reduce_sum → lane 0 of each warp holds its partial.
+//   Cross-warp reduce via __shared__ float tmp_shared[4] + __syncthreads.
+//   Warp 0 lane 0 sums the 4 partials and writes residual[row] += total.
+//
+// Grid:  hidden_dim blocks (was hidden_dim/8)
+// Block: 128 threads = 4 warps (was 256 = 8 warps)
+// Shmem: s_x_q8_1 = (intermediate_dim / 32) × 36 B, same as v1.
+//        (tmp_shared[4] is static 16B, does NOT add to dynamic request.)
+
+extern "C" __global__ void fused_q4km_down_residual_dp4a_v2_f32(
+    const uint8_t* __restrict__ W_down,
+    const float* __restrict__ intermediate,
+    float* __restrict__ residual,
+    const int hidden_dim,
+    const int intermediate_dim
+) {
+    extern __shared__ uint8_t s_mem_down_v2[];
+    uint8_t* s_x_q8_1 = s_mem_down_v2;
+
+    const int row = blockIdx.x;
+    if (row >= hidden_dim) return;
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;     // 0..3
+    const int lane    = tid & 31;     // 0..31
+
+    // ── Phase 1: Inline quantize intermediate[] → q8_1 blocks in shmem ──
+    // 4 warps, stride-4. Each warp owns its q8_1 block end-to-end (one warp
+    // per 32-element block so warp_reduce_* is well-defined).
+    const int n_q8_blocks = intermediate_dim / 32;  // e.g. 18944/32 = 592
+
+    for (int blk = warp_id; blk < n_q8_blocks; blk += 4) {
+        const int idx = blk * 32 + lane;
+        const float xi = (idx < intermediate_dim) ? intermediate[idx] : 0.0f;
+
+        float amax = warp_reduce_max(fabsf(xi));
+
+        const float d     = amax / 127.0f;
+        const float d_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+        int qi = __float2int_rn(xi * d_inv);
+        qi = max(-128, min(127, qi));
+        const int8_t q = (amax == 0.0f) ? (int8_t)0 : (int8_t)qi;
+
+        float sum_q = warp_reduce_sum((float)q);
+
+        uint8_t* block_ptr = s_x_q8_1 + (size_t)blk * 36;
+        int8_t*  qs_ptr    = reinterpret_cast<int8_t*>(block_ptr + 4);
+        qs_ptr[lane] = q;
+
+        if (lane == 0) {
+            const float s = d * sum_q;
+            half2 ds = __floats2half2_rn(d, s);
+            *reinterpret_cast<half2*>(block_ptr) = ds;
+        }
+    }
+    __syncthreads();
+
+    // ── Phase 2: dp4a matvec for W_down, 4-warp stride-4 on THE row ──
+    const int sub    = lane >> 2;     // 0..7 sub-block
+    const int slot   = lane & 3;      // 0..3 int32 slot
+    const int grp_w  = sub >> 1;      // 0..3 Q4K byte-group
+    const int is_hi  = sub & 1;       // 0 | 1
+
+    const int n_superblocks = intermediate_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+
+    const uint8_t* row_base = W_down + (size_t)row * bytes_per_row;
+
+    float partial = 0.0f;
+
+    for (int sb = warp_id; sb < n_superblocks; sb += 4) {
+        const uint8_t* blk = row_base + sb * Q4K_BLOCK_SIZE;
+
+        uint16_t d_bits  = blk[0] | (blk[1] << 8);
+        uint16_t dm_bits = blk[2] | (blk[3] << 8);
+        float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+        float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+        uint8_t sc_u8, m_u8;
+        get_scale_min_k4(sub, blk + 4, &sc_u8, &m_u8);
+
+        const int* qs32 = reinterpret_cast<const int*>(blk + 16 + grp_w * 32);
+        int q4_0 = qs32[slot];
+        int q4_1 = qs32[slot + 4];
+
+        int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
+        int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
+
+        const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * 36;
+        uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
+        float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+
+        const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+        int u0 = qs8[slot];
+        int u1 = qs8[slot + 4];
+
+        int sumi = __dp4a(v0, u0, 0);
+        sumi     = __dp4a(v1, u1, sumi);
+
+        int sum_u = __dp4a(0x01010101, u0, 0);
+        sum_u     = __dp4a(0x01010101, u1, sum_u);
+
+        float lane_d = d_w    * (float)sc_u8 * (float)sumi  * d8;
+        float lane_m = dmin_w * (float)m_u8  * (float)sum_u * d8;
+
+        partial += (lane_d - lane_m);
+    }
+
+    // ── Phase 3: reduce (intra-warp → cross-warp) + residual add ──
+    // Step 1: intra-warp. Lane 0 of each warp holds its partial over sb=w+4k.
+    float warp_sum = warp_reduce_sum(partial);
+
+    // Step 2: cross-warp via shmem. 4 partials, one per warp.
+    __shared__ float tmp_shared[4];
+    if (lane == 0) {
+        tmp_shared[warp_id] = warp_sum;
+    }
+    __syncthreads();
+
+    // Warp 0 lane 0 finalizes.
+    if (warp_id == 0 && lane == 0) {
+        float total = tmp_shared[0] + tmp_shared[1] + tmp_shared[2] + tmp_shared[3];
+        residual[row] += total;
+    }
+}
+
 // ─── Kernel 1-dp4a: RMSNorm + QKV + bias, INT8 dp4a matvec ──────
 //
 // Same grid/row-range dispatch as fused_norm_q4km_qkv_bias_f32, but the

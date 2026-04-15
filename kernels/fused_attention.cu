@@ -884,3 +884,98 @@ extern "C" __global__ void gqa_decode_attention_shared_k_f32(
         }
     }
 }
+
+// ─── Sparse-V GQA decode attention (Phase 1: uncompressed V only) ─────────
+// Owner: Hadamard (KV Compression). Design: docs/sparse-v-design.md.
+//
+// Mirrors `gqa_decode_attention_f32` for Phases 1-2 (Q·K, online softmax).
+// Before the V accumulate (Phase 3), gate on the *fractional* softmax weight
+// `w_frac = expf(score - running_max)` (i.e. weight relative to current max,
+// which is always in (0,1]). If `w_frac < threshold`, the V row is not read
+// and the acc is still scaled by `rf` (the running-max rescale) so the
+// online-softmax invariant holds.
+//
+// Q3 open-question decision (knowledge graph, `unblocks:hadamard-open-q`):
+// threshold is a fraction-of-max (robust across models), default 0.01.
+//
+// Pure additive — does not touch `gqa_decode_attention_f32`. No dispatch
+// wiring yet; Rust launcher is feature-gated behind `sparse-v`.
+extern "C" __global__ void gqa_decode_attention_sparse_v_f32(
+    const float* __restrict__ Q,     // [n_heads, 1, head_dim] (current query)
+    const float* __restrict__ K,     // [n_kv_heads, max_seq, head_dim]
+    const float* __restrict__ V,     // [n_kv_heads, max_seq, head_dim]
+    float* __restrict__ output,      // [n_heads, head_dim]
+    const int n_heads,
+    const int n_kv_heads,
+    const int seq_len,
+    const int max_seq,
+    const int head_dim,
+    const float scale,               // 1/sqrt(head_dim)
+    const float threshold            // fractional-of-max skip threshold
+) {
+    const int head_idx = blockIdx.x;
+    if (head_idx >= n_heads) return;
+    const int tid = threadIdx.x;
+    const int kv_head = head_idx / (n_heads / n_kv_heads);
+
+    __shared__ float s_q[MAX_HEAD_DIM];
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        s_q[d] = ld_readonly(&Q[head_idx * head_dim + d]);
+    }
+    __syncthreads();
+
+    const int n_acc = (head_dim + blockDim.x - 1) / blockDim.x;
+    float acc[9];
+    for (int i = 0; i < n_acc; ++i) acc[i] = 0.0f;
+    float running_max = -1e10f;
+    float running_sum = 0.0f;
+
+    const float* kv_k = K + kv_head * max_seq * head_dim;
+    const float* kv_v = V + kv_head * max_seq * head_dim;
+
+    for (int k = 0; k < seq_len; ++k) {
+        // Phase 1: Q · K dot product
+        const float* k_row = kv_k + k * head_dim;
+        float partial_dot = 0.0f;
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            partial_dot += s_q[d] * ld_readonly(&k_row[d]);
+        }
+        float score = block_reduce_sum(partial_dot) * scale;
+
+        // Phase 2: online softmax update (always executes — skipping this
+        // would break running_sum, so threshold only gates V reads)
+        float old_max = running_max;
+        float new_max = fmaxf(old_max, score);
+        float rf = expf(old_max - new_max);
+        float w = expf(score - new_max);  // in (0, 1]; current-token weight
+        running_sum = running_sum * rf + w;
+        running_max = new_max;
+
+        // Phase 3: gated V accumulate. `w` is already fractional-of-max
+        // (since w = exp(score - new_max) and new_max >= score). Skip the
+        // V read entirely when w < threshold. We still apply `rf` to acc
+        // because earlier tokens had different (smaller) max.
+        if (w < threshold) {
+            for (int i = 0; i < n_acc; ++i) {
+                acc[i] = acc[i] * rf;
+            }
+            continue;
+        }
+
+        const float* v_row = kv_v + k * head_dim;
+        for (int i = 0; i < n_acc; ++i) {
+            int d = tid + i * blockDim.x;
+            if (d < head_dim) {
+                acc[i] = acc[i] * rf + w * ld_readonly(&v_row[d]);
+            }
+        }
+    }
+
+    float inv_sum = (running_sum > 0.0f) ? 1.0f / running_sum : 0.0f;
+    for (int i = 0; i < n_acc; ++i) {
+        int d = tid + i * blockDim.x;
+        if (d < head_dim) {
+            output[head_idx * head_dim + d] = acc[i] * inv_sum;
+        }
+    }
+}
