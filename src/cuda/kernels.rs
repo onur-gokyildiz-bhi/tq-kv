@@ -2569,15 +2569,32 @@ pub fn flash_decode_mma(
     scale: f32,
 ) -> Result<(), DriverError> {
     let f = reg.get_fn("flash_decode_mma", "flash_decode_mma_f16_f32")?;
-    // Phase 1: fp32 compute fallback, grid = n_kv_heads (one block per GQA
-    // group). Block = 32 threads to minimize per-thread register pressure
-    // during the skeleton phase; Phase 2 will lift to 128 (4 warps) once the
-    // mma tiles land.
+    // Phase 2.a: MMA QK path on sm_80+ uses dynamic shmem:
+    //   q_half    = FDM_MMA_N (8)              * head_dim * 2 bytes
+    //   k_half    = FDM_MMA_M (16)             * head_dim * 2 bytes
+    //   acc_sm    = FDM_MAX_GQA_RATIO (16)     * head_dim * 4 bytes
+    //   scores_sm = FDM_MMA_M * FDM_MMA_N * 4  = 512 bytes
+    // For head_dim=128: ~14.5 KB total, well under 48 KB default.
+    //
+    // The sm_75 fallback path uses static shmem only, so the extra dynamic
+    // allocation is harmless (unused) there.
+    //
+    // Grid = n_kv_heads (one block per GQA group). Block = 32 threads (1
+    // warp) — Phase 2.a keeps the MMA tile owner singular; Phase 2.b will
+    // lift to multi-warp when AV also runs on tensor cores.
     let block_dim: u32 = 32;
+    const FDM_MMA_N: usize = 8;
+    const FDM_MMA_M: usize = 16;
+    const FDM_MAX_GQA: usize = 16;
+    let smem_q      = FDM_MMA_N   * head_dim * 2;
+    let smem_k      = FDM_MMA_M   * head_dim * 2;
+    let smem_acc    = FDM_MAX_GQA * head_dim * 4;
+    let smem_scores = FDM_MMA_M   * FDM_MMA_N * 4;
+    let smem_bytes  = (smem_q + smem_k + smem_acc + smem_scores) as u32;
     let cfg = LaunchConfig {
         grid_dim: (n_kv_heads as u32, 1, 1),
         block_dim: (block_dim, 1, 1),
-        shared_mem_bytes: 0,
+        shared_mem_bytes: smem_bytes,
     };
     let nh = n_heads as i32;
     let nkv = n_kv_heads as i32;
@@ -2884,6 +2901,227 @@ mod tests {
         assert!(max_rel <= 0.03,
             "dp4a vs fp32 reference: max rel error {:.4} > 0.03 (max_abs={:.6})",
             max_rel, max_diff);
+    }
+
+    // ─── Persistent Kernel Lite — Phase 3 integration harness ────────────
+    //
+    // Owner: Hazy. Proves the feature-gated `persistent_decode_layer`
+    // launcher compiles + launches end-to-end on a single decoder layer
+    // with synthetic dimensions. It does NOT cross-validate against the
+    // standalone norm/qkv/rope path — that comparison lives in Phase 4,
+    // once phases 2-7 grow real bodies. The goal here is a launch-contract
+    // smoke test:
+    //   1. All buffers wired through `PersistentDecodeBuffers` match the
+    //      kernel signature (bias ptrs, cos/sin tables, rope_dim).
+    //   2. The kernel returns without error (grid completes the 9-phase
+    //      walk, even though phases 2-7 are no-op stubs).
+    //   3. Phase 0 (RMSNorm+QKV) writes non-zero into q/k/v buffers, so
+    //      we know that phase body actually ran.
+    //
+    // Dimensions kept tiny to minimize register/shmem load while still
+    // hitting the real Q4_K code path (hidden_dim is a multiple of QK_K=256).
+    //
+    // Runtime gate: `TQ_PERSISTENT=1` is required. The test sets it on the
+    // process before invocation so launch isn't rejected with INVALID_VALUE.
+    #[cfg(feature = "persistent-kernel")]
+    #[test]
+    fn persistent_decode_one_layer_smoke() {
+        // Opt-in gate — matches the runtime check inside persistent_decode_layer.
+        std::env::set_var("TQ_PERSISTENT", "1");
+
+        let ctx = match cudarc::driver::CudaContext::new(0) {
+            Ok(c) => c,
+            Err(e) => { eprintln!("[skip] no CUDA device: {:?}", e); return; }
+        };
+        let stream = ctx.default_stream();
+        let (sm_major, sm_minor) = {
+            use cudarc::driver::sys;
+            let mut device: sys::CUdevice = 0;
+            let mut major: i32 = 0;
+            let mut minor: i32 = 0;
+            unsafe {
+                sys::cuDeviceGet(&mut device, 0);
+                sys::cuDeviceGetAttribute(&mut major,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+                sys::cuDeviceGetAttribute(&mut minor,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+            }
+            (major as u32, minor as u32)
+        };
+        if sm_major < 6 || (sm_major == 6 && sm_minor < 1) {
+            eprintln!("[skip] persistent_decode requires sm_61+ (dp4a), have sm_{}{}",
+                sm_major, sm_minor);
+            return;
+        }
+        let reg = KernelRegistry::new(&ctx, &stream, sm_major, sm_minor)
+            .expect("kernel registry init");
+
+        // ── Synthetic micro-layer dimensions ─────────────────────────────
+        //   hidden_dim = 256 (= 1 super-block Q4_K per row)
+        //   n_heads=4, n_kv_heads=2, head_dim=64 → q_out=256, kv_out=128 each
+        //   intermediate_dim=256 (same super-block shape)
+        //   rope_dim=head_dim (full rope, halved layout)
+        const HIDDEN:        usize = 256;
+        const INTERMEDIATE:  usize = 256;
+        const N_HEADS:       usize = 4;
+        const N_KV_HEADS:    usize = 2;
+        const HEAD_DIM:      usize = 64;
+        const ROPE_DIM:      usize = HEAD_DIM;
+        const MAX_SEQ:       usize = 32;
+        const SEQ_LEN:       usize = 1;
+        const POS:           usize = 0;
+        const Q4K_BYTES:     usize = 144; // per 256-element super-block
+        const N_SB:          usize = HIDDEN / 256;
+        const BYTES_PER_ROW: usize = N_SB * Q4K_BYTES;
+
+        let q_out  = N_HEADS    * HEAD_DIM;   // 256
+        let kv_out = N_KV_HEADS * HEAD_DIM;   // 128
+
+        // ── Synthetic Q4_K super-block (valid layout, zero-ish weights) ──
+        // We don't care about numeric correctness here, only that the
+        // unpack path (pd_get_scale_min_k4, dp4a) hits valid memory.
+        // Layout: [0..2] d (half), [2..4] dmin (half), [4..16] 12 scale bytes,
+        //         [16..144] 128 nibble bytes (256 × 4-bit).
+        let build_row = |seed: u32| -> Vec<u8> {
+            let mut row = vec![0u8; BYTES_PER_ROW];
+            // d = 1/256 in fp16 → bits 0x1800 (small positive)
+            row[0] = 0x00; row[1] = 0x18;
+            // dmin = 0 in fp16 → 0x0000
+            row[2] = 0x00; row[3] = 0x00;
+            // scales: all 1 (low 6 bits) → predictable lane_d
+            for j in 0..12 { row[4 + j] = 1; }
+            // nibbles: varied by seed so dp4a path doesn't collapse to 0
+            let mut s = seed | 1;
+            for j in 0..128 {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                row[16 + j] = (s >> 24) as u8;
+            }
+            row
+        };
+        let mk_weights = |out_rows: usize, seed_base: u32| -> Vec<u8> {
+            let mut buf = Vec::with_capacity(out_rows * BYTES_PER_ROW);
+            for r in 0..out_rows {
+                buf.extend_from_slice(&build_row(seed_base + r as u32));
+            }
+            buf
+        };
+
+        let w_q_host     = mk_weights(q_out,   0x1000);
+        let w_k_host     = mk_weights(kv_out,  0x2000);
+        let w_v_host     = mk_weights(kv_out,  0x3000);
+        let w_o_host     = mk_weights(HIDDEN,  0x4000);
+        let w_gate_host  = mk_weights(INTERMEDIATE, 0x5000);
+        let w_up_host    = mk_weights(INTERMEDIATE, 0x6000);
+        let w_down_host  = mk_weights(HIDDEN,  0x7000);
+
+        // ── Residual input + norm weights ────────────────────────────────
+        let mut residual_host = vec![0.0f32; HIDDEN];
+        for i in 0..HIDDEN { residual_host[i] = 0.1 + 0.01 * (i as f32); }
+        let norm_attn_host: Vec<f32> = (0..HIDDEN).map(|_| 1.0).collect();
+        let norm_ffn_host:  Vec<f32> = (0..HIDDEN).map(|_| 1.0).collect();
+
+        // ── RoPE tables (cos/sin), shape [MAX_SEQ, ROPE_DIM/2] ───────────
+        let half = ROPE_DIM / 2;
+        let mut cos_host = vec![0.0f32; MAX_SEQ * half];
+        let mut sin_host = vec![0.0f32; MAX_SEQ * half];
+        for p in 0..MAX_SEQ {
+            for i in 0..half {
+                let theta = (p as f32) / 10000f32.powf(2.0 * i as f32 / ROPE_DIM as f32);
+                cos_host[p * half + i] = theta.cos();
+                sin_host[p * half + i] = theta.sin();
+            }
+        }
+
+        // ── QKV biases (optional — exercise the bias != NULL path) ───────
+        let bias_q_host: Vec<f32> = (0..q_out ).map(|i| 0.001 * i as f32).collect();
+        let bias_k_host: Vec<f32> = (0..kv_out).map(|i| 0.002 * i as f32).collect();
+        let bias_v_host: Vec<f32> = (0..kv_out).map(|i| 0.003 * i as f32).collect();
+
+        // ── Upload to device ─────────────────────────────────────────────
+        let mut residual    = stream.memcpy_stod(&residual_host).expect("up residual");
+        let norm_attn       = stream.memcpy_stod(&norm_attn_host).expect("up na");
+        let norm_ffn        = stream.memcpy_stod(&norm_ffn_host).expect("up nf");
+        let w_q             = stream.memcpy_stod(&w_q_host).expect("up wq");
+        let w_k             = stream.memcpy_stod(&w_k_host).expect("up wk");
+        let w_v             = stream.memcpy_stod(&w_v_host).expect("up wv");
+        let bias_q_dev      = stream.memcpy_stod(&bias_q_host).expect("up bq");
+        let bias_k_dev      = stream.memcpy_stod(&bias_k_host).expect("up bk");
+        let bias_v_dev      = stream.memcpy_stod(&bias_v_host).expect("up bv");
+        let w_o             = stream.memcpy_stod(&w_o_host).expect("up wo");
+        let w_gate          = stream.memcpy_stod(&w_gate_host).expect("up wg");
+        let w_up            = stream.memcpy_stod(&w_up_host).expect("up wu");
+        let w_down          = stream.memcpy_stod(&w_down_host).expect("up wd");
+        let cos_table       = stream.memcpy_stod(&cos_host).expect("up cos");
+        let sin_table       = stream.memcpy_stod(&sin_host).expect("up sin");
+
+        let mut q_buf: CudaSlice<f32>       = stream.alloc_zeros(q_out).expect("q_buf");
+        let mut k_buf: CudaSlice<f32>       = stream.alloc_zeros(kv_out).expect("k_buf");
+        let mut v_buf: CudaSlice<f32>       = stream.alloc_zeros(kv_out).expect("v_buf");
+        let mut attn_buf: CudaSlice<f32>    = stream.alloc_zeros(q_out).expect("attn_buf");
+        let mut wo_buf: CudaSlice<f32>      = stream.alloc_zeros(HIDDEN).expect("wo_buf");
+        let mut intermediate: CudaSlice<f32> = stream.alloc_zeros(INTERMEDIATE).expect("intermediate");
+        let mut k_cache: CudaSlice<f32>     =
+            stream.alloc_zeros(MAX_SEQ * N_KV_HEADS * HEAD_DIM).expect("k_cache");
+        let mut v_cache: CudaSlice<f32>     =
+            stream.alloc_zeros(MAX_SEQ * N_KV_HEADS * HEAD_DIM).expect("v_cache");
+        let mut phase_counter: CudaSlice<i32> = stream.alloc_zeros(1).expect("phase_counter");
+
+        let mut bufs = PersistentDecodeBuffers {
+            residual:         &mut residual,
+            norm_attn_weight: &norm_attn,
+            norm_ffn_weight:  &norm_ffn,
+            w_q: &w_q, w_k: &w_k, w_v: &w_v,
+            bias_q: Some(&bias_q_dev),
+            bias_k: Some(&bias_k_dev),
+            bias_v: Some(&bias_v_dev),
+            w_o: &w_o,
+            w_gate: &w_gate, w_up: &w_up, w_down: &w_down,
+            cos_table: &cos_table, sin_table: &sin_table,
+            q_buf: &mut q_buf, k_buf: &mut k_buf, v_buf: &mut v_buf,
+            attn_buf: &mut attn_buf, wo_buf: &mut wo_buf,
+            intermediate: &mut intermediate,
+            k_cache: &mut k_cache, v_cache: &mut v_cache,
+            phase_counter: &mut phase_counter,
+        };
+
+        let rms_eps: f32 = 1e-6;
+        let attn_scale: f32 = 1.0 / (HEAD_DIM as f32).sqrt();
+
+        persistent_decode_layer(
+            &reg,
+            &mut bufs,
+            HIDDEN, INTERMEDIATE,
+            N_HEADS, N_KV_HEADS, HEAD_DIM, ROPE_DIM,
+            MAX_SEQ, SEQ_LEN, POS,
+            /* rope_interleaved = */ false,
+            rms_eps, attn_scale,
+        ).expect("persistent_decode_layer launch");
+
+        stream.synchronize().expect("sync after persistent decode");
+
+        // ── Verify Phase 0 wrote to q/k/v buffers (non-zero output) ──────
+        let q_host = stream.memcpy_dtov(&q_buf).expect("dl q");
+        let k_host = stream.memcpy_dtov(&k_buf).expect("dl k");
+        let v_host = stream.memcpy_dtov(&v_buf).expect("dl v");
+
+        let q_nonzero = q_host.iter().any(|&x| x != 0.0);
+        let k_nonzero = k_host.iter().any(|&x| x != 0.0);
+        let v_nonzero = v_host.iter().any(|&x| x != 0.0);
+        assert!(q_nonzero, "Phase 0 did not write to q_buf (all zeros)");
+        assert!(k_nonzero, "Phase 0 did not write to k_buf (all zeros)");
+        assert!(v_nonzero, "Phase 0 did not write to v_buf (all zeros)");
+
+        // Phase counter should equal TQ_N_PHASES * n_blocks (9 * 68 = 612).
+        let pc = stream.memcpy_dtov(&phase_counter).expect("dl pc");
+        eprintln!("[persistent-decode smoke] phase_counter = {} (expect 9 * n_blocks)", pc[0]);
+        assert!(pc[0] > 0, "phase counter never advanced — kernel didn't run");
+
+        // Sanity: Phase 1 (RoPE) at pos=0 means cos=1, sin=0 → identity,
+        // so q_buf contents after rope should still be non-zero (same as Phase 0 write).
+        let q_finite = q_host.iter().all(|x| x.is_finite());
+        assert!(q_finite, "q_buf contains NaN/Inf after RoPE at pos=0");
+
+        eprintln!("[persistent-decode smoke] PASS — launcher + phase-0/1 bodies executed");
     }
 }
 

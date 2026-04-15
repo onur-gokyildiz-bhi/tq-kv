@@ -1117,17 +1117,35 @@ impl GenericTurboModel {
             span: tracing::span!(tracing::Level::TRACE, "model"),
             span_output: tracing::span!(tracing::Level::TRACE, "output"),
             #[cfg(feature = "cuda")]
-            // CUDA Graph and layer swap are mutually exclusive: graph replay
-            // captures device addresses, which change every prefetch under
-            // swap. If either TQ_LAYER_SWAP=1 or =force is set, disable graph.
+            // CUDA Graph is disabled automatically when:
+            //   1. TQ_LAYER_SWAP is active — swap prefetch changes device
+            //      addresses between iterations, invalidating replay.
+            //   2. TurboQuant KV compression is active — the compressed-KV
+            //      attention path contains CPU-side ops (codebook lookups,
+            //      group reductions, TriAttention eviction bookkeeping) that
+            //      are not capture-safe. Running capture across these layers
+            //      produces either a silent hang or truncates the bench so
+            //      only the Standard row completes. The hybrid boundary in
+            //      `maybe_end_hybrid_capture` was meant to cover this but is
+            //      brittle in practice; treat TQ + graph as mutually exclusive
+            //      until the compressed-KV path is fully GPU-resident.
+            //
+            // Override: `TQ_GRAPH=force` keeps graph on even with TQ active
+            // (opt-in for testing; expected to be unstable).
             graph_manager: crate::cuda::graph::CudaGraphManager::new({
-                let graph_wanted = std::env::var("TQ_GRAPH").map(|v| v == "1").unwrap_or(false);
+                let graph_var = std::env::var("TQ_GRAPH").ok();
+                let graph_wanted = matches!(graph_var.as_deref(), Some("1") | Some("force"));
+                let graph_forced = matches!(graph_var.as_deref(), Some("force"));
                 let swap_active = matches!(
                     std::env::var("TQ_LAYER_SWAP").ok().as_deref(),
                     Some("1") | Some("force")
                 );
+                let tq_active = tq_config.skip_layers != Some(999);
                 if graph_wanted && swap_active {
                     eprintln!("[cuda] TQ_GRAPH disabled (TQ_LAYER_SWAP active)");
+                    false
+                } else if graph_wanted && tq_active && !graph_forced {
+                    eprintln!("[cuda] TQ_GRAPH disabled (TurboQuant KV active — compressed path not capture-safe). Set TQ_GRAPH=force to override.");
                     false
                 } else {
                     graph_wanted
