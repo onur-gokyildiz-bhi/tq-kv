@@ -1158,8 +1158,13 @@ impl GenericTurboModel {
             //      until the compressed-KV path is fully GPU-resident.
             //
             // Default: ON for Std path (safe-gate verified, +4-5% tok/s).
-            // Auto-disabled when TQ KV compression is active (capture-unsafe)
-            // or layer-swap is active (prefetch incompatible).
+            // Auto-disabled when:
+            //   - TQ KV compression active (capture-unsafe)
+            //   - layer-swap active (prefetch incompatible)
+            //   - dp4a kernel path active (TQ_GATEUP/Q4KM/DOWN/QKV=dp4a) — dp4a
+            //     variants use a process-lifetime q8_1 scratch buffer whose
+            //     address can differ between capture and replay, producing
+            //     CUDA_ERROR_ILLEGAL_ADDRESS on the first graph replay.
             // Opt-out:    TQ_GRAPH=0 | off | false
             // Opt-in TQ:  TQ_GRAPH=force (debug; expected unstable with TQ)
             graph_manager: crate::cuda::graph::CudaGraphManager::new({
@@ -1177,6 +1182,13 @@ impl GenericTurboModel {
                     Some("1") | Some("force")
                 );
                 let tq_active = tq_config.skip_layers != Some(999);
+                // dp4a dispatch path uses a q8_1 scratch whose address is not
+                // graph-replay-stable. Disable graph whenever any dp4a variant
+                // is explicitly selected.
+                let dp4a_active = ["TQ_GATEUP", "TQ_Q4KM", "TQ_DOWN", "TQ_QKV"]
+                    .iter()
+                    .any(|k| std::env::var(k).ok().as_deref() == Some("dp4a")
+                         || std::env::var(k).ok().as_deref() == Some("dp4a_v2"));
                 if graph_wanted && swap_active {
                     if graph_explicit_on {
                         eprintln!("[cuda] TQ_GRAPH disabled (TQ_LAYER_SWAP active)");
@@ -1187,6 +1199,11 @@ impl GenericTurboModel {
                     // Default path stays quiet for the common TQ+default-graph case.
                     if graph_explicit_on {
                         eprintln!("[cuda] TQ_GRAPH disabled (TurboQuant KV active — compressed path not capture-safe). Set TQ_GRAPH=force to override.");
+                    }
+                    false
+                } else if graph_wanted && dp4a_active && !graph_forced {
+                    if graph_explicit_on {
+                        eprintln!("[cuda] TQ_GRAPH disabled (dp4a scratch buffer not graph-safe). Set TQ_GRAPH=force to override.");
                     }
                     false
                 } else {
