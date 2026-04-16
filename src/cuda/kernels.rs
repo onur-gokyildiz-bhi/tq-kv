@@ -313,16 +313,18 @@ pub fn q4km_matvec(
     //                         occupancy on small out_features (e.g. down_proj).
     // Default flipped to dp4a_v2: +59% Std / +65% TQ out-of-box on RTX 3080
     // vs mrow8 (measured 2026-04-16). Explicit opt-outs preserved.
+    // dp4a_mrow4: 4-row-per-block variant (opt-in for testing).
     #[derive(Copy, Clone, PartialEq, Eq)]
-    enum Dp4aVariant { Off, V1, V2 }
+    enum Dp4aVariant { Off, V1, V2, Mrow4 }
     static DP4A_VAR: std::sync::OnceLock<Dp4aVariant> = std::sync::OnceLock::new();
     let dp4a_var = *DP4A_VAR.get_or_init(||
         match std::env::var("TQ_Q4KM").ok().as_deref() {
-            Some("dp4a")     => Dp4aVariant::V1,
+            Some("dp4a")       => Dp4aVariant::V1,
+            Some("dp4a_mrow4") => Dp4aVariant::Mrow4,
             // Explicit opt-out to legacy mrow8/baseline/wx/mrow16 falls through below.
             Some("baseline") | Some("wx") | Some("mrow8") | Some("mrow16") => Dp4aVariant::Off,
             // Default and explicit "dp4a_v2" both use V2.
-            _                => Dp4aVariant::V2,
+            _                  => Dp4aVariant::V2,
         }
     );
     if dp4a_var != Dp4aVariant::Off && in_features % QK8_1 == 0 {
@@ -344,6 +346,7 @@ pub fn q4km_matvec(
         return match dp4a_var {
             Dp4aVariant::V1 => q4km_matvec_dp4a(reg, w_packed, x_q8_1, output, out_features, in_features),
             Dp4aVariant::V2 => q4km_matvec_dp4a_v2(reg, w_packed, x_q8_1, output, out_features, in_features),
+            Dp4aVariant::Mrow4 => q4km_matvec_dp4a_mrow4(reg, w_packed, x_q8_1, output, out_features, in_features),
             Dp4aVariant::Off => unreachable!(),
         };
     }
@@ -596,6 +599,36 @@ pub fn q4km_matvec_dp4a_v2(
             .arg(output)
             .arg(&of)
             .arg(&inf)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Launch `q4km_matvec_dp4a_mrow4_f32`: 4-row-per-block dp4a matvec.
+/// Same math as `q4km_matvec_dp4a_v2` but grid = out_features/4 blocks
+/// (4× fewer launches) and x_q8_1 reads are amortized across 4 rows via
+/// L1 cache. Expected win on large out_features (Wo=3584, lm_head=152064).
+pub fn q4km_matvec_dp4a_mrow4(
+    reg: &KernelRegistry,
+    w_packed: &CudaSlice<u8>,
+    x_q8_1: &CudaSlice<u8>,
+    output: &mut CudaSlice<f32>,
+    out_features: usize,
+    in_features: usize,
+) -> Result<(), DriverError> {
+    debug_assert!(in_features % 256 == 0);
+    let f = reg.get_fn("qmatmul", "q4km_matvec_dp4a_mrow4_f32")?;
+    let cfg = LaunchConfig {
+        grid_dim: ((out_features as u32 + 3) / 4, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let of = out_features as i32;
+    let inf = in_features as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(w_packed).arg(x_q8_1).arg(output)
+            .arg(&of).arg(&inf)
             .launch(cfg)?;
     }
     Ok(())

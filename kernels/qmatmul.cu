@@ -1365,6 +1365,99 @@ extern "C" __global__ void q4km_matvec_dp4a_v2_f32(
     }
 }
 
+// ─── DP4A v2 × MROW4: 4 rows per block × 4 warps ────────────────
+// Combines the dp4a_v2 math (1-row × 4-warp stride-4) with mrow4 pattern
+// (4 output rows per block) to quarter the grid size + amortize the
+// q8_1 activation reads in L1 across 4 rows. 128 threads = 4 warps.
+// Each warp computes partials for ALL 4 rows using stride-4 sb walk;
+// lane 0 of each warp writes per-row partials to shared memory;
+// warp 0 finalizes a 4-value cross-warp reduce per row → 4 outputs.
+__launch_bounds__(128, 8)
+extern "C" __global__ void q4km_matvec_dp4a_mrow4_f32(
+    const uint8_t * __restrict__ W_q4k,
+    const void    * __restrict__ X_q8_1,
+    float         * __restrict__ output,
+    const int      out_features,
+    const int      in_features
+) {
+    const int base_row = blockIdx.x * 4;
+    if (base_row >= out_features) return;
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
+    const int sub     = lane >> 2;
+    const int slot    = lane & 3;
+
+    const int n_superblocks = in_features / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+    const int grp   = sub >> 1;
+    const int is_hi = sub & 1;
+
+    float partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint8_t* q8_1_base = reinterpret_cast<const uint8_t*>(X_q8_1);
+
+    for (int sb = warp_id; sb < n_superblocks; sb += 4) {
+        // q8_1 activation block (same for all 4 rows) — read once per sb.
+        const uint8_t* q8_1_block = q8_1_base + (size_t)(sb * 8 + sub) * Q8_1_BLOCK_SIZE;
+        float d8 = __half2float(*reinterpret_cast<const __half*>(q8_1_block));
+        const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+        int u0 = __ldg(qs8 + slot);
+        int u1 = __ldg(qs8 + slot + 4);
+        int sum_u = __dp4a(0x01010101, u0, 0);
+        sum_u     = __dp4a(0x01010101, u1, sum_u);
+
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int row = base_row + r;
+            if (row >= out_features) break;
+            const uint8_t* block = W_q4k + (size_t)row * bytes_per_row + sb * Q4K_BLOCK_SIZE;
+
+            float d_w    = __half2float(*reinterpret_cast<const __half*>(block));
+            float dmin_w = __half2float(*reinterpret_cast<const __half*>(block + 2));
+            const uint8_t* scales = block + 4;
+            const uint8_t* qs     = block + 16;
+
+            uint8_t sc_u8, m_u8;
+            get_scale_min_k4(sub, scales, &sc_u8, &m_u8);
+
+            const int* qs32 = reinterpret_cast<const int*>(qs + grp * 32);
+            int q4_0 = __ldg(qs32 + slot);
+            int q4_1 = __ldg(qs32 + slot + 4);
+            int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
+            int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
+
+            int sumi = __dp4a(v0, u0, 0);
+            sumi     = __dp4a(v1, u1, sumi);
+
+            float lane_d = d_w    * (float)sc_u8 * (float)sumi  * d8;
+            float lane_m = dmin_w * (float)m_u8  * (float)sum_u * d8;
+            partial[r] += (lane_d - lane_m);
+        }
+    }
+
+    // Per-row warp-reduce, then cross-warp reduce.
+    __shared__ float tmp_shared[4][4];  // [row][warp_id]
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        float warp_sum = warp_reduce_sum(partial[r]);
+        if (lane == 0) tmp_shared[r][warp_id] = warp_sum;
+    }
+    __syncthreads();
+
+    // Warp 0 finalizes all 4 rows (uses 4 threads, rest idle — trivial).
+    if (warp_id == 0 && lane < 4) {
+        const int r = lane;
+        const int row = base_row + r;
+        if (row < out_features) {
+            float total = tmp_shared[r][0] + tmp_shared[r][1]
+                        + tmp_shared[r][2] + tmp_shared[r][3];
+            output[row] = total;
+        }
+    }
+}
+
 extern "C" __global__ void quantize_f32_to_q8_1_f32(
     const float* __restrict__ x,
     uint8_t* __restrict__ y,        // points at array of block_q8_1 (36B each)
