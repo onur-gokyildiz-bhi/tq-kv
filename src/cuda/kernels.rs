@@ -42,22 +42,31 @@ pub struct KernelRegistry {
     /// Cached cuBLAS handle (expensive to create, reuse across all matmul calls).
     pub cublas: std::sync::OnceLock<cudarc::cublas::CudaBlas>,
     /// Reusable q8_1 scratch buffer for TQ_Q4KM=dp4a dispatch path.
-    /// Lazily allocated; grown on demand. Avoids per-call alloc_zeros
-    /// in `q4km_matvec` dp4a branch (~33 calls/token on Qwen2 7B decode).
+    /// Pre-allocated to a generous 64KB at registry init so the buffer
+    /// address is stable across the program lifetime — required for
+    /// CUDA Graph capture/replay to remain valid with dp4a dispatch.
+    /// 64KB covers in_features up to 58000 (exceeds any current model).
     /// Mutex-wrapped because `KernelRegistry` is shared via `Arc` globally
     /// even though decode is single-threaded in practice.
     pub q8_1_pool: std::sync::Mutex<Option<CudaSlice<u8>>>,
 }
 
 impl KernelRegistry {
+    /// Pre-allocated q8_1 scratch pool capacity (bytes). 64 KB covers
+    /// in_features up to ceil(58192/32) × 36 bytes. Allocated once at
+    /// registry init → address stable for CUDA Graph safety.
+    const Q8_1_POOL_CAPACITY: usize = 64 * 1024;
+
     /// Initialize the kernel registry — detects GPU arch, loads matching PTX modules.
     pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, sm_major: u32, sm_minor: u32) -> Result<Self, DriverError> {
+        // Pre-allocate q8_1 pool with stable address for graph-replay safety.
+        let q8_1_buf = stream.alloc_zeros::<u8>(Self::Q8_1_POOL_CAPACITY)?;
         let mut reg = Self {
             ctx: ctx.clone(),
             stream: stream.clone(),
             modules: std::collections::HashMap::new(),
             cublas: std::sync::OnceLock::new(),
-            q8_1_pool: std::sync::Mutex::new(None),
+            q8_1_pool: std::sync::Mutex::new(Some(q8_1_buf)),
         };
         reg.load_all_ptx(sm_major, sm_minor)?;
         Ok(reg)
@@ -319,9 +328,9 @@ pub fn q4km_matvec(
     if dp4a_var != Dp4aVariant::Off && in_features % QK8_1 == 0 {
         let n_blocks = in_features / QK8_1;
         let bytes_needed = n_blocks * Q8_1_BLOCK_BYTES;
-        // Reuse pre-allocated scratch; grow if a larger matvec shows up.
-        // `quantize_f32_to_q8_1` fully overwrites every block (scale+sum+32 int8s
-        // per warp/block), so stale contents from a prior call are harmless.
+        // Pool pre-allocated at registry init to Q8_1_POOL_CAPACITY for
+        // graph-replay-stable address. Grow on demand for oversize matmuls —
+        // but growing invalidates any active CUDA Graph capture.
         let mut pool = reg.q8_1_pool.lock().unwrap();
         let need_grow = match pool.as_ref() {
             Some(buf) => buf.len() < bytes_needed,
