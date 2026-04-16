@@ -302,14 +302,18 @@ pub fn q4km_matvec(
     //   dp4a_v2:              INT8 tensor-pipe, 1-row-per-block × 4-warp reduce
     //                         (TQ_Q4KM=dp4a_v2) — MMVQ Step 6, better SM
     //                         occupancy on small out_features (e.g. down_proj).
+    // Default flipped to dp4a_v2: +59% Std / +65% TQ out-of-box on RTX 3080
+    // vs mrow8 (measured 2026-04-16). Explicit opt-outs preserved.
     #[derive(Copy, Clone, PartialEq, Eq)]
     enum Dp4aVariant { Off, V1, V2 }
     static DP4A_VAR: std::sync::OnceLock<Dp4aVariant> = std::sync::OnceLock::new();
     let dp4a_var = *DP4A_VAR.get_or_init(||
         match std::env::var("TQ_Q4KM").ok().as_deref() {
-            Some("dp4a")    => Dp4aVariant::V1,
-            Some("dp4a_v2") => Dp4aVariant::V2,
-            _               => Dp4aVariant::Off,
+            Some("dp4a")     => Dp4aVariant::V1,
+            // Explicit opt-out to legacy mrow8/baseline/wx/mrow16 falls through below.
+            Some("baseline") | Some("wx") | Some("mrow8") | Some("mrow16") => Dp4aVariant::Off,
+            // Default and explicit "dp4a_v2" both use V2.
+            _                => Dp4aVariant::V2,
         }
     );
     if dp4a_var != Dp4aVariant::Off && in_features % QK8_1 == 0 {
@@ -2401,12 +2405,13 @@ pub fn fused_norm_q4km_qkv_bias(
     // Qwen2 7B (2026-04-14 bench: TQ -3% vs baseline). Default stays on the
     // proven baseline kernel; set TQ_QKV=cpasync or TQ_QKV=dp4a to try on
     // other workloads. dp4a is mrow8 (8 rows/block, INT8 dp4a inner loop).
+    // Default flipped to dp4a (+X% in full stack). `baseline` available for opt-out.
     static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let kernel_name = *VARIANT.get_or_init(|| {
         match std::env::var("TQ_QKV").ok().as_deref() {
-            Some("cpasync") => "fused_norm_q4km_qkv_bias_cpasync_f32",
-            Some("dp4a")    => "fused_norm_q4km_qkv_bias_dp4a_f32",
-            _               => "fused_norm_q4km_qkv_bias_f32",
+            Some("baseline") => "fused_norm_q4km_qkv_bias_f32",
+            Some("cpasync")  => "fused_norm_q4km_qkv_bias_cpasync_f32",
+            _                => "fused_norm_q4km_qkv_bias_dp4a_f32",
         }
     });
     let f = reg.get_fn("fused_layer", kernel_name)?;
@@ -2469,6 +2474,8 @@ pub fn fused_addnorm_q4km_gateup_silu(
     //   baseline:          original no-pipeline version  (TQ_GATEUP=baseline)
     //   lut:               warp-shuffle dequant LUT       (TQ_GATEUP=lut)
     //   dp4a:              INT8 dp4a matvec + inline q8_1 quantize (TQ_GATEUP=dp4a)
+    // Default flipped to dp4a: full-stack wins vs mrow8 (see TQ_Q4KM note).
+    // Explicit selectors preserved. `mrow8` available for opt-out.
     static GATEUP_VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let kernel_name = *GATEUP_VARIANT.get_or_init(|| {
         match std::env::var("TQ_GATEUP").ok().as_deref() {
@@ -2477,9 +2484,9 @@ pub fn fused_addnorm_q4km_gateup_silu(
             Some("cpasync")  => "fused_addnorm_q4km_gateup_silu_cpasync_f32",
             Some("mrow2")    => "fused_addnorm_q4km_gateup_silu_mrow2_f32",
             Some("mrow4")    => "fused_addnorm_q4km_gateup_silu_mrow4_f32",
+            Some("mrow8")    => "fused_addnorm_q4km_gateup_silu_mrow8_f32",
             Some("mrow16")   => "fused_addnorm_q4km_gateup_silu_mrow16_f32",
-            Some("dp4a")     => "fused_addnorm_q4km_gateup_silu_dp4a_f32",
-            _                => "fused_addnorm_q4km_gateup_silu_mrow8_f32",
+            _                => "fused_addnorm_q4km_gateup_silu_dp4a_f32",
         }
     });
     let f = reg.get_fn("fused_layer", kernel_name)?;
@@ -2548,14 +2555,17 @@ pub fn fused_q4km_down_residual(
     //   dp4a:              MMVQ Step 4: inline q8_1 quantize + INT8 dp4a matvec (opt-in)
     //   dp4a_v2:           MMVQ Step 8: 1-row × 4-warp DP4A (128 threads, grid = hidden_dim)
     //   baseline:          thread-per-superblock original
+    // Default flipped to dp4a (v1): +14% Std when paired with dp4a QKV/gateup
+    // (shared q8_1 scratch amortizes). Isolated dp4a regressed; full-stack wins.
+    // `cpasync` available for opt-out. dp4a_v2 regressed -29% in isolation — kept as opt-in.
     static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let kernel_name = *VARIANT.get_or_init(|| {
         match std::env::var("TQ_DOWN").ok().as_deref() {
             Some("baseline") => "fused_q4km_down_residual_f32",
             Some("mrow2")    => "fused_q4km_down_residual_mrow2_cpasync_f32",
-            Some("dp4a")     => "fused_q4km_down_residual_dp4a_f32",
+            Some("cpasync")  => "fused_q4km_down_residual_cpasync_f32",
             Some("dp4a_v2")  => "fused_q4km_down_residual_dp4a_v2_f32",
-            _                => "fused_q4km_down_residual_cpasync_f32",
+            _                => "fused_q4km_down_residual_dp4a_f32",
         }
     });
     let f = reg.get_fn("fused_layer", kernel_name)?;
