@@ -1159,6 +1159,7 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_mrow16_f32(
 
 #define Q8_1_BLOCK_SIZE_LOCAL 36
 
+__launch_bounds__(256, 4)
 extern "C" __global__ void fused_addnorm_q4km_gateup_silu_dp4a_f32(
     const float* __restrict__ input,
     const float* __restrict__ _unused,
@@ -1258,29 +1259,25 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_dp4a_f32(
             ? (W_up   + row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
             : (W_up);
 
-        // Gate scales/mins.
-        uint16_t dg_bits  = blk_g[0] | (blk_g[1] << 8);
-        uint16_t dmg_bits = blk_g[2] | (blk_g[3] << 8);
-        float d_g   = __half2float(*reinterpret_cast<const __half*>(&dg_bits));
-        float dm_g  = __half2float(*reinterpret_cast<const __half*>(&dmg_bits));
+        // Gate scales/mins — direct __half read (block is 4-byte aligned).
+        float d_g  = __half2float(*reinterpret_cast<const __half*>(blk_g));
+        float dm_g = __half2float(*reinterpret_cast<const __half*>(blk_g + 2));
         uint8_t sc_g_u8, m_g_u8;
         get_scale_min_k4(sub, blk_g + 4, &sc_g_u8, &m_g_u8);
 
-        // Up scales/mins.
-        uint16_t du_bits  = blk_u[0] | (blk_u[1] << 8);
-        uint16_t dmu_bits = blk_u[2] | (blk_u[3] << 8);
-        float d_u   = __half2float(*reinterpret_cast<const __half*>(&du_bits));
-        float dm_u  = __half2float(*reinterpret_cast<const __half*>(&dmu_bits));
+        // Up scales/mins — direct __half read.
+        float d_u  = __half2float(*reinterpret_cast<const __half*>(blk_u));
+        float dm_u = __half2float(*reinterpret_cast<const __half*>(blk_u + 2));
         uint8_t sc_u_u8, m_u_u8;
         get_scale_min_k4(sub, blk_u + 4, &sc_u_u8, &m_u_u8);
 
-        // Q4_K qs lookup (shared byte-group between lo/hi pair).
+        // Q4_K qs lookup (shared byte-group between lo/hi pair) — __ldg for read-only cache.
         const int* gs32 = reinterpret_cast<const int*>(blk_g + 16 + grp_w * 32);
         const int* us32 = reinterpret_cast<const int*>(blk_u + 16 + grp_w * 32);
-        int qg_0 = gs32[slot];
-        int qg_1 = gs32[slot + 4];
-        int qu_0 = us32[slot];
-        int qu_1 = us32[slot + 4];
+        int qg_0 = __ldg(gs32 + slot);
+        int qg_1 = __ldg(gs32 + slot + 4);
+        int qu_0 = __ldg(us32 + slot);
+        int qu_1 = __ldg(us32 + slot + 4);
 
         int vg_0 = is_hi ? ((qg_0 >> 4) & 0x0F0F0F0F) : (qg_0 & 0x0F0F0F0F);
         int vg_1 = is_hi ? ((qg_1 >> 4) & 0x0F0F0F0F) : (qg_1 & 0x0F0F0F0F);
@@ -1289,8 +1286,7 @@ extern "C" __global__ void fused_addnorm_q4km_gateup_silu_dp4a_f32(
 
         // q8_1 activation block for this sub-block (shared mem).
         const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * Q8_1_BLOCK_SIZE_LOCAL;
-        uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
-        float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+        float d8 = __half2float(*reinterpret_cast<const __half*>(q8_1_block));
 
         const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
         int u0 = qs8[slot];
@@ -1697,6 +1693,7 @@ extern "C" __global__ void fused_q4km_down_residual_f32(
 // SiLU(gate)*up already in the proper scale. Phase 1 reads it straight from
 // global (warmed by L2 across blocks on same SM).
 
+__launch_bounds__(256, 4)
 extern "C" __global__ void fused_q4km_down_residual_dp4a_f32(
     const uint8_t* __restrict__ W_down,
     const float* __restrict__ intermediate,
@@ -1771,26 +1768,24 @@ extern "C" __global__ void fused_q4km_down_residual_dp4a_f32(
             ? (W_down + row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
             : (W_down);
 
-        uint16_t d_bits  = blk[0] | (blk[1] << 8);
-        uint16_t dm_bits = blk[2] | (blk[3] << 8);
-        float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
-        float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+        // Direct __half read of fp16 header (block is 4-byte aligned).
+        float d_w    = __half2float(*reinterpret_cast<const __half*>(blk));
+        float dmin_w = __half2float(*reinterpret_cast<const __half*>(blk + 2));
 
         uint8_t sc_u8, m_u8;
         get_scale_min_k4(sub, blk + 4, &sc_u8, &m_u8);
 
-        // Q4K qs lookup (shared byte-group between lo/hi pair).
+        // Q4K qs lookup (shared byte-group between lo/hi pair) — __ldg for read-only cache.
         const int* qs32 = reinterpret_cast<const int*>(blk + 16 + grp_w * 32);
-        int q4_0 = qs32[slot];
-        int q4_1 = qs32[slot + 4];
+        int q4_0 = __ldg(qs32 + slot);
+        int q4_1 = __ldg(qs32 + slot + 4);
 
         int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
         int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
 
         // q8_1 activation block (shared memory).
         const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * 36;
-        uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
-        float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+        float d8 = __half2float(*reinterpret_cast<const __half*>(q8_1_block));
 
         const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
         int u0 = qs8[slot];
@@ -1995,6 +1990,7 @@ extern "C" __global__ void fused_q4km_down_residual_dp4a_v2_f32(
 // Shmem: s_normed (hidden_dim × 4 B) + s_x_q8_1 ((hidden_dim/32) × 36 B).
 //   Qwen2 7B (hidden_dim=3584): 14 336 + 4 032 = 18 368 B ≈ 18 KB, under 48 KB.
 
+__launch_bounds__(256, 4)
 extern "C" __global__ void fused_norm_q4km_qkv_bias_dp4a_f32(
     const float* __restrict__ input,
     const float* __restrict__ norm_weight,
@@ -2122,26 +2118,24 @@ extern "C" __global__ void fused_norm_q4km_qkv_bias_dp4a_f32(
             ? (W_sel + local_row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
             : (W_sel);
 
-        uint16_t d_bits  = blk[0] | (blk[1] << 8);
-        uint16_t dm_bits = blk[2] | (blk[3] << 8);
-        float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
-        float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+        // Direct __half read of fp16 header (block is 4-byte aligned).
+        float d_w    = __half2float(*reinterpret_cast<const __half*>(blk));
+        float dmin_w = __half2float(*reinterpret_cast<const __half*>(blk + 2));
 
         uint8_t sc_u8, m_u8;
         get_scale_min_k4(sub, blk + 4, &sc_u8, &m_u8);
 
-        // Q4K qs lookup (shared byte-group between lo/hi pair).
+        // Q4K qs lookup — __ldg for read-only cache.
         const int* qs32 = reinterpret_cast<const int*>(blk + 16 + grp_w * 32);
-        int q4_0 = qs32[slot];
-        int q4_1 = qs32[slot + 4];
+        int q4_0 = __ldg(qs32 + slot);
+        int q4_1 = __ldg(qs32 + slot + 4);
 
         int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
         int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
 
         // q8_1 activation block (shared memory).
         const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * 36;
-        uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
-        float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+        float d8 = __half2float(*reinterpret_cast<const __half*>(q8_1_block));
 
         const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
         int u0 = qs8[slot];
