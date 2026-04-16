@@ -1271,6 +1271,7 @@ extern "C" __global__ void q4km_matvec_dp4a_f32(
 // Block: 128 threads (4 warps × 32 lanes)
 // Shmem: 16 B static (4 floats — one partial per warp)
 
+__launch_bounds__(128, 8)
 extern "C" __global__ void q4km_matvec_dp4a_v2_f32(
     const uint8_t * __restrict__ W_q4k,      // [out_features * bytes_per_row]
     const void    * __restrict__ X_q8_1,     // [n_superblocks * 8] q8_1 blocks (36B each)
@@ -1306,11 +1307,10 @@ extern "C" __global__ void q4km_matvec_dp4a_v2_f32(
     for (int sb = warp_id; sb < n_superblocks; sb += 4) {
         const uint8_t* block = row_base + sb * Q4K_BLOCK_SIZE;
 
-        // Q4_K super-block header.
-        uint16_t d_bits  = block[0] | (block[1] << 8);
-        uint16_t dm_bits = block[2] | (block[3] << 8);
-        float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
-        float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+        // Q4_K super-block header — direct __half read (block is 4-byte
+        // aligned so the 2-byte fp16 scalar is naturally aligned).
+        float d_w    = __half2float(*reinterpret_cast<const __half*>(block));
+        float dmin_w = __half2float(*reinterpret_cast<const __half*>(block + 2));
         const uint8_t* scales = block + 4;
         const uint8_t* qs     = block + 16;
 
@@ -1321,19 +1321,18 @@ extern "C" __global__ void q4km_matvec_dp4a_v2_f32(
 
         // 2 int32s of nibbles for this lane's sub-block (group-aligned).
         const int* qs32 = reinterpret_cast<const int*>(qs + grp * 32);
-        int q4_0 = qs32[slot];
-        int q4_1 = qs32[slot + 4];
+        int q4_0 = __ldg(qs32 + slot);
+        int q4_1 = __ldg(qs32 + slot + 4);
         int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
         int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
 
-        // Matching q8_1 block.
+        // Matching q8_1 block — direct __half read on 4-byte aligned header.
         const uint8_t* q8_1_block = q8_1_base + (size_t)(sb * 8 + sub) * Q8_1_BLOCK_SIZE;
-        uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
-        float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+        float d8 = __half2float(*reinterpret_cast<const __half*>(q8_1_block));
 
         const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
-        int u0 = qs8[slot];
-        int u1 = qs8[slot + 4];
+        int u0 = __ldg(qs8 + slot);
+        int u1 = __ldg(qs8 + slot + 4);
 
         // VDR=2 dp4a: 2 × __dp4a per sub-block.
         int sumi = __dp4a(v0, u0, 0);
