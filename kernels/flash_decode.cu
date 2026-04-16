@@ -22,6 +22,7 @@
 // Grid: (n_splits, n_heads, batch), Block: BLOCK_SIZE threads
 // Each block processes split_size KV tokens with online softmax.
 
+__launch_bounds__(128, 8)
 extern "C" __global__ void flash_decode_partial(
     const float* __restrict__ Q,          // [B, H, 1, D]
     const float* __restrict__ K,          // [B, Hkv, max_seq, D]
@@ -132,6 +133,7 @@ extern "C" __global__ void flash_decode_partial(
 // Grid: (1, n_heads, batch), Block: BLOCK_SIZE threads
 // Combines partial results from all splits with online softmax rescaling.
 
+__launch_bounds__(128, 8)
 extern "C" __global__ void flash_decode_reduce(
     const float* __restrict__ partial_O,    // [B, H, n_splits, D]
     const float* __restrict__ partial_max,   // [B, H, n_splits]
