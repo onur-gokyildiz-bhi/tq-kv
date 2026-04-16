@@ -370,13 +370,16 @@ fn try_fused_decode_layer(
                         ptime!("gqa_attn", {
                             let gpu_kv = layer.gpu_kv_cache.as_ref().unwrap();
                             let attn_mut = Arc::get_mut(&mut scratch.attn_out).expect("attn_out aliased");
-                            // Lower flash_decode threshold increases SM occupancy
-                            // for short-KV decode (one-block-per-head → many-blocks).
-                            // Default 64; env TQ_FLASH_THRESHOLD overrides.
+                            // Always-flash default: persistent scratch partial
+                            // buffers (e185d65) eliminate per-step alloc overhead,
+                            // so flash path is viable even at tiny seq_kv where
+                            // it degenerates to n_splits=1 (~same as single-block).
+                            // Env TQ_FLASH_THRESHOLD overrides; set large to restore
+                            // single-block attention for legacy comparison.
                             let flash_threshold: usize = {
                                 static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
                                 *C.get_or_init(|| std::env::var("TQ_FLASH_THRESHOLD")
-                                    .ok().and_then(|v| v.parse().ok()).unwrap_or(64))
+                                    .ok().and_then(|v| v.parse().ok()).unwrap_or(0))
                             };
                             let use_flash = !capturing && !graph_replayed
                                 && gpu_kv.seq_len > flash_threshold;
