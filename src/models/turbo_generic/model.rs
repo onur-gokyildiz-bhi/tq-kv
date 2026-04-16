@@ -408,15 +408,42 @@ fn try_fused_decode_layer(
                             } else {
                                 // Graph-safe single-block attention
                                 let attn_extra = if capturing { 1i32 } else { 0 };
-                                crate::cuda::kernels::gqa_decode_attention_graph(
-                                    reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
-                                    attn_mut, &gpu_kv.valid_len_gpu,
-                                    scratch.n_head, scratch.n_kv_head,
-                                    gpu_kv.max_seq, scratch.head_dim,
-                                    1.0 / (scratch.head_dim as f32).sqrt(),
-                                    attn_extra,
-                                    0, // window_size: 0 = global (TODO: per-layer sliding window for Gemma 2)
-                                ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))?;
+                                let scale_f = 1.0 / (scratch.head_dim as f32).sqrt();
+                                #[cfg(feature = "sparse-v")]
+                                let sparse_v_threshold: Option<f32> = {
+                                    static C: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+                                    *C.get_or_init(|| {
+                                        std::env::var("TQ_SPARSE_V").ok()
+                                            .and_then(|v| v.parse::<f32>().ok())
+                                            .filter(|&t| t > 0.0)
+                                    })
+                                };
+                                #[cfg(not(feature = "sparse-v"))]
+                                let sparse_v_threshold: Option<f32> = None;
+
+                                if let Some(thr) = sparse_v_threshold {
+                                    #[cfg(feature = "sparse-v")]
+                                    crate::cuda::kernels::gqa_decode_attention_graph_sparse_v(
+                                        reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
+                                        attn_mut, &gpu_kv.valid_len_gpu,
+                                        scratch.n_head, scratch.n_kv_head,
+                                        gpu_kv.max_seq, scratch.head_dim,
+                                        scale_f, attn_extra,
+                                        0, // window_size: 0 = global
+                                        thr,
+                                    ).map_err(|e| TqError::Msg(format!("gqa_decode_sparse_v: {}", e)))?;
+                                    #[cfg(not(feature = "sparse-v"))]
+                                    { let _ = thr; unreachable!(); }
+                                } else {
+                                    crate::cuda::kernels::gqa_decode_attention_graph(
+                                        reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
+                                        attn_mut, &gpu_kv.valid_len_gpu,
+                                        scratch.n_head, scratch.n_kv_head,
+                                        gpu_kv.max_seq, scratch.head_dim,
+                                        scale_f, attn_extra,
+                                        0, // window_size: 0 = global (TODO: per-layer sliding window for Gemma 2)
+                                    ).map_err(|e| TqError::Msg(format!("gqa_decode_attn: {}", e)))?;
+                                }
                                 Ok(())
                             }
                         })?;

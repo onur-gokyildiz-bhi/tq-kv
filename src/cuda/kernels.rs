@@ -1538,6 +1538,50 @@ pub fn gqa_decode_attention(
     Ok(())
 }
 
+/// Graph-safe sparse-V decode: `gqa_decode_attention_graph_sparse_v_f32`.
+/// Mirrors `gqa_decode_attention_graph` (GPU seq_len scalar) with fractional-
+/// of-max V skip. Safe for CUDA Graph replay — seq_len_ptr + threshold are
+/// the only scalars read at launch-site, everything else is static.
+///
+/// Feature-gated behind `sparse-v`.
+#[cfg(feature = "sparse-v")]
+pub fn gqa_decode_attention_graph_sparse_v(
+    reg: &KernelRegistry,
+    q: &CudaSlice<f32>,
+    k: &CudaSlice<f32>,
+    v: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    seq_len_ptr: &CudaSlice<i32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    max_seq: usize,
+    head_dim: usize,
+    scale: f32,
+    extra: i32,
+    window_size: i32,
+    threshold: f32,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("fused_attention", "gqa_decode_attention_graph_sparse_v_f32")?;
+    let block_dim = decode_attn_block_dim(head_dim);
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nh = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let ms = max_seq as i32;
+    let hd = head_dim as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q).arg(k).arg(v).arg(output).arg(seq_len_ptr)
+            .arg(&nh).arg(&nkv).arg(&ms).arg(&hd).arg(&scale)
+            .arg(&extra).arg(&window_size).arg(&threshold)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Launch `gqa_decode_attention_sparse_v_f32` — attention-gated V skipping
 /// during decode. Mirrors `gqa_decode_attention` but takes a fractional-of-
 /// max `threshold`: positions whose softmax weight (relative to running max)
