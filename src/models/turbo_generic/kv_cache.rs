@@ -1438,6 +1438,13 @@ pub(crate) struct DecodeScratch {
     /// Combined residual + attn — ping-pong pair.
     /// Even layers write to [0], odd to [1]. Previous layer's output is read from the other.
     pub(crate) combined_bufs: [std::sync::Arc<cudarc::driver::CudaSlice<f32>>; 2],
+    /// flash_decode partial buffers — persistent across decode steps. Sized
+    /// for max n_splits at TQ_MAX_SEQ to avoid per-step alloc_zeros in the
+    /// hot attention path.
+    pub(crate) flash_partial_o: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    pub(crate) flash_partial_max: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    pub(crate) flash_partial_sum: std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    pub(crate) flash_max_splits: usize,
     /// Cached stream for tensor wrapping
     pub(crate) stream: std::sync::Arc<cudarc::driver::CudaStream>,
     /// Dimension metadata
@@ -1476,9 +1483,20 @@ impl DecodeScratch {
         let wo_out = alloc("wo_out", hidden_dim)?;
         let combined_a = alloc("combined_a", hidden_dim)?;
         let combined_b = alloc("combined_b", hidden_dim)?;
-        let total_kb = (q_out * 2 + k_out + v_out + intermediate_dim + hidden_dim * 3) * 4 / 1024;
-        eprintln!("  DecodeScratch allocated: qkv={}+{}+{} attn={} wo={} comb={}x2 inter={} ({}KB)",
-            q_out, k_out, v_out, q_out, hidden_dim, hidden_dim, intermediate_dim, total_kb);
+        // flash_decode persistent partial buffers — sized for max n_splits at
+        // TQ_MAX_SEQ with split_size=256. Pre-allocation eliminates the 3×
+        // alloc_zeros per decode step in the hot gqa_attn path.
+        let max_seq = get_max_kv_seq();
+        let flash_split_size = 256usize;
+        let flash_max_splits = (max_seq + flash_split_size - 1) / flash_split_size;
+        let flash_partial_o = alloc("flash_partial_o", n_head * flash_max_splits * head_dim)?;
+        let flash_partial_max = alloc("flash_partial_max", n_head * flash_max_splits)?;
+        let flash_partial_sum = alloc("flash_partial_sum", n_head * flash_max_splits)?;
+        let total_kb = (q_out * 2 + k_out + v_out + intermediate_dim + hidden_dim * 3
+            + n_head * flash_max_splits * (head_dim + 2)) * 4 / 1024;
+        eprintln!("  DecodeScratch allocated: qkv={}+{}+{} attn={} wo={} comb={}x2 inter={} flash={}×{} ({}KB)",
+            q_out, k_out, v_out, q_out, hidden_dim, hidden_dim, intermediate_dim,
+            n_head, flash_max_splits, total_kb);
         Ok(Self {
             q_buf: std::sync::Arc::new(q_buf),
             k_buf: std::sync::Arc::new(k_buf),
@@ -1487,6 +1505,10 @@ impl DecodeScratch {
             attn_out: std::sync::Arc::new(attn_out),
             wo_out: std::sync::Arc::new(wo_out),
             combined_bufs: [std::sync::Arc::new(combined_a), std::sync::Arc::new(combined_b)],
+            flash_partial_o: std::sync::Arc::new(flash_partial_o),
+            flash_partial_max: std::sync::Arc::new(flash_partial_max),
+            flash_partial_sum: std::sync::Arc::new(flash_partial_sum),
+            flash_max_splits,
             stream,
             q_out,
             k_out,

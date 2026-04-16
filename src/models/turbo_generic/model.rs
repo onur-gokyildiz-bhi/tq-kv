@@ -382,25 +382,27 @@ fn try_fused_decode_layer(
                                 && gpu_kv.seq_len > flash_threshold;
 
                             if use_flash {
-                                // Flash decode: split KV across blocks for parallelism
+                                // Flash decode: split KV across blocks for parallelism.
+                                // Uses persistent scratch partial buffers — no per-step
+                                // alloc_zeros. Sized for max n_splits at TQ_MAX_SEQ.
                                 let actual_seq = gpu_kv.seq_len;
                                 let split_size = 256usize;
                                 let n_splits = (actual_seq + split_size - 1) / split_size;
+                                debug_assert!(n_splits <= scratch.flash_max_splits,
+                                    "flash n_splits {} exceeds scratch capacity {}",
+                                    n_splits, scratch.flash_max_splits);
                                 let scale = 1.0 / (scratch.head_dim as f32).sqrt();
 
-                                let mut partial_o: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
-                                    scratch.n_head * n_splits * scratch.head_dim
-                                ).map_err(|e| TqError::Msg(format!("flash partial_o: {}", e)))?;
-                                let mut partial_max: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
-                                    scratch.n_head * n_splits
-                                ).map_err(|e| TqError::Msg(format!("flash partial_max: {}", e)))?;
-                                let mut partial_sum: cudarc::driver::CudaSlice<f32> = reg.stream.alloc_zeros(
-                                    scratch.n_head * n_splits
-                                ).map_err(|e| TqError::Msg(format!("flash partial_sum: {}", e)))?;
+                                let partial_o_mut = Arc::get_mut(&mut scratch.flash_partial_o)
+                                    .expect("flash_partial_o aliased");
+                                let partial_max_mut = Arc::get_mut(&mut scratch.flash_partial_max)
+                                    .expect("flash_partial_max aliased");
+                                let partial_sum_mut = Arc::get_mut(&mut scratch.flash_partial_sum)
+                                    .expect("flash_partial_sum aliased");
 
                                 crate::cuda::kernels::flash_decode_partial(
                                     reg, &*scratch.q_buf, &*gpu_kv.k_buf, &*gpu_kv.v_buf,
-                                    &mut partial_o, &mut partial_max, &mut partial_sum,
+                                    partial_o_mut, partial_max_mut, partial_sum_mut,
                                     1, scratch.n_head, scratch.n_kv_head,
                                     actual_seq, scratch.head_dim, scale, split_size,
                                     gpu_kv.max_seq,
@@ -408,7 +410,10 @@ fn try_fused_decode_layer(
                                 ).map_err(|e| TqError::Msg(format!("flash_decode_partial: {}", e)))?;
 
                                 crate::cuda::kernels::flash_decode_reduce(
-                                    reg, &partial_o, &partial_max, &partial_sum,
+                                    reg,
+                                    &*scratch.flash_partial_o,
+                                    &*scratch.flash_partial_max,
+                                    &*scratch.flash_partial_sum,
                                     attn_mut,
                                     scratch.n_head, n_splits, scratch.head_dim, 1,
                                 ).map_err(|e| TqError::Msg(format!("flash_decode_reduce: {}", e)))?;
