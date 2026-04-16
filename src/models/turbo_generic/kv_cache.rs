@@ -1490,7 +1490,7 @@ impl DecodeScratch {
         let max_seq = get_max_kv_seq();
         let flash_split_size: usize = std::env::var("TQ_FLASH_SPLIT")
             .ok().and_then(|v| v.parse().ok())
-            .unwrap_or(64)
+            .unwrap_or(32)
             .max(16);
         let flash_max_splits = (max_seq + flash_split_size - 1) / flash_split_size;
         let flash_partial_o = alloc("flash_partial_o", n_head * flash_max_splits * head_dim)?;

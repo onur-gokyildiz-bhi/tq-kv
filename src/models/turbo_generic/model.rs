@@ -391,7 +391,7 @@ fn try_fused_decode_layer(
                                 let split_size: usize = {
                                     static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
                                     *C.get_or_init(|| std::env::var("TQ_FLASH_SPLIT")
-                                        .ok().and_then(|v| v.parse().ok()).unwrap_or(64))
+                                        .ok().and_then(|v| v.parse().ok()).unwrap_or(32))
                                 };
                                 let n_splits = (actual_seq + split_size - 1) / split_size;
                                 debug_assert!(n_splits <= scratch.flash_max_splits,
