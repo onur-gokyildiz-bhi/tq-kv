@@ -1157,22 +1157,37 @@ impl GenericTurboModel {
             //      brittle in practice; treat TQ + graph as mutually exclusive
             //      until the compressed-KV path is fully GPU-resident.
             //
-            // Override: `TQ_GRAPH=force` keeps graph on even with TQ active
-            // (opt-in for testing; expected to be unstable).
+            // Default: ON for Std path (safe-gate verified, +4-5% tok/s).
+            // Auto-disabled when TQ KV compression is active (capture-unsafe)
+            // or layer-swap is active (prefetch incompatible).
+            // Opt-out:    TQ_GRAPH=0 | off | false
+            // Opt-in TQ:  TQ_GRAPH=force (debug; expected unstable with TQ)
             graph_manager: crate::cuda::graph::CudaGraphManager::new({
                 let graph_var = std::env::var("TQ_GRAPH").ok();
-                let graph_wanted = matches!(graph_var.as_deref(), Some("1") | Some("force"));
+                let graph_off_explicit = matches!(
+                    graph_var.as_deref(),
+                    Some("0") | Some("off") | Some("false")
+                );
+                let graph_explicit_on = matches!(graph_var.as_deref(), Some("1") | Some("force"));
                 let graph_forced = matches!(graph_var.as_deref(), Some("force"));
+                // Default ON unless user explicitly opts out with TQ_GRAPH=0.
+                let graph_wanted = !graph_off_explicit;
                 let swap_active = matches!(
                     std::env::var("TQ_LAYER_SWAP").ok().as_deref(),
                     Some("1") | Some("force")
                 );
                 let tq_active = tq_config.skip_layers != Some(999);
                 if graph_wanted && swap_active {
-                    eprintln!("[cuda] TQ_GRAPH disabled (TQ_LAYER_SWAP active)");
+                    if graph_explicit_on {
+                        eprintln!("[cuda] TQ_GRAPH disabled (TQ_LAYER_SWAP active)");
+                    }
                     false
                 } else if graph_wanted && tq_active && !graph_forced {
-                    eprintln!("[cuda] TQ_GRAPH disabled (TurboQuant KV active — compressed path not capture-safe). Set TQ_GRAPH=force to override.");
+                    // Only announce auto-disable when user explicitly asked for it.
+                    // Default path stays quiet for the common TQ+default-graph case.
+                    if graph_explicit_on {
+                        eprintln!("[cuda] TQ_GRAPH disabled (TurboQuant KV active — compressed path not capture-safe). Set TQ_GRAPH=force to override.");
+                    }
                     false
                 } else {
                     graph_wanted
