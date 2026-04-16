@@ -1484,10 +1484,14 @@ impl DecodeScratch {
         let combined_a = alloc("combined_a", hidden_dim)?;
         let combined_b = alloc("combined_b", hidden_dim)?;
         // flash_decode persistent partial buffers — sized for max n_splits at
-        // TQ_MAX_SEQ with split_size=256. Pre-allocation eliminates the 3×
-        // alloc_zeros per decode step in the hot gqa_attn path.
+        // TQ_MAX_SEQ with split_size chosen to match the runtime-smallest value.
+        // Default split_size=64 (matches model.rs TQ_FLASH_SPLIT default); env
+        // override consulted here so buffer is big enough for user's choice.
         let max_seq = get_max_kv_seq();
-        let flash_split_size = 256usize;
+        let flash_split_size: usize = std::env::var("TQ_FLASH_SPLIT")
+            .ok().and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+            .max(16);
         let flash_max_splits = (max_seq + flash_split_size - 1) / flash_split_size;
         let flash_partial_o = alloc("flash_partial_o", n_head * flash_max_splits * head_dim)?;
         let flash_partial_max = alloc("flash_partial_max", n_head * flash_max_splits)?;

@@ -385,8 +385,14 @@ fn try_fused_decode_layer(
                                 // Flash decode: split KV across blocks for parallelism.
                                 // Uses persistent scratch partial buffers — no per-step
                                 // alloc_zeros. Sized for max n_splits at TQ_MAX_SEQ.
+                                // split_size=64: at seq_kv=200, 4 splits × 28 heads = 112
+                                // blocks (~80% sm_86 utilization). Env override available.
                                 let actual_seq = gpu_kv.seq_len;
-                                let split_size = 256usize;
+                                let split_size: usize = {
+                                    static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                                    *C.get_or_init(|| std::env::var("TQ_FLASH_SPLIT")
+                                        .ok().and_then(|v| v.parse().ok()).unwrap_or(64))
+                                };
                                 let n_splits = (actual_seq + split_size - 1) / split_size;
                                 debug_assert!(n_splits <= scratch.flash_max_splits,
                                     "flash n_splits {} exceeds scratch capacity {}",
