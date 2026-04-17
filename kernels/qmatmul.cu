@@ -463,6 +463,183 @@ extern "C" __global__ void q6k_matvec_mrow8_f32(
 }
 #undef MROW8_Q6K
 
+// ─── Q6_K × q8_1 dp4a Matvec — MMVQ-style for Q6K ─────────────────
+//
+// Mirror of q4km_matvec_dp4a_v2_f32 adapted to Q6K's 6-bit weight layout.
+// Motivation: Q6K is used for lm_head + token_embd (Qwen2 7B: 151936×3584
+// matmul, 306 MB of Q6K weights, dominates per-token cost at ~2.6ms / 13% of
+// decode budget). Existing q6k_matvec_f32 uses fp32 dequant-style math and
+// tops out at ~15% of peak DRAM bandwidth. DP4A INT8 path has higher
+// arithmetic throughput and smaller per-thread state → better occupancy.
+//
+// Q6_K block layout (210 bytes → 256 weights):
+//   ql[0..127]:    4-bit LO nibbles (128 bytes)
+//   qh[128..191]:  2-bit HI bits, 4 sub-blocks packed per byte (64 bytes)
+//   scales[192..207]: 16 × int8 per-pair scales
+//   d[208..209]:   fp16 overall scale
+//
+// Weight value at position (grp, sub, l): q6 = (ql_nibble) | (qh_bits << 4)
+// where ql/qh selection follows the reference kernel. Dequantized:
+//   w = d * scale * (q6 - 32)    — symmetric around 32, no dmin/m zero-point
+//
+// Lane mapping (mirror Q4K dp4a_v2):
+//   sub  = lane >> 2        0..7 (maps to q6_grp×4 + q6_sub)
+//   slot = lane & 3         0..3 (int32 slot within a sub-block half)
+//   q6_grp  = sub >> 2      0..1 (which 128-byte ql group)
+//   q6_sub  = sub & 3       0..3 (which sub-block within group)
+//   ql_half = q6_sub & 1    0..1 (low/high 32-byte half of ql group)
+//   is_hi   = q6_sub >> 1   0..1 (lo nibble or hi nibble of ql)
+//
+// Each lane processes 8 weight positions within one sub-block:
+//   q6_0 = 4 weights at positions slot*4 + {0..3}
+//   q6_1 = 4 weights at positions slot*4 + {16..19}
+// Two __dp4a ops per sub-block (× 4-warp stride-4 iteration over superblocks).
+//
+// Per-byte subtract-32 uses __vsub4 (SIMD byte subtract, no borrow between
+// bytes). q6 bytes ∈ [0, 63]; after vsub4 with 0x20202020 → [-32, 31] as
+// signed int8 (two's complement per byte). dp4a treats inputs as signed int8.
+//
+// Q6K blocks are 210 bytes → NOT uniformly 4-byte aligned across the row.
+// We load ql/qh bytes individually and pack into int32 in-register. Compiler
+// emits LDG.U32 when aligned, LDG.U8 × 4 otherwise. Slight overhead on
+// misaligned blocks, but required for correctness (reinterpret_cast<int*> on
+// misaligned pointer = UB / crash).
+//
+// Math: bit-identical-equivalent to q6k_matvec_f32 modulo dp4a int8
+// quantization of x (via q8_1). PPL impact: identical to q4km dp4a path
+// (~+0.04% noise from q8_1 rounding).
+//
+// Grid:  out_features blocks (1 row each)
+// Block: 128 threads = 4 warps
+// Shmem: 16 B static only (tmp_shared[4] for cross-warp reduce)
+__launch_bounds__(128, 12)
+extern "C" __global__ void q6k_matvec_dp4a_v2_f32(
+    const uint8_t * __restrict__ W_q6k,
+    const void    * __restrict__ X_q8_1,    // pre-quantized (in_features/32)*36 B
+    float         * __restrict__ output,
+    const int      out_features,
+    const int      in_features              // must be multiple of QK_K (256)
+) {
+    const int row = blockIdx.x;
+    if (row >= out_features) return;
+
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;            // 0..3
+    const int lane    = tid & 31;            // 0..31
+    const int sub     = lane >> 2;           // 0..7
+    const int slot    = lane & 3;            // 0..3
+
+    const int q6_grp  = sub >> 2;            // 0 or 1
+    const int q6_sub  = sub & 3;             // 0..3
+    const int ql_half = q6_sub & 1;          // which 32B half of ql[grp*64..]
+    const int is_hi   = q6_sub >> 1;         // 0 = lo nibble, 1 = hi nibble
+    const int qh_shift = q6_sub * 2;         // which 2 bits of each qh byte
+
+    const int n_superblocks = in_features / QK_K;
+    const int bytes_per_row = n_superblocks * Q6K_BLOCK_SIZE;
+    const uint8_t* row_base  = W_q6k + (size_t)row * bytes_per_row;
+    const uint8_t* q8_1_base = reinterpret_cast<const uint8_t*>(X_q8_1);
+
+    float partial = 0.0f;
+
+    // 4-warp stride-4 superblock iteration — adjacent warps walk sequential
+    // superblocks for L2 reuse on q8_1 (shared across all CTAs on same SM).
+    for (int sb = warp_id; sb < n_superblocks; sb += 4) {
+        const uint8_t* blk = row_base + sb * Q6K_BLOCK_SIZE;
+        const uint8_t* ql = blk;
+        const uint8_t* qh = blk + 128;
+        const int8_t*  scales = reinterpret_cast<const int8_t*>(blk + 192);
+
+        // fp16 overall scale (2-byte load, potentially unaligned).
+        uint16_t d_bits = (uint16_t)blk[208] | ((uint16_t)blk[209] << 8);
+        float d_w = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+
+        const int ql_off = q6_grp * 64;
+        const int qh_off = q6_grp * 32;
+        const int sc_off = q6_grp * 8;
+
+        // ── Load 4 consecutive ql bytes for q6_0 (positions slot*4..+3) ──
+        // Not using reinterpret_cast<int*> because Q6K blocks are 210 B and
+        // not 4-byte aligned on every super-block.
+        const uint8_t* ql_p0 = ql + ql_off + ql_half * 32 + slot * 4;
+        int ql_0 = (int)ql_p0[0]
+                 | ((int)ql_p0[1] << 8)
+                 | ((int)ql_p0[2] << 16)
+                 | ((int)ql_p0[3] << 24);
+
+        // Load 4 ql bytes for q6_1 (positions slot*4+16..+19 within sub-block).
+        // These are 16 bytes further within the same half.
+        const uint8_t* ql_p1 = ql_p0 + 16;
+        int ql_1 = (int)ql_p1[0]
+                 | ((int)ql_p1[1] << 8)
+                 | ((int)ql_p1[2] << 16)
+                 | ((int)ql_p1[3] << 24);
+
+        // Extract target nibbles: lo for is_hi=0, hi for is_hi=1.
+        int n0 = is_hi ? ((ql_0 >> 4) & 0x0F0F0F0F) : (ql_0 & 0x0F0F0F0F);
+        int n1 = is_hi ? ((ql_1 >> 4) & 0x0F0F0F0F) : (ql_1 & 0x0F0F0F0F);
+
+        // ── Load 4 qh bytes for q6_0 (positions slot*4..+3) ──
+        // qh is 64 B total (grp×32 per group), so qh[qh_off + l] ∈ [0, 32).
+        const uint8_t* qh_p0 = qh + qh_off + slot * 4;
+        int qh_0 = (int)qh_p0[0]
+                 | ((int)qh_p0[1] << 8)
+                 | ((int)qh_p0[2] << 16)
+                 | ((int)qh_p0[3] << 24);
+
+        const uint8_t* qh_p1 = qh_p0 + 16;
+        int qh_1 = (int)qh_p1[0]
+                 | ((int)qh_p1[1] << 8)
+                 | ((int)qh_p1[2] << 16)
+                 | ((int)qh_p1[3] << 24);
+
+        // Extract 2 high bits per byte for this sub-block.
+        int h0 = (qh_0 >> qh_shift) & 0x03030303;
+        int h1 = (qh_1 >> qh_shift) & 0x03030303;
+
+        // Combine → q6 value per byte in [0, 63], then subtract 32 per byte
+        // via SIMD __vsub4 (no borrow between bytes) → signed int8 in [-32, 31].
+        int q_raw_0 = n0 | (h0 << 4);
+        int q_raw_1 = n1 | (h1 << 4);
+        int q_signed_0 = __vsub4(q_raw_0, 0x20202020);
+        int q_signed_1 = __vsub4(q_raw_1, 0x20202020);
+
+        // ── q8_1 activation block for this sub-block ──
+        // sub-block index within super-block = sub (0..7), matches Q4K pattern.
+        const uint8_t* q8_1_block = q8_1_base + (size_t)(sb * 8 + sub) * 36;
+        float d8 = __half2float(*reinterpret_cast<const __half*>(q8_1_block));
+        const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+        int u0 = __ldg(qs8 + slot);
+        int u1 = __ldg(qs8 + slot + 4);
+
+        // ── Two dp4a dots: signed int8 × signed int8 → int32 accumulator ──
+        int dot0 = __dp4a(q_signed_0, u0, 0);
+        int dot1 = __dp4a(q_signed_1, u1, 0);
+
+        // Per-pair int8 scales (signed).
+        int sc0 = (int)scales[sc_off + q6_sub * 2 + 0];  // is=0 pair (l=0..15)
+        int sc1 = (int)scales[sc_off + q6_sub * 2 + 1];  // is=1 pair (l=16..31)
+
+        // Accumulate: d_w * d8 * (sc0 * dot0 + sc1 * dot1). Note Q6K has no
+        // per-sub-block zero-point (symmetric around 32, already handled in
+        // q_signed), so no dmin × Σq8 correction term (unlike Q4K).
+        partial += d_w * d8 * ((float)sc0 * (float)dot0 + (float)sc1 * (float)dot1);
+    }
+
+    // Intra-warp reduce → lane 0 of each warp holds its stride-4 partial.
+    float warp_sum = warp_reduce_sum(partial);
+
+    // Cross-warp reduce via 16B shmem.
+    __shared__ float tmp_shared[4];
+    if (lane == 0) tmp_shared[warp_id] = warp_sum;
+    __syncthreads();
+
+    if (warp_id == 0 && lane == 0) {
+        float total = tmp_shared[0] + tmp_shared[1] + tmp_shared[2] + tmp_shared[3];
+        output[row] = total;
+    }
+}
+
 // ─── Q8_0 Fused Matvec ───────────────────────────────────────
 // Simpler: each block is 34 bytes = [f16 d][i8 × 32]
 #define Q8_0_BLOCK_SIZE 34
