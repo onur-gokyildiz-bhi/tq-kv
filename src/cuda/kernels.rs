@@ -2592,24 +2592,73 @@ pub fn fused_q4km_down_residual(
     intermediate_dim: usize,
 ) -> Result<(), DriverError> {
     // Down kernel dispatch:
-    //   default (cpasync): single-row cp.async cooperative (Plan #9)
-    //   mrow2:             2 rows/block (Std +4% but TQ -3% on RTX 3080 — opt-in)
-    //   dp4a:              MMVQ Step 4: inline q8_1 quantize + INT8 dp4a matvec (opt-in)
-    //   dp4a_v2:           MMVQ Step 8: 1-row × 4-warp DP4A (128 threads, grid = hidden_dim)
-    //   baseline:          thread-per-superblock original
-    // Default flipped to dp4a (v1): +14% Std when paired with dp4a QKV/gateup
-    // (shared q8_1 scratch amortizes). Isolated dp4a regressed; full-stack wins.
-    // `cpasync` available for opt-out. dp4a_v2 regressed -29% in isolation — kept as opt-in.
-    static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-    let kernel_name = *VARIANT.get_or_init(|| {
+    //   baseline:   thread-per-superblock original
+    //   mrow2:      2 rows/block (Std +4% but TQ -3% on RTX 3080 — opt-in)
+    //   cpasync:    single-row cp.async cooperative (Plan #9)
+    //   dp4a:       v1 — 8 rows × 1 warp, inline q8_1 quantize (previous default)
+    //   dp4a_v2:    1-row × 4-warp DP4A with inline quantize + shmem (regresses)
+    //   dp4a_v3:    1-row × 4-warp DP4A with EXTERNAL pre-quantized q8_1 (DEFAULT)
+    // v3 lifts Phase-1 quantize out of the matvec: ONE quantize_f32_to_q8_1
+    // launch fills the shared pool, then a shmem-less matvec runs with grid =
+    // hidden_dim blocks. Avoids both the shmem-occupancy ceiling and the 3584×
+    // redundant Phase-1 work that killed v2. Measured on RTX 3080 sm_86 Qwen2 7B:
+    // +4% Std tok/s (avg of 3 runs), TQ-path neutral, PPL neutral (4.979 → 4.981).
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum DownVariant { Baseline, Mrow2, Cpasync, Dp4aV1, Dp4aV2, Dp4aV3 }
+    static VARIANT: std::sync::OnceLock<DownVariant> = std::sync::OnceLock::new();
+    let variant = *VARIANT.get_or_init(|| {
         match std::env::var("TQ_DOWN").ok().as_deref() {
-            Some("baseline") => "fused_q4km_down_residual_f32",
-            Some("mrow2")    => "fused_q4km_down_residual_mrow2_cpasync_f32",
-            Some("cpasync")  => "fused_q4km_down_residual_cpasync_f32",
-            Some("dp4a_v2")  => "fused_q4km_down_residual_dp4a_v2_f32",
-            _                => "fused_q4km_down_residual_dp4a_f32",
+            Some("baseline") => DownVariant::Baseline,
+            Some("mrow2")    => DownVariant::Mrow2,
+            Some("cpasync")  => DownVariant::Cpasync,
+            Some("dp4a")     => DownVariant::Dp4aV1,
+            Some("dp4a_v2")  => DownVariant::Dp4aV2,
+            Some("dp4a_v3")  => DownVariant::Dp4aV3,
+            _                => DownVariant::Dp4aV3,
         }
     });
+
+    // v3 path: pre-quantize intermediate into shared pool, then shmem-less matvec.
+    if variant == DownVariant::Dp4aV3 && intermediate_dim % QK8_1 == 0 {
+        let n_blocks = intermediate_dim / QK8_1;
+        let bytes_needed = n_blocks * Q8_1_BLOCK_BYTES;
+        let mut pool = reg.q8_1_pool.lock().unwrap();
+        let need_grow = match pool.as_ref() {
+            Some(buf) => buf.len() < bytes_needed,
+            None => true,
+        };
+        if need_grow {
+            *pool = Some(reg.stream.alloc_zeros::<u8>(bytes_needed)?);
+        }
+        let x_q8_1 = pool.as_mut().unwrap();
+        quantize_f32_to_q8_1(reg, intermediate, x_q8_1, intermediate_dim)?;
+        let f = reg.get_fn("fused_layer", "fused_q4km_down_residual_dp4a_v3_f32")?;
+        let cfg = LaunchConfig {
+            grid_dim: (hidden_dim as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let hd = hidden_dim as i32;
+        let id = intermediate_dim as i32;
+        unsafe {
+            reg.stream.launch_builder(&f)
+                .arg(w_down)
+                .arg(&*x_q8_1)
+                .arg(residual)
+                .arg(&hd).arg(&id)
+                .launch(cfg)?;
+        }
+        return Ok(());
+    }
+
+    let kernel_name = match variant {
+        DownVariant::Baseline => "fused_q4km_down_residual_f32",
+        DownVariant::Mrow2    => "fused_q4km_down_residual_mrow2_cpasync_f32",
+        DownVariant::Cpasync  => "fused_q4km_down_residual_cpasync_f32",
+        DownVariant::Dp4aV1   => "fused_q4km_down_residual_dp4a_f32",
+        DownVariant::Dp4aV2   => "fused_q4km_down_residual_dp4a_v2_f32",
+        DownVariant::Dp4aV3   => unreachable!(),
+    };
     let f = reg.get_fn("fused_layer", kernel_name)?;
     let grid = if *kernel_name == *"fused_q4km_down_residual_mrow2_cpasync_f32" {
         (hidden_dim as u32 + 1) / 2
