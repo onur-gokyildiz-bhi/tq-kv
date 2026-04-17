@@ -754,6 +754,20 @@ impl GenericTurboModel {
         let head_count_kv = md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
         let block_count = md_get(&format!("{arch}.block_count"))?.to_u32()? as usize;
         let embedding_length = md_get(&format!("{arch}.embedding_length"))?.to_u32()? as usize;
+
+        // Apply model-specific kernel dispatch preset before any kernel OnceLock
+        // initializes on first inference. Safe: weight loading & QWeight construction
+        // don't trigger matvec dispatch — that happens on first forward pass.
+        #[cfg(feature = "cuda")]
+        if device.is_cuda() {
+            let (sm_major, sm_minor) = crate::cuda::device::compute_capability(0);
+            let _ = crate::autocalib::apply_preset(
+                &arch,
+                embedding_length,
+                sm_major as u8,
+                sm_minor as u8,
+            );
+        }
         let rms_norm_eps = md_get(&format!("{arch}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
         let rope_freq_base = md_get(&format!("{arch}.rope.freq_base"))
             .and_then(|m| m.to_f32())

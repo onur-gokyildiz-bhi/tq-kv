@@ -170,6 +170,13 @@ pub fn total_vram_bytes(ordinal: usize) -> u64 {
     bytes as u64
 }
 
+/// Public accessor for compute capability — used by `autocalib` to pick a
+/// SM-specific kernel dispatch preset at model load time.
+#[cfg(feature = "cuda")]
+pub fn compute_capability(ordinal: usize) -> (u32, u32) {
+    get_compute_capability(ordinal)
+}
+
 /// Query GPU compute capability via CUDA driver API.
 /// Returns (sm_major, sm_minor), e.g. (8, 6) for RTX 3080.
 /// Falls back to (8, 6) if the query fails.
