@@ -195,6 +195,16 @@ pub(crate) enum Commands {
         /// Primary metric to maximise: "std" (default), "tq", or "tq+ta"
         #[arg(long, default_value = "std")]
         metric: String,
+        /// Repetitions per variant; median tok/s is used to pick winners (default: 1)
+        #[arg(long, default_value = "1")]
+        reps: u32,
+        /// Validate PPL on this file for each variant; variants with PPL delta > 1% are disqualified.
+        /// Off by default (perf-only autotune).
+        #[arg(long)]
+        validate_ppl: Option<PathBuf>,
+        /// Max PPL delta fraction tolerated when --validate-ppl is set (default 0.01 = 1%).
+        #[arg(long, default_value = "0.01")]
+        ppl_tolerance: f32,
     },
     /// Calibrate TurboQuant for a model (computes optimal codebook, rotation, scales)
     Calibrate {

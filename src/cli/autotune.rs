@@ -73,10 +73,18 @@ const SWEEPS: &[DispatchSweep] = &[
 ];
 
 /// JSON on-disk format for a calibration result.
+///
+/// Filename encodes the minimum fields needed to route the cache to the
+/// right (arch, hidden_dim, sm) triple. JSON body adds provenance +
+/// per-variant raw measurements so `tq autotune` output stays debuggable.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AutotuneCache {
     pub model_name:  String,
     pub model_hash:  String,
+    /// Model architecture string from GGUF `general.architecture` (e.g. "qwen2", "llama").
+    pub arch:        String,
+    /// Embedding dim (hidden_size) — distinguishes 7B vs 13B even within same arch.
+    pub hidden_dim:  usize,
     pub sm_major:    u8,
     pub sm_minor:    u8,
     pub tokens_per_run: u32,
@@ -89,14 +97,25 @@ pub struct AutotuneCache {
 pub struct VariantResult {
     pub env_key: String,
     pub variant: String,
+    /// Median tok/s across `samples.len()` reps. NaN on all-fail.
     pub tok_per_sec: f32,
+    /// Raw per-rep measurements (length == reps arg).
+    pub samples: Vec<f32>,
+    /// Whether at least one rep succeeded.
     pub ok: bool,
+    /// If --validate-ppl ran: measured PPL. NaN if not run or failed.
+    pub ppl: f32,
+    /// True if the variant was disqualified by PPL tolerance (ppl > baseline * (1+tol)).
+    pub ppl_disqualified: bool,
 }
 
 pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
-    let (model, tokens, quick, only, dry_run, metric_str) = match &cli.command {
-        Some(Commands::Autotune { model, tokens, quick, only, dry_run, metric }) => {
-            (model.clone(), *tokens, *quick, only.clone(), *dry_run, metric.clone())
+    let (model, tokens, quick, only, dry_run, metric_str, reps, validate_ppl, ppl_tol) = match &cli.command {
+        Some(Commands::Autotune { model, tokens, quick, only, dry_run, metric, reps, validate_ppl, ppl_tolerance }) => {
+            (
+                model.clone(), *tokens, *quick, only.clone(), *dry_run, metric.clone(),
+                *reps, validate_ppl.clone(), *ppl_tolerance,
+            )
         }
         _ => unreachable!(),
     };
@@ -106,6 +125,7 @@ pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
         "tq+ta" | "tqta" | "triattn" | "tq+triattn" => PrimaryMetric::TqTriAttn,
         other => anyhow::bail!("unknown --metric '{}': use 'std', 'tq', or 'tq+ta'", other),
     };
+    let reps = reps.max(1);
 
     // Filter sweeps by --only.
     let only_set: Option<std::collections::HashSet<String>> = only.map(|s| {
@@ -122,20 +142,29 @@ pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
 
     // Detect SM + model hash up front.
     let (sm_major, sm_minor) = detect_sm();
-    let model_hash = model_hash(&model)?;
+    let (model_hash, arch, hidden_dim) = probe_model(&model)?;
     let exe = std::env::current_exe().context("current_exe()")?;
 
     eprintln!("=== tq autotune ===");
-    eprintln!("  model       : {} (hash {})", model, &model_hash[..12]);
+    eprintln!("  model       : {} (arch={} hidden={} hash {})", model, arch, hidden_dim, &model_hash[..12]);
     eprintln!("  gpu         : sm_{}{}", sm_major, sm_minor);
     eprintln!("  tokens/run  : {}", tokens);
     eprintln!("  mode        : {}", if quick { "quick" } else { "full" });
     eprintln!("  metric      : {:?}", metric);
+    eprintln!("  reps        : {} (median aggregation)", reps);
+    if let Some(ref p) = validate_ppl {
+        eprintln!("  ppl-guard   : file={} tol={:.2}%", p.display(), ppl_tol * 100.0);
+    } else {
+        eprintln!("  ppl-guard   : off (perf-only)");
+    }
     eprintln!("  dispatches  : {}", sweeps.iter().map(|s| s.env_key).collect::<Vec<_>>().join(", "));
     eprintln!();
 
-    let n_runs: usize = sweeps.iter().map(|d| if quick { d.quick.len() } else { d.full.len() }).sum();
-    eprintln!("Plan: {} subprocess invocations (~{:.0}s each)", n_runs, 15.0);
+    let n_variants: usize = sweeps.iter().map(|d| if quick { d.quick.len() } else { d.full.len() }).sum();
+    let ppl_cost = if validate_ppl.is_some() { 1 } else { 0 };
+    let runs_per_variant = (reps as usize) + ppl_cost;
+    let n_runs = n_variants * runs_per_variant;
+    eprintln!("Plan: {} variants × {} runs each = {} subprocess invocations (~20s each)", n_variants, runs_per_variant, n_runs);
     if dry_run {
         for d in &sweeps {
             let variants = if quick { d.quick } else { d.full };
@@ -146,6 +175,21 @@ pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
     }
     eprintln!();
 
+    // Optional PPL baseline (computed once per run, used as the reference for tolerance).
+    let ppl_baseline = if let Some(ref ppl_file) = validate_ppl {
+        eprintln!("Measuring PPL baseline (no variant overrides)...");
+        let t = Instant::now();
+        let b = run_ppl(&exe, &model, ppl_file, None, None).ok();
+        if let Some(v) = b {
+            eprintln!("  baseline PPL = {:.4} ({:.1}s)\n", v, t.elapsed().as_secs_f32());
+        } else {
+            eprintln!("  baseline PPL = FAILED — PPL guard will be disabled for this run\n");
+        }
+        b
+    } else {
+        None
+    };
+
     let mut all_results: Vec<VariantResult> = Vec::new();
     let mut winners: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
@@ -155,37 +199,86 @@ pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
         eprintln!("--- {} ({} variants) ---", d.env_key, variants.len());
         let mut local: Vec<(f32, String)> = Vec::new();
         for v in variants {
-            let run_start = Instant::now();
-            let result = run_variant(&exe, &model, d.env_key, v, tokens, metric);
-            let elapsed = run_start.elapsed().as_secs_f32();
-            match result {
-                Ok(tps) => {
-                    eprintln!("  {:<10} = {:<12}  {:>6.1} tok/s  ({:.1}s)", d.env_key, v, tps, elapsed);
-                    local.push((tps, v.to_string()));
-                    all_results.push(VariantResult {
-                        env_key: d.env_key.to_string(),
-                        variant: v.to_string(),
-                        tok_per_sec: tps,
-                        ok: true,
-                    });
-                }
-                Err(e) => {
-                    eprintln!("  {:<10} = {:<12}  FAILED ({:.1}s): {}", d.env_key, v, elapsed, e);
-                    all_results.push(VariantResult {
-                        env_key: d.env_key.to_string(),
-                        variant: v.to_string(),
-                        tok_per_sec: 0.0,
-                        ok: false,
-                    });
+            // Multi-rep perf sweep.
+            let mut samples: Vec<f32> = Vec::with_capacity(reps as usize);
+            for rep in 0..reps {
+                let run_start = Instant::now();
+                let result = run_variant(&exe, &model, d.env_key, v, tokens, metric);
+                let elapsed = run_start.elapsed().as_secs_f32();
+                match result {
+                    Ok(tps) => {
+                        if reps > 1 {
+                            eprintln!("  {:<10} = {:<12}  rep {}/{}: {:.1} tok/s  ({:.1}s)",
+                                d.env_key, v, rep + 1, reps, tps, elapsed);
+                        }
+                        samples.push(tps);
+                    }
+                    Err(e) => {
+                        eprintln!("  {:<10} = {:<12}  rep {}/{} FAILED ({:.1}s): {}",
+                            d.env_key, v, rep + 1, reps, elapsed, e);
+                    }
                 }
             }
+
+            // Median of successful samples.
+            let (median, ok) = if samples.is_empty() { (f32::NAN, false) } else {
+                let mut s = samples.clone();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                (s[s.len() / 2], true)
+            };
+
+            // Optional PPL guard.
+            let (ppl, ppl_disq) = if let (Some(ref ppl_file), Some(base)) = (validate_ppl.as_ref(), ppl_baseline) {
+                match run_ppl(&exe, &model, ppl_file, Some(d.env_key), Some(v)) {
+                    Ok(p) => {
+                        let disq = p > base * (1.0 + ppl_tol);
+                        (p, disq)
+                    }
+                    Err(e) => {
+                        eprintln!("  {:<10} = {:<12}  PPL check FAILED: {}", d.env_key, v, e);
+                        (f32::NAN, false)
+                    }
+                }
+            } else {
+                (f32::NAN, false)
+            };
+
+            // Log summary line.
+            let ppl_tag = if !ppl.is_nan() {
+                if ppl_disq {
+                    format!(" PPL={:.4} [DISQUALIFIED]", ppl)
+                } else {
+                    format!(" PPL={:.4}", ppl)
+                }
+            } else {
+                String::new()
+            };
+            if ok {
+                eprintln!("  {:<10} = {:<12}  median {:>6.1} tok/s  (n={}){}",
+                    d.env_key, v, median, samples.len(), ppl_tag);
+                if !ppl_disq {
+                    local.push((median, v.to_string()));
+                }
+            } else {
+                eprintln!("  {:<10} = {:<12}  ALL REPS FAILED{}", d.env_key, v, ppl_tag);
+            }
+
+            all_results.push(VariantResult {
+                env_key: d.env_key.to_string(),
+                variant: v.to_string(),
+                tok_per_sec: median,
+                samples,
+                ok,
+                ppl,
+                ppl_disqualified: ppl_disq,
+            });
         }
-        // Pick winner (highest tok/s).
+        // Pick winner (highest median tok/s, skipping disqualified variants).
         if let Some((tps, winner)) = local.into_iter().reduce(|a, b| if a.0 >= b.0 { a } else { b }) {
             eprintln!("  → winner: {} = {} ({:.1} tok/s)\n", d.env_key, winner, tps);
             winners.insert(d.env_key.to_string(), winner);
         } else {
-            eprintln!("  ! no successful runs for {} — skipping winner\n", d.env_key);
+            eprintln!("  ! no qualified winners for {} — leaving preset/default\n", d.env_key);
         }
     }
 
@@ -201,6 +294,8 @@ pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
     let cache = AutotuneCache {
         model_name: model.clone(),
         model_hash: model_hash.clone(),
+        arch: arch.clone(),
+        hidden_dim,
         sm_major,
         sm_minor,
         tokens_per_run: tokens,
@@ -208,7 +303,7 @@ pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
         winners,
         all_results,
     };
-    let cache_path = cache_path_for(&model_hash, sm_major, sm_minor)?;
+    let cache_path = cache_path_for(&arch, hidden_dim, &model_hash, sm_major, sm_minor)?;
     std::fs::create_dir_all(cache_path.parent().unwrap()).ok();
     let json = serde_json::to_string_pretty(&cache).context("serialize cache")?;
     std::fs::write(&cache_path, json).with_context(|| format!("write {}", cache_path.display()))?;
@@ -264,6 +359,38 @@ fn run_variant(exe: &Path, model: &str, env_key: &str, variant: &str, tokens: u3
     Err(anyhow!("no '{}' tok/s line found. Child exit: {:?}", target_prefix, output.status))
 }
 
+/// Run `tq perplexity --model <m> <file>` optionally with a dispatch env var
+/// forced. Returns parsed final PPL value.
+fn run_ppl(exe: &Path, model: &str, ppl_file: &Path, env_key: Option<&str>, variant: Option<&str>) -> Result<f32> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("perplexity")
+        .arg("--model").arg(model)
+        .arg(ppl_file)
+        .env("TQ_AUTOTUNE_CHILD", "1");
+    if let (Some(k), Some(v)) = (env_key, variant) {
+        cmd.env(k, v);
+    }
+    let output = cmd.output()
+        .with_context(|| format!("spawn tq perplexity for {:?}={:?}", env_key, variant))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Look for "Perplexity: X.XXX" or "Final perplexity: X.XXX".
+    for hay in [stderr.as_ref(), stdout.as_ref()] {
+        for line in hay.lines() {
+            let lower = line.to_ascii_lowercase();
+            if let Some(idx) = lower.find("perplexity:") {
+                let after = &line[idx + "perplexity:".len()..];
+                // Grab first float token.
+                let tok = after.split_whitespace().next().unwrap_or("");
+                if let Ok(v) = tok.trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.').parse::<f32>() {
+                    if v.is_finite() && v > 0.0 { return Ok(v); }
+                }
+            }
+        }
+    }
+    Err(anyhow!("no 'Perplexity:' line in child output. Exit: {:?}", output.status))
+}
+
 fn parse_tok_per_sec(line: &str) -> Option<f32> {
     // matches "...: 36.0 tok/s"
     let trimmed = line.trim();
@@ -284,23 +411,32 @@ fn detect_sm() -> (u8, u8) {
     { (0, 0) }
 }
 
-/// Compute a stable fingerprint of the model file contents. We use a FNV-1a
-/// hash over (length, first 4 KB of file) — the GGUF header + first few
-/// metadata entries, which encode arch, tensor layout, quantization type.
-/// Any reshape / requantize produces a different hash. No crypto needed —
-/// we're just deduplicating cache entries, not verifying integrity.
-fn model_hash(model_name: &str) -> Result<String> {
+/// Probe GGUF metadata + compute model fingerprint. Returns (hash16hex,
+/// arch, hidden_dim). Fingerprint is FNV-1a over (length, first 4 KB) —
+/// stable across file moves, changes on requantize. No crypto needed.
+fn probe_model(model_name: &str) -> Result<(String, String, usize)> {
     use std::io::Read;
 
     let (gguf_path, _) = crate::hub::resolve(model_name)
         .with_context(|| format!("resolve model '{}'", model_name))?;
     let len = std::fs::metadata(&gguf_path)?.len();
+
+    // Parse GGUF metadata to get arch + embedding_length.
+    let mut reader = std::io::BufReader::new(std::fs::File::open(&gguf_path)?);
+    let ct = crate::gguf::GgufContent::read(&mut reader)
+        .with_context(|| format!("read GGUF metadata {}", gguf_path.display()))?;
+    let arch = ct.metadata.get("general.architecture")
+        .and_then(|v| v.to_string_val().ok())
+        .unwrap_or_else(|| "llama".to_string());
+    let hidden_dim = ct.metadata.get(&format!("{}.embedding_length", arch))
+        .and_then(|v| v.to_u32().ok())
+        .ok_or_else(|| anyhow!("no {}.embedding_length in metadata", arch))? as usize;
+
+    // Fingerprint over (length, first 4 KB).
     let mut file = std::fs::File::open(&gguf_path)?;
     let head_size = len.min(4096) as usize;
     let mut head = vec![0u8; head_size];
     file.read_exact(&mut head)?;
-
-    // FNV-1a 64-bit over length + head bytes.
     let mut h: u64 = 0xcbf29ce484222325;
     for b in len.to_le_bytes() {
         h ^= b as u64;
@@ -310,13 +446,25 @@ fn model_hash(model_name: &str) -> Result<String> {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    Ok(format!("{:016x}", h))
+    Ok((format!("{:016x}", h), arch, hidden_dim))
 }
 
-fn cache_path_for(model_hash: &str, sm_major: u8, sm_minor: u8) -> Result<PathBuf> {
+/// Filename encoding: `autocalib-<arch>-h<hidden_dim>-<hash16>-sm<NN>.json`.
+/// - `<arch>`: from GGUF, lowercased (e.g. `qwen2`, `llama`)
+/// - `<hidden_dim>`: distinguishes 7B (3584) vs 13B vs 0.5B within same arch
+/// - `<hash16>`: FNV-1a fingerprint, first 16 hex chars, for exact file match
+/// - `<NN>`: sm_major*10 + sm_minor (e.g. 86 for sm_8.6)
+///
+/// The autocalib read path filters filenames on (arch, hidden_dim, sm) first
+/// and only falls back to mtime when multiple caches survive. This prevents
+/// the "newest overwrites all" bug that would hit a user who autotunes
+/// Qwen2 then Llama3 on the same machine.
+fn cache_path_for(arch: &str, hidden_dim: usize, model_hash: &str, sm_major: u8, sm_minor: u8) -> Result<PathBuf> {
     let base = dirs_cache_tq()?;
     Ok(base.join(format!(
-        "autocalib-{}-sm{}{}.json",
+        "autocalib-{}-h{}-{}-sm{}{}.json",
+        arch.to_ascii_lowercase(),
+        hidden_dim,
         &model_hash[..16],
         sm_major,
         sm_minor
@@ -391,5 +539,20 @@ mod tests {
     fn parse_tok_per_sec_ignores_unrelated() {
         assert_eq!(parse_tok_per_sec("Loading model..."), None);
         assert_eq!(parse_tok_per_sec(""), None);
+    }
+
+    #[test]
+    fn cache_filename_format() {
+        let p = cache_path_for("qwen2", 3584, "deadbeefcafef00d", 8, 6)
+            .expect("cache path constructed");
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name, "autocalib-qwen2-h3584-deadbeefcafef00d-sm86.json");
+    }
+
+    #[test]
+    fn cache_filename_lowercases_arch() {
+        let p = cache_path_for("QWEN2", 3584, "deadbeefcafef00d", 8, 6).unwrap();
+        let name = p.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("autocalib-qwen2-"));
     }
 }

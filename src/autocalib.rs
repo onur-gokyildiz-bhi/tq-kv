@@ -227,25 +227,30 @@ pub fn apply_preset(
 /// Load the most recent autotune cache matching this (arch, hidden_dim, sm).
 /// Returns the winners map if found.
 ///
-/// We scan the cache dir for files of the form `autocalib-<hash>-sm<N><M>.json`
-/// and match on (sm_major, sm_minor) plus a model shape signal. Since the
-/// cache was written for a specific model, any entry we load is for a
-/// compatible GPU/model. If multiple caches exist for different models at
-/// the same (hidden_dim, sm), we pick the newest mtime.
+/// Filename format (written by `tq autotune`):
+///   `autocalib-<arch>-h<hidden_dim>-<hash16>-sm<NN>.json`
+///
+/// We filter candidates by arch + hidden_dim + sm (exact match in the
+/// filename), then pick newest mtime. This prevents a cache written for
+/// Llama3 (arch=llama, h=4096) from applying to Qwen2 (arch=qwen2, h=3584)
+/// even when both ran on the same machine.
 fn try_load_cache_by_arch(
-    _arch: &str,
-    _hidden_dim: usize,
+    arch: &str,
+    hidden_dim: usize,
     sm_major: u8,
     sm_minor: u8,
 ) -> Option<std::collections::BTreeMap<String, String>> {
     let cache_dir = cache_dir()?;
+    let arch_lc = arch.to_ascii_lowercase();
+    let prefix = format!("autocalib-{}-h{}-", arch_lc, hidden_dim);
     let sm_suffix = format!("-sm{}{}.json", sm_major, sm_minor);
+
     let entries = std::fs::read_dir(&cache_dir).ok()?;
     let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
     for e in entries.flatten() {
         let p = e.path();
         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if !name.starts_with("autocalib-") || !name.ends_with(&sm_suffix) {
+        if !name.starts_with(&prefix) || !name.ends_with(&sm_suffix) {
             continue;
         }
         let mtime = e.metadata().ok().and_then(|m| m.modified().ok())?;
@@ -255,9 +260,6 @@ fn try_load_cache_by_arch(
     }
     let path = newest?.1;
     let text = std::fs::read_to_string(&path).ok()?;
-    // Minimal extraction of `winners` object — avoid full serde dependency
-    // here, keep the autocalib crate free of serde coupling. We just look
-    // for the winners block in the JSON.
     parse_winners_from_json(&text)
 }
 
