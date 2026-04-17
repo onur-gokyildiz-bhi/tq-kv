@@ -598,14 +598,65 @@ fn cmd_eagle_probe(cli: &Cli) -> Result<()> {
     println!("  vocab      : {}", cfg.vocab_size);
     println!("  weights    : {}", weights.display());
     println!();
-    match eagle::EagleDraft::load(&weights, cfg) {
-        Ok(d) => {
+    // Initialise CUDA device + kernel registry so the draft's GPU upload path
+    // has something to upload into. We keep the device alive for the whole
+    // probe so the registry stays resident.
+    #[cfg(feature = "cuda")]
+    let _cuda_device = if cli.cpu {
+        None
+    } else {
+        match cuda::TqDevice::cuda_if_available(0) {
+            Ok(d) if d.is_cuda() => Some(d),
+            _ => None,
+        }
+    };
+
+    match eagle::EagleDraft::load(&weights, cfg.clone()) {
+        Ok(mut d) => {
             println!("[ok] draft scaffold loaded.");
             if let Some(stub) = &d.model {
                 println!("  raw size : {:.2} GB", stub.total_bytes as f64 / 1e9);
             }
-            println!("  runnable : {} (Sprint 1 WIP — tensor parse + forward pending)", d.is_runnable());
+
+            // Architecture summary (from discoveries logged in config).
             println!();
+            println!("Architecture flags:");
+            println!("  has_fc_fusion         : {} (fc: hidden <- 2*hidden = {})",
+                cfg.has_fc_fusion, cfg.fc_in_dim());
+            println!("  has_pre_attention_norm: {}", cfg.has_pre_attention_norm);
+            println!("  num_kv_heads / heads  : {} / {} ({})",
+                cfg.num_key_value_heads, cfg.num_attention_heads,
+                if cfg.num_key_value_heads == cfg.num_attention_heads {
+                    "full-rank, no GQA"
+                } else {
+                    "GQA"
+                });
+            println!("  kv_bytes_per_token    : {} B", cfg.kv_bytes_per_token());
+
+            // Sprint 1 Day 3: promote BF16 → FP16 and upload to GPU.
+            #[cfg(feature = "cuda")]
+            {
+                match d.upload_to_gpu() {
+                    Ok(()) => {
+                        if let Some(gw) = &d.gpu {
+                            println!();
+                            println!("GPU allocation ({:.2} GB FP16 total):", gw.total_bytes as f64 / 1e9);
+                            for (name, bytes) in gw.allocation_report(&cfg) {
+                                println!("  {:<24} {:>8.2} MB", name, bytes as f64 / 1e6);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!();
+                        eprintln!("[warn] GPU upload failed: {}", e);
+                        eprintln!("       (not fatal — scaffold remains valid for CPU-only tests)");
+                    }
+                }
+            }
+
+            println!();
+            println!("  runnable : {} (Sprint 2 wires forward pass + tree_attention kernel)",
+                d.is_runnable());
             println!("Next step: Sprint 2 will add tree_attention kernel + verify loop.");
             println!("Track progress: memory/project_eagle3_integration_plan.md");
             Ok(())

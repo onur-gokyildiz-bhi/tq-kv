@@ -22,25 +22,66 @@
 use std::path::{Path, PathBuf};
 
 /// Config of an EAGLE draft model. Mirrors the subset of `config.json` fields
-/// that actually influence forward-pass tensor layout. Numbers MUST match the
-/// target model's corresponding field (hidden_size, intermediate_size,
-/// vocab_size, rope_theta) — if they diverge, the draft's predicted logits
-/// cannot be re-projected into the target vocabulary.
+/// that actually influence forward-pass tensor layout, plus three
+/// EAGLE-specific architecture flags discovered 2026-04-17 by inspecting the
+/// yuhuili/EAGLE-Qwen2-7B-Instruct weight file:
+///
+/// 1. `has_fc_fusion`: a `fc` layer projects `[prev_hidden, embed(new_token)]`
+///    (width `2 * hidden_size`) back down to `hidden_size` before attention.
+///    Target models have no such layer.
+/// 2. `has_pre_attention_norm`: draft has ONLY `post_attention_layernorm`,
+///    no `input_layernorm`. The fc-projected input goes straight into attention.
+/// 3. `num_key_value_heads == num_attention_heads`: draft uses full-rank K/V,
+///    not GQA. Even when the target model uses GQA (e.g. Qwen2 7B 28/4),
+///    the draft stays at 28/28. Draft KV cache is 7× per-token bigger but
+///    draft runs ≤1 layer so total cache footprint stays small.
+///
+/// Numbers that MUST match the target model (for logits to drop into the
+/// target's vocab): `hidden_size`, `intermediate_size`, `vocab_size`,
+/// `rope_theta`, `rms_norm_eps`.
 #[derive(Debug, Clone)]
 pub struct EagleDraftConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,      // EAGLE-1: 1, EAGLE-3: varies
     pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,    // often equals num_attention_heads (no GQA in draft)
+    pub num_key_value_heads: usize,    // for EAGLE usually equals num_attention_heads
     pub vocab_size: usize,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
     pub max_position_embeddings: usize,
     pub qkv_bias: bool,
-    /// Draft stores its weights in this precision. Loader may promote to FP16
-    /// at load time to match the rest of the engine.
+
+    /// EAGLE has a `fc` layer that fuses target's previous-layer hidden state
+    /// with the embedding of the most recently sampled token. When true, the
+    /// draft builder must emit an extra dense + bias call point before attention.
+    /// Input width: `2 * hidden_size`. Output width: `hidden_size`.
+    pub has_fc_fusion: bool,
+
+    /// True if the draft has an `input_layernorm` BEFORE attention (like a
+    /// normal transformer block). False for EAGLE — the fc-projected input
+    /// goes straight into attention, and only `post_attention_layernorm`
+    /// applies before the MLP.
+    pub has_pre_attention_norm: bool,
+
+    /// Draft stores its weights in this precision. Loader promotes to FP16
+    /// at upload time to match the rest of the engine (FP16 intermediate).
     pub native_dtype: DraftDType,
+}
+
+impl EagleDraftConfig {
+    /// Width of the fc fusion layer's input vector. Only meaningful when
+    /// `has_fc_fusion` is true.
+    pub fn fc_in_dim(&self) -> usize {
+        2 * self.hidden_size
+    }
+
+    /// KV cache per-layer bytes per token at FP16 (2 bytes per element).
+    /// Useful for VRAM budgeting when attaching the draft to a running target.
+    pub fn kv_bytes_per_token(&self) -> usize {
+        // 2 (K and V) × hidden_size × 2 bytes
+        2 * self.hidden_size * 2
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,12 +103,15 @@ pub fn eagle_qwen2_7b_config() -> EagleDraftConfig {
         intermediate_size:        18944,
         num_hidden_layers:        1,
         num_attention_heads:      28,
-        num_key_value_heads:      28,
+        num_key_value_heads:      28,        // no GQA in draft (target is 28/4)
         vocab_size:               152064,
         rope_theta:               1_000_000.0,
         rms_norm_eps:             1e-6,
         max_position_embeddings:  2048,
         qkv_bias:                 true,
+        // EAGLE-specific flags (see struct doc for rationale)
+        has_fc_fusion:            true,      // fc.weight [hidden, 2*hidden]
+        has_pre_attention_norm:   false,     // only post_attention_layernorm present
         native_dtype:             DraftDType::BFloat16,
     }
 }
@@ -79,8 +123,64 @@ pub fn eagle_qwen2_7b_config() -> EagleDraftConfig {
 pub struct EagleDraft {
     pub config: EagleDraftConfig,
     pub weights_path: PathBuf,
-    /// Will hold the loaded inner model once Sprint 1 finishes. For now None.
+    /// Scaffold + shape-validation metadata. Populated by [`EagleDraft::load`].
     pub model: Option<DraftModelStub>,
+    /// GPU-resident weights, populated by [`EagleDraft::upload_to_gpu`].
+    /// `None` before upload, CPU-only usage (tests, probe).
+    #[cfg(feature = "cuda")]
+    pub gpu: Option<DraftWeights>,
+}
+
+/// GPU-resident draft weights. All tensors promoted from BF16 (native) to FP16
+/// at upload time — engine's intermediate precision is FP16 and keeping the
+/// draft on the same dtype avoids per-kernel promote overhead. The one-shot
+/// conversion cost is bounded (~1.65 GB of BF16 → ~825 MB of FP16 on GPU).
+#[cfg(feature = "cuda")]
+#[derive(Debug)]
+pub struct DraftWeights {
+    pub embed_tokens:             cudarc::driver::CudaSlice<half::f16>,  // [vocab, hidden]
+    pub fc_weight:                cudarc::driver::CudaSlice<half::f16>,  // [hidden, 2*hidden]
+    pub fc_bias:                  cudarc::driver::CudaSlice<half::f16>,  // [hidden]
+    pub q_proj_weight:            cudarc::driver::CudaSlice<half::f16>,  // [hidden, hidden]
+    pub q_proj_bias:              cudarc::driver::CudaSlice<half::f16>,  // [hidden]
+    pub k_proj_weight:            cudarc::driver::CudaSlice<half::f16>,  // [hidden, hidden]
+    pub k_proj_bias:              cudarc::driver::CudaSlice<half::f16>,  // [hidden]
+    pub v_proj_weight:            cudarc::driver::CudaSlice<half::f16>,  // [hidden, hidden]
+    pub v_proj_bias:              cudarc::driver::CudaSlice<half::f16>,  // [hidden]
+    pub o_proj_weight:            cudarc::driver::CudaSlice<half::f16>,  // [hidden, hidden]
+    pub mlp_gate_weight:          cudarc::driver::CudaSlice<half::f16>,  // [intermediate, hidden]
+    pub mlp_up_weight:            cudarc::driver::CudaSlice<half::f16>,  // [intermediate, hidden]
+    pub mlp_down_weight:          cudarc::driver::CudaSlice<half::f16>,  // [hidden, intermediate]
+    pub post_attn_norm_weight:    cudarc::driver::CudaSlice<half::f16>,  // [hidden]
+
+    /// Sum of all tensor bytes on GPU (post-FP16 promotion).
+    pub total_bytes: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl DraftWeights {
+    /// Summarised per-tensor allocation — used by `eagle-probe` UX only.
+    pub fn allocation_report(&self, cfg: &EagleDraftConfig) -> Vec<(&'static str, usize)> {
+        let h = cfg.hidden_size;
+        let i = cfg.intermediate_size;
+        let v = cfg.vocab_size;
+        vec![
+            ("embed_tokens",         v * h * 2),
+            ("fc.weight",            h * 2 * h * 2),
+            ("fc.bias",              h * 2),
+            ("q_proj.weight",        h * h * 2),
+            ("q_proj.bias",          h * 2),
+            ("k_proj.weight",        h * h * 2),
+            ("k_proj.bias",          h * 2),
+            ("v_proj.weight",        h * h * 2),
+            ("v_proj.bias",          h * 2),
+            ("o_proj.weight",        h * h * 2),
+            ("gate_proj.weight",     i * h * 2),
+            ("up_proj.weight",       i * h * 2),
+            ("down_proj.weight",     h * i * 2),
+            ("post_attn_norm",       h * 2),
+        ]
+    }
 }
 
 /// Stub for the draft inner model. Sprint 1 replaces this with a real
@@ -262,14 +362,118 @@ impl EagleDraft {
                 total_bytes: size,
                 tensors,
             }),
+            #[cfg(feature = "cuda")]
+            gpu: None,
         })
     }
 
-    /// Report whether the draft is ready for speculation. Returns false during
-    /// Sprint 1 Day 1 (scaffold-only).
+    /// Upload the 14 validated draft tensors to GPU, promoting BF16 → FP16
+    /// on the fly. Expensive (~1-3 seconds on 1.65 GB checkpoint) but one-shot.
+    ///
+    /// Precondition: `load` must have succeeded so `self.model` is populated.
+    /// After this returns OK, `self.gpu` is `Some(DraftWeights)` with every
+    /// tensor sitting in device memory ready for the Sprint 2 forward kernel.
+    #[cfg(feature = "cuda")]
+    pub fn upload_to_gpu(&mut self) -> Result<(), EagleError> {
+        if self.model.is_none() {
+            return Err(EagleError::Msg("upload_to_gpu called before load()".into()));
+        }
+
+        let reg = crate::cuda::kernels::global_registry()
+            .ok_or_else(|| EagleError::Msg("no GPU registry available".into()))?;
+        let stream = &reg.stream;
+
+        // Re-mmap the file (the first load took ownership via a local scope).
+        let file = std::fs::File::open(&self.weights_path)
+            .map_err(|e| EagleError::Msg(format!("open({}): {}", self.weights_path.display(), e)))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| EagleError::Msg(format!("mmap: {}", e)))?;
+        let st = safetensors::SafeTensors::deserialize(&mmap)
+            .map_err(|e| EagleError::Msg(format!("safetensors parse: {:?}", e)))?;
+
+        let up = |name: &str| -> Result<cudarc::driver::CudaSlice<half::f16>, EagleError> {
+            upload_bf16_as_fp16(&st, name, stream)
+        };
+
+        let t_start = std::time::Instant::now();
+        let weights = DraftWeights {
+            embed_tokens:          up("embed_tokens.weight")?,
+            fc_weight:             up("fc.weight")?,
+            fc_bias:                up("fc.bias")?,
+            q_proj_weight:         up("layers.0.self_attn.q_proj.weight")?,
+            q_proj_bias:            up("layers.0.self_attn.q_proj.bias")?,
+            k_proj_weight:         up("layers.0.self_attn.k_proj.weight")?,
+            k_proj_bias:            up("layers.0.self_attn.k_proj.bias")?,
+            v_proj_weight:         up("layers.0.self_attn.v_proj.weight")?,
+            v_proj_bias:            up("layers.0.self_attn.v_proj.bias")?,
+            o_proj_weight:         up("layers.0.self_attn.o_proj.weight")?,
+            mlp_gate_weight:       up("layers.0.mlp.gate_proj.weight")?,
+            mlp_up_weight:         up("layers.0.mlp.up_proj.weight")?,
+            mlp_down_weight:       up("layers.0.mlp.down_proj.weight")?,
+            post_attn_norm_weight: up("layers.0.post_attention_layernorm.weight")?,
+            total_bytes: 0, // set below
+        };
+        let _ = stream.synchronize();
+        let elapsed = t_start.elapsed();
+
+        // Compute allocation summary.
+        let total_bytes: usize = weights.allocation_report(&self.config).iter()
+            .map(|(_, b)| *b).sum();
+
+        eprintln!(
+            "[eagle] uploaded 14 tensors to GPU, {:.2} GB FP16 in {:.1}s",
+            total_bytes as f64 / 1e9,
+            elapsed.as_secs_f32(),
+        );
+        self.gpu = Some(DraftWeights { total_bytes: total_bytes as u64, ..weights });
+        Ok(())
+    }
+
+    /// Report whether the draft is ready for speculation. Returns true only
+    /// after `load()` + `upload_to_gpu()` have both succeeded AND the forward
+    /// pass path is wired (Sprint 2 gates the latter).
     pub fn is_runnable(&self) -> bool {
+        // Sprint 1: even with GPU upload, forward pass isn't wired yet, so
+        // report false. Sprint 2 will flip this to check gpu + forward wiring.
         false
     }
+}
+
+/// Read a BF16 tensor from the safetensors view, convert every element to
+/// FP16 via an f32 round-trip (bf16 and f16 have different mantissa/exponent
+/// splits, so truncation alone doesn't work), and upload to GPU.
+///
+/// Worst-case cost: O(numel) CPU conversion, then one H2D copy. For a 1.65 GB
+/// draft this is ~1 B elements which takes under 2 seconds on modern CPUs —
+/// acceptable as a one-shot load overhead.
+#[cfg(feature = "cuda")]
+fn upload_bf16_as_fp16(
+    st: &safetensors::SafeTensors<'_>,
+    name: &str,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> Result<cudarc::driver::CudaSlice<half::f16>, EagleError> {
+    let view = st.tensor(name)
+        .map_err(|e| EagleError::Msg(format!("tensor({}): {:?}", name, e)))?;
+    if view.dtype() != safetensors::Dtype::BF16 {
+        return Err(EagleError::Msg(format!(
+            "tensor '{}' dtype {:?}, expected BF16", name, view.dtype()
+        )));
+    }
+    let raw = view.data();
+    let numel = raw.len() / 2;
+
+    // BF16 → F32 → F16. Doing it in one pass via iter to let the compiler
+    // vectorize as much as possible.
+    let mut buf: Vec<half::f16> = Vec::with_capacity(numel);
+    for chunk in raw.chunks_exact(2) {
+        let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let f32v = half::bf16::from_bits(bits).to_f32();
+        buf.push(half::f16::from_f32(f32v));
+    }
+
+    let slice = stream.memcpy_stod(&buf)
+        .map_err(|e| EagleError::Msg(format!("H2D upload '{}': {}", name, e)))?;
+    Ok(slice)
 }
 
 #[derive(Debug)]
@@ -321,8 +525,24 @@ mod tests {
             config: cfg,
             weights_path: PathBuf::from("/dev/null"),
             model: None,
+            #[cfg(feature = "cuda")]
+            gpu: None,
         };
         assert!(!stub.is_runnable());
+    }
+
+    #[test]
+    fn config_reflects_eagle_specific_architecture() {
+        let cfg = eagle_qwen2_7b_config();
+        // Three flags that diverge from a standard Qwen2 block:
+        assert!(cfg.has_fc_fusion, "fc layer fuses prev_hidden + embed(token)");
+        assert!(!cfg.has_pre_attention_norm, "only post_attention_layernorm present");
+        assert_eq!(cfg.num_key_value_heads, cfg.num_attention_heads,
+                   "draft uses full-rank KV (no GQA)");
+        // fc input width is always 2*hidden
+        assert_eq!(cfg.fc_in_dim(), 7168);
+        // KV cache budget: 2 * hidden * 2 bytes = 14,336 B per token per layer
+        assert_eq!(cfg.kv_bytes_per_token(), 14336);
     }
 
     #[test]
