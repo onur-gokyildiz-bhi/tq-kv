@@ -26,6 +26,11 @@ pub mod forward;
 #[cfg(feature = "cuda")]
 pub use forward::DraftRuntime;
 
+/// Sprint 2 Day 1: tree data structure + CPU reference attention. Pure
+/// compute; always compiled (no cuda feature needed).
+pub mod tree;
+pub use tree::{TreeSpec, TreeError, build_ancestor_mask, tree_attention_cpu, MAX_TREE_NODES};
+
 /// Config of an EAGLE draft model. Mirrors the subset of `config.json` fields
 /// that actually influence forward-pass tensor layout, plus three
 /// EAGLE-specific architecture flags discovered 2026-04-17 by inspecting the
