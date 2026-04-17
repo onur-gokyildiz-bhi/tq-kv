@@ -35,6 +35,23 @@ impl ModelWeights {
     pub fn project_hidden_to_logits(&self, hidden: &Tensor) -> crate::cuda::Result<Tensor> {
         self.0.project_hidden_to_logits(hidden)
     }
+
+    /// Delegates to [`GenericTurboModel::forward_hidden_all`]. Returns
+    /// `[seq_len, hidden]` — every position's pre-norm/pre-lm_head hidden.
+    pub fn forward_hidden_all(&mut self, x: &Tensor, pos: usize) -> crate::cuda::Result<Tensor> {
+        self.0.forward_hidden_all(x, pos)
+    }
+
+    /// Delegates to [`GenericTurboModel::project_hidden_to_logits_no_norm`].
+    pub fn project_hidden_to_logits_no_norm(&self, hidden: &Tensor) -> crate::cuda::Result<Tensor> {
+        self.0.project_hidden_to_logits_no_norm(hidden)
+    }
+
+    /// Delegates to [`GenericTurboModel::apply_final_norm`]. Used by EAGLE
+    /// probe to normalise target hidden before feeding to the draft.
+    pub fn apply_final_norm(&self, hidden: &Tensor) -> crate::cuda::Result<Tensor> {
+        self.0.apply_final_norm(hidden)
+    }
     fn forward_partial(&mut self, x: &Tensor, n_layers: usize, pos: usize) -> crate::cuda::Result<Tensor> {
         self.0.forward_partial(x, n_layers, pos)
     }

@@ -289,9 +289,8 @@ impl DraftRuntime {
         let blas = reg.get_cublas();
 
         // ── 1. concat_buf = [prev_hidden | embed_tokens[token_id, :]] ──────
-        // H2D copy of prev_hidden into a temp slice, then D2D into
-        // concat_buf[0..hidden]. D2D for embedding row so we don't spend a
-        // host round-trip per step.
+        // Original SafeAILab cnets.py convention: torch.cat([hidden, embed], dim=-1).
+        // Reverted Day 2 after the swap experiment collapsed draft output.
         let prev_slice = stream_arc.memcpy_stod(prev_hidden)
             .map_err(|e| EagleError::Msg(format!("H2D prev_hidden: {}", e)))?;
         let f32_bytes = std::mem::size_of::<f32>();

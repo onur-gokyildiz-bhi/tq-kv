@@ -2212,6 +2212,140 @@ impl GenericTurboModel {
         Ok(last)
     }
 
+    /// Variant of [`Self::forward_last_hidden`] that returns hidden states
+    /// for ALL positions, not just the last one. Shape `[seq_len, hidden]`
+    /// (batch squeezed out, assumes b_sz=1 which is the only case actually
+    /// exercised in this engine).
+    ///
+    /// Sprint 3 Day 2: the EAGLE acceptance probe needs prompt prefill —
+    /// the draft's KV cache must absorb `[hidden[0], hidden[1], ..., hidden[N-1]]`
+    /// before generation starts so its attention sees the same context the
+    /// target saw. The Day 1 `forward_last_hidden` returned only position
+    /// N-1, which is insufficient for that prefill.
+    pub fn forward_hidden_all(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (_b_sz, seq_len) = x.dims2()?;
+        let backend = self.backend.clone();
+        let backend = backend.as_ref();
+
+        let mask = if seq_len == 1 { None } else {
+            Some(self.mask(seq_len, index_pos, x.device())?)
+        };
+
+        let mut layer_in = self.tok_embeddings.forward(x)?;
+        if let Some(scale) = self.embed_scale {
+            let data = layer_in.as_slice();
+            let scaled: Vec<f32> = data.iter().map(|&v| v * scale).collect();
+            layer_in = Tensor::from_vec(scaled, layer_in.shape().to_vec(), layer_in.device())?;
+        }
+        #[cfg(feature = "cuda")]
+        if backend.is_gpu() {
+            if let Ok(gpu_tensor) = layer_in.to_device_auto() {
+                layer_in = gpu_tensor;
+            }
+        }
+
+        let n = self.layers.len();
+        for layer in self.layers[..n].iter_mut() {
+            let residual = &layer_in;
+            let x = layer.attention_norm.forward(&layer_in, backend)?;
+            let attn = layer.forward_attn(&x, None, mask.as_ref(), index_pos, backend)?;
+            let attn = match &layer.post_attention_norm {
+                Some(norm) => norm.forward(&attn, backend)?,
+                None => attn,
+            };
+
+            let attn_f32 = attn.to_dtype(DType::F32)?;
+            let residual_f32 = residual.to_dtype(DType::F32)?;
+
+            #[cfg(feature = "cuda")]
+            let (x, residual_owned) = if attn_f32.is_cuda() {
+                attn_f32.fused_add_rms_norm_gpu(
+                    &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
+                )?
+            } else {
+                let shape = attn_f32.shape().to_vec();
+                let hidden = *shape.last().unwrap();
+                let n_tokens = attn_f32.elem_count() / hidden;
+                let (normed, new_res) = backend.fused_add_rms_norm(
+                    attn_f32.as_slice(), residual_f32.as_slice(),
+                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                    n_tokens, hidden,
+                );
+                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
+            };
+            #[cfg(not(feature = "cuda"))]
+            let (x, residual_owned) = {
+                let shape = attn_f32.shape().to_vec();
+                let hidden = *shape.last().unwrap();
+                let n_tokens = attn_f32.elem_count() / hidden;
+                let (normed, new_res) = backend.fused_add_rms_norm(
+                    attn_f32.as_slice(), residual_f32.as_slice(),
+                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                    n_tokens, hidden,
+                );
+                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
+            };
+            let x = layer.mlp_or_moe.forward(&x, backend)?;
+            let x = match &layer.post_ffn_norm {
+                Some(norm) => norm.forward(&x, backend)?,
+                None => x,
+            };
+            layer_in = (x + &residual_owned)?;
+        }
+
+        // Squeeze batch → [seq_len, hidden].
+        let out = layer_in.squeeze(0)?;
+        Ok(out)
+    }
+
+    /// Apply the base model's final RMSNorm (but NOT the LM head) to a
+    /// hidden vector. Useful for EAGLE draft inputs: SafeAILab's cnets.py
+    /// normalises `hidden_states` with the base model's final norm BEFORE
+    /// concatenating with embeds and feeding to the fc fusion layer.
+    /// Without this, fc_out overshoots by roughly sqrt(hidden) * sigma_W.
+    pub fn apply_final_norm(&self, hidden: &Tensor) -> Result<Tensor> {
+        let backend = self.backend.clone();
+        let backend = backend.as_ref();
+        let shape = hidden.shape().to_vec();
+        let h = if shape.len() == 1 {
+            hidden.unsqueeze(0)?.unsqueeze(0)?
+        } else {
+            hidden.clone()
+        };
+        let normed = self.norm.forward(&h, backend)?;
+        // Squeeze back to the original rank.
+        let normed = if shape.len() == 1 {
+            normed.squeeze(0)?.squeeze(0)?
+        } else {
+            normed
+        };
+        Ok(normed)
+    }
+
+    /// Apply LM head (+ softcap) to a hidden vector, **SKIPPING the final
+    /// RMSNorm**. Some EAGLE draft variants produce outputs in the same
+    /// space the base model applies `lm_head` to directly, WITHOUT a
+    /// preceding norm. Used by the acceptance probe for draft outputs.
+    pub fn project_hidden_to_logits_no_norm(&self, hidden: &Tensor) -> Result<Tensor> {
+        let backend = self.backend.clone();
+        let backend = backend.as_ref();
+        let shape = hidden.shape().to_vec();
+        let h = if shape.len() == 1 {
+            hidden.unsqueeze(0)?.unsqueeze(0)?
+        } else {
+            hidden.clone()
+        };
+        let (_b, s) = { let sh = h.shape(); (sh[0], sh[1]) };
+        let h = h.narrow(1, s - 1, 1)?.squeeze(1)?;
+        let logits = self.output.forward(&h, backend)?;
+        let logits = if let Some(cap) = self.final_logit_softcap {
+            apply_softcap(&logits, cap)?
+        } else { logits };
+        Ok(logits)
+    }
+
     /// Apply final norm + LM head + softcap to a single hidden vector.
     /// Inverse of `forward_last_hidden`: takes `[hidden_dim]`, returns
     /// `[vocab_size]` logits. Used by the acceptance-rate probe to project
