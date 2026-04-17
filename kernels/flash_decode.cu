@@ -129,6 +129,136 @@ extern "C" __global__ void flash_decode_partial(
     }
 }
 
+// ─── Tree Decode Partial (EAGLE Sprint 2 Day 2) ──────────────
+//
+// Like flash_decode_partial but:
+// - "Batch" dim becomes "tree query" dim: each grid.z = one Q row.
+//   Queries share one K/V cache (no per-batch stride) — the tree frames
+//   all N candidates against the same committed prefix + N proposals.
+// - Takes per-query ancestor bitmask (u64). Position `p` in `[seq_prefix,
+//   seq_kv)` is attended iff bit `(p - seq_prefix)` of the query's mask
+//   is set. Positions `[0, seq_prefix)` are attended unconditionally.
+// - Causal across the tree: since the mask depends only on `query_idx`,
+//   all threads in a block make the same in/out-of-scope decision at
+//   each `p`, so `continue` cannot cause __syncthreads divergence.
+//
+// CPU reference: src/eagle/tree.rs::tree_attention_cpu (same pass structure,
+// same online-softmax semantics). The integration test in src/cuda/kernels.rs
+// downloads GPU output and asserts |diff| < 1e-4 vs the CPU reference.
+//
+// n_query <= 64 (bit per position in a u64).
+
+__launch_bounds__(128, 8)
+extern "C" __global__ void tree_decode_partial_f32(
+    const float* __restrict__ Q,                                 // [N_q, H, D]
+    const float* __restrict__ K,                                 // [Hkv, seq_kv, D]
+    const float* __restrict__ V,                                 // [Hkv, seq_kv, D]
+    const unsigned long long* __restrict__ ancestor_mask,        // [N_q]
+    float* __restrict__ partial_O,                               // [N_q, H, n_splits, D]
+    float* __restrict__ partial_max,                             // [N_q, H, n_splits]
+    float* __restrict__ partial_sum,                             // [N_q, H, n_splits]
+    const int n_query,
+    const int n_heads,
+    const int n_kv_heads,
+    const int seq_prefix,
+    const int seq_kv,
+    const int head_dim,
+    const float scale,
+    const int split_size,
+    const int max_seq
+) {
+    const int query_idx = blockIdx.z;
+    const int head_idx  = blockIdx.y;
+    const int split_idx = blockIdx.x;
+    const int n_rep     = n_heads / n_kv_heads;
+    const int kv_head   = head_idx / n_rep;
+
+    const int kv_start = split_idx * split_size;
+    const int kv_end   = min(kv_start + split_size, seq_kv);
+    if (kv_start >= seq_kv) return;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp_id = tid >> 5;
+    const int n_warps = BLOCK_SIZE >> 5;
+
+    // Loaded once per block — all threads see the same mask for this query.
+    const unsigned long long mask = ancestor_mask[query_idx];
+
+    __shared__ float s_q[HEAD_DIM_MAX];
+    const float* q_ptr = Q + (query_idx * n_heads + head_idx) * head_dim;
+    for (int d = tid; d < head_dim; d += BLOCK_SIZE) {
+        s_q[d] = ld_readonly(&q_ptr[d]);
+    }
+    __syncthreads();
+
+    float local_max = -1e10f;
+    float local_sum = 0.0f;
+    const int n_d_per_thread = (head_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    float local_o[HEAD_DIM_MAX / BLOCK_SIZE + 1];
+    for (int i = 0; i < n_d_per_thread; ++i) local_o[i] = 0.0f;
+
+    // Shared K/V cache — NOT indexed by batch.
+    const float* k_base = K + (kv_head * max_seq) * head_dim;
+    const float* v_base = V + (kv_head * max_seq) * head_dim;
+
+    __shared__ float s_warp_dot[8];
+
+    for (int p = kv_start; p < kv_end; ++p) {
+        // Mask test: unconditional for committed prefix, bit-gated for tree.
+        bool in_scope;
+        if (p < seq_prefix) {
+            in_scope = true;
+        } else {
+            int bit = p - seq_prefix;
+            in_scope = ((mask >> bit) & 1ull) != 0;
+        }
+        if (!in_scope) continue;
+
+        // Q · K[p]
+        float dot = 0.0f;
+        const float* k_ptr = k_base + p * head_dim;
+        for (int d = tid; d < head_dim; d += BLOCK_SIZE) {
+            dot += s_q[d] * ld_readonly(&k_ptr[d]);
+        }
+        dot = warp_reduce_sum(dot);
+        if (lane == 0) s_warp_dot[warp_id] = dot;
+        __syncthreads();
+        float score = 0.0f;
+        for (int w = 0; w < n_warps; ++w) score += s_warp_dot[w];
+        score *= scale;
+
+        // Online softmax + V accumulate
+        float old_max = local_max;
+        float new_max = fmaxf(old_max, score);
+        float rescale = expf(old_max - new_max);
+        float p_e = expf(score - new_max);
+
+        const float* v_ptr = v_base + p * head_dim;
+        for (int i = 0; i < n_d_per_thread; ++i) {
+            int d = i * BLOCK_SIZE + tid;
+            if (d < head_dim) {
+                local_o[i] = local_o[i] * rescale + p_e * ld_readonly(&v_ptr[d]);
+            }
+        }
+        local_sum = local_sum * rescale + p_e;
+        local_max = new_max;
+    }
+
+    const int n_splits = (seq_kv + split_size - 1) / split_size;
+    float* po = partial_O + ((query_idx * n_heads + head_idx) * n_splits + split_idx) * head_dim;
+    for (int i = 0; i < n_d_per_thread; ++i) {
+        int d = i * BLOCK_SIZE + tid;
+        if (d < head_dim) {
+            po[d] = local_o[i];
+        }
+    }
+    if (tid == 0) {
+        partial_max[(query_idx * n_heads + head_idx) * n_splits + split_idx] = local_max;
+        partial_sum[(query_idx * n_heads + head_idx) * n_splits + split_idx] = local_sum;
+    }
+}
+
 // ─── Phase 2: Reduce Partial Results ─────────────────────────
 // Grid: (1, n_heads, batch), Block: BLOCK_SIZE threads
 // Combines partial results from all splits with online softmax rescaling.

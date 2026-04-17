@@ -319,6 +319,196 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+// ─── GPU integration (Sprint 2 Day 2) ──────────────────────────────────────
+//
+// The CPU reference above has unit-test coverage of the mask logic and the
+// attention numerics. Day 2 ports the inner loop to CUDA (`tree_decode_partial_f32`
+// in `kernels/flash_decode.cu`, launched via `crate::cuda::kernels::tree_decode_partial`).
+// The GPU test below asserts element-wise parity with `tree_attention_cpu`
+// to within 1e-4.
+
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_tests {
+    use super::*;
+    use crate::cuda::kernels as K;
+    use crate::cuda::kernels::KernelRegistry;
+    use cudarc::driver::CudaContext;
+
+    /// Construct a fresh registry for this test. Don't go through the global
+    /// registry so parallel tests don't race on initialisation order.
+    fn build_registry() -> Option<std::sync::Arc<KernelRegistry>> {
+        let ctx = CudaContext::new(0).ok()?;
+        let stream = ctx.default_stream();
+        let (sm_major, sm_minor) = {
+            use cudarc::driver::sys;
+            let mut device: sys::CUdevice = 0;
+            let mut major: i32 = 0;
+            let mut minor: i32 = 0;
+            unsafe {
+                sys::cuDeviceGet(&mut device, 0);
+                sys::cuDeviceGetAttribute(&mut major,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+                sys::cuDeviceGetAttribute(&mut minor,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+            }
+            (major as u32, minor as u32)
+        };
+        KernelRegistry::new(&ctx, &stream, sm_major, sm_minor)
+            .ok().map(std::sync::Arc::new)
+    }
+
+    /// Canonical test: 7-node binary tree, Qwen2-shaped heads (GQA 4/1),
+    /// short prefix. Asserts GPU output matches CPU reference on every
+    /// element to within 1e-4 absolute.
+    #[test]
+    fn tree_gpu_matches_cpu_on_binary_tree() {
+        let reg = match build_registry() {
+            Some(r) => r,
+            None => { eprintln!("[skip] no CUDA device"); return; }
+        };
+        let reg = reg.as_ref();
+
+        let tree = TreeSpec::full(2, 2).unwrap();
+        let n_nodes = tree.n_nodes();      // 7
+        let mask = build_ancestor_mask(&tree).unwrap();
+
+        let n_heads = 4;
+        let n_kv = 1;       // 4/1 GQA fold
+        let head_dim = 16;  // small, keeps partial_o buffer tiny
+        let seq_prefix = 5;
+        let seq_kv = seq_prefix + n_nodes;
+        let max_seq = seq_kv;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let split_size = 8;
+        let n_splits = (seq_kv + split_size - 1) / split_size;
+
+        // Deterministic pseudo-random tensors (value depends only on index).
+        let rand = |seed: u32, n: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|i| {
+                let x = (i as u32).wrapping_mul(2_654_435_761u32) ^ seed;
+                let u = (x & 0xFFFFFF) as f32 / 16_777_216.0;
+                (u - 0.5) * 2.0 * scale
+            }).collect()
+        };
+
+        let q_host = rand(0x1234, n_nodes * n_heads * head_dim, 1.0);
+        let k_host = rand(0xABCD, n_kv * seq_kv * head_dim, 0.5);
+        let v_host = rand(0x9876, n_kv * seq_kv * head_dim, 0.3);
+
+        // ── CPU reference ──
+        let out_cpu = tree_attention_cpu(
+            &q_host, &k_host, &v_host, &mask,
+            n_nodes, n_heads, n_kv, head_dim, seq_prefix, scale,
+        ).unwrap();
+
+        // ── GPU path ──
+        let stream = reg.stream.clone();
+        let q_dev = stream.memcpy_stod(&q_host).unwrap();
+        let k_dev = stream.memcpy_stod(&k_host).unwrap();
+        let v_dev = stream.memcpy_stod(&v_host).unwrap();
+        let mask_dev = stream.memcpy_stod(&mask).unwrap();
+        let mut partial_o   = stream.alloc_zeros::<f32>(n_nodes * n_heads * n_splits * head_dim).unwrap();
+        let mut partial_max = stream.alloc_zeros::<f32>(n_nodes * n_heads * n_splits).unwrap();
+        let mut partial_sum = stream.alloc_zeros::<f32>(n_nodes * n_heads * n_splits).unwrap();
+        let mut out_dev     = stream.alloc_zeros::<f32>(n_nodes * n_heads * head_dim).unwrap();
+
+        K::tree_decode_partial(
+            reg, &q_dev, &k_dev, &v_dev, &mask_dev,
+            &mut partial_o, &mut partial_max, &mut partial_sum,
+            n_nodes, n_heads, n_kv, seq_prefix, seq_kv, head_dim, scale,
+            split_size, max_seq,
+        ).unwrap();
+        K::flash_decode_reduce(
+            reg, &partial_o, &partial_max, &partial_sum,
+            &mut out_dev, n_heads, n_splits, head_dim, n_nodes,
+        ).unwrap();
+        stream.synchronize().unwrap();
+        let out_gpu = stream.memcpy_dtov(&out_dev).unwrap();
+
+        // Element-wise compare.
+        let mut max_diff = 0f32;
+        let mut argmax = 0;
+        for i in 0..out_cpu.len() {
+            let diff = (out_cpu[i] - out_gpu[i]).abs();
+            if diff > max_diff { max_diff = diff; argmax = i; }
+        }
+        assert!(max_diff < 1e-4,
+            "tree GPU vs CPU diverged: max |diff| = {:.2e} at index {} (cpu={} gpu={})",
+            max_diff, argmax, out_cpu[argmax], out_gpu[argmax]);
+    }
+
+    /// Degenerate case: linear chain behaves like plain causal decode,
+    /// so each query's output must equal the naive all-in-scope attention
+    /// (up to numerical rounding).
+    #[test]
+    fn tree_gpu_linear_chain_matches_naive() {
+        let reg = match build_registry() {
+            Some(r) => r,
+            None => { eprintln!("[skip] no CUDA device"); return; }
+        };
+        let reg = reg.as_ref();
+
+        let tree = TreeSpec::linear(4);
+        let mask = build_ancestor_mask(&tree).unwrap();
+        let n_nodes = 4;
+        let n_heads = 2;
+        let n_kv = 2;
+        let head_dim = 8;
+        let seq_prefix = 3;
+        let seq_kv = seq_prefix + n_nodes;
+        let max_seq = seq_kv;
+        let scale = 0.5;
+        let split_size = 4;
+
+        let rand = |seed: u32, n: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|i| {
+                let x = (i as u32).wrapping_mul(2_654_435_761u32) ^ seed;
+                let u = (x & 0xFFFFFF) as f32 / 16_777_216.0;
+                (u - 0.5) * 2.0 * scale
+            }).collect()
+        };
+        let q_host = rand(0x55, n_nodes * n_heads * head_dim, 1.0);
+        let k_host = rand(0xAA, n_kv * seq_kv * head_dim, 0.4);
+        let v_host = rand(0xCC, n_kv * seq_kv * head_dim, 0.3);
+
+        let out_cpu = tree_attention_cpu(
+            &q_host, &k_host, &v_host, &mask,
+            n_nodes, n_heads, n_kv, head_dim, seq_prefix, scale,
+        ).unwrap();
+
+        let n_splits = (seq_kv + split_size - 1) / split_size;
+        let stream = reg.stream.clone();
+        let q_dev = stream.memcpy_stod(&q_host).unwrap();
+        let k_dev = stream.memcpy_stod(&k_host).unwrap();
+        let v_dev = stream.memcpy_stod(&v_host).unwrap();
+        let mask_dev = stream.memcpy_stod(&mask).unwrap();
+        let mut partial_o   = stream.alloc_zeros::<f32>(n_nodes * n_heads * n_splits * head_dim).unwrap();
+        let mut partial_max = stream.alloc_zeros::<f32>(n_nodes * n_heads * n_splits).unwrap();
+        let mut partial_sum = stream.alloc_zeros::<f32>(n_nodes * n_heads * n_splits).unwrap();
+        let mut out_dev     = stream.alloc_zeros::<f32>(n_nodes * n_heads * head_dim).unwrap();
+
+        K::tree_decode_partial(
+            reg, &q_dev, &k_dev, &v_dev, &mask_dev,
+            &mut partial_o, &mut partial_max, &mut partial_sum,
+            n_nodes, n_heads, n_kv, seq_prefix, seq_kv, head_dim, scale,
+            split_size, max_seq,
+        ).unwrap();
+        K::flash_decode_reduce(
+            reg, &partial_o, &partial_max, &partial_sum,
+            &mut out_dev, n_heads, n_splits, head_dim, n_nodes,
+        ).unwrap();
+        stream.synchronize().unwrap();
+        let out_gpu = stream.memcpy_dtov(&out_dev).unwrap();
+
+        for i in 0..out_cpu.len() {
+            let diff = (out_cpu[i] - out_gpu[i]).abs();
+            assert!(diff < 1e-4,
+                "linear chain mismatch at {}: cpu={} gpu={} diff={:.2e}",
+                i, out_cpu[i], out_gpu[i], diff);
+        }
+    }
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {

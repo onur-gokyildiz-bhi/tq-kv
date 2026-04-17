@@ -1170,6 +1170,64 @@ pub fn flash_decode_reduce(
     Ok(())
 }
 
+/// Launch tree_decode_partial_f32 — EAGLE tree attention, split-KV.
+///
+/// Shapes:
+/// - `q`              : `[n_query, n_heads, head_dim]`
+/// - `k`, `v`         : `[n_kv_heads, max_seq, head_dim]` (shared across queries)
+/// - `ancestor_mask`  : `[n_query]` u64, bit j of row i = 1 iff query i attends
+///                      to the tree-position j (see `src/eagle/tree.rs`).
+/// - `partial_o`      : `[n_query, n_heads, n_splits, head_dim]`
+/// - `partial_max`,
+///   `partial_sum`    : `[n_query, n_heads, n_splits]`
+///
+/// Call `flash_decode_reduce` with `batch_size = n_query` to finalise.
+pub fn tree_decode_partial(
+    reg: &KernelRegistry,
+    q: &CudaSlice<f32>,
+    k: &CudaSlice<f32>,
+    v: &CudaSlice<f32>,
+    ancestor_mask: &CudaSlice<u64>,
+    partial_o: &mut CudaSlice<f32>,
+    partial_max: &mut CudaSlice<f32>,
+    partial_sum: &mut CudaSlice<f32>,
+    n_query: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    seq_prefix: usize,
+    seq_kv: usize,
+    head_dim: usize,
+    scale: f32,
+    split_size: usize,
+    max_seq: usize,
+) -> Result<(), DriverError> {
+    let f = reg.get_fn("flash_decode", "tree_decode_partial_f32")?;
+    let n_splits = (seq_kv + split_size - 1) / split_size;
+    let cfg = LaunchConfig {
+        grid_dim: (n_splits as u32, n_heads as u32, n_query as u32),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nq  = n_query as i32;
+    let nh  = n_heads as i32;
+    let nkv = n_kv_heads as i32;
+    let sp  = seq_prefix as i32;
+    let skv = seq_kv as i32;
+    let hd  = head_dim as i32;
+    let ss  = split_size as i32;
+    let ms  = max_seq as i32;
+    unsafe {
+        reg.stream.launch_builder(&f)
+            .arg(q).arg(k).arg(v)
+            .arg(ancestor_mask)
+            .arg(partial_o).arg(partial_max).arg(partial_sum)
+            .arg(&nq).arg(&nh).arg(&nkv).arg(&sp).arg(&skv).arg(&hd)
+            .arg(&scale).arg(&ss).arg(&ms)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Launch flash_attention_prefill_f32.
 pub fn flash_attention_prefill(
     reg: &KernelRegistry,
