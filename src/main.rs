@@ -175,6 +175,27 @@ pub(crate) enum Commands {
     },
     /// Check system compatibility
     Doctor,
+    /// Auto-tune kernel dispatch: benchmarks each TQ_* variant and writes winners to per-machine cache
+    Autotune {
+        /// Model name (e.g., qwen2:7b, llama:8b)
+        model: String,
+        /// Tokens per variant mini-bench (default: 80)
+        #[arg(short = 'n', long, default_value = "80")]
+        tokens: u32,
+        /// Quick mode — try fewer variants per dispatch (fast default-sanity check)
+        #[arg(long)]
+        quick: bool,
+        /// Which dispatches to include (comma-separated subset of q4km,down,gateup,qkv,q6k).
+        /// Default: all.
+        #[arg(long)]
+        only: Option<String>,
+        /// Dry-run — print the plan without executing subprocesses
+        #[arg(long)]
+        dry_run: bool,
+        /// Primary metric to maximise: "std" (default), "tq", or "tq+ta"
+        #[arg(long, default_value = "std")]
+        metric: String,
+    },
     /// Calibrate TurboQuant for a model (computes optimal codebook, rotation, scales)
     Calibrate {
         /// Model name (e.g., qwen2:7b, llama:8b)
@@ -271,6 +292,7 @@ async fn main() -> Result<()> {
         Some(Commands::Bench { .. }) => cli::bench::cmd_bench(&cli),
         Some(Commands::Compress { .. }) => cli::compress::cmd_compress(&cli),
         Some(Commands::Ablate { .. }) => cli::ablate::cmd_ablate_study(&cli),
+        Some(Commands::Autotune { .. }) => cli::autotune::cmd_autotune(&cli),
         Some(Commands::DebugEmbedding { .. }) => cli::debug::cmd_debug_embedding(&cli),
         Some(Commands::DebugTokenize { .. }) => cli::debug::cmd_debug_tokenize(&cli),
         None => {

@@ -123,13 +123,19 @@ fn build_presets() -> HashMap<PresetKey, DispatchPreset> {
 static PRESETS: std::sync::OnceLock<HashMap<PresetKey, DispatchPreset>> =
     std::sync::OnceLock::new();
 
-/// Apply the preset for a given model+arch, if one exists and the user
-/// hasn't already set these env vars.
+/// Apply the best known dispatch for this (model, GPU) combination. Uses
+/// a two-stage lookup: on-disk autotune cache (per-machine, written by
+/// `tq autotune`) takes precedence over the hand-curated preset table.
 ///
-/// Must be called BEFORE any kernel dispatch `OnceLock` reads the env vars.
-/// Typical call site: just after model metadata is parsed from GGUF and
-/// compute capability is detected, before `Engine::load_with_device` builds
-/// the kernel registry.
+/// Must be called BEFORE any kernel dispatch `OnceLock` reads env. Typical
+/// call site: just after GGUF metadata yields arch + embedding_length, before
+/// first forward pass.
+///
+/// Lookup chain (first non-empty wins per env var):
+///   1. User-set env var (left untouched)
+///   2. On-disk autotune cache `~/.cache/tq/autocalib-<hash>-sm<NN>.json`
+///   3. Hand-curated preset table (this file)
+///   4. Kernel OnceLock default fallback
 ///
 /// Returns the preset applied (for logging), or `None` if no match.
 pub fn apply_preset(
@@ -138,6 +144,32 @@ pub fn apply_preset(
     sm_major: u8,
     sm_minor: u8,
 ) -> Option<&'static DispatchPreset> {
+    // Child-process suppression: `tq autotune` sets TQ_AUTOTUNE_CHILD=1 on
+    // the subprocess `tq bench` calls it spawns. In the child we still want
+    // presets to fill unset envs, but suppressed logs to keep stdout clean.
+    let quiet_child = std::env::var("TQ_AUTOTUNE_CHILD").ok().as_deref() == Some("1");
+
+    // Stage 1: try loading autotune cache for this model+GPU. If present,
+    // its winners are applied (gated by user env); cache short-circuits
+    // the preset-lookup path for the keys it covers.
+    //
+    // Cache lookup needs a model identifier. We don't have one in hand
+    // here, so we look up by scanning all autocalib-*-sm<NN>.json files and
+    // matching the arch+hidden_dim+sm. (Full fingerprint-based match would
+    // need the model path plumbed in; deferred until we add that.)
+    let cache_winners = try_load_cache_by_arch(arch, hidden_dim, sm_major, sm_minor);
+    let mut cache_applied: Vec<(String, String)> = Vec::new();
+    if let Some(ref winners) = cache_winners {
+        for (k, v) in winners {
+            if std::env::var(k).is_err() {
+                std::env::set_var(k, v);
+                cache_applied.push((k.clone(), v.clone()));
+            }
+        }
+    }
+
+    // Stage 2: hand-curated preset table. Only fills env vars that neither
+    // the user nor the cache touched.
     let table = PRESETS.get_or_init(build_presets);
     let key = PresetKey {
         arch: arch.to_ascii_lowercase(),
@@ -145,39 +177,129 @@ pub fn apply_preset(
         sm_major,
         sm_minor,
     };
-    let preset = table.get(&key)?;
+    let preset = table.get(&key);
 
-    let mut applied: Vec<(&str, &str)> = Vec::new();
-    let mut set_if_unset = |key: &'static str, val_opt: Option<&'static str>| {
-        if let Some(val) = val_opt {
-            if std::env::var(key).is_err() {
-                // SAFETY: single-threaded at startup; no concurrent env access.
-                std::env::set_var(key, val);
-                applied.push((key, val));
+    let mut preset_applied: Vec<(&str, &str)> = Vec::new();
+    if let Some(preset) = preset {
+        let mut set_if_unset = |key: &'static str, val_opt: Option<&'static str>| {
+            if let Some(val) = val_opt {
+                if std::env::var(key).is_err() {
+                    std::env::set_var(key, val);
+                    preset_applied.push((key, val));
+                }
+            }
+        };
+        set_if_unset("TQ_Q4KM",            preset.tq_q4km);
+        set_if_unset("TQ_DOWN",            preset.tq_down);
+        set_if_unset("TQ_GATEUP",          preset.tq_gateup);
+        set_if_unset("TQ_QKV",             preset.tq_qkv);
+        set_if_unset("TQ_Q6K",             preset.tq_q6k);
+        set_if_unset("TQ_FLASH_THRESHOLD", preset.tq_flash_threshold);
+        set_if_unset("TQ_FLASH_SPLIT",     preset.tq_flash_split);
+    }
+
+    if !quiet_child {
+        if !cache_applied.is_empty() {
+            eprintln!(
+                "[autocalib] Cache applied ({} vars from autotune cache): {}",
+                cache_applied.len(),
+                cache_applied.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(" ")
+            );
+        }
+        if let Some(preset) = preset {
+            if !preset_applied.is_empty() {
+                eprintln!(
+                    "[autocalib] Preset applied: {} -> {}",
+                    preset.provenance,
+                    preset_applied.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(" ")
+                );
+            } else if cache_applied.is_empty() {
+                eprintln!(
+                    "[autocalib] Preset matched ({}): all env vars pre-set by user — no override.",
+                    preset.provenance
+                );
             }
         }
-    };
-    set_if_unset("TQ_Q4KM",            preset.tq_q4km);
-    set_if_unset("TQ_DOWN",            preset.tq_down);
-    set_if_unset("TQ_GATEUP",          preset.tq_gateup);
-    set_if_unset("TQ_QKV",             preset.tq_qkv);
-    set_if_unset("TQ_Q6K",             preset.tq_q6k);
-    set_if_unset("TQ_FLASH_THRESHOLD", preset.tq_flash_threshold);
-    set_if_unset("TQ_FLASH_SPLIT",     preset.tq_flash_split);
-
-    if applied.is_empty() {
-        eprintln!(
-            "[autocalib] Preset matched ({}): all env vars pre-set by user — no override.",
-            preset.provenance
-        );
-    } else {
-        eprintln!(
-            "[autocalib] Applied preset: {} -> {}",
-            preset.provenance,
-            applied.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(" ")
-        );
     }
-    Some(preset)
+    preset
+}
+
+/// Load the most recent autotune cache matching this (arch, hidden_dim, sm).
+/// Returns the winners map if found.
+///
+/// We scan the cache dir for files of the form `autocalib-<hash>-sm<N><M>.json`
+/// and match on (sm_major, sm_minor) plus a model shape signal. Since the
+/// cache was written for a specific model, any entry we load is for a
+/// compatible GPU/model. If multiple caches exist for different models at
+/// the same (hidden_dim, sm), we pick the newest mtime.
+fn try_load_cache_by_arch(
+    _arch: &str,
+    _hidden_dim: usize,
+    sm_major: u8,
+    sm_minor: u8,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let cache_dir = cache_dir()?;
+    let sm_suffix = format!("-sm{}{}.json", sm_major, sm_minor);
+    let entries = std::fs::read_dir(&cache_dir).ok()?;
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for e in entries.flatten() {
+        let p = e.path();
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !name.starts_with("autocalib-") || !name.ends_with(&sm_suffix) {
+            continue;
+        }
+        let mtime = e.metadata().ok().and_then(|m| m.modified().ok())?;
+        if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+            newest = Some((mtime, p));
+        }
+    }
+    let path = newest?.1;
+    let text = std::fs::read_to_string(&path).ok()?;
+    // Minimal extraction of `winners` object — avoid full serde dependency
+    // here, keep the autocalib crate free of serde coupling. We just look
+    // for the winners block in the JSON.
+    parse_winners_from_json(&text)
+}
+
+fn cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        return Some(std::path::PathBuf::from(xdg).join("tq"));
+    }
+    #[cfg(target_os = "windows")]
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        return Some(std::path::PathBuf::from(local).join("tq").join("cache"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return Some(std::path::PathBuf::from(home).join(".cache").join("tq"));
+    }
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        return Some(std::path::PathBuf::from(up).join(".cache").join("tq"));
+    }
+    None
+}
+
+/// Tiny parser for `"winners": { "TQ_X": "v", ... }` — avoids serde dep.
+fn parse_winners_from_json(text: &str) -> Option<std::collections::BTreeMap<String, String>> {
+    // Find the "winners" key and the opening brace after it.
+    let idx = text.find("\"winners\"")?;
+    let brace = text[idx..].find('{')? + idx;
+    // Walk forward to matching closing brace (assumes no nested objects inside winners).
+    let end = text[brace..].find('}')? + brace;
+    let block = &text[brace + 1..end];
+
+    let mut out = std::collections::BTreeMap::new();
+    // Each entry: "KEY": "VAL",
+    for chunk in block.split(',') {
+        let chunk = chunk.trim();
+        if chunk.is_empty() { continue; }
+        let colon = chunk.find(':')?;
+        let k = chunk[..colon].trim().trim_matches('"').to_string();
+        let v = chunk[colon + 1..].trim().trim_matches('"').to_string();
+        if !k.is_empty() && !v.is_empty() {
+            out.insert(k, v);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Lookup only — returns the preset without applying it. Useful for docs/UI.

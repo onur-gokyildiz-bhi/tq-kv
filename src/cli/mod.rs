@@ -6,6 +6,7 @@
 pub(crate) mod common;
 
 pub(crate) mod ablate;
+pub(crate) mod autotune;
 pub(crate) mod bench;
 pub(crate) mod calibrate;
 pub(crate) mod compress;
