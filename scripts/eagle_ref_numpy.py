@@ -160,8 +160,9 @@ def main():
 
     print(f"\n[ref] input: prev_hidden=zeros({HIDDEN}), token_id={TOKEN_ID}, pos={POSITION}")
 
-    # Step 1: concat [prev_hidden, embed(token_id)]  (SafeAILab convention)
-    concat = np.concatenate([PREV_HIDDEN, embed[TOKEN_ID].astype(np.float32)])
+    # Step 1: concat [embed(token_id), prev_hidden]
+    # SafeAILab cnets1.py: torch.cat((inputs_embeds, hidden_states), dim=-1) — EMBED FIRST.
+    concat = np.concatenate([embed[TOKEN_ID].astype(np.float32), PREV_HIDDEN])
     dump("01_concat", concat, out_dir)
 
     # Step 2: fc.weight @ concat + fc.bias

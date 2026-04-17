@@ -111,8 +111,8 @@ pub fn run_acceptance_probe(
     // later `&mut model` calls to forward_last_hidden.)
 
     // ── PREFILL draft's KV cache with prompt positions 1..prompt_len ──
-    // At position p >= 1, draft sees (norm(hidden[p-1]), prompt[p]) → predicts prompt[p+1].
-    // Apply base's final RMSNorm to each hidden before handing to draft (see `normed` doc).
+    // EAGLE-1 in HF transformers consumes outputs.last_hidden_state which
+    // is POST-final-norm. Apply base's final norm before handing to draft.
     eprintln!("[probe] prefilling draft with {} prompt positions ...", prompt_len - 1);
     for p in 1..prompt_len {
         let prev_h = &all_h_host[(p - 1) * hidden_dim .. p * hidden_dim];
@@ -184,23 +184,20 @@ pub fn run_acceptance_probe(
     Ok(steps)
 }
 
-/// Apply a plain RMSNorm (weight=ones) to a host vec `[hidden]`.
-///
-/// # Why not the base model's final norm?
-///
-/// Day 2 tried `model.apply_final_norm` (base's final RMSNorm with trained
-/// weights). Qwen2's final-norm weights have mean ≈ 5, so the normed output
-/// had L2 ≈ 290 — still several× too large for the fc layer's trained input
-/// scale. Switching to a pure RMSNorm (divide by RMS only, weight = 1) brings
-/// the input to L2 ≈ sqrt(hidden) ≈ 60 which matches what a one-layer draft
-/// trained with standard LayerNorm preprocessing expects.
-fn apply_base_norm(_model: &crate::engine::ModelWeights, raw: &[f32])
+/// Apply base model's final RMSNorm (with its trained weights) to a host
+/// vec `[hidden]`. EAGLE-1 in HuggingFace transformers consumes
+/// `outputs.last_hidden_state` which IS post-final-norm (Llama/Qwen2's
+/// `model.norm` has been applied). Our `forward_last_hidden` returns
+/// pre-norm — so we must apply the base's final norm here to match.
+fn apply_base_norm(model: &crate::engine::ModelWeights, raw: &[f32])
     -> Result<Vec<f32>, EagleError>
 {
-    let eps = 1e-6f32;
-    let sum_sq: f32 = raw.iter().map(|x| x * x).sum();
-    let rms = (sum_sq / raw.len() as f32 + eps).sqrt();
-    Ok(raw.iter().map(|x| x / rms).collect())
+    let t = Tensor::from_vec(raw.to_vec(), vec![raw.len()],
+                             &crate::cuda::TqDevice::Cpu)
+        .map_err(|e| EagleError::Msg(format!("wrap for norm: {}", e)))?;
+    let n = model.apply_final_norm(&t)
+        .map_err(|e| EagleError::Msg(format!("apply_final_norm: {}", e)))?;
+    n.to_vec1().map_err(|e| EagleError::Msg(format!("norm to_vec: {}", e)))
 }
 
 fn argmax(v: &[f32]) -> u32 {

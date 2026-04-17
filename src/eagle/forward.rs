@@ -307,29 +307,23 @@ impl DraftRuntime {
             Ok(())
         };
 
-        // ── 1. concat_buf = [prev_hidden | embed_tokens[token_id, :]] ──────
-        // Original SafeAILab cnets.py convention: torch.cat([hidden, embed], dim=-1).
-        // Reverted Day 2 after the swap experiment collapsed draft output.
+        // ── 1. concat_buf = [embed_tokens[token_id, :] | prev_hidden] ─────
+        // Day 3 finding (competitive-intel read of cnets1.py):
+        //     hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
+        // Embed FIRST, hidden SECOND. Our earlier [prev_hidden, embed] was the
+        // mirror-image error; Day 2's swap experiment had hit this ordering
+        // but I misread the output collapse as "worse" and reverted.
         let prev_slice = stream_arc.memcpy_stod(prev_hidden)
             .map_err(|e| EagleError::Msg(format!("H2D prev_hidden: {}", e)))?;
         let f32_bytes = std::mem::size_of::<f32>();
-        {
-            let (src_ptr, _g1) = prev_slice.device_ptr(stream);
-            let (dst_ptr, _g2) = self.concat_buf.device_ptr_mut(stream);
-            let bytes = hidden * f32_bytes;
-            let res = unsafe { drv_sys::cuMemcpyDtoDAsync_v2(dst_ptr, src_ptr, bytes, raw_stream) };
-            if res != drv_sys::cudaError_enum::CUDA_SUCCESS {
-                return Err(EagleError::Msg(format!("D2D prev→concat: {:?}", res)));
-            }
-        }
+        // embed_tokens row → concat_buf[0..hidden]
         {
             let (emb_ptr, _g1) = self.embed_tokens.device_ptr(stream);
-            let (dst_ptr,  _g2) = self.concat_buf.device_ptr_mut(stream);
+            let (dst_ptr, _g2) = self.concat_buf.device_ptr_mut(stream);
             let row_off_bytes = (token_id as usize) * hidden * f32_bytes;
-            let dst_off_bytes = hidden * f32_bytes;
             let res = unsafe {
                 drv_sys::cuMemcpyDtoDAsync_v2(
-                    dst_ptr + dst_off_bytes as u64,
+                    dst_ptr,
                     emb_ptr + row_off_bytes as u64,
                     hidden * f32_bytes,
                     raw_stream,
@@ -337,6 +331,24 @@ impl DraftRuntime {
             };
             if res != drv_sys::cudaError_enum::CUDA_SUCCESS {
                 return Err(EagleError::Msg(format!("D2D embed→concat: {:?}", res)));
+            }
+        }
+        // prev_hidden → concat_buf[hidden..2*hidden]  (RAW — no preprocessing per EAGLE-1 contract)
+        {
+            let (src_ptr, _g1) = prev_slice.device_ptr(stream);
+            let (dst_ptr, _g2) = self.concat_buf.device_ptr_mut(stream);
+            let dst_off_bytes = hidden * f32_bytes;
+            let bytes = hidden * f32_bytes;
+            let res = unsafe {
+                drv_sys::cuMemcpyDtoDAsync_v2(
+                    dst_ptr + dst_off_bytes as u64,
+                    src_ptr,
+                    bytes,
+                    raw_stream,
+                )
+            };
+            if res != drv_sys::cudaError_enum::CUDA_SUCCESS {
+                return Err(EagleError::Msg(format!("D2D prev→concat: {:?}", res)));
             }
         }
 
