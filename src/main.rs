@@ -289,6 +289,19 @@ pub(crate) enum Commands {
         /// print output statistics (sum/max/min/NaN-check). Requires --features cuda.
         #[arg(long, default_value_t = false)]
         smoke: bool,
+        /// Sprint 3 Day 1: acceptance-rate probe against a target model.
+        /// Requires --target and --prompt.
+        #[arg(long, default_value_t = false)]
+        acceptance: bool,
+        /// Target model name (e.g. "qwen2:7b"). Used only with --acceptance.
+        #[arg(long)]
+        target: Option<String>,
+        /// Prompt for the acceptance probe. Used only with --acceptance.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Number of decode steps to probe. Used only with --acceptance.
+        #[arg(long, default_value_t = 20usize)]
+        n: usize,
     },
     /// Debug: dump embedding row statistics (Bug #2 investigation)
     DebugEmbedding {
@@ -582,10 +595,27 @@ async fn cmd_serve(cli: &Cli) -> Result<()> {
     serve::run_server(engine, template, display_name, port, tq_config, cli.cpu).await
 }
 
+/// Load a target Engine by model name (legacy catalog OR hub resolution).
+/// Used by the Sprint 3 Day 1 acceptance probe. No TQ, no quality gate —
+/// the probe wants the baseline target behaviour.
+fn load_target_engine(model_name: &str, cli: &Cli) -> Result<Engine> {
+    if let Some(model_config) = config::get_model(model_name) {
+        model::load_engine(model_config, None, None, None, cli.cpu)
+    } else {
+        let (gguf_path, tokenizer_path) = hub::resolve(model_name)?;
+        let tok_path = tokenizer_path.ok_or_else(||
+            anyhow::anyhow!("no tokenizer resolved for '{}'", model_name))?;
+        let mf = gguf_path.to_string_lossy().to_string();
+        let arch = config::detect_arch(&mf);
+        Engine::load_with_device(&gguf_path, &tok_path, arch, None, cli.cpu)
+    }
+}
+
 fn cmd_eagle_probe(cli: &Cli) -> Result<()> {
-    let (weights, preset, smoke) = match &cli.command {
-        Some(Commands::EagleProbe { weights, preset, smoke }) =>
-            (weights.clone(), preset.clone(), *smoke),
+    let (weights, preset, smoke, acceptance, target, prompt, n_steps) = match &cli.command {
+        Some(Commands::EagleProbe { weights, preset, smoke, acceptance, target, prompt, n }) =>
+            (weights.clone(), preset.clone(), *smoke, *acceptance,
+             target.clone(), prompt.clone(), *n),
         _ => unreachable!(),
     };
     let cfg = match preset.as_str() {
@@ -692,8 +722,25 @@ fn cmd_eagle_probe(cli: &Cli) -> Result<()> {
                 eprintln!("[warn] --smoke requested but GPU upload unavailable");
             }
 
+            // Sprint 3 Day 1: acceptance-rate probe.
+            #[cfg(feature = "cuda")]
+            if acceptance {
+                let target = target.clone().ok_or_else(||
+                    anyhow::anyhow!("--acceptance requires --target MODEL"))?;
+                let prompt = prompt.clone().ok_or_else(||
+                    anyhow::anyhow!("--acceptance requires --prompt TEXT"))?;
+                println!();
+                println!("Loading target '{}' for acceptance probe ...", target);
+                let mut engine = load_target_engine(&target, cli)?;
+                println!("Running acceptance probe ({} steps) ...", n_steps);
+                match eagle::probe::run_acceptance_probe(&mut engine, &mut d, &prompt, n_steps) {
+                    Ok(steps) => eagle::probe::summarise(&steps),
+                    Err(e) => eprintln!("[err] probe: {}", e),
+                }
+            }
+
             println!();
-            println!("  runnable : {} (Sprint 2 wires tree_attention + verify loop)",
+            println!("  runnable : {} (Sprint 2 tree_attn kernel done, Sprint 3 engine wiring next)",
                 d.is_runnable());
             println!("Track progress: memory/project_eagle3_integration_plan.md");
             Ok(())

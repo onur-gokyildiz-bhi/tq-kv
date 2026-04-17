@@ -23,6 +23,18 @@ impl ModelWeights {
     fn forward(&mut self, x: &Tensor, pos: usize) -> crate::cuda::Result<Tensor> {
         self.0.forward(x, pos)
     }
+
+    /// Delegates to [`GenericTurboModel::forward_last_hidden`]. Added 2026-04-17
+    /// for Sprint 3 Day 1 acceptance probe — returns the pre-norm, pre-lm_head
+    /// hidden state EAGLE needs as its draft input.
+    pub fn forward_last_hidden(&mut self, x: &Tensor, pos: usize) -> crate::cuda::Result<Tensor> {
+        self.0.forward_last_hidden(x, pos)
+    }
+
+    /// Delegates to [`GenericTurboModel::project_hidden_to_logits`].
+    pub fn project_hidden_to_logits(&self, hidden: &Tensor) -> crate::cuda::Result<Tensor> {
+        self.0.project_hidden_to_logits(hidden)
+    }
     fn forward_partial(&mut self, x: &Tensor, n_layers: usize, pos: usize) -> crate::cuda::Result<Tensor> {
         self.0.forward_partial(x, n_layers, pos)
     }
@@ -121,7 +133,7 @@ pub struct Engine {
     pub tokenizer: Tokenizer,
     device: Device,
     position: usize,
-    eos_token_ids: Vec<u32>,
+    pub(crate) eos_token_ids: Vec<u32>,
     /// Optional quality gate for runtime PPL monitoring.
     pub quality_gate: Option<QualityGate>,
 }

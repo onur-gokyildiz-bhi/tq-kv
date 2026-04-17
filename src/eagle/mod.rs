@@ -31,6 +31,11 @@ pub use forward::DraftRuntime;
 pub mod tree;
 pub use tree::{TreeSpec, TreeError, build_ancestor_mask, tree_attention_cpu, MAX_TREE_NODES};
 
+/// Sprint 3 Day 1: acceptance-rate probe — does the draft agree with the
+/// target's greedy? Drives the go/no-go decision on tree decode integration.
+#[cfg(feature = "cuda")]
+pub mod probe;
+
 /// Config of an EAGLE draft model. Mirrors the subset of `config.json` fields
 /// that actually influence forward-pass tensor layout, plus three
 /// EAGLE-specific architecture flags discovered 2026-04-17 by inspecting the

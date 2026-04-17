@@ -2121,6 +2121,126 @@ impl GenericTurboModel {
     ///
     /// IMPORTANT: this writes to layers[0..n_layers]'s KV caches. The caller
     /// must handle truncation on rejection. Layers beyond n_layers are untouched.
+    /// Run all transformer layers and return the LAST-POSITION hidden state
+    /// *before* the final norm + LM head. This is what EAGLE-style speculative
+    /// decoding needs to drive its draft model.
+    ///
+    /// Modelled after `forward_partial` (single-token / prefill), skips the
+    /// norm + lm_head + softcap tail. Returns a `[hidden_dim]` 1D tensor on
+    /// whichever device the layer output lives on.
+    ///
+    /// Safe to call back-to-back with single-token inputs — uses the same KV
+    /// cache state as `forward`, so caller pass the same `index_pos` they'd
+    /// pass to `forward`.
+    pub fn forward_last_hidden(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
+        let (_b_sz, seq_len) = x.dims2()?;
+        let backend = self.backend.clone();
+        let backend = backend.as_ref();
+
+        let mask = if seq_len == 1 { None } else {
+            Some(self.mask(seq_len, index_pos, x.device())?)
+        };
+
+        let mut layer_in = self.tok_embeddings.forward(x)?;
+        if let Some(scale) = self.embed_scale {
+            let data = layer_in.as_slice();
+            let scaled: Vec<f32> = data.iter().map(|&v| v * scale).collect();
+            layer_in = Tensor::from_vec(scaled, layer_in.shape().to_vec(), layer_in.device())?;
+        }
+        #[cfg(feature = "cuda")]
+        if backend.is_gpu() {
+            if let Ok(gpu_tensor) = layer_in.to_device_auto() {
+                layer_in = gpu_tensor;
+            }
+        }
+
+        let n = self.layers.len();
+        for layer in self.layers[..n].iter_mut() {
+            let residual = &layer_in;
+            let x = layer.attention_norm.forward(&layer_in, backend)?;
+            let attn = layer.forward_attn(&x, None, mask.as_ref(), index_pos, backend)?;
+            let attn = match &layer.post_attention_norm {
+                Some(norm) => norm.forward(&attn, backend)?,
+                None => attn,
+            };
+
+            let attn_f32 = attn.to_dtype(DType::F32)?;
+            let residual_f32 = residual.to_dtype(DType::F32)?;
+
+            #[cfg(feature = "cuda")]
+            let (x, residual_owned) = if attn_f32.is_cuda() {
+                attn_f32.fused_add_rms_norm_gpu(
+                    &residual_f32, &layer.ffn_norm.weight, layer.ffn_norm.eps as f32,
+                )?
+            } else {
+                let shape = attn_f32.shape().to_vec();
+                let hidden = *shape.last().unwrap();
+                let n_tokens = attn_f32.elem_count() / hidden;
+                let (normed, new_res) = backend.fused_add_rms_norm(
+                    attn_f32.as_slice(), residual_f32.as_slice(),
+                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                    n_tokens, hidden,
+                );
+                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
+            };
+            #[cfg(not(feature = "cuda"))]
+            let (x, residual_owned) = {
+                let shape = attn_f32.shape().to_vec();
+                let hidden = *shape.last().unwrap();
+                let n_tokens = attn_f32.elem_count() / hidden;
+                let (normed, new_res) = backend.fused_add_rms_norm(
+                    attn_f32.as_slice(), residual_f32.as_slice(),
+                    layer.ffn_norm.weight.as_slice(), layer.ffn_norm.eps as f32,
+                    n_tokens, hidden,
+                );
+                (Tensor::from_vec(normed, shape.clone(), attn_f32.device())?,
+                 Tensor::from_vec(new_res, shape, attn_f32.device())?)
+            };
+            let x = layer.mlp_or_moe.forward(&x, backend)?;
+            let x = match &layer.post_ffn_norm {
+                Some(norm) => norm.forward(&x, backend)?,
+                None => x,
+            };
+            layer_in = (x + &residual_owned)?;
+        }
+
+        // Narrow to last position + squeeze → [hidden]. Matches the layout
+        // EAGLE's draft_forward expects (`prev_hidden: &[f32]` of length hidden).
+        let last = layer_in.narrow(1, seq_len - 1, 1)?.squeeze(1)?;   // [b, hidden]
+        let last = last.squeeze(0)?;                                   // [hidden]
+        Ok(last)
+    }
+
+    /// Apply final norm + LM head + softcap to a single hidden vector.
+    /// Inverse of `forward_last_hidden`: takes `[hidden_dim]`, returns
+    /// `[vocab_size]` logits. Used by the acceptance-rate probe to project
+    /// a draft-predicted hidden back into token space.
+    pub fn project_hidden_to_logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        let backend = self.backend.clone();
+        let backend = backend.as_ref();
+        // hidden is [hidden_dim]; expand to [1, 1, hidden] so `norm.forward`
+        // and `output.forward` see the batch layout they expect.
+        let shape = hidden.shape().to_vec();
+        let h = if shape.len() == 1 {
+            hidden.unsqueeze(0)?.unsqueeze(0)?
+        } else {
+            hidden.clone()
+        };
+        let normed = self.norm.forward(&h, backend)?;
+        // Narrow to last position (no-op if seq_len already 1) + squeeze.
+        let (_b, s) = {
+            let sh = normed.shape();
+            (sh[0], sh[1])
+        };
+        let normed = normed.narrow(1, s - 1, 1)?.squeeze(1)?;
+        let logits = self.output.forward(&normed, backend)?;
+        let logits = if let Some(cap) = self.final_logit_softcap {
+            apply_softcap(&logits, cap)?
+        } else { logits };
+        Ok(logits)
+    }
+
     pub fn forward_partial(&mut self, x: &Tensor, n_layers: usize, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
         let backend = self.backend.clone();
