@@ -288,6 +288,25 @@ impl DraftRuntime {
         let raw_stream = stream.cu_stream();
         let blas = reg.get_cublas();
 
+        // Day 3 debug: when TQ_EAGLE_DUMP=<dir> is set, write every
+        // intermediate to <dir>/rust_<stage>.npy for element-wise comparison
+        // against the Python reference in scripts/eagle_ref_numpy.py.
+        let dump_dir: Option<std::path::PathBuf> = std::env::var("TQ_EAGLE_DUMP")
+            .ok().filter(|s| !s.is_empty()).map(|s| s.into());
+        let dump = |slice: &CudaSlice<f32>, stage: &str| -> Result<(), EagleError> {
+            let Some(ref dir) = dump_dir else { return Ok(()); };
+            let _ = std::fs::create_dir_all(dir);
+            stream_arc.synchronize().ok();
+            let v = stream_arc.memcpy_dtov(slice)
+                .map_err(|e| EagleError::Msg(format!("dump {} d2h: {}", stage, e)))?;
+            let path = dir.join(format!("rust_{}.npy", stage));
+            write_npy_f32(&path, &v)
+                .map_err(|e| EagleError::Msg(format!("dump {} write: {}", stage, e)))?;
+            let l2: f32 = v.iter().map(|x| x*x).sum::<f32>().sqrt();
+            eprintln!("  [rust] {:<18} len={} L2={:.3}", stage, v.len(), l2);
+            Ok(())
+        };
+
         // ── 1. concat_buf = [prev_hidden | embed_tokens[token_id, :]] ──────
         // Original SafeAILab cnets.py convention: torch.cat([hidden, embed], dim=-1).
         // Reverted Day 2 after the swap experiment collapsed draft output.
@@ -321,12 +340,15 @@ impl DraftRuntime {
             }
         }
 
+        dump(&self.concat_buf, "01_concat")?;
+
         // ── 2. fc_out = fc_weight @ concat_buf + fc_bias ──────────────────
         // fc_weight shape [hidden, 2*hidden], input [2*hidden], output [hidden].
         matvec_row_major(&blas, &self.fc_weight, &self.concat_buf,
                          &mut self.fc_out, 2 * hidden, hidden)?;
         kernels::bias_add_inplace(reg, &mut self.fc_out, &self.fc_bias, hidden)
             .map_err(|e| EagleError::Msg(format!("fc bias: {}", e)))?;
+        dump(&self.fc_out, "02_fc_out")?;
 
         // ── 3. q/k/v projections (fc_out -> {q,k,v}_buf) ──────────────────
         matvec_row_major(&blas, &self.q_weight, &self.fc_out,
@@ -341,6 +363,9 @@ impl DraftRuntime {
                          &mut self.v_buf, hidden, hidden)?;
         kernels::bias_add_inplace(reg, &mut self.v_buf, &self.v_bias, hidden)
             .map_err(|e| EagleError::Msg(format!("v bias: {}", e)))?;
+        dump(&self.q_buf, "03_q")?;
+        dump(&self.k_buf, "04_k")?;
+        dump(&self.v_buf, "05_v")?;
 
         // ── 4. RoPE(q, k) at `position` ───────────────────────────────────
         kernels::rope_halved(reg, &mut self.q_buf, &self.rope_cos, &self.rope_sin,
@@ -349,6 +374,8 @@ impl DraftRuntime {
         kernels::rope_halved(reg, &mut self.k_buf, &self.rope_cos, &self.rope_sin,
                              1, n_kv_heads, head_dim, rope_dim, position)
             .map_err(|e| EagleError::Msg(format!("rope k: {}", e)))?;
+        dump(&self.q_buf, "06_q_rope")?;
+        dump(&self.k_buf, "07_k_rope")?;
 
         // ── 5. Scatter k, v into cache at slot `position` ─────────────────
         // K cache layout is [n_kv_heads, max_seq, head_dim]. Our k_buf is
@@ -407,10 +434,12 @@ impl DraftRuntime {
             reg, &self.partial_o, &self.partial_max, &self.partial_sum,
             &mut self.attn_out, n_heads, n_splits, head_dim, 1,
         ).map_err(|e| EagleError::Msg(format!("flash_decode_reduce: {}", e)))?;
+        dump(&self.attn_out, "08_attn_out")?;
 
         // ── 7. o_out = o_weight @ attn_out ─────────────────────────────────
         matvec_row_major(&blas, &self.o_weight, &self.attn_out,
                          &mut self.o_out, hidden, hidden)?;
+        dump(&self.o_out, "09_o_out")?;
 
         // ── 8. post-attention block:
         //        residual <- fc_out + o_out    (residual path)
@@ -426,23 +455,30 @@ impl DraftRuntime {
             &mut self.norm_out,   // output (normalised)
             1, hidden, cfg.rms_norm_eps,
         ).map_err(|e| EagleError::Msg(format!("post_attn norm: {}", e)))?;
+        dump(&self.fc_out,   "10_residual_1")?;
+        dump(&self.norm_out, "11_norm_out")?;
 
         // ── 9. MLP: gate, up, silu_mul, down ──────────────────────────────
         matvec_row_major(&blas, &self.gate_weight, &self.norm_out,
                          &mut self.mlp_gate, hidden, intermediate)?;
         matvec_row_major(&blas, &self.up_weight, &self.norm_out,
                          &mut self.mlp_up, hidden, intermediate)?;
+        dump(&self.mlp_gate, "12_gate")?;
+        dump(&self.mlp_up,   "13_up")?;
         kernels::fused_silu_mul(reg, &self.mlp_gate, &self.mlp_up,
                                 &mut self.mlp_silu, intermediate)
             .map_err(|e| EagleError::Msg(format!("silu_mul: {}", e)))?;
+        dump(&self.mlp_silu, "14_silu_mul")?;
         matvec_row_major(&blas, &self.down_weight, &self.mlp_silu,
                          &mut self.mlp_down, intermediate, hidden)?;
+        dump(&self.mlp_down, "15_down")?;
 
         // ── 10. residual2 = residual + mlp_down  (in-place into fc_out) ───
         // bias_add_inplace is "data += bias" which is elementwise add over
         // arbitrary [n]-vectors — exactly what we need here.
         kernels::bias_add_inplace(reg, &mut self.fc_out, &self.mlp_down, hidden)
             .map_err(|e| EagleError::Msg(format!("mlp residual: {}", e)))?;
+        dump(&self.fc_out, "16_final")?;
 
         // ── 11. D2H → return ───────────────────────────────────────────────
         stream_arc.synchronize()
@@ -492,6 +528,41 @@ fn matvec_row_major(
         blas.gemm(cfg, x, w, out)
             .map_err(|e| EagleError::Msg(format!("matvec gemm: {}", e)))?;
     }
+    Ok(())
+}
+
+/// Minimal NPY v1 writer for 1-D f32 arrays. Avoids adding a numpy crate
+/// dependency for what's essentially a debug-only dump path.
+/// Format reference: https://numpy.org/doc/stable/reference/generated/numpy.lib.format.html
+fn write_npy_f32(path: &std::path::Path, data: &[f32]) -> std::io::Result<()> {
+    use std::io::Write;
+    let magic = b"\x93NUMPY";
+    let version_major = 1u8;
+    let version_minor = 0u8;
+    let header = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({},), }}",
+        data.len()
+    );
+    // Header must be padded so the total (magic+version+header_len+header) is a
+    // multiple of 64; the header string is padded with spaces + trailing '\n'.
+    let prefix_len = 6 + 2 + 2; // magic + version bytes + header_len u16
+    let mut header_bytes = header.into_bytes();
+    header_bytes.push(b'\n');
+    while (prefix_len + header_bytes.len()) % 64 != 0 {
+        header_bytes.insert(header_bytes.len() - 1, b' ');
+    }
+    let header_len = header_bytes.len() as u16;
+
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(magic)?;
+    f.write_all(&[version_major, version_minor])?;
+    f.write_all(&header_len.to_le_bytes())?;
+    f.write_all(&header_bytes)?;
+    // Data as little-endian f32 bytes
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+    };
+    f.write_all(bytes)?;
     Ok(())
 }
 

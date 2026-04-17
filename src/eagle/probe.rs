@@ -140,10 +140,9 @@ pub fn run_acceptance_probe(
         let d_tensor = Tensor::from_vec(d_hidden_host, vec![hidden_dim],
                                         &crate::cuda::TqDevice::Cpu)
             .map_err(|e| EagleError::Msg(format!("wrap draft hidden: {}", e)))?;
-        // Day 2 debug: try passing draft output through base's final norm +
-        // lm_head (same projection target uses). If acceptance jumps from 0%
-        // we've confirmed the draft is in pre-norm residual space.
-        let d_logits = model.project_hidden_to_logits(&d_tensor)
+        // Draft output → base.lm_head directly (NO base norm). SafeAILab's
+        // ea_model.py convention: `logits = self.base_model.lm_head(ea_hidden)`.
+        let d_logits = model.project_hidden_to_logits_no_norm(&d_tensor)
             .map_err(|e| EagleError::Msg(format!("project draft: {}", e)))?;
         let d_logits_host = d_logits.to_vec1()
             .map_err(|e| EagleError::Msg(format!("draft logits to_vec: {}", e)))?;
@@ -185,18 +184,23 @@ pub fn run_acceptance_probe(
     Ok(steps)
 }
 
-/// Apply base model's final RMSNorm to a host vec `[hidden]`. EAGLE's draft
-/// was trained to consume NORMALISED hidden states, not raw residual stream —
-/// without this, `fc_out` overshoots by `sqrt(hidden) * sigma_W` ≈ 10×.
-fn apply_base_norm(model: &crate::engine::ModelWeights, raw: &[f32])
+/// Apply a plain RMSNorm (weight=ones) to a host vec `[hidden]`.
+///
+/// # Why not the base model's final norm?
+///
+/// Day 2 tried `model.apply_final_norm` (base's final RMSNorm with trained
+/// weights). Qwen2's final-norm weights have mean ≈ 5, so the normed output
+/// had L2 ≈ 290 — still several× too large for the fc layer's trained input
+/// scale. Switching to a pure RMSNorm (divide by RMS only, weight = 1) brings
+/// the input to L2 ≈ sqrt(hidden) ≈ 60 which matches what a one-layer draft
+/// trained with standard LayerNorm preprocessing expects.
+fn apply_base_norm(_model: &crate::engine::ModelWeights, raw: &[f32])
     -> Result<Vec<f32>, EagleError>
 {
-    let t = Tensor::from_vec(raw.to_vec(), vec![raw.len()],
-                             &crate::cuda::TqDevice::Cpu)
-        .map_err(|e| EagleError::Msg(format!("wrap for norm: {}", e)))?;
-    let n = model.apply_final_norm(&t)
-        .map_err(|e| EagleError::Msg(format!("apply_final_norm: {}", e)))?;
-    n.to_vec1().map_err(|e| EagleError::Msg(format!("norm to_vec: {}", e)))
+    let eps = 1e-6f32;
+    let sum_sq: f32 = raw.iter().map(|x| x * x).sum();
+    let rms = (sum_sq / raw.len() as f32 + eps).sqrt();
+    Ok(raw.iter().map(|x| x / rms).collect())
 }
 
 fn argmax(v: &[f32]) -> u32 {
