@@ -209,7 +209,10 @@ fn try_fused_decode_layer(
 
                         if let Some(ref mut scratch) = decode_scratch {
                             let pdet_qkv = profiling && layer_idx == 0;
-                            let _tqkv = if pdet_qkv { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
+                            let _tqkv = if pdet_qkv {
+                                crate::cuda::event_timer::EventTimer::new().ok()
+                                    .filter(|t| t.start(&reg.stream).is_ok())
+                            } else { None };
 
                             // Try fully-fused path: single kernel does RMSNorm + Q/K/V Q4K matvec + biases.
                             // Requires all three weights to be Q4K (fallback for Q6K V below).
@@ -292,9 +295,9 @@ fn try_fused_decode_layer(
                                 }
                             }
                             if let Some(t) = _tqkv {
-                                let _ = reg.stream.synchronize();
+                                let _ = t.stop(&reg.stream);
                                 let label = if use_fused { "fused-qkv" } else { "norm+qkv" };
-                                eprintln!("[kernel] {:>12}: {:.1}μs", label, t.elapsed().as_nanos() as f64 / 1000.0);
+                                eprintln!("[kernel] {:>12}: {:.1}μs", label, t.elapsed_us().unwrap_or(0.0));
                             }
                             Some((true, None, hidden_dim))
                         } else {
@@ -320,13 +323,23 @@ fn try_fused_decode_layer(
                         let scratch = decode_scratch.as_mut().unwrap();
                         let reg = crate::cuda::kernels::global_registry().unwrap();
 
-                        // Per-kernel detail profiling (TQ_PROFILE=1, layer 0 only)
+                        // Per-kernel detail profiling (TQ_PROFILE=1, layer 0 only).
+                        // Uses CUDA events so each section measures exactly the GPU time
+                        // of the kernels launched between start/stop — no pipeline drain
+                        // or host-side polling artifacts (see cuda::event_timer docs).
                         let pdet = profiling && layer_idx == 0;
                         macro_rules! ptime {
                             ($label:expr, $body:expr) => {{
-                                let _t = if pdet { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
+                                let timer = if pdet {
+                                    crate::cuda::event_timer::EventTimer::new().ok()
+                                        .filter(|t| t.start(&reg.stream).is_ok())
+                                } else { None };
                                 let r = $body;
-                                if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", $label, t.elapsed().as_nanos() as f64 / 1000.0); }
+                                if let Some(t) = timer {
+                                    let _ = t.stop(&reg.stream);
+                                    let us = t.elapsed_us().unwrap_or(0.0);
+                                    eprintln!("[kernel] {:>12}: {:.1}μs", $label, us);
+                                }
                                 r
                             }};
                         }
@@ -538,7 +551,10 @@ fn try_fused_decode_layer(
                             let pdet = profiling && layer_idx == 0;
 
                             // 1. combined = residual + attn
-                            let _t = if pdet { let _ = reg.stream.synchronize(); Some(std::time::Instant::now()) } else { None };
+                            let timer = if pdet {
+                                crate::cuda::event_timer::EventTimer::new().ok()
+                                    .filter(|t| t.start(&reg.stream).is_ok())
+                            } else { None };
                             {
                                 let comb = Arc::get_mut(&mut scratch.combined_bufs[ci])
                                     .expect("scratch combined ping-pong aliased");
@@ -547,10 +563,16 @@ fn try_fused_decode_layer(
                                     comb, hidden_dim,
                                 ).map_err(|e| TqError::Msg(format!("scratch add: {}", e)))?;
                             }
-                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "res+attn", t.elapsed().as_nanos() as f64 / 1000.0); }
+                            if let Some(t) = timer {
+                                let _ = t.stop(&reg.stream);
+                                eprintln!("[kernel] {:>12}: {:.1}μs", "res+attn", t.elapsed_us().unwrap_or(0.0));
+                            }
 
                             // 2. fused gateup+silu
-                            let _t = if pdet { Some(std::time::Instant::now()) } else { None };
+                            let timer = if pdet {
+                                crate::cuda::event_timer::EventTimer::new().ok()
+                                    .filter(|t| t.start(&reg.stream).is_ok())
+                            } else { None };
                             {
                                 let inter = Arc::get_mut(&mut scratch.intermediate_buf)
                                     .expect("scratch intermediate_buf aliased");
@@ -562,10 +584,16 @@ fn try_fused_decode_layer(
                                     layer.ffn_norm.eps as f32,
                                 ).map_err(|e| TqError::Msg(format!("fused gateup: {}", e)))?;
                             }
-                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "gateup", t.elapsed().as_nanos() as f64 / 1000.0); }
+                            if let Some(t) = timer {
+                                let _ = t.stop(&reg.stream);
+                                eprintln!("[kernel] {:>12}: {:.1}μs", "gateup", t.elapsed_us().unwrap_or(0.0));
+                            }
 
                             // 3. down projection + residual add
-                            let _t = if pdet { Some(std::time::Instant::now()) } else { None };
+                            let timer = if pdet {
+                                crate::cuda::event_timer::EventTimer::new().ok()
+                                    .filter(|t| t.start(&reg.stream).is_ok())
+                            } else { None };
                             {
                                 let wdown = if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
                                     &mlp.feed_forward_w2
@@ -595,7 +623,10 @@ fn try_fused_decode_layer(
                                     return Err(TqError::Msg("down weight: unsupported".into()));
                                 }
                             }
-                            if let Some(t) = _t { let _ = reg.stream.synchronize(); eprintln!("[kernel] {:>12}: {:.1}μs", "down+res", t.elapsed().as_nanos() as f64 / 1000.0); }
+                            if let Some(t) = timer {
+                                let _ = t.stop(&reg.stream);
+                                eprintln!("[kernel] {:>12}: {:.1}μs", "down+res", t.elapsed_us().unwrap_or(0.0));
+                            }
 
                             return Ok(Tensor::from_cuda_arc(Arc::clone(&scratch.combined_bufs[ci]),
                                 vec![1, 1, hidden_dim], scratch.stream.clone()));
@@ -1652,15 +1683,14 @@ impl GenericTurboModel {
         let _enter = self.span_output.enter();
 
         #[cfg(feature = "cuda")]
-        let _t_lm = if profiling {
-            if let Some(s) = prof_stream { let _ = s.synchronize(); }
-            Some(std::time::Instant::now())
+        let _lm_timer: Option<crate::cuda::event_timer::EventTimer> = if profiling {
+            if let Some(s) = prof_stream {
+                crate::cuda::event_timer::EventTimer::new().ok()
+                    .filter(|t| t.start(s).is_ok())
+            } else { None }
         } else { None };
         #[cfg(not(feature = "cuda"))]
-        let _t_lm: Option<std::time::Instant> = {
-            let _ = profiling;
-            None
-        };
+        let _lm_timer: Option<()> = { let _ = profiling; None };
 
         // Debug: compare GPU vs CPU lm_head output.
         if gpu_debug {
@@ -1690,9 +1720,11 @@ impl GenericTurboModel {
         } else { output };
 
         #[cfg(feature = "cuda")]
-        if let Some(t) = _t_lm {
-            if let Some(s) = prof_stream { let _ = s.synchronize(); }
-            eprintln!("[kernel] {:>12}: {:.1}μs", "lm_head", t.elapsed().as_nanos() as f64 / 1000.0);
+        if let Some(t) = _lm_timer {
+            if let Some(s) = prof_stream {
+                let _ = t.stop(s);
+                eprintln!("[kernel] {:>12}: {:.1}μs", "lm_head", t.elapsed_us().unwrap_or(0.0));
+            }
         }
 
         Ok(output)

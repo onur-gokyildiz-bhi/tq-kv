@@ -6,6 +6,8 @@
 pub mod device;
 #[cfg(feature = "cuda")]
 pub mod dispatch_override;
+#[cfg(feature = "cuda")]
+pub mod event_timer;
 mod dtype;
 mod tensor;
 mod ops;
