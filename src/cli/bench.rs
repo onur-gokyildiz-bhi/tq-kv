@@ -329,14 +329,14 @@ pub(crate) fn cmd_bench(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-struct BenchResult {
-    tokens_generated: u32,
-    total_secs: f64,
-    tok_per_sec: f64,
-    ttft_secs: f64,
+pub(crate) struct BenchResult {
+    pub tokens_generated: u32,
+    pub total_secs: f64,
+    pub tok_per_sec: f64,
+    pub ttft_secs: f64,
 }
 
-fn bench_run(
+pub(crate) fn bench_run(
     engine: &mut Engine,
     prompt: &str,
     params: &GenerationParams,

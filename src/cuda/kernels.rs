@@ -314,10 +314,23 @@ pub fn q4km_matvec(
     // Default flipped to dp4a_v2: +59% Std / +65% TQ out-of-box on RTX 3080
     // vs mrow8 (measured 2026-04-16). Explicit opt-outs preserved.
     // dp4a_mrow4: 4-row-per-block variant (opt-in for testing).
+    // Variant discriminants MUST match indices in
+    // `cuda::dispatch_override::set_q4km_override_by_name`.
     #[derive(Copy, Clone, PartialEq, Eq)]
-    enum Dp4aVariant { Off, V1, V2, Mrow4 }
+    #[repr(i8)]
+    enum Dp4aVariant { Off = 0, V1 = 1, V2 = 2, Mrow4 = 3 }
+    fn q4km_from_i8(i: i8) -> Option<Dp4aVariant> {
+        match i {
+            0 => Some(Dp4aVariant::Off),
+            1 => Some(Dp4aVariant::V1),
+            2 => Some(Dp4aVariant::V2),
+            3 => Some(Dp4aVariant::Mrow4),
+            _ => None,
+        }
+    }
     static DP4A_VAR: std::sync::OnceLock<Dp4aVariant> = std::sync::OnceLock::new();
-    let dp4a_var = *DP4A_VAR.get_or_init(||
+    let ov = super::dispatch_override::Q4KM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let dp4a_var = q4km_from_i8(ov).unwrap_or_else(|| *DP4A_VAR.get_or_init(||
         match std::env::var("TQ_Q4KM").ok().as_deref() {
             Some("dp4a")       => Dp4aVariant::V1,
             Some("dp4a_mrow4") => Dp4aVariant::Mrow4,
@@ -326,7 +339,7 @@ pub fn q4km_matvec(
             // Default and explicit "dp4a_v2" both use V2.
             _                  => Dp4aVariant::V2,
         }
-    );
+    ));
     if dp4a_var != Dp4aVariant::Off && in_features % QK8_1 == 0 {
         let n_blocks = in_features / QK8_1;
         let bytes_needed = n_blocks * Q8_1_BLOCK_BYTES;
@@ -408,17 +421,30 @@ pub fn q6k_matvec(
     //              Measured +33% Std, +16% TQ 4-bit, +22% TQ+TriAttn on RTX 3080.
     //              PPL 17.354 → 17.331 (-0.13% noise, int32 exact accumulation
     //              actually slightly better than fp32 per-element sum).
+    // Variant discriminants MUST match indices in
+    // `cuda::dispatch_override::set_q6k_override_by_name`.
     #[derive(Copy, Clone, PartialEq, Eq)]
-    enum Q6kVariant { Baseline, Mrow8, Dp4aV2 }
+    #[repr(i8)]
+    enum Q6kVariant { Baseline = 0, Mrow8 = 1, Dp4aV2 = 2 }
+    fn q6k_from_i8(i: i8) -> Option<Q6kVariant> {
+        match i {
+            0 => Some(Q6kVariant::Baseline),
+            1 => Some(Q6kVariant::Mrow8),
+            2 => Some(Q6kVariant::Dp4aV2),
+            _ => None,
+        }
+    }
     static VARIANT: std::sync::OnceLock<Q6kVariant> = std::sync::OnceLock::new();
-    let variant = *VARIANT.get_or_init(|| {
+    // Runtime override wins over env/OnceLock. Sentinel -1 = no override.
+    let ov = super::dispatch_override::Q6K_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let variant = q6k_from_i8(ov).unwrap_or_else(|| *VARIANT.get_or_init(|| {
         match std::env::var("TQ_Q6K").ok().as_deref() {
             Some("baseline") => Q6kVariant::Baseline,
             Some("mrow8")    => Q6kVariant::Mrow8,
             Some("dp4a_v2")  => Q6kVariant::Dp4aV2,
             _                => Q6kVariant::Dp4aV2,
         }
-    });
+    }));
 
     // dp4a_v2 path: pre-quantize x into shared q8_1 pool, then shmem-less matvec.
     if variant == Q6kVariant::Dp4aV2 && in_features % QK8_1 == 0 {
@@ -2498,14 +2524,33 @@ pub fn fused_norm_q4km_qkv_bias(
     // proven baseline kernel; set TQ_QKV=cpasync or TQ_QKV=dp4a to try on
     // other workloads. dp4a is mrow8 (8 rows/block, INT8 dp4a inner loop).
     // Default flipped to dp4a (+X% in full stack). `baseline` available for opt-out.
-    static VARIANT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-    let kernel_name = *VARIANT.get_or_init(|| {
-        match std::env::var("TQ_QKV").ok().as_deref() {
-            Some("baseline") => "fused_norm_q4km_qkv_bias_f32",
-            Some("cpasync")  => "fused_norm_q4km_qkv_bias_cpasync_f32",
-            _                => "fused_norm_q4km_qkv_bias_dp4a_f32",
+    // Variant discriminants MUST match indices in
+    // `cuda::dispatch_override::set_qkv_override_by_name`.
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    #[repr(i8)]
+    enum QkvVariant { Baseline = 0, Cpasync = 1, Dp4a = 2 }
+    fn qkv_from_i8(i: i8) -> Option<QkvVariant> {
+        match i {
+            0 => Some(QkvVariant::Baseline),
+            1 => Some(QkvVariant::Cpasync),
+            2 => Some(QkvVariant::Dp4a),
+            _ => None,
         }
-    });
+    }
+    static VARIANT_DEFAULT: std::sync::OnceLock<QkvVariant> = std::sync::OnceLock::new();
+    let ov = super::dispatch_override::QKV_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let variant = qkv_from_i8(ov).unwrap_or_else(|| *VARIANT_DEFAULT.get_or_init(|| {
+        match std::env::var("TQ_QKV").ok().as_deref() {
+            Some("baseline") => QkvVariant::Baseline,
+            Some("cpasync")  => QkvVariant::Cpasync,
+            _                => QkvVariant::Dp4a,
+        }
+    }));
+    let kernel_name: &'static str = match variant {
+        QkvVariant::Baseline => "fused_norm_q4km_qkv_bias_f32",
+        QkvVariant::Cpasync  => "fused_norm_q4km_qkv_bias_cpasync_f32",
+        QkvVariant::Dp4a     => "fused_norm_q4km_qkv_bias_dp4a_f32",
+    };
     let f = reg.get_fn("fused_layer", kernel_name)?;
     let total_rows = (q_out + k_out + v_out) as u32;
     let block = 256u32;
@@ -2653,10 +2698,27 @@ pub fn fused_q4km_down_residual(
     // hidden_dim blocks. Avoids both the shmem-occupancy ceiling and the 3584×
     // redundant Phase-1 work that killed v2. Measured on RTX 3080 sm_86 Qwen2 7B:
     // +4% Std tok/s (avg of 3 runs), TQ-path neutral, PPL neutral (4.979 → 4.981).
+    // Variant discriminants MUST match indices in
+    // `cuda::dispatch_override::set_down_override_by_name`.
     #[derive(Copy, Clone, PartialEq, Eq)]
-    enum DownVariant { Baseline, Mrow2, Cpasync, Dp4aV1, Dp4aV2, Dp4aV3 }
+    #[repr(i8)]
+    enum DownVariant {
+        Baseline = 0, Mrow2 = 1, Cpasync = 2, Dp4aV1 = 3, Dp4aV2 = 4, Dp4aV3 = 5,
+    }
+    fn down_from_i8(i: i8) -> Option<DownVariant> {
+        match i {
+            0 => Some(DownVariant::Baseline),
+            1 => Some(DownVariant::Mrow2),
+            2 => Some(DownVariant::Cpasync),
+            3 => Some(DownVariant::Dp4aV1),
+            4 => Some(DownVariant::Dp4aV2),
+            5 => Some(DownVariant::Dp4aV3),
+            _ => None,
+        }
+    }
     static VARIANT: std::sync::OnceLock<DownVariant> = std::sync::OnceLock::new();
-    let variant = *VARIANT.get_or_init(|| {
+    let ov = super::dispatch_override::DOWN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let variant = down_from_i8(ov).unwrap_or_else(|| *VARIANT.get_or_init(|| {
         match std::env::var("TQ_DOWN").ok().as_deref() {
             Some("baseline") => DownVariant::Baseline,
             Some("mrow2")    => DownVariant::Mrow2,
@@ -2666,7 +2728,7 @@ pub fn fused_q4km_down_residual(
             Some("dp4a_v3")  => DownVariant::Dp4aV3,
             _                => DownVariant::Dp4aV3,
         }
-    });
+    }));
 
     // v3 path: pre-quantize intermediate into shared pool, then shmem-less matvec.
     if variant == DownVariant::Dp4aV3 && intermediate_dim % QK8_1 == 0 {

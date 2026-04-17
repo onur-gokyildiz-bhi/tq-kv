@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use crate::engine::{Engine, GenerationParams};
 use crate::{Cli, Commands};
 
 /// Dispatch keys we sweep over, with their candidate variants per mode.
@@ -110,15 +111,16 @@ pub struct VariantResult {
 }
 
 pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
-    let (model, tokens, quick, only, dry_run, metric_str, reps, validate_ppl, ppl_tol) = match &cli.command {
-        Some(Commands::Autotune { model, tokens, quick, only, dry_run, metric, reps, validate_ppl, ppl_tolerance }) => {
+    let (model, tokens, quick, only, dry_run, metric_str, reps, validate_ppl, ppl_tol, no_in_process) = match &cli.command {
+        Some(Commands::Autotune { model, tokens, quick, only, dry_run, metric, reps, validate_ppl, ppl_tolerance, no_in_process }) => {
             (
                 model.clone(), *tokens, *quick, only.clone(), *dry_run, metric.clone(),
-                *reps, validate_ppl.clone(), *ppl_tolerance,
+                *reps, validate_ppl.clone(), *ppl_tolerance, *no_in_process,
             )
         }
         _ => unreachable!(),
     };
+    let in_process_enabled = !no_in_process;
     let metric = match metric_str.to_ascii_lowercase().as_str() {
         "std" | "standard"         => PrimaryMetric::Standard,
         "tq" | "tq4" | "tq4bit"    => PrimaryMetric::Tq4Bit,
@@ -152,6 +154,7 @@ pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
     eprintln!("  mode        : {}", if quick { "quick" } else { "full" });
     eprintln!("  metric      : {:?}", metric);
     eprintln!("  reps        : {} (median aggregation)", reps);
+    eprintln!("  engine      : {}", if in_process_enabled { "in-process (one engine load, cycle overrides)" } else { "subprocess (fresh engine per variant)" });
     if let Some(ref p) = validate_ppl {
         eprintln!("  ppl-guard   : file={} tol={:.2}%", p.display(), ppl_tol * 100.0);
     } else {
@@ -190,20 +193,73 @@ pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
         None
     };
 
+    // In-process engine (for dispatches that support override). PPL still
+    // subprocesses out (can't run tq perplexity in-process without tokenizer
+    // plumbing).
+    #[cfg(feature = "cuda")]
+    let mut inproc_engine = if in_process_enabled {
+        eprintln!("Loading engine once for in-process sweep...");
+        let t = Instant::now();
+        match load_engine_for_metric(&model, metric) {
+            Ok(e) => {
+                eprintln!("  engine loaded in {:.1}s; warming up...", t.elapsed().as_secs_f32());
+                Some(e)
+            }
+            Err(e) => {
+                eprintln!("  engine load FAILED ({}); falling back to subprocess for all variants", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cuda"))]
+    let mut inproc_engine: Option<Engine> = None;
+
+    // Prompt + generation params for in-process runs. Temperature 0 = deterministic,
+    // matches `tq bench` which uses temperature=0.0 for benchmarking.
+    let inproc_prompt = format_prompt_for(&model);
+    let inproc_params = GenerationParams {
+        max_tokens: tokens,
+        temperature: 0.0,
+        ..Default::default()
+    };
+
+    // Warm up engine so first-variant kernel compilation/UMA doesn't skew measurements.
+    if let Some(ref mut eng) = inproc_engine {
+        // Short warm-up run (10 tokens) discarded.
+        let warmup_params = GenerationParams { max_tokens: 10, temperature: 0.0, ..Default::default() };
+        if let Err(e) = crate::cli::bench::bench_run(eng, &inproc_prompt, &warmup_params) {
+            eprintln!("  engine warm-up FAILED ({}); disabling in-process mode", e);
+            inproc_engine = None;
+        } else {
+            eprintln!("  engine warmed, ready to sweep\n");
+        }
+    }
+
     let mut all_results: Vec<VariantResult> = Vec::new();
     let mut winners: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 
     let total_start = Instant::now();
     for d in &sweeps {
         let variants = if quick { d.quick } else { d.full };
-        eprintln!("--- {} ({} variants) ---", d.env_key, variants.len());
+        let uses_inproc = inproc_engine.is_some()
+            && crate::cuda::dispatch_override::supports_override(d.env_key);
+        eprintln!("--- {} ({} variants, mode: {}) ---",
+            d.env_key, variants.len(),
+            if uses_inproc { "in-process" } else { "subprocess" });
         let mut local: Vec<(f32, String)> = Vec::new();
         for v in variants {
             // Multi-rep perf sweep.
             let mut samples: Vec<f32> = Vec::with_capacity(reps as usize);
             for rep in 0..reps {
                 let run_start = Instant::now();
-                let result = run_variant(&exe, &model, d.env_key, v, tokens, metric);
+                let result = if uses_inproc {
+                    let eng = inproc_engine.as_mut().unwrap();
+                    run_variant_inproc(eng, &inproc_prompt, &inproc_params, d.env_key, v)
+                } else {
+                    run_variant(&exe, &model, d.env_key, v, tokens, metric)
+                };
                 let elapsed = run_start.elapsed().as_secs_f32();
                 match result {
                     Ok(tps) => {
@@ -282,6 +338,11 @@ pub(crate) fn cmd_autotune(cli: &Cli) -> Result<()> {
         }
     }
 
+    // Restore dispatch overrides so subsequent code (cache write, etc.) is
+    // unaffected. Next process invocation reads the cache we just wrote.
+    crate::cuda::dispatch_override::clear_all();
+    drop(inproc_engine);
+
     let total_secs = total_start.elapsed().as_secs_f32();
     eprintln!("=== autotune complete in {:.1}s ===", total_secs);
     eprintln!();
@@ -357,6 +418,79 @@ fn run_variant(exe: &Path, model: &str, env_key: &str, variant: &str, tokens: u3
         if let Some(tps) = parse_tok_per_sec(line) { return Ok(tps); }
     }
     Err(anyhow!("no '{}' tok/s line found. Child exit: {:?}", target_prefix, output.status))
+}
+
+/// Load the engine inside the autotune process for the primary metric.
+/// Matches what `tq bench` would load for the same metric.
+#[cfg(feature = "cuda")]
+fn load_engine_for_metric(model_name: &str, metric: PrimaryMetric) -> Result<Engine> {
+    use tq_kv::TurboQuantConfig;
+
+    let tq_config = match metric {
+        PrimaryMetric::Standard => None,
+        PrimaryMetric::Tq4Bit | PrimaryMetric::TqTriAttn => {
+            let cfg = TurboQuantConfig::balanced();
+            Some(cfg)
+        }
+    };
+    if matches!(metric, PrimaryMetric::TqTriAttn) {
+        // Mirror `tq bench`: set_triattention_override(true) before engine build.
+        crate::models::turbo_generic::set_triattention_override(true);
+    } else {
+        crate::models::turbo_generic::set_triattention_override(false);
+    }
+
+    if let Some(model_config) = crate::config::get_model(model_name) {
+        crate::model::load_engine(model_config, None, tq_config, None, false)
+            .map_err(|e| anyhow!("load_engine: {}", e))
+    } else {
+        let (gguf_path, tokenizer_path) = crate::hub::resolve(model_name)?;
+        let tok_path = tokenizer_path.ok_or_else(|| anyhow!("no tokenizer for '{}'", model_name))?;
+        let mf = gguf_path.to_string_lossy().to_string();
+        let arch = crate::config::detect_arch(&mf);
+        Engine::load_with_device(&gguf_path, &tok_path, arch, tq_config, false)
+            .map_err(|e| anyhow!("load_with_device: {}", e))
+    }
+}
+
+/// Lightweight chat-template-aware prompt for in-process benches. Matches
+/// `tq bench` formatting: Qwen and Llama get their chat tokens, everything
+/// else runs raw.
+fn format_prompt_for(model_name: &str) -> String {
+    let bench_prompt = "Explain the theory of relativity in simple terms. Include examples.";
+    if let Some(entry) = crate::catalog::find(model_name) {
+        let lower = entry.arch.to_lowercase();
+        if lower.contains("qwen") {
+            return format!(
+                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                bench_prompt
+            );
+        }
+        if lower.contains("llama") {
+            return format!(
+                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+                bench_prompt
+            );
+        }
+    }
+    bench_prompt.to_string()
+}
+
+/// In-process variant measurement. Sets the dispatch override, runs a bench,
+/// returns tok/s. Caller clears all overrides at end of sweep.
+fn run_variant_inproc(
+    engine: &mut Engine,
+    prompt: &str,
+    params: &GenerationParams,
+    env_key: &str,
+    variant: &str,
+) -> Result<f32> {
+    if !crate::cuda::dispatch_override::set_override(env_key, variant) {
+        return Err(anyhow!("unknown variant '{}' for {}", variant, env_key));
+    }
+    let res = crate::cli::bench::bench_run(engine, prompt, params)
+        .map_err(|e| anyhow!("in-process bench_run: {}", e))?;
+    Ok(res.tok_per_sec as f32)
 }
 
 /// Run `tq perplexity --model <m> <file>` optionally with a dispatch env var

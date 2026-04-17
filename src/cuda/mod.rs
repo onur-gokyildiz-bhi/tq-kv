@@ -4,6 +4,8 @@
 //! CPU fallback for all operations.
 
 pub mod device;
+#[cfg(feature = "cuda")]
+pub mod dispatch_override;
 mod dtype;
 mod tensor;
 mod ops;

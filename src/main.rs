@@ -205,6 +205,10 @@ pub(crate) enum Commands {
         /// Max PPL delta fraction tolerated when --validate-ppl is set (default 0.01 = 1%).
         #[arg(long, default_value = "0.01")]
         ppl_tolerance: f32,
+        /// In-process mode: reuse one loaded engine across all variants (5-10x faster).
+        /// Disabled paths fall back to subprocess per variant. Default: on.
+        #[arg(long)]
+        no_in_process: bool,
     },
     /// Calibrate TurboQuant for a model (computes optimal codebook, rotation, scales)
     Calibrate {
