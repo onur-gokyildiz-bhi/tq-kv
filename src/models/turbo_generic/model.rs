@@ -1204,37 +1204,42 @@ impl GenericTurboModel {
                     Some("1") | Some("force")
                 );
                 let tq_active = tq_config.skip_layers != Some(999);
-                // dp4a dispatch path uses a q8_1 scratch whose address is not
-                // graph-replay-stable. Disable graph whenever ANY matvec path
-                // resolves to a dp4a variant — including via the new default
-                // dispatch (TQ_GATEUP/Q4KM/DOWN/QKV unset → dp4a).
+                // dp4a dispatch auto-disables graph as a PERFORMANCE heuristic,
+                // not a safety gate. Isolation test 2026-04-17 on RTX 3080 sm_86:
+                // dp4a + graph runs clean (no CUDA_ERROR_ILLEGAL_ADDRESS on Std
+                // path) but regresses Std -7% (67.5 → 62.8 tok/s avg, 2 runs).
+                // Why: dp4a kernels already have low per-launch overhead that
+                // amortizes well in eager mode; graph instantiation + replay
+                // overhead exceeds the launch savings on this path.
+                // The prior "not graph-safe" comment was wrong — pool is
+                // pre-allocated to Q8_1_POOL_CAPACITY (64 KB) at registry init
+                // and never grows for Qwen2 7B / Llama3 8B (max 21 KB needed).
                 let path_uses_dp4a = |key: &str| -> bool {
                     match std::env::var(key).ok().as_deref() {
-                        Some("dp4a") | Some("dp4a_v2") => true,
-                        Some(_) => false,     // explicit legacy variant selected
-                        None    => true,      // unset → new default is dp4a
+                        Some("dp4a") | Some("dp4a_v2") | Some("dp4a_v3") => true,
+                        Some(_) => false,
+                        None    => true,  // current defaults are all dp4a-based
                     }
                 };
                 let dp4a_active =
                     path_uses_dp4a("TQ_GATEUP")
                  || path_uses_dp4a("TQ_Q4KM")
                  || path_uses_dp4a("TQ_DOWN")
-                 || path_uses_dp4a("TQ_QKV");
+                 || path_uses_dp4a("TQ_QKV")
+                 || path_uses_dp4a("TQ_Q6K");
                 if graph_wanted && swap_active {
                     if graph_explicit_on {
                         eprintln!("[cuda] TQ_GRAPH disabled (TQ_LAYER_SWAP active)");
                     }
                     false
                 } else if graph_wanted && tq_active && !graph_forced {
-                    // Only announce auto-disable when user explicitly asked for it.
-                    // Default path stays quiet for the common TQ+default-graph case.
                     if graph_explicit_on {
                         eprintln!("[cuda] TQ_GRAPH disabled (TurboQuant KV active — compressed path not capture-safe). Set TQ_GRAPH=force to override.");
                     }
                     false
                 } else if graph_wanted && dp4a_active && !graph_forced {
                     if graph_explicit_on {
-                        eprintln!("[cuda] TQ_GRAPH disabled (dp4a scratch buffer not graph-safe). Set TQ_GRAPH=force to override.");
+                        eprintln!("[cuda] TQ_GRAPH disabled (dp4a path faster eager than with graph; -7% Std measured). Set TQ_GRAPH=force to override.");
                     }
                     false
                 } else {
