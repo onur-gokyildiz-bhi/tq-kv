@@ -90,13 +90,66 @@ pub struct DraftModelStub {
     pub loaded: bool,
     pub tensor_count: usize,
     pub total_bytes: u64,
+    /// Inventory of tensor (name, shape, bf16_bytes) actually present in the
+    /// safetensors file. Populated once tensors parse successfully.
+    pub tensors: Vec<TensorMeta>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TensorMeta {
+    pub name:  String,
+    pub shape: Vec<usize>,
+    pub bytes: usize,
+    pub dtype: String,
+}
+
+/// Expected tensor shape spec for the EAGLE-1 Qwen2-7B draft. Derived from
+/// running `scripts/convert_eagle_weights.py` once and reading the output
+/// inventory. Used by `EagleDraft::validate_shapes` to catch mismatched
+/// checkpoints at load time rather than at first forward pass.
+///
+/// Notable architectural quirks (why this list isn't a generic Qwen2 spec):
+/// - Only ONE RMSNorm per layer (`post_attention_layernorm`) — pre-attention
+///   norm is absent because input is already fc-projected from fused features.
+/// - `fc.weight` shape (hidden, 2*hidden): the EAGLE fusion layer, takes
+///   concat(prev_layer_hidden, embed(token)) and projects back to hidden.
+/// - K/V are full-rank (hidden, hidden), NOT GQA-reduced. Target Qwen2 7B uses
+///   28/4 GQA; draft uses 28/28.
+/// - No lm_head weight — at decode time the draft clones the target's.
+pub fn eagle_qwen2_7b_expected_tensors() -> Vec<(&'static str, Vec<usize>)> {
+    let hidden = 3584_usize;
+    let intermediate = 18944_usize;
+    let vocab = 152064_usize;
+    vec![
+        ("layers.0.self_attn.q_proj.weight",             vec![hidden, hidden]),
+        ("layers.0.self_attn.q_proj.bias",               vec![hidden]),
+        ("layers.0.self_attn.k_proj.weight",             vec![hidden, hidden]),
+        ("layers.0.self_attn.k_proj.bias",               vec![hidden]),
+        ("layers.0.self_attn.v_proj.weight",             vec![hidden, hidden]),
+        ("layers.0.self_attn.v_proj.bias",               vec![hidden]),
+        ("layers.0.self_attn.o_proj.weight",             vec![hidden, hidden]),
+        ("layers.0.mlp.gate_proj.weight",                vec![intermediate, hidden]),
+        ("layers.0.mlp.up_proj.weight",                  vec![intermediate, hidden]),
+        ("layers.0.mlp.down_proj.weight",                vec![hidden, intermediate]),
+        ("layers.0.post_attention_layernorm.weight",     vec![hidden]),
+        ("embed_tokens.weight",                          vec![vocab, hidden]),
+        ("fc.weight",                                    vec![hidden, 2 * hidden]),
+        ("fc.bias",                                      vec![hidden]),
+    ]
 }
 
 impl EagleDraft {
-    /// Minimal scaffolding load — opens the weights file (safetensors or a
-    /// directory containing `model.safetensors`) and validates that the file
-    /// exists and has non-zero size. Actual tensor parsing lives in Sprint 1
-    /// when we wire through `GenericTurboModel::build_from_source`.
+    /// Parse the safetensors file and validate tensor inventory against the
+    /// expected EAGLE draft layout.
+    ///
+    /// This runs actual tensor metadata inspection (safetensors header parse,
+    /// zero tensor data read — so it's fast even for multi-GB files). The
+    /// result is compared against `eagle_qwen2_7b_expected_tensors` so shape
+    /// mismatches are surfaced immediately instead of triggering obscure
+    /// kernel-arg errors later during forward.
+    ///
+    /// Sprint 1 Day 2: validation only, no GPU upload / kernel dispatch yet.
+    /// Sprint 2 will extend this into a full `GenericTurboModel` instance.
     pub fn load(weights_path: &Path, config: EagleDraftConfig) -> Result<Self, EagleError> {
         // Accept either a directory (containing model.safetensors) or a direct
         // .safetensors / .bin path — same convention as target model loading.
@@ -120,21 +173,94 @@ impl EagleDraft {
             .len();
 
         eprintln!(
-            "[eagle] scaffold load: {} ({:.2} GB), native {:?}, {} layers",
+            "[eagle] loading {} ({:.2} GB), native {:?}, {} layers",
             canonical.display(),
             size as f64 / 1e9,
             config.native_dtype,
             config.num_hidden_layers,
         );
 
+        // Memory-map the safetensors file and parse its header. SafeTensors
+        // puts a JSON header at the start listing every tensor's dtype, shape,
+        // and byte offsets; reading the header is a few KB of IO regardless of
+        // file size.
+        let file = std::fs::File::open(&canonical)
+            .map_err(|e| EagleError::Msg(format!("open({}): {}", canonical.display(), e)))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| EagleError::Msg(format!("mmap({}): {}", canonical.display(), e)))?;
+
+        let st = safetensors::SafeTensors::deserialize(&mmap)
+            .map_err(|e| EagleError::Msg(format!("safetensors parse: {:?}", e)))?;
+
+        let mut tensors: Vec<TensorMeta> = Vec::new();
+        for name in st.names() {
+            let view = st.tensor(name)
+                .map_err(|e| EagleError::Msg(format!("tensor({}): {:?}", name, e)))?;
+            tensors.push(TensorMeta {
+                name:  name.to_string(),
+                shape: view.shape().to_vec(),
+                bytes: view.data().len(),
+                dtype: format!("{:?}", view.dtype()),
+            });
+        }
+        tensors.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Validate against the EAGLE-Qwen2-7B expected inventory. Missing
+        // tensors are hard errors; unexpected extras are warnings (upstream
+        // may ship auxiliary keys we don't need).
+        let mut errors: Vec<String> = Vec::new();
+        let expected = eagle_qwen2_7b_expected_tensors();
+        for (name, shape) in &expected {
+            match tensors.iter().find(|t| t.name == *name) {
+                None => errors.push(format!("missing tensor '{}'", name)),
+                Some(t) => {
+                    if t.shape != *shape {
+                        errors.push(format!(
+                            "tensor '{}' shape mismatch: expected {:?}, got {:?}",
+                            name, shape, t.shape
+                        ));
+                    }
+                }
+            }
+        }
+        if !errors.is_empty() {
+            return Err(EagleError::Msg(format!(
+                "EAGLE weight validation failed ({} errors):\n  {}",
+                errors.len(),
+                errors.join("\n  "),
+            )));
+        }
+
+        // Warn (don't fail) on extras — future EAGLE revisions might add fields.
+        let expected_names: std::collections::HashSet<&str> =
+            expected.iter().map(|(n, _)| *n).collect();
+        let extras: Vec<&str> = tensors.iter()
+            .map(|t| t.name.as_str())
+            .filter(|n| !expected_names.contains(n))
+            .collect();
+        if !extras.is_empty() {
+            eprintln!(
+                "[eagle] note: {} unexpected tensor(s) in checkpoint (safe to ignore): {}",
+                extras.len(),
+                extras.join(", ")
+            );
+        }
+
+        eprintln!(
+            "[eagle] validated {}/{} expected tensors, total {:.2} GB",
+            expected.len(),
+            tensors.len(),
+            size as f64 / 1e9,
+        );
+
         Ok(Self {
             config,
             weights_path: canonical,
-            // Stub: Sprint 1 replaces with real tensor load.
             model: Some(DraftModelStub {
                 loaded: true,
-                tensor_count: 0,
+                tensor_count: tensors.len(),
                 total_bytes: size,
+                tensors,
             }),
         })
     }
@@ -197,5 +323,34 @@ mod tests {
             model: None,
         };
         assert!(!stub.is_runnable());
+    }
+
+    #[test]
+    fn expected_tensors_match_hf_inventory() {
+        // Ordered sanity check — the 14 tensor names + shapes derived from
+        // running `scripts/convert_eagle_weights.py` against
+        // yuhuili/EAGLE-Qwen2-7B-Instruct on 2026-04-17.
+        let t = eagle_qwen2_7b_expected_tensors();
+        assert_eq!(t.len(), 14, "EAGLE-1 Qwen2 7B draft has exactly 14 tensors");
+
+        // fc layer: the EAGLE fusion projection, hidden ← 2*hidden
+        let fc_w = t.iter().find(|(n, _)| *n == "fc.weight").unwrap();
+        assert_eq!(fc_w.1, vec![3584, 7168], "fc.weight projects 2*hidden to hidden");
+
+        // K/V are full rank (no GQA in draft, unlike target Qwen2 7B which uses 28/4 GQA).
+        let k_w = t.iter().find(|(n, _)| *n == "layers.0.self_attn.k_proj.weight").unwrap();
+        assert_eq!(k_w.1, vec![3584, 3584], "draft K is NOT GQA-reduced");
+
+        // Only ONE norm: post_attention_layernorm. No input_layernorm because
+        // input is already fc-projected from fused features.
+        let norm_count = t.iter().filter(|(n, _)| n.contains("layernorm")).count();
+        assert_eq!(norm_count, 1, "EAGLE draft has only post_attention_layernorm");
+    }
+
+    #[test]
+    fn expected_tensor_names_are_unique() {
+        let t = eagle_qwen2_7b_expected_tensors();
+        let names: std::collections::HashSet<&str> = t.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names.len(), t.len(), "no duplicate tensor names in spec");
     }
 }
