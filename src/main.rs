@@ -285,6 +285,10 @@ pub(crate) enum Commands {
         /// Preset config (only "qwen2-7b" recognised for Sprint 1)
         #[arg(long, default_value = "qwen2-7b")]
         preset: String,
+        /// Sprint 1 Day 4: run one draft forward pass on a dummy input and
+        /// print output statistics (sum/max/min/NaN-check). Requires --features cuda.
+        #[arg(long, default_value_t = false)]
+        smoke: bool,
     },
     /// Debug: dump embedding row statistics (Bug #2 investigation)
     DebugEmbedding {
@@ -579,8 +583,9 @@ async fn cmd_serve(cli: &Cli) -> Result<()> {
 }
 
 fn cmd_eagle_probe(cli: &Cli) -> Result<()> {
-    let (weights, preset) = match &cli.command {
-        Some(Commands::EagleProbe { weights, preset }) => (weights.clone(), preset.clone()),
+    let (weights, preset, smoke) = match &cli.command {
+        Some(Commands::EagleProbe { weights, preset, smoke }) =>
+            (weights.clone(), preset.clone(), *smoke),
         _ => unreachable!(),
     };
     let cfg = match preset.as_str() {
@@ -654,10 +659,42 @@ fn cmd_eagle_probe(cli: &Cli) -> Result<()> {
                 }
             }
 
+            // Sprint 1 Day 4: --smoke runs a single draft forward and prints stats.
+            #[cfg(feature = "cuda")]
+            if smoke && d.gpu.is_some() {
+                println!();
+                println!("Running draft forward smoke test ...");
+                match d.init_runtime() {
+                    Ok(()) => match d.draft_forward(&vec![0.0f32; cfg.hidden_size], 42, 0) {
+                        Ok(out) => {
+                            let n = out.len();
+                            let finite = out.iter().all(|x| x.is_finite());
+                            let abs_max = out.iter().map(|x| x.abs()).fold(0f32, f32::max);
+                            let sum: f32 = out.iter().sum();
+                            let mean = sum / n as f32;
+                            let first = &out[..out.len().min(8)];
+                            println!("  output len   : {}", n);
+                            println!("  all finite   : {}", finite);
+                            println!("  |max|        : {:.4}", abs_max);
+                            println!("  mean         : {:.6}", mean);
+                            println!("  first 8      : {:?}", first);
+                            if !finite || abs_max > 100.0 {
+                                eprintln!("[warn] smoke output looks unhealthy (nan/inf or |x|>100)");
+                            } else {
+                                println!("[ok] smoke test passed (finite, |x|<100)");
+                            }
+                        }
+                        Err(e) => eprintln!("[err] draft_forward: {}", e),
+                    },
+                    Err(e) => eprintln!("[err] init_runtime: {}", e),
+                }
+            } else if smoke {
+                eprintln!("[warn] --smoke requested but GPU upload unavailable");
+            }
+
             println!();
-            println!("  runnable : {} (Sprint 2 wires forward pass + tree_attention kernel)",
+            println!("  runnable : {} (Sprint 2 wires tree_attention + verify loop)",
                 d.is_runnable());
-            println!("Next step: Sprint 2 will add tree_attention kernel + verify loop.");
             println!("Track progress: memory/project_eagle3_integration_plan.md");
             Ok(())
         }

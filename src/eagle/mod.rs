@@ -21,6 +21,11 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "cuda")]
+pub mod forward;
+#[cfg(feature = "cuda")]
+pub use forward::DraftRuntime;
+
 /// Config of an EAGLE draft model. Mirrors the subset of `config.json` fields
 /// that actually influence forward-pass tensor layout, plus three
 /// EAGLE-specific architecture flags discovered 2026-04-17 by inspecting the
@@ -129,6 +134,12 @@ pub struct EagleDraft {
     /// `None` before upload, CPU-only usage (tests, probe).
     #[cfg(feature = "cuda")]
     pub gpu: Option<DraftWeights>,
+    /// FP32 runtime (scratch + KV cache + dequantised weight shadows),
+    /// populated by [`EagleDraft::init_runtime`] the first time a forward is
+    /// requested. Kept `Option` so CPU-only tests can still construct an
+    /// `EagleDraft`.
+    #[cfg(feature = "cuda")]
+    pub runtime: Option<DraftRuntime>,
 }
 
 /// GPU-resident draft weights. All tensors promoted from BF16 (native) to FP16
@@ -364,6 +375,8 @@ impl EagleDraft {
             }),
             #[cfg(feature = "cuda")]
             gpu: None,
+            #[cfg(feature = "cuda")]
+            runtime: None,
         })
     }
 
@@ -430,12 +443,47 @@ impl EagleDraft {
     }
 
     /// Report whether the draft is ready for speculation. Returns true only
-    /// after `load()` + `upload_to_gpu()` have both succeeded AND the forward
-    /// pass path is wired (Sprint 2 gates the latter).
+    /// after `load()` + `upload_to_gpu()` have both succeeded AND the FP32
+    /// runtime has been initialised.
+    ///
+    /// Sprint 1 Day 4: `runtime` populated = "can run a single-token forward".
+    /// Sprint 3 flips this true only after tree + verify land too.
     pub fn is_runnable(&self) -> bool {
-        // Sprint 1: even with GPU upload, forward pass isn't wired yet, so
-        // report false. Sprint 2 will flip this to check gpu + forward wiring.
-        false
+        #[cfg(feature = "cuda")]
+        { self.runtime.is_some() }
+        #[cfg(not(feature = "cuda"))]
+        { false }
+    }
+
+    /// Sprint 1 Day 4: build the FP32 runtime (dequantise FP16 weights, build
+    /// RoPE tables, allocate scratch + KV cache). Idempotent — second call is
+    /// a no-op. Requires prior `upload_to_gpu()`.
+    #[cfg(feature = "cuda")]
+    pub fn init_runtime(&mut self) -> Result<(), EagleError> {
+        if self.runtime.is_some() { return Ok(()); }
+        let gpu = self.gpu.as_ref().ok_or_else(||
+            EagleError::Msg("init_runtime called before upload_to_gpu()".into()))?;
+        let rt = DraftRuntime::from_weights(gpu, &self.config)?;
+        eprintln!(
+            "[eagle] FP32 runtime ready: ~{:.2} GB weight shadows + KV cache + scratch",
+            rt.total_bytes() as f64 / 1e9,
+        );
+        self.runtime = Some(rt);
+        Ok(())
+    }
+
+    /// Single-step draft forward pass. See [`DraftRuntime::forward`] for the
+    /// contract. Call `init_runtime()` first.
+    #[cfg(feature = "cuda")]
+    pub fn draft_forward(
+        &mut self,
+        prev_hidden: &[f32],
+        token_id: u32,
+        position: usize,
+    ) -> Result<Vec<f32>, EagleError> {
+        let rt = self.runtime.as_mut().ok_or_else(||
+            EagleError::Msg("draft_forward called before init_runtime()".into()))?;
+        rt.forward(prev_hidden, token_id, position)
     }
 }
 
@@ -517,16 +565,19 @@ mod tests {
     }
 
     #[test]
-    fn draft_not_runnable_in_sprint1_day1() {
-        // Scaffold is explicit about its incomplete state.
+    fn draft_not_runnable_without_runtime() {
+        // Scaffold is explicit about its incomplete state: is_runnable is
+        // false until init_runtime() populates the FP32 runtime. Day 4 wires
+        // the runtime but the stub here represents the pre-init state.
         let cfg = eagle_qwen2_7b_config();
-        // Don't call load() (no real path), just verify API contract.
         let stub = EagleDraft {
             config: cfg,
             weights_path: PathBuf::from("/dev/null"),
             model: None,
             #[cfg(feature = "cuda")]
             gpu: None,
+            #[cfg(feature = "cuda")]
+            runtime: None,
         };
         assert!(!stub.is_runnable());
     }
