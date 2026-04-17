@@ -2,6 +2,7 @@ mod auto_tq;
 pub mod autocalib;
 pub mod backend;
 mod calibrate;
+pub mod eagle;
 mod catalog;
 mod chat;
 mod cli;
@@ -272,6 +273,19 @@ pub(crate) enum Commands {
         #[arg(long)]
         output: Option<PathBuf>,
     },
+    /// EAGLE speculative decoding scaffolding (Sprint 1 WIP — draft load + validate).
+    /// Loads the EAGLE draft model from a safetensors file and reports its shape.
+    /// Does NOT yet run speculation — Sprint 2+ will wire tree decode.
+    ///
+    /// Convert a HuggingFace `pytorch_model.bin` first with:
+    ///   python scripts/convert_eagle_weights.py PATH
+    EagleProbe {
+        /// Path to converted safetensors file or directory containing model.safetensors
+        weights: PathBuf,
+        /// Preset config (only "qwen2-7b" recognised for Sprint 1)
+        #[arg(long, default_value = "qwen2-7b")]
+        preset: String,
+    },
     /// Debug: dump embedding row statistics (Bug #2 investigation)
     DebugEmbedding {
         /// Model name (e.g., qwen2:7b)
@@ -307,6 +321,7 @@ async fn main() -> Result<()> {
         Some(Commands::Compress { .. }) => cli::compress::cmd_compress(&cli),
         Some(Commands::Ablate { .. }) => cli::ablate::cmd_ablate_study(&cli),
         Some(Commands::Autotune { .. }) => cli::autotune::cmd_autotune(&cli),
+        Some(Commands::EagleProbe { .. }) => cmd_eagle_probe(&cli),
         Some(Commands::DebugEmbedding { .. }) => cli::debug::cmd_debug_embedding(&cli),
         Some(Commands::DebugTokenize { .. }) => cli::debug::cmd_debug_tokenize(&cli),
         None => {
@@ -561,6 +576,45 @@ async fn cmd_serve(cli: &Cli) -> Result<()> {
     let template = chat::ChatTemplate::detect(&model_file);
 
     serve::run_server(engine, template, display_name, port, tq_config, cli.cpu).await
+}
+
+fn cmd_eagle_probe(cli: &Cli) -> Result<()> {
+    let (weights, preset) = match &cli.command {
+        Some(Commands::EagleProbe { weights, preset }) => (weights.clone(), preset.clone()),
+        _ => unreachable!(),
+    };
+    let cfg = match preset.as_str() {
+        "qwen2-7b" => eagle::eagle_qwen2_7b_config(),
+        other => anyhow::bail!(
+            "unknown preset '{}'. Sprint 1 supports only 'qwen2-7b'. \
+             Other presets land as their EAGLE checkpoints are tested.",
+            other
+        ),
+    };
+    println!("EAGLE draft probe");
+    println!("  preset     : {} ({:?} native)", preset, cfg.native_dtype);
+    println!("  hidden     : {}", cfg.hidden_size);
+    println!("  layers     : {}", cfg.num_hidden_layers);
+    println!("  vocab      : {}", cfg.vocab_size);
+    println!("  weights    : {}", weights.display());
+    println!();
+    match eagle::EagleDraft::load(&weights, cfg) {
+        Ok(d) => {
+            println!("[ok] draft scaffold loaded.");
+            if let Some(stub) = &d.model {
+                println!("  raw size : {:.2} GB", stub.total_bytes as f64 / 1e9);
+            }
+            println!("  runnable : {} (Sprint 1 WIP — tensor parse + forward pending)", d.is_runnable());
+            println!();
+            println!("Next step: Sprint 2 will add tree_attention kernel + verify loop.");
+            println!("Track progress: memory/project_eagle3_integration_plan.md");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[err] {}", e);
+            anyhow::bail!("draft load failed")
+        }
+    }
 }
 
 fn cmd_doctor() -> Result<()> {
