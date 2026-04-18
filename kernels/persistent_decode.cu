@@ -8,11 +8,12 @@
 // RMSNORM_GATEUP, DOWN, DONE) synchronized via an atomic counter +
 // __threadfence + __syncthreads. Hazy Research Llama-1B megakernel pattern.
 //
-// PHASE 3 STATUS: phases 0 (RMSNORM_QKV), 1 (ROPE), 2 (KV_APPEND),
-// 4 (WO), 5 (RES_ADD), 6 (RMSNORM_GATEUP), 7 (DOWN) have real
-// device-function bodies. Only phase 3 (ATTN) remains a stub — it
-// ports the flash_decode split-KV path and is the last piece before
-// wiring TQ_MEGAKERNEL=1 into main decode.
+// PHASE 3 STATUS: all 8 phases (0 RMSNORM_QKV, 1 ROPE, 2 KV_APPEND,
+// 3 ATTN, 4 WO, 5 RES_ADD, 6 RMSNORM_GATEUP, 7 DOWN) have real
+// device-function bodies. Phase 3 uses a minimum-viable-correct online-
+// softmax GQA impl (one block per head); the flash_decode split-KV port
+// is a Phase 4 optimization. TQ_MEGAKERNEL=1 wiring into main decode
+// lands next.
 //
 // Row distribution across 68 persistent blocks:
 //   Phase 0 (QKV): total_rows = q_out + k_out + v_out; grouped in 8-row
@@ -365,18 +366,87 @@ static __device__ __forceinline__ void phase_kv_append_body(
     }
 }
 
-static __device__ __noinline__ void phase_attn_stub(
-    const float* __restrict__ /*Q*/,
-    const float* __restrict__ /*K*/,
-    const float* __restrict__ /*V*/,
-    float* __restrict__ /*attn_out*/,
-    int /*n_heads*/,
-    int /*n_kv_heads*/,
-    int /*seq_len*/,
-    int /*max_seq*/,
-    int /*head_dim*/,
-    float /*scale*/
-) {}
+// Phase 3: decode attention (GQA, online softmax).
+//   q        : [n_heads, head_dim]                      (post-RoPE)
+//   K_cache  : [n_kv_heads, max_seq, head_dim]          (Phase 2 appended)
+//   V_cache  : [n_kv_heads, max_seq, head_dim]
+//   attn_buf : [n_heads, head_dim]                      (output)
+//
+// Minimum-viable-correct geometry: one block handles one query head via
+// block_id-stride over n_heads. For Qwen2 7B (n_heads=28, n_blocks=68)
+// blocks 0..27 each do one head, 28..67 stay idle during this phase.
+// This wastes ~60% of the grid during Phase 3 — the proper flash_decode
+// split-KV port will reclaim that. Correctness first.
+//
+// Within a block: online-softmax with per-thread state. `block_reduce_sum`
+// produces the identical score in all threads (v2 API), so every thread
+// can run sm.update(score) synchronously without any shmem handshake.
+// Each of the first head_dim threads carries one accumulator slot for
+// its output dimension.
+//
+// Static shmem cost: block_reduce_sum uses WARP_SIZE floats internally
+// (128 bytes). No per-phase shmem is consumed beyond that — the q/out
+// arrays live in registers.
+//
+// head_dim bound: comes from model config; we rely on WARP_SIZE-aligned
+// head_dim in [32..128] which covers every model in tree (Qwen2 128,
+// Llama3 128, Mistral 128, Gemma2 256 will need two-slot-per-thread if
+// revisited — not in scope here).
+// Promoted from stub 2026-04-18 (Phase 3 Step 0f — final stub).
+static __device__ __forceinline__ void phase_attn_body(
+    const float* __restrict__ q,
+    const float* __restrict__ K_cache,
+    const float* __restrict__ V_cache,
+    float* __restrict__ attn_buf,
+    const int n_heads,
+    const int n_kv_heads,
+    const int seq_len,      // = pos + 1 (valid KV entries)
+    const int max_seq,
+    const int head_dim,
+    const float scale,
+    const int block_id,
+    const int n_blocks
+) {
+    const int tid        = threadIdx.x;
+    const int group_size = n_heads / n_kv_heads;
+    const bool active    = (tid < head_dim);
+
+    for (int h = block_id; h < n_heads; h += n_blocks) {
+        const int kv_head = h / group_size;
+
+        // Load Q[h, :] into a per-thread register (one element per lane).
+        const float q_val = active ? q[h * head_dim + tid] : 0.0f;
+
+        // Per-thread softmax state (identical evolution across threads
+        // because all threads observe the same score from block_reduce).
+        OnlineSoftmax sm;
+        float acc = 0.0f;
+
+        for (int t = 0; t < seq_len; ++t) {
+            // Dot product Q · K[kv_head, t]
+            const float k_val = active
+                ? K_cache[(kv_head * max_seq + t) * head_dim + tid]
+                : 0.0f;
+            const float score = block_reduce_sum(q_val * k_val) * scale;
+
+            // Online softmax update: returns rescale for prior accumulator.
+            const float rescale = sm.update(score);
+            const float w       = sm.weight(score);
+
+            if (active) {
+                const float v_val =
+                    V_cache[(kv_head * max_seq + t) * head_dim + tid];
+                acc = acc * rescale + w * v_val;
+            }
+            // No explicit sync needed: block_reduce_sum trails a __syncthreads
+            // that protects its internal smem buffer for the next iteration.
+        }
+
+        if (active) {
+            attn_buf[h * head_dim + tid] = acc * sm.finalize();
+        }
+    }
+}
 
 // Phase 4: attention output projection W_o : [hidden, hidden] Q4_K_M.
 // Mirrors phase_rmsnorm_qkv_body's matvec core, minus the RMSNorm prefix,
@@ -946,9 +1016,13 @@ void persistent_decode_layer_f32(
         n_kv_heads, max_seq, head_dim, pos, block_id, n_blocks);
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_KV_APPEND, n_blocks);
 
-    // ── Phase 3: Attention (stub) ──
-    phase_attn_stub(q_buf, K_cache, V_cache, attn_buf,
-        n_heads, n_kv_heads, seq_len, max_seq, head_dim, attn_scale);
+    // ── Phase 3: Decode attention (online softmax) ──
+    phase_attn_body(
+        q_buf, K_cache, V_cache, attn_buf,
+        n_heads, n_kv_heads, seq_len, max_seq, head_dim,
+        attn_scale,
+        block_id, n_blocks
+    );
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_ATTN, n_blocks);
 
     // ── Phase 4: W_o projection ──
