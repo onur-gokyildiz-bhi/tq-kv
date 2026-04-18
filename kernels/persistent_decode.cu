@@ -326,16 +326,43 @@ static __device__ __forceinline__ void phase_rope_body(
 
 // ─── Phase stubs (3-7 — Phase 3+ work) ─────────────────────────────────
 
-static __device__ __noinline__ void phase_kv_append_stub(
-    const float* __restrict__ /*k_new*/,
-    const float* __restrict__ /*v_new*/,
-    float* __restrict__ /*K_cache*/,
-    float* __restrict__ /*V_cache*/,
-    int /*n_kv_heads*/,
-    int /*max_seq*/,
-    int /*head_dim*/,
-    int /*pos*/
-) {}
+// Phase 2: scatter new K/V vectors into their cache slot at `pos`.
+// Layout: K_cache, V_cache are [n_kv_heads, max_seq, head_dim] row-major.
+// k_new, v_new are [n_kv_heads, head_dim] contiguous.
+// For Qwen2 7B Q4K: n_kv_heads=4, head_dim=128 → 1024 floats total per K/V.
+// Grid-strided loop over n_kv_heads * head_dim elements (×2 for K+V).
+static __device__ __forceinline__ void phase_kv_append_body(
+    const float* __restrict__ k_new,
+    const float* __restrict__ v_new,
+    float* __restrict__ K_cache,
+    float* __restrict__ V_cache,
+    const int n_kv_heads,
+    const int max_seq,
+    const int head_dim,
+    const int pos,
+    const int block_id,
+    const int n_blocks
+) {
+    const int tid = threadIdx.x;
+    const int threads_per_block = blockDim.x;
+    const int total_threads = n_blocks * threads_per_block;
+    const int global_tid = block_id * threads_per_block + tid;
+    const int total_elements = n_kv_heads * head_dim;
+    // K scatter
+    for (int i = global_tid; i < total_elements; i += total_threads) {
+        const int h = i / head_dim;
+        const int d = i % head_dim;
+        const int dst_idx = (h * max_seq + pos) * head_dim + d;
+        K_cache[dst_idx] = k_new[i];
+    }
+    // V scatter (same layout)
+    for (int i = global_tid; i < total_elements; i += total_threads) {
+        const int h = i / head_dim;
+        const int d = i % head_dim;
+        const int dst_idx = (h * max_seq + pos) * head_dim + d;
+        V_cache[dst_idx] = v_new[i];
+    }
+}
 
 static __device__ __noinline__ void phase_attn_stub(
     const float* __restrict__ /*Q*/,
@@ -486,9 +513,9 @@ void persistent_decode_layer_f32(
     );
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_ROPE, n_blocks);
 
-    // ── Phase 2: KV cache append (stub) ──
-    phase_kv_append_stub(k_buf, v_buf, K_cache, V_cache,
-        n_kv_heads, max_seq, head_dim, pos);
+    // ── Phase 2: KV cache append ──
+    phase_kv_append_body(k_buf, v_buf, K_cache, V_cache,
+        n_kv_heads, max_seq, head_dim, pos, block_id, n_blocks);
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_KV_APPEND, n_blocks);
 
     // ── Phase 3: Attention (stub) ──
