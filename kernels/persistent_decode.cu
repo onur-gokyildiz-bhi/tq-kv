@@ -357,11 +357,25 @@ static __device__ __noinline__ void phase_wo_stub(
     int /*hidden_dim*/
 ) {}
 
-static __device__ __noinline__ void phase_res_add_stub(
-    const float* __restrict__ /*delta*/,
-    float* __restrict__ /*residual*/,
-    int /*hidden_dim*/
-) {}
+// Phase 5: residual += delta. Trivial vector add. Each block strides through
+// hidden_dim with its own slice via `block_id * threads + tid` global index.
+// Promoted from stub 2026-04-18 (Phase 3 Step 0 — plumbing verification).
+static __device__ __forceinline__ void phase_res_add_body(
+    const float* __restrict__ delta,
+    float* __restrict__ residual,
+    const int hidden_dim,
+    const int block_id,
+    const int n_blocks
+) {
+    const int tid = threadIdx.x;
+    const int threads_per_block = blockDim.x;
+    const int total_threads = n_blocks * threads_per_block;
+    const int global_tid = block_id * threads_per_block + tid;
+    #pragma unroll 2
+    for (int i = global_tid; i < hidden_dim; i += total_threads) {
+        residual[i] += delta[i];
+    }
+}
 
 static __device__ __noinline__ void phase_rmsnorm_gateup_stub(
     const float* __restrict__ /*input*/,
@@ -486,8 +500,8 @@ void persistent_decode_layer_f32(
     phase_wo_stub(W_o, attn_buf, wo_buf, hidden_dim);
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_WO, n_blocks);
 
-    // ── Phase 5: residual += wo_buf (stub) ──
-    phase_res_add_stub(wo_buf, residual, hidden_dim);
+    // ── Phase 5: residual += wo_buf ──
+    phase_res_add_body(wo_buf, residual, hidden_dim, block_id, n_blocks);
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_RES_ADD, n_blocks);
 
     // ── Phase 6: RMSNorm + gate*up*silu (stub) ──
