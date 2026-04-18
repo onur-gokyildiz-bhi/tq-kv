@@ -8,10 +8,9 @@
 // RMSNORM_GATEUP, DOWN, DONE) synchronized via an atomic counter +
 // __threadfence + __syncthreads. Hazy Research Llama-1B megakernel pattern.
 //
-// PHASE 2 STATUS: phases 0 (RMSNORM_QKV) and 1 (ROPE) have real device-
-// function bodies mirroring fused_norm_q4km_qkv_bias_dp4a_f32 and the
-// halved/interleaved fused rope_qk kernels. Phases 2-7 remain empty stubs
-// pending Phase 3 (shmem handoff) and Phase 4 (weight prefetch) work.
+// PHASE 3 STATUS: phases 0 (RMSNORM_QKV), 1 (ROPE), 2 (KV_APPEND),
+// 4 (WO), 5 (RES_ADD) have real device-function bodies. Phases 3 (ATTN),
+// 6 (RMSNORM_GATEUP), 7 (DOWN) remain stubs pending additional work.
 //
 // Row distribution across 68 persistent blocks:
 //   Phase 0 (QKV): total_rows = q_out + k_out + v_out; grouped in 8-row
@@ -377,12 +376,137 @@ static __device__ __noinline__ void phase_attn_stub(
     float /*scale*/
 ) {}
 
-static __device__ __noinline__ void phase_wo_stub(
-    const uint8_t* __restrict__ /*W_o*/,
-    const float* __restrict__ /*attn_out*/,
-    float* __restrict__ /*wo_out*/,
-    int /*hidden_dim*/
-) {}
+// Phase 4: attention output projection W_o : [hidden, hidden] Q4_K_M.
+// Mirrors phase_rmsnorm_qkv_body's matvec core, minus the RMSNorm prefix,
+// the Q/K/V row-range dispatch, and the bias add.
+//
+// Input lives in attn_buf (float), weight is Q4_K_M, output is wo_buf.
+// Row distribution: 8 rows per block, block_id stride (same as Phase 0).
+//
+// Shmem reuse: s_normed + s_x_q8_1 from Phase 0's region. Safe because
+// Phases 1-3 (rope / kv_append / attn-stub) do not touch these buffers,
+// and Phase 4 overwrites s_normed (attn_buf stage) before reading. When
+// phase_attn becomes real it may claim shmem — revisit the aliasing plan.
+//
+// Input is constant across row-groups, so q8_1 quantize runs ONCE per
+// block outside the matvec loop (Phase 0 recomputes per iteration because
+// its s_normed is row-independent but the code is shared there for
+// simplicity — Phase 4 is cleaner as a single-shot).
+// Promoted from stub 2026-04-18 (Phase 3 Step 0c).
+static __device__ __forceinline__ void phase_wo_body(
+    const uint8_t* __restrict__ W_o,
+    const float* __restrict__ attn_buf,
+    float* __restrict__ wo_buf,
+    float* __restrict__ s_normed,        // shmem region: hidden_dim floats
+    uint8_t* __restrict__ s_x_q8_1,      // shmem region: (hidden_dim/32)*36 bytes
+    const int hidden_dim,
+    const int block_id,
+    const int n_blocks
+) {
+    const int tid         = threadIdx.x;
+    const int warp_id     = tid >> 5;
+    const int lane        = tid & 31;
+    const int total_rows  = hidden_dim;
+    const int n_row_grp   = (total_rows + 7) >> 3;
+    const int n_q8_blocks = hidden_dim / 32;
+
+    // 1) Stage attn_buf → s_normed so the quantize pattern matches Phase 0.
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        s_normed[i] = attn_buf[i];
+    }
+    __syncthreads();
+
+    // 2) q8_1 quantize s_normed → s_x_q8_1 (per-warp 32-element blocks).
+    for (int blk = warp_id; blk < n_q8_blocks; blk += 8) {
+        const int idx = blk * 32 + lane;
+        const float xi = (idx < hidden_dim) ? s_normed[idx] : 0.0f;
+
+        float amax = warp_reduce_max(fabsf(xi));
+
+        const float d     = amax / 127.0f;
+        const float d_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+        int qi = __float2int_rn(xi * d_inv);
+        qi = max(-128, min(127, qi));
+        const int8_t q = (amax == 0.0f) ? (int8_t)0 : (int8_t)qi;
+
+        float sum_q = warp_reduce_sum((float)q);
+
+        uint8_t* block_ptr = s_x_q8_1 + (size_t)blk * 36;
+        int8_t*  qs_ptr    = reinterpret_cast<int8_t*>(block_ptr + 4);
+        qs_ptr[lane] = q;
+
+        if (lane == 0) {
+            const float s = d * sum_q;
+            half2 ds = __floats2half2_rn(d, s);
+            *reinterpret_cast<half2*>(block_ptr) = ds;
+        }
+    }
+    __syncthreads();
+
+    // 3) dp4a matvec — 8 warps × 1 row each per row-group, block_id stride.
+    const int sub    = lane >> 2;
+    const int slot   = lane & 3;
+    const int grp_w  = sub >> 1;
+    const int is_hi  = sub & 1;
+
+    const int n_superblocks = hidden_dim / QK_K;
+    const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+
+    for (int rg = block_id; rg < n_row_grp; rg += n_blocks) {
+        const int row         = rg * 8 + warp_id;
+        const bool row_active = (row < total_rows);
+
+        float partial = 0.0f;
+
+        for (int sb = 0; sb < n_superblocks; ++sb) {
+            const uint8_t* blk = row_active
+                ? (W_o + row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
+                : W_o;
+
+            uint16_t d_bits  = blk[0] | (blk[1] << 8);
+            uint16_t dm_bits = blk[2] | (blk[3] << 8);
+            float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+            float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+            uint8_t sc_u8, m_u8;
+            pd_get_scale_min_k4(sub, blk + 4, &sc_u8, &m_u8);
+
+            const int* qs32 = reinterpret_cast<const int*>(blk + 16 + grp_w * 32);
+            int q4_0 = qs32[slot];
+            int q4_1 = qs32[slot + 4];
+
+            int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
+            int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
+
+            const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * 36;
+            uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
+            float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+
+            const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+            int u0 = qs8[slot];
+            int u1 = qs8[slot + 4];
+
+            int sumi = __dp4a(v0, u0, 0);
+            sumi     = __dp4a(v1, u1, sumi);
+
+            int sum_u = __dp4a(0x01010101, u0, 0);
+            sum_u     = __dp4a(0x01010101, u1, sum_u);
+
+            float lane_d = d_w    * (float)sc_u8 * (float)sumi  * d8;
+            float lane_m = dmin_w * (float)m_u8  * (float)sum_u * d8;
+
+            partial += (lane_d - lane_m);
+        }
+
+        float row_sum = warp_reduce_sum(partial);
+
+        if (row_active && lane == 0) {
+            wo_buf[row] = row_sum;
+        }
+        __syncthreads();
+    }
+}
 
 // Phase 5: residual += delta. Trivial vector add. Each block strides through
 // hidden_dim with its own slice via `block_id * threads + tid` global index.
@@ -523,8 +647,13 @@ void persistent_decode_layer_f32(
         n_heads, n_kv_heads, seq_len, max_seq, head_dim, attn_scale);
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_ATTN, n_blocks);
 
-    // ── Phase 4: W_o projection (stub) ──
-    phase_wo_stub(W_o, attn_buf, wo_buf, hidden_dim);
+    // ── Phase 4: W_o projection ──
+    phase_wo_body(
+        W_o, attn_buf, wo_buf,
+        s_normed, s_x_q8_1,
+        hidden_dim,
+        block_id, n_blocks
+    );
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_WO, n_blocks);
 
     // ── Phase 5: residual += wo_buf ──
