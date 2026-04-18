@@ -2156,8 +2156,15 @@ impl GenericTurboModel {
 
         let n = self.layers.len();
         for layer in self.layers[..n].iter_mut() {
-            let residual = &layer_in;
-            let x = layer.attention_norm.forward(&layer_in, backend)?;
+            // Snapshot layer_in BEFORE the fused add-norm mutates its Arc'd
+            // storage in-place. Without this copy-on-write boundary, the
+            // fused_add_rms_norm_gpu write stomps the input buffer we also
+            // read via `residual`, producing corrupt state on the 2nd+
+            // forward_last_hidden call after a forward_hidden_all prefill.
+            // Mirrors forward()'s pattern at the top of its layer loop.
+            let x = layer_in.clone();
+            let residual = &x;
+            let x = layer.attention_norm.forward(&x, backend)?;
             let attn = layer.forward_attn(&x, None, mask.as_ref(), index_pos, backend)?;
             let attn = match &layer.post_attention_norm {
                 Some(norm) => norm.forward(&attn, backend)?,
@@ -2246,8 +2253,13 @@ impl GenericTurboModel {
 
         let n = self.layers.len();
         for layer in self.layers[..n].iter_mut() {
-            let residual = &layer_in;
-            let x = layer.attention_norm.forward(&layer_in, backend)?;
+            // Snapshot layer_in BEFORE the fused add-norm mutates its Arc'd
+            // storage in-place. See forward_last_hidden for the full rationale;
+            // without this copy-on-write boundary, chained prefill+decode
+            // corrupts the target's KV state.
+            let x = layer_in.clone();
+            let residual = &x;
+            let x = layer.attention_norm.forward(&x, backend)?;
             let attn = layer.forward_attn(&x, None, mask.as_ref(), index_pos, backend)?;
             let attn = match &layer.post_attention_norm {
                 Some(norm) => norm.forward(&attn, backend)?,
