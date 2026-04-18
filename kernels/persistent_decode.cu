@@ -9,9 +9,10 @@
 // __threadfence + __syncthreads. Hazy Research Llama-1B megakernel pattern.
 //
 // PHASE 3 STATUS: phases 0 (RMSNORM_QKV), 1 (ROPE), 2 (KV_APPEND),
-// 4 (WO), 5 (RES_ADD), 7 (DOWN) have real device-function bodies.
-// Phases 3 (ATTN) and 6 (RMSNORM_GATEUP) remain stubs pending
-// additional work.
+// 4 (WO), 5 (RES_ADD), 6 (RMSNORM_GATEUP), 7 (DOWN) have real
+// device-function bodies. Only phase 3 (ATTN) remains a stub — it
+// ports the flash_decode split-KV path and is the last piece before
+// wiring TQ_MEGAKERNEL=1 into main decode.
 //
 // Row distribution across 68 persistent blocks:
 //   Phase 0 (QKV): total_rows = q_out + k_out + v_out; grouped in 8-row
@@ -529,16 +530,182 @@ static __device__ __forceinline__ void phase_res_add_body(
     }
 }
 
-static __device__ __noinline__ void phase_rmsnorm_gateup_stub(
-    const float* __restrict__ /*input*/,
-    const float* __restrict__ /*norm_weight*/,
-    const uint8_t* __restrict__ /*W_gate*/,
-    const uint8_t* __restrict__ /*W_up*/,
-    float* __restrict__ /*intermediate*/,
-    int /*hidden_dim*/,
-    int /*intermediate_dim*/,
-    float /*eps*/
-) {}
+// Phase 6: RMSNorm(residual) → gate/up matvecs → SiLU-multiply → intermediate.
+//   x = rmsnorm(residual) * norm_ffn_weight            [hidden_dim]
+//   g = W_gate @ x                                      [intermediate_dim]
+//   u = W_up   @ x                                      [intermediate_dim]
+//   intermediate[i] = silu(g[i]) * u[i]   where silu(x) = x / (1 + exp(-x))
+//
+// Per-row fused inner loop: each warp iterates the hidden_dim super-blocks
+// once, accumulating BOTH gate and up partials against the shared q8_1
+// staging of x. No extra scratch for g/u — only the final scalar pair
+// crosses into the SiLU-multiply. Trade-off vs running gate then up
+// separately: 2× weight global traffic regardless, but the q8_1 block
+// read amortises across both matvecs (already in shmem).
+//
+// Row distribution: 8 rows per block, block_id stride, total_rows =
+// intermediate_dim (same warp-per-row geometry as Phase 0/4/7).
+// Promoted from stub 2026-04-18 (Phase 3 Step 0e).
+static __device__ __forceinline__ void phase_rmsnorm_gateup_body(
+    const float* __restrict__ input,
+    const float* __restrict__ norm_weight,
+    const uint8_t* __restrict__ W_gate,
+    const uint8_t* __restrict__ W_up,
+    float* __restrict__ intermediate,
+    float* __restrict__ s_normed,        // shmem: hidden_dim floats
+    uint8_t* __restrict__ s_x_q8_1,      // shmem: (hidden_dim/32)*36 bytes
+    const int hidden_dim,
+    const int intermediate_dim,
+    const float eps,
+    const int block_id,
+    const int n_blocks
+) {
+    const int tid         = threadIdx.x;
+    const int warp_id     = tid >> 5;
+    const int lane        = tid & 31;
+    const int total_rows  = intermediate_dim;
+    const int n_row_grp   = (total_rows + 7) >> 3;
+    const int n_q8_blocks = hidden_dim / 32;
+
+    // 1) RMSNorm(input) * norm_weight → s_normed.
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        float v = input[i];
+        sum_sq += v * v;
+        s_normed[i] = v;
+    }
+    sum_sq = block_reduce_sum(sum_sq);
+    __shared__ float s_rms_inv;
+    if (tid == 0) {
+        s_rms_inv = rsqrtf(sum_sq / (float)hidden_dim + eps);
+    }
+    __syncthreads();
+    for (int i = tid; i < hidden_dim; i += blockDim.x) {
+        s_normed[i] = s_normed[i] * s_rms_inv * norm_weight[i];
+    }
+    __syncthreads();
+
+    // 2) q8_1 quantize s_normed → s_x_q8_1 (once — input constant across rows).
+    for (int blk = warp_id; blk < n_q8_blocks; blk += 8) {
+        const int idx = blk * 32 + lane;
+        const float xi = (idx < hidden_dim) ? s_normed[idx] : 0.0f;
+
+        float amax = warp_reduce_max(fabsf(xi));
+
+        const float d     = amax / 127.0f;
+        const float d_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+        int qi = __float2int_rn(xi * d_inv);
+        qi = max(-128, min(127, qi));
+        const int8_t q = (amax == 0.0f) ? (int8_t)0 : (int8_t)qi;
+
+        float sum_q = warp_reduce_sum((float)q);
+
+        uint8_t* block_ptr = s_x_q8_1 + (size_t)blk * 36;
+        int8_t*  qs_ptr    = reinterpret_cast<int8_t*>(block_ptr + 4);
+        qs_ptr[lane] = q;
+
+        if (lane == 0) {
+            const float s = d * sum_q;
+            half2 ds = __floats2half2_rn(d, s);
+            *reinterpret_cast<half2*>(block_ptr) = ds;
+        }
+    }
+    __syncthreads();
+
+    // 3) dp4a matvec — interleaved gate/up per super-block. 8 warps × 1 row.
+    const int sub    = lane >> 2;
+    const int slot   = lane & 3;
+    const int grp_w  = sub >> 1;
+    const int is_hi  = sub & 1;
+
+    const int n_superblocks_in = hidden_dim / QK_K;
+    const int bytes_per_row    = n_superblocks_in * Q4K_BLOCK_SIZE;
+
+    for (int rg = block_id; rg < n_row_grp; rg += n_blocks) {
+        const int row         = rg * 8 + warp_id;
+        const bool row_active = (row < total_rows);
+
+        float partial_g = 0.0f;
+        float partial_u = 0.0f;
+
+        for (int sb = 0; sb < n_superblocks_in; ++sb) {
+            const uint8_t* blk_g = row_active
+                ? (W_gate + row * bytes_per_row + sb * Q4K_BLOCK_SIZE) : W_gate;
+            const uint8_t* blk_u = row_active
+                ? (W_up   + row * bytes_per_row + sb * Q4K_BLOCK_SIZE) : W_up;
+
+            // Shared q8_1 block — loaded once per super-block, reused by both.
+            const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * 36;
+            uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
+            float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+
+            const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+            int u0_q8 = qs8[slot];
+            int u1_q8 = qs8[slot + 4];
+            int sum_u = __dp4a(0x01010101, u0_q8, 0);
+            sum_u     = __dp4a(0x01010101, u1_q8, sum_u);
+
+            // Gate super-block.
+            {
+                uint16_t d_bits  = blk_g[0] | (blk_g[1] << 8);
+                uint16_t dm_bits = blk_g[2] | (blk_g[3] << 8);
+                float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+                float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+                uint8_t sc_u8, m_u8;
+                pd_get_scale_min_k4(sub, blk_g + 4, &sc_u8, &m_u8);
+
+                const int* qs32 = reinterpret_cast<const int*>(blk_g + 16 + grp_w * 32);
+                int q4_0 = qs32[slot];
+                int q4_1 = qs32[slot + 4];
+                int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
+                int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
+
+                int sumi = __dp4a(v0, u0_q8, 0);
+                sumi     = __dp4a(v1, u1_q8, sumi);
+
+                float lane_d = d_w    * (float)sc_u8 * (float)sumi  * d8;
+                float lane_m = dmin_w * (float)m_u8  * (float)sum_u * d8;
+                partial_g += (lane_d - lane_m);
+            }
+
+            // Up super-block (same structure, different weight tensor).
+            {
+                uint16_t d_bits  = blk_u[0] | (blk_u[1] << 8);
+                uint16_t dm_bits = blk_u[2] | (blk_u[3] << 8);
+                float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+                float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+                uint8_t sc_u8, m_u8;
+                pd_get_scale_min_k4(sub, blk_u + 4, &sc_u8, &m_u8);
+
+                const int* qs32 = reinterpret_cast<const int*>(blk_u + 16 + grp_w * 32);
+                int q4_0 = qs32[slot];
+                int q4_1 = qs32[slot + 4];
+                int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
+                int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
+
+                int sumi = __dp4a(v0, u0_q8, 0);
+                sumi     = __dp4a(v1, u1_q8, sumi);
+
+                float lane_d = d_w    * (float)sc_u8 * (float)sumi  * d8;
+                float lane_m = dmin_w * (float)m_u8  * (float)sum_u * d8;
+                partial_u += (lane_d - lane_m);
+            }
+        }
+
+        float gate_sum = warp_reduce_sum(partial_g);
+        float up_sum   = warp_reduce_sum(partial_u);
+
+        if (row_active && lane == 0) {
+            // SiLU(gate) = gate * sigmoid(gate) = gate / (1 + exp(-gate)).
+            float silu = gate_sum / (1.0f + __expf(-gate_sum));
+            intermediate[row] = silu * up_sum;
+        }
+        __syncthreads();
+    }
+}
 
 // Phase 7: down projection + fused residual add.
 //   W_down : [hidden_dim, intermediate_dim] Q4_K_M
@@ -797,11 +964,13 @@ void persistent_decode_layer_f32(
     phase_res_add_body(wo_buf, residual, hidden_dim, block_id, n_blocks);
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_RES_ADD, n_blocks);
 
-    // ── Phase 6: RMSNorm + gate*up*silu (stub) ──
-    phase_rmsnorm_gateup_stub(
+    // ── Phase 6: RMSNorm + gate/up matvecs + SiLU-multiply ──
+    phase_rmsnorm_gateup_body(
         residual, norm_ffn_weight,
         W_gate, W_up, intermediate,
-        hidden_dim, intermediate_dim, rms_eps
+        s_normed, s_x_q8_1,
+        hidden_dim, intermediate_dim, rms_eps,
+        block_id, n_blocks
     );
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_RMSNORM_GATEUP, n_blocks);
 
