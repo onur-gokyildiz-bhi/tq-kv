@@ -3579,11 +3579,19 @@ pub fn persistent_decode_layer(
     // (RTX 3080 target). Phase 4 will query cuDeviceGetAttribute.
     let n_sm: u32 = 68;
     let block: u32 = 256;
-    // Dynamic shmem (per design doc §4): hidden_dim*4 (s_normed) +
-    // (hidden_dim/32)*36 (s_x_q8_1). For Qwen2 7B hidden=3584 →
-    // 14336 + 4032 = 18368 bytes.
+    // Dynamic shmem (per design doc §4): stage_cap*4 (s_normed) +
+    // (stage_cap/32)*36 (s_x_q8_1). stage_cap = max(hidden_dim,
+    // intermediate_dim) since Phase 7 (down) stages the intermediate
+    // buffer, typically larger than hidden_dim. Phase 0/4/6 only touch
+    // the first hidden_dim floats so oversizing is harmless.
+    //
+    // Qwen2 7B: stage_cap=18944 → 75776 + 21312 = 97088 bytes ≈ 95 KB.
+    // Exceeds the 48 KB default → TODO(phase-4): cudaFuncSetAttribute
+    // MaxDynamicSharedMemorySize opt-in before the launch.
+    // Smoke test: stage_cap=256 → 1024 + 288 = 1312 bytes.
+    let stage_cap = hidden_dim.max(intermediate_dim);
     let shmem: u32 =
-        (hidden_dim * 4 + (hidden_dim / 32) * 36) as u32;
+        (stage_cap * 4 + (stage_cap / 32) * 36) as u32;
 
     let cfg = LaunchConfig {
         grid_dim: (n_sm, 1, 1),

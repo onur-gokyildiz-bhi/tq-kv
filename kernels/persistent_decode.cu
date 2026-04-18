@@ -9,8 +9,9 @@
 // __threadfence + __syncthreads. Hazy Research Llama-1B megakernel pattern.
 //
 // PHASE 3 STATUS: phases 0 (RMSNORM_QKV), 1 (ROPE), 2 (KV_APPEND),
-// 4 (WO), 5 (RES_ADD) have real device-function bodies. Phases 3 (ATTN),
-// 6 (RMSNORM_GATEUP), 7 (DOWN) remain stubs pending additional work.
+// 4 (WO), 5 (RES_ADD), 7 (DOWN) have real device-function bodies.
+// Phases 3 (ATTN) and 6 (RMSNORM_GATEUP) remain stubs pending
+// additional work.
 //
 // Row distribution across 68 persistent blocks:
 //   Phase 0 (QKV): total_rows = q_out + k_out + v_out; grouped in 8-row
@@ -539,13 +540,145 @@ static __device__ __noinline__ void phase_rmsnorm_gateup_stub(
     float /*eps*/
 ) {}
 
-static __device__ __noinline__ void phase_down_stub(
-    const uint8_t* __restrict__ /*W_down*/,
-    const float* __restrict__ /*intermediate*/,
-    float* __restrict__ /*residual*/,
-    int /*hidden_dim*/,
-    int /*intermediate_dim*/
-) {}
+// Phase 7: down projection + fused residual add.
+//   W_down : [hidden_dim, intermediate_dim] Q4_K_M
+//   input  : intermediate  [intermediate_dim]  (float)
+//   output : residual[i] += (W_down @ intermediate)[i]
+//
+// Mirrors phase_wo_body but with three differences:
+//   1) Input is `intermediate`, dim = intermediate_dim (not hidden_dim).
+//      Typically intermediate_dim > hidden_dim (e.g. 18944 vs 3584 for
+//      Qwen2 7B), so shmem staging requires more space than Phase 0/4.
+//      Kernel entry computes s_x_q8_1 offset from max(hidden, intermediate).
+//   2) Total output rows = hidden_dim (not intermediate_dim).
+//   3) Output is a residual add, not a scratch write. Each row is owned by
+//      exactly one (block, warp) pair under the block_id-stride layout, so
+//      a plain `+=` is race-free.
+//
+// Shmem cliff note: for Qwen2 7B stage_cap = 18944 floats → ~95 KB shmem
+// total when combined with the q8_1 staging. That exceeds the 48 KB default
+// and requires cudaFuncSetAttribute(MaxDynamicSharedMemorySize) at launcher
+// level — tracked under Phase 4 (shmem aliasing / opt-in) in the design doc.
+// The 256-dim smoke test stays under the default limit.
+// Promoted from stub 2026-04-18 (Phase 3 Step 0d).
+static __device__ __forceinline__ void phase_down_body(
+    const uint8_t* __restrict__ W_down,
+    const float* __restrict__ intermediate,
+    float* __restrict__ residual,
+    float* __restrict__ s_normed,        // shmem: at least intermediate_dim floats
+    uint8_t* __restrict__ s_x_q8_1,      // shmem: (intermediate_dim/32)*36 bytes
+    const int hidden_dim,
+    const int intermediate_dim,
+    const int block_id,
+    const int n_blocks
+) {
+    const int tid         = threadIdx.x;
+    const int warp_id     = tid >> 5;
+    const int lane        = tid & 31;
+    const int total_rows  = hidden_dim;
+    const int n_row_grp   = (total_rows + 7) >> 3;
+    const int n_q8_blocks = intermediate_dim / 32;
+
+    // 1) Stage intermediate → s_normed. Input size = intermediate_dim.
+    for (int i = tid; i < intermediate_dim; i += blockDim.x) {
+        s_normed[i] = intermediate[i];
+    }
+    __syncthreads();
+
+    // 2) q8_1 quantize s_normed → s_x_q8_1 (per-warp 32-element blocks).
+    //    n_q8_blocks = intermediate_dim / 32, iterated by warp_id stride.
+    for (int blk = warp_id; blk < n_q8_blocks; blk += 8) {
+        const int idx = blk * 32 + lane;
+        const float xi = (idx < intermediate_dim) ? s_normed[idx] : 0.0f;
+
+        float amax = warp_reduce_max(fabsf(xi));
+
+        const float d     = amax / 127.0f;
+        const float d_inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+        int qi = __float2int_rn(xi * d_inv);
+        qi = max(-128, min(127, qi));
+        const int8_t q = (amax == 0.0f) ? (int8_t)0 : (int8_t)qi;
+
+        float sum_q = warp_reduce_sum((float)q);
+
+        uint8_t* block_ptr = s_x_q8_1 + (size_t)blk * 36;
+        int8_t*  qs_ptr    = reinterpret_cast<int8_t*>(block_ptr + 4);
+        qs_ptr[lane] = q;
+
+        if (lane == 0) {
+            const float s = d * sum_q;
+            half2 ds = __floats2half2_rn(d, s);
+            *reinterpret_cast<half2*>(block_ptr) = ds;
+        }
+    }
+    __syncthreads();
+
+    // 3) dp4a matvec — output rows = hidden_dim. Weight row width =
+    //    intermediate_dim cols → n_superblocks_in super-blocks per row.
+    const int sub    = lane >> 2;
+    const int slot   = lane & 3;
+    const int grp_w  = sub >> 1;
+    const int is_hi  = sub & 1;
+
+    const int n_superblocks_in = intermediate_dim / QK_K;
+    const int bytes_per_row    = n_superblocks_in * Q4K_BLOCK_SIZE;
+
+    for (int rg = block_id; rg < n_row_grp; rg += n_blocks) {
+        const int row         = rg * 8 + warp_id;
+        const bool row_active = (row < total_rows);
+
+        float partial = 0.0f;
+
+        for (int sb = 0; sb < n_superblocks_in; ++sb) {
+            const uint8_t* blk = row_active
+                ? (W_down + row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
+                : W_down;
+
+            uint16_t d_bits  = blk[0] | (blk[1] << 8);
+            uint16_t dm_bits = blk[2] | (blk[3] << 8);
+            float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+            float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+
+            uint8_t sc_u8, m_u8;
+            pd_get_scale_min_k4(sub, blk + 4, &sc_u8, &m_u8);
+
+            const int* qs32 = reinterpret_cast<const int*>(blk + 16 + grp_w * 32);
+            int q4_0 = qs32[slot];
+            int q4_1 = qs32[slot + 4];
+
+            int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
+            int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
+
+            const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * 36;
+            uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
+            float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+
+            const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+            int u0 = qs8[slot];
+            int u1 = qs8[slot + 4];
+
+            int sumi = __dp4a(v0, u0, 0);
+            sumi     = __dp4a(v1, u1, sumi);
+
+            int sum_u = __dp4a(0x01010101, u0, 0);
+            sum_u     = __dp4a(0x01010101, u1, sum_u);
+
+            float lane_d = d_w    * (float)sc_u8 * (float)sumi  * d8;
+            float lane_m = dmin_w * (float)m_u8  * (float)sum_u * d8;
+
+            partial += (lane_d - lane_m);
+        }
+
+        float row_sum = warp_reduce_sum(partial);
+
+        if (row_active && lane == 0) {
+            // Residual add (race-free: each row owned by one warp).
+            residual[row] += row_sum;
+        }
+        __syncthreads();
+    }
+}
 
 // ─── Persistent kernel entry point ─────────────────────────────────────
 //
@@ -605,10 +738,14 @@ void persistent_decode_layer_f32(
     int* __restrict__ g_phase_counter,
     int n_blocks
 ) {
-    // Dynamic shmem carved once. Phase 0 owns it; later phases unused for now.
+    // Dynamic shmem carved once. s_normed stages either hidden_dim floats
+    // (Phase 0/4/6) or intermediate_dim floats (Phase 7), so s_x_q8_1 sits
+    // past the LARGER of the two capacities. Launcher sizes shmem to match.
     extern __shared__ float s_mem_pd[];
+    const int stage_cap =
+        (hidden_dim > intermediate_dim) ? hidden_dim : intermediate_dim;
     float*   s_normed = s_mem_pd;
-    uint8_t* s_x_q8_1 = reinterpret_cast<uint8_t*>(s_mem_pd + hidden_dim);
+    uint8_t* s_x_q8_1 = reinterpret_cast<uint8_t*>(s_mem_pd + stage_cap);
 
     const int block_id = blockIdx.x;
 
@@ -668,9 +805,13 @@ void persistent_decode_layer_f32(
     );
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_RMSNORM_GATEUP, n_blocks);
 
-    // ── Phase 7: down projection + final residual add (stub) ──
-    phase_down_stub(W_down, intermediate, residual,
-        hidden_dim, intermediate_dim);
+    // ── Phase 7: down projection + fused residual add ──
+    phase_down_body(
+        W_down, intermediate, residual,
+        s_normed, s_x_q8_1,
+        hidden_dim, intermediate_dim,
+        block_id, n_blocks
+    );
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_DOWN, n_blocks);
 
     // ── Phase 8: drain ──
