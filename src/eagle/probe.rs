@@ -53,6 +53,10 @@ pub struct ProbeStep {
     pub position: usize,
     pub target_token: u32,
     pub draft_token: Option<u32>,
+    /// Top-10 indices for the target and draft at this step. None for the
+    /// bootstrap step where no draft prediction exists yet.
+    pub target_top10: Option<Vec<u32>>,
+    pub draft_top10:  Option<Vec<u32>>,
 }
 
 impl ProbeStep {
@@ -147,6 +151,7 @@ pub fn run_acceptance_probe(
         let d_logits_host = d_logits.to_vec1()
             .map_err(|e| EagleError::Msg(format!("draft logits to_vec: {}", e)))?;
         let draft_pred = argmax(&d_logits_host);
+        let draft_top10 = topk(&d_logits_host, 10);
 
         // ── Target forward for ground truth at target_pos ──
         let x_token = Tensor::from_vec(vec![pending_token as f32], vec![1, 1],
@@ -161,11 +166,14 @@ pub fn run_acceptance_probe(
         let tgt_logits_host = tgt_logits.to_vec1()
             .map_err(|e| EagleError::Msg(format!("target logits to_vec: {}", e)))?;
         let tgt_next_token = argmax(&tgt_logits_host);
+        let target_top10 = topk(&tgt_logits_host, 10);
 
         steps.push(ProbeStep {
-            position: target_pos + 1,  // position of the token being predicted
+            position: target_pos + 1,
             target_token: tgt_next_token,
             draft_token: Some(draft_pred),
+            target_top10: Some(target_top10),
+            draft_top10:  Some(draft_top10),
         });
 
         if eos.contains(&tgt_next_token) {
@@ -209,19 +217,53 @@ fn argmax(v: &[f32]) -> u32 {
     best_i as u32
 }
 
+/// Return indices of the K largest values.
+fn topk(v: &[f32], k: usize) -> Vec<u32> {
+    let mut idx: Vec<(usize, f32)> = v.iter().copied().enumerate().collect();
+    idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    idx.into_iter().take(k).map(|(i, _)| i as u32).collect()
+}
+
 pub fn summarise(steps: &[ProbeStep]) {
     let (mut compared, mut accepted) = (0usize, 0usize);
+    // Top-K overlap: how many of target's top-10 appear in draft's top-10.
+    // For a healthy draft, this should be ≥ 5 on average (50%+ overlap).
+    // Signal floor: ~0.6 overlap = chance (10/152064 × 10 = near-zero).
+    let mut overlap_sum = 0usize;
+    let mut overlap_count = 0usize;
+    // Is draft's argmax in target's top-10 (weaker check than exact match)?
+    let mut draft_in_tgt_top10 = 0usize;
+    // Is target's argmax in draft's top-10?
+    let mut tgt_in_draft_top10 = 0usize;
     for s in steps {
         if let Some(a) = s.is_accepted() {
             compared += 1;
             if a { accepted += 1; }
         }
+        if let (Some(t10), Some(d10)) = (s.target_top10.as_ref(), s.draft_top10.as_ref()) {
+            let tset: std::collections::HashSet<u32> = t10.iter().copied().collect();
+            let dset: std::collections::HashSet<u32> = d10.iter().copied().collect();
+            overlap_sum += tset.intersection(&dset).count();
+            overlap_count += 1;
+            if tset.contains(&s.draft_token.unwrap_or(u32::MAX)) {
+                draft_in_tgt_top10 += 1;
+            }
+            if dset.contains(&s.target_token) {
+                tgt_in_draft_top10 += 1;
+            }
+        }
     }
     let rate = if compared > 0 { 100.0 * accepted as f32 / compared as f32 } else { 0.0 };
+    let avg_overlap = if overlap_count > 0 { overlap_sum as f32 / overlap_count as f32 } else { 0.0 };
     println!();
     println!("Acceptance-rate probe:");
-    println!("  steps compared : {}", compared);
-    println!("  draft == target: {} ({:.1}%)", accepted, rate);
+    println!("  steps compared      : {}", compared);
+    println!("  draft == target     : {} ({:.1}%)", accepted, rate);
+    println!("  draft in tgt-top10  : {} ({:.1}%)", draft_in_tgt_top10,
+             100.0 * draft_in_tgt_top10 as f32 / overlap_count.max(1) as f32);
+    println!("  tgt in draft-top10  : {} ({:.1}%)", tgt_in_draft_top10,
+             100.0 * tgt_in_draft_top10 as f32 / overlap_count.max(1) as f32);
+    println!("  avg top10 overlap   : {:.2} / 10", avg_overlap);
     if compared > 0 {
         println!();
         println!("  step  pos   target   draft    match");
