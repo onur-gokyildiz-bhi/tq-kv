@@ -32,6 +32,8 @@ mod mlp;
 mod kv_cache;
 mod layer;
 mod model;
+#[cfg(all(feature = "cuda", feature = "persistent-kernel"))]
+mod megakernel;
 
 pub use model::GenericTurboModel;
 pub(crate) use kv_cache::{set_triattention_override, clear_triattention_override, get_triattention_budget, set_auto_layer_bits};
