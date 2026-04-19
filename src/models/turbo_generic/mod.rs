@@ -26,7 +26,6 @@ std::thread_local! {
 }
 
 mod primitives;
-pub use primitives::MAX_SEQ_LEN;
 
 mod mlp;
 mod kv_cache;

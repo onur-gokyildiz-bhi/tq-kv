@@ -1,9 +1,7 @@
 //! TurboQuant KV Cache: compression, GPU buffers, config helpers, RoPE, TriAttention.
 
-use crate::backend::ComputeBackend;
 use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
 use crate::cuda::Result;
-use crate::qmatmul as qmm;
 use tq_kv::TurboQuantConfig;
 
 // ============================================================
@@ -451,7 +449,7 @@ impl GpuCompressedKv {
     /// Uses D2D copies to gather retained positions to buffer start.
     /// Much faster than full re-seed (copies only retained tokens, not all).
     pub(crate) fn compact(&mut self, retained: &[usize]) -> std::result::Result<(), crate::cuda::TqError> {
-        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use cudarc::driver::DevicePtr;
         use cudarc::driver::sys;
 
         let n_retain = retained.len();
@@ -623,7 +621,7 @@ impl GpuColdKv {
             // For now, silently drop (circular buffer behavior).
             return Ok(());
         }
-        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use cudarc::driver::DevicePtr;
         use cudarc::driver::sys;
 
         let cold_pos = self.count;
@@ -687,7 +685,7 @@ impl GpuColdKv {
         let mc = self.max_cold;
         let raw_stream = self.stream.cu_stream();
 
-        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use cudarc::driver::DevicePtr;
         use cudarc::driver::sys;
 
         let (src_base, _) = hot_decomp.device_ptr(self.stream.as_ref());

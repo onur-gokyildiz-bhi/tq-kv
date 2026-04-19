@@ -6,11 +6,11 @@ use std::sync::Arc;
 use crate::backend::ComputeBackend;
 use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
 use crate::cuda::Result;
-use crate::gguf::{GgufContent, GgmlDType, WeightSource, GgufSource};
+use crate::gguf::{GgufContent, WeightSource, GgufSource};
 use crate::qmatmul as qmm;
 use tq_kv::TurboQuantConfig;
 
-use super::primitives::{Embedding, RmsNorm, apply_softcap, softmax_last_dim, Module, MAX_SEQ_LEN};
+use super::primitives::{Embedding, RmsNorm, apply_softcap, Module, MAX_SEQ_LEN};
 use super::mlp::*;
 use super::kv_cache::*;
 use super::layer::*;

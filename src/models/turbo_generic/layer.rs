@@ -1,15 +1,13 @@
 //! LayerWeights: per-layer weights, QKV, RoPE, forward_attn (attention + TQ compression).
 
-use std::sync::Arc;
 
 use crate::backend::ComputeBackend;
 use crate::cuda::{TqTensor as Tensor, TqDevice as Device, TqDType as DType, TqError};
 use crate::cuda::Result;
-use crate::qmatmul as qmm;
 use tq_kv::TurboQuantConfig;
 
 use super::primitives::{Module, RmsNorm, softmax_last_dim, apply_softcap};
-use super::mlp::{QMatMul, MlpOrMoe, repeat_kv, masked_fill};
+use super::mlp::{QMatMul, MlpOrMoe, repeat_kv};
 use super::kv_cache::*;
 
 /// QKV weight layout — separate tensors (most models) or merged single tensor (Phi-3.5).
@@ -631,7 +629,7 @@ fn try_all_gpu_tq_decompress_attention(
     sink_k_gpu: &mut Option<cudarc::driver::CudaSlice<f32>>,
     sink_v_gpu: &mut Option<cudarc::driver::CudaSlice<f32>>,
     signs_gpu: &Option<cudarc::driver::CudaSlice<f32>>,
-    q: &Tensor,
+    _q: &Tensor,
     q_f32: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -2279,7 +2277,7 @@ impl LayerWeights {
         q: &Tensor,
         k: Tensor,
         v: Tensor,
-        mask: Option<&Tensor>,
+        _mask: Option<&Tensor>,
         index_pos: usize,
         n_rep: usize,
         b_sz: usize,
@@ -2548,12 +2546,12 @@ impl LayerWeights {
         v: Tensor,
         k_pre_rope: Option<Tensor>,
         pre_rope_mode: bool,
-        tri_enabled: bool,
+        _tri_enabled: bool,
         effective_bits: u8,
         n_rep: usize,
         b_sz: usize,
         seq_len: usize,
-        mask: Option<&Tensor>,
+        _mask: Option<&Tensor>,
         index_pos: usize,
         backend: &dyn ComputeBackend,
     ) -> Result<Tensor> {
