@@ -34,6 +34,11 @@
 #ifndef Q4K_BLOCK_SIZE
 #define Q4K_BLOCK_SIZE 144
 #endif
+#ifndef Q6K_BLOCK_SIZE
+// Q6K block: ql[0..127] (4-bit LO) + qh[128..191] (2-bit HI) + scales[192..207]
+// (16×int8) + d[208..209] (fp16). Total 210 bytes → 256 values.
+#define Q6K_BLOCK_SIZE 210
+#endif
 
 static __device__ __forceinline__ void pd_get_scale_min_k4(
     int j, const uint8_t* scales, uint8_t* sc, uint8_t* m
@@ -118,6 +123,7 @@ static __device__ __forceinline__ void phase_rmsnorm_qkv_body(
     const int k_out,
     const int v_out,
     const float eps,
+    const int v_is_q6k,                  // 0 = V is Q4K; 1 = V is Q6K
     const int block_id,
     const int n_blocks
 ) {
@@ -208,48 +214,139 @@ static __device__ __forceinline__ void phase_rmsnorm_qkv_body(
         }
 
         const int n_superblocks = hidden_dim / QK_K;
-        const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
+
+        // Warp-uniform: all 32 lanes share the same `row`, so this branch
+        // doesn't create in-warp divergence. Different warps within a
+        // block may take different paths; that's fine — warps aren't
+        // required to execute in lockstep.
+        const bool row_is_q6k = (row >= q_out + k_out) && (v_is_q6k != 0);
 
         float partial = 0.0f;
 
-        for (int sb = 0; sb < n_superblocks; ++sb) {
-            const uint8_t* blk = row_active
-                ? (W_sel + local_row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
-                : (W_sel);
+        if (!row_is_q6k) {
+            // ── Q4K path (existing). Q/K rows always take this; V rows
+            //    also take it when v_is_q6k == 0. ──
+            const int bytes_per_row = n_superblocks * Q4K_BLOCK_SIZE;
 
-            uint16_t d_bits  = blk[0] | (blk[1] << 8);
-            uint16_t dm_bits = blk[2] | (blk[3] << 8);
-            float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
-            float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
+            for (int sb = 0; sb < n_superblocks; ++sb) {
+                const uint8_t* blk = row_active
+                    ? (W_sel + local_row * bytes_per_row + sb * Q4K_BLOCK_SIZE)
+                    : (W_sel);
 
-            uint8_t sc_u8, m_u8;
-            pd_get_scale_min_k4(sub, blk + 4, &sc_u8, &m_u8);
+                uint16_t d_bits  = blk[0] | (blk[1] << 8);
+                uint16_t dm_bits = blk[2] | (blk[3] << 8);
+                float d_w    = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+                float dmin_w = __half2float(*reinterpret_cast<const __half*>(&dm_bits));
 
-            const int* qs32 = reinterpret_cast<const int*>(blk + 16 + grp_w * 32);
-            int q4_0 = qs32[slot];
-            int q4_1 = qs32[slot + 4];
+                uint8_t sc_u8, m_u8;
+                pd_get_scale_min_k4(sub, blk + 4, &sc_u8, &m_u8);
 
-            int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
-            int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
+                const int* qs32 = reinterpret_cast<const int*>(blk + 16 + grp_w * 32);
+                int q4_0 = qs32[slot];
+                int q4_1 = qs32[slot + 4];
 
-            const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * 36;
-            uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
-            float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+                int v0 = is_hi ? ((q4_0 >> 4) & 0x0F0F0F0F) : (q4_0 & 0x0F0F0F0F);
+                int v1 = is_hi ? ((q4_1 >> 4) & 0x0F0F0F0F) : (q4_1 & 0x0F0F0F0F);
 
-            const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
-            int u0 = qs8[slot];
-            int u1 = qs8[slot + 4];
+                const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * 36;
+                uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
+                float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
 
-            int sumi = __dp4a(v0, u0, 0);
-            sumi     = __dp4a(v1, u1, sumi);
+                const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+                int u0 = qs8[slot];
+                int u1 = qs8[slot + 4];
 
-            int sum_u = __dp4a(0x01010101, u0, 0);
-            sum_u     = __dp4a(0x01010101, u1, sum_u);
+                int sumi = __dp4a(v0, u0, 0);
+                sumi     = __dp4a(v1, u1, sumi);
 
-            float lane_d = d_w    * (float)sc_u8 * (float)sumi  * d8;
-            float lane_m = dmin_w * (float)m_u8  * (float)sum_u * d8;
+                int sum_u = __dp4a(0x01010101, u0, 0);
+                sum_u     = __dp4a(0x01010101, u1, sum_u);
 
-            partial += (lane_d - lane_m);
+                float lane_d = d_w    * (float)sc_u8 * (float)sumi  * d8;
+                float lane_m = dmin_w * (float)m_u8  * (float)sum_u * d8;
+
+                partial += (lane_d - lane_m);
+            }
+        } else {
+            // ── Q6K V path (new in Sprint 3). Qwen2 7B / Llama3 Q4_K_M
+            //    GGUFs store V as Q6K (quality upgrade). Mirrors the
+            //    `q6k_matvec_dp4a_v2_f32` kernel's decode, adapted to the
+            //    phase-0 warp-linear super-block walk. Q6K has no dmin
+            //    zero-point (symmetric around 32), so the lane_m term
+            //    drops — just one weighted dot term per sub-block pair. ──
+            const int bytes_per_row = n_superblocks * Q6K_BLOCK_SIZE;
+            const int q6_grp   = sub >> 2;   // 0 or 1
+            const int q6_sub   = sub & 3;    // 0..3
+            const int ql_half  = q6_sub & 1; // low/high 32B half of ql group
+            const int is_hi_q6 = q6_sub >> 1;// 0 = lo nibble, 1 = hi nibble
+            const int qh_shift = q6_sub * 2; // which 2 bits of each qh byte
+
+            for (int sb = 0; sb < n_superblocks; ++sb) {
+                const uint8_t* blk = row_active
+                    ? (W_sel + local_row * bytes_per_row + sb * Q6K_BLOCK_SIZE)
+                    : (W_sel);
+                const uint8_t* ql = blk;
+                const uint8_t* qh = blk + 128;
+                const int8_t* scales = reinterpret_cast<const int8_t*>(blk + 192);
+
+                // fp16 overall scale (unaligned 2-byte load).
+                uint16_t d_bits = (uint16_t)blk[208] | ((uint16_t)blk[209] << 8);
+                float d_w = __half2float(*reinterpret_cast<const __half*>(&d_bits));
+
+                const int ql_off = q6_grp * 64;
+                const int qh_off = q6_grp * 32;
+                const int sc_off = q6_grp * 8;
+
+                // 4 consecutive ql bytes (q6_0 @ slot*4..+3); byte-wise
+                // load because 210-byte blocks aren't uniformly 4-B aligned.
+                const uint8_t* ql_p0 = ql + ql_off + ql_half * 32 + slot * 4;
+                int ql_0 = (int)ql_p0[0]
+                         | ((int)ql_p0[1] << 8)
+                         | ((int)ql_p0[2] << 16)
+                         | ((int)ql_p0[3] << 24);
+                const uint8_t* ql_p1 = ql_p0 + 16;
+                int ql_1 = (int)ql_p1[0]
+                         | ((int)ql_p1[1] << 8)
+                         | ((int)ql_p1[2] << 16)
+                         | ((int)ql_p1[3] << 24);
+
+                int n0 = is_hi_q6 ? ((ql_0 >> 4) & 0x0F0F0F0F) : (ql_0 & 0x0F0F0F0F);
+                int n1 = is_hi_q6 ? ((ql_1 >> 4) & 0x0F0F0F0F) : (ql_1 & 0x0F0F0F0F);
+
+                const uint8_t* qh_p0 = qh + qh_off + slot * 4;
+                int qh_0 = (int)qh_p0[0]
+                         | ((int)qh_p0[1] << 8)
+                         | ((int)qh_p0[2] << 16)
+                         | ((int)qh_p0[3] << 24);
+                const uint8_t* qh_p1 = qh_p0 + 16;
+                int qh_1 = (int)qh_p1[0]
+                         | ((int)qh_p1[1] << 8)
+                         | ((int)qh_p1[2] << 16)
+                         | ((int)qh_p1[3] << 24);
+
+                int h0 = (qh_0 >> qh_shift) & 0x03030303;
+                int h1 = (qh_1 >> qh_shift) & 0x03030303;
+
+                int q_raw_0 = n0 | (h0 << 4);
+                int q_raw_1 = n1 | (h1 << 4);
+                int q_signed_0 = __vsub4(q_raw_0, 0x20202020);
+                int q_signed_1 = __vsub4(q_raw_1, 0x20202020);
+
+                const uint8_t* q8_1_block = s_x_q8_1 + (size_t)(sb * 8 + sub) * 36;
+                uint16_t d8_bits = q8_1_block[0] | (q8_1_block[1] << 8);
+                float d8 = __half2float(*reinterpret_cast<const __half*>(&d8_bits));
+                const int* qs8 = reinterpret_cast<const int*>(q8_1_block + 4);
+                int u0 = qs8[slot];
+                int u1 = qs8[slot + 4];
+
+                int dot0 = __dp4a(q_signed_0, u0, 0);
+                int dot1 = __dp4a(q_signed_1, u1, 0);
+
+                int sc0 = (int)scales[sc_off + q6_sub * 2 + 0];
+                int sc1 = (int)scales[sc_off + q6_sub * 2 + 1];
+
+                partial += d_w * d8 * ((float)sc0 * (float)dot0 + (float)sc1 * (float)dot1);
+            }
         }
 
         float row_sum = warp_reduce_sum(partial);
@@ -969,6 +1066,7 @@ void persistent_decode_layer_f32(
     int seq_len,
     int pos,
     int rope_interleaved,                    // 0 = halved, 1 = interleaved
+    int v_is_q6k,                            // 0 = V is Q4K; 1 = V is Q6K (Qwen2 / Llama Q4_K_M default)
     float rms_eps,
     float attn_scale,
     // Sync counter (zeroed by launcher before entry)
@@ -996,6 +1094,7 @@ void persistent_decode_layer_f32(
         hidden_dim,
         n_heads * head_dim, n_kv_heads * head_dim, n_kv_heads * head_dim,
         rms_eps,
+        v_is_q6k,
         block_id, n_blocks
     );
     phase_enter_and_wait(g_phase_counter, TQ_PHASE_RMSNORM_QKV, n_blocks);

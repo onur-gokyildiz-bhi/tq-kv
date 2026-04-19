@@ -3409,6 +3409,7 @@ mod tests {
             N_HEADS, N_KV_HEADS, HEAD_DIM, ROPE_DIM,
             MAX_SEQ, SEQ_LEN, POS,
             /* rope_interleaved = */ false,
+            /* v_is_q6k        = */ false,
             rms_eps, attn_scale,
         ).expect("persistent_decode_layer launch");
 
@@ -3613,6 +3614,7 @@ mod tests {
             N_HEADS, N_KV_HEADS, HEAD_DIM, ROPE_DIM,
             MAX_SEQ, SEQ_LEN, POS,
             /* rope_interleaved = */ false,
+            /* v_is_q6k        = */ false,
             rms_eps, attn_scale,
         ).expect("persistent_decode_layer launch with >48KB shmem");
 
@@ -3781,6 +3783,7 @@ pub fn persistent_decode_layer(
     seq_len: usize,
     pos: usize,
     rope_interleaved: bool,
+    v_is_q6k: bool,
     rms_eps: f32,
     attn_scale: f32,
 ) -> Result<(), DriverError> {
@@ -3855,6 +3858,7 @@ pub fn persistent_decode_layer(
     let sl_i   = seq_len as i32;
     let p_i    = pos as i32;
     let ril_i  = if rope_interleaved { 1_i32 } else { 0_i32 };
+    let vq6k_i = if v_is_q6k { 1_i32 } else { 0_i32 };
     let nb_i   = n_sm as i32;
     let null_ptr: u64 = 0;
 
@@ -3879,7 +3883,7 @@ pub fn persistent_decode_layer(
             .arg(&hd_i).arg(&id_i)
             .arg(&nh_i).arg(&nkv_i).arg(&hdm_i).arg(&rpd_i)
             .arg(&ms_i).arg(&sl_i).arg(&p_i)
-            .arg(&ril_i)
+            .arg(&ril_i).arg(&vq6k_i)
             .arg(&rms_eps).arg(&attn_scale)
             .arg(&mut *bufs.phase_counter)
             .arg(&nb_i)

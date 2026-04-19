@@ -65,6 +65,25 @@ impl QMatMul {
         Some((gpu, qw.out_features(), qw.in_features()))
     }
 
+    /// Get inner QWeight if it's Q6K quantized (Qwen2/Llama Q4_K_M GGUFs
+    /// store V projection + sometimes down_proj as Q6K for quality).
+    pub(crate) fn q6k_weight(&self) -> Option<&qmm::QWeight> {
+        match &self.inner {
+            qmm::QMatMul::Quantized(qw) if matches!(qw.dtype, crate::gguf::GgmlDType::Q6K) => Some(qw),
+            _ => None,
+        }
+    }
+
+    /// Get GPU-resident raw Q6K weight bytes for the megakernel's V-path
+    /// (phase_rmsnorm_qkv_body) and related kernels.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn q6k_gpu_data(&self) -> Option<(&cudarc::driver::CudaSlice<u8>, usize, usize)> {
+        let qw = self.q6k_weight()?;
+        let reg = crate::cuda::kernels::global_registry()?;
+        let gpu = qw.gpu_cache_or_upload(&reg.stream);
+        Some((gpu, qw.out_features(), qw.in_features()))
+    }
+
     pub(crate) fn forward(&self, xs: &Tensor, backend: &dyn ComputeBackend) -> Result<Tensor> {
         let _enter = self.span.enter();
         match &self.inner {

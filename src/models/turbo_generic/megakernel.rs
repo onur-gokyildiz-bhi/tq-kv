@@ -165,6 +165,22 @@ pub(crate) fn assemble_persistent_buffers<'a>(
 fn megakernel_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| std::env::var("TQ_MEGAKERNEL").ok().as_deref() == Some("1"))
+    && !DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One-shot kill switch. Once ANY layer fails assemble (e.g. because a
+/// weight it needs isn't supported yet), we latch this bit so the rest
+/// of the process skips megakernel entirely. Without the latch every
+/// layer of every decode step pays the full shape-check cost — visible
+/// as a ~10% Std regression on Qwen2 7B when `down` is Q6K (not yet
+/// supported by phase_down_body).
+static DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn disable_for_process(reason: &str) {
+    if !DISABLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[megakernel] disabled for rest of process: {}", reason);
+    }
 }
 
 /// Try to run the whole layer through `persistent_decode_layer`. Returns
@@ -218,31 +234,50 @@ pub(crate) fn try_megakernel_layer(
         None => return Ok(false),
     };
 
-    // ── Layer-shape gates (separate QKV, gated-silu MLP, Q4_K_M weights
-    //   already uploaded). Weights fetched here double as the assembly's
-    //   inputs below — we can't borrow them again after taking the &mut
-    //   reference to layer.gpu_kv_cache. ──
-    let (wq_bytes, wk_bytes, wv_bytes) = match &layer.qkv {
-        QkvWeights::Separate { wq, wk, wv } => (
-            wq.q4k_gpu_data().map(|(s, _, _)| s)
-                .ok_or_else(|| AssembleError("wq not Q4K or not uploaded".into()))?,
-            wk.q4k_gpu_data().map(|(s, _, _)| s)
-                .ok_or_else(|| AssembleError("wk not Q4K or not uploaded".into()))?,
-            wv.q4k_gpu_data().map(|(s, _, _)| s)
-                .ok_or_else(|| AssembleError("wv not Q4K or not uploaded".into()))?,
-        ),
+    // ── Layer-shape gates (separate QKV, gated-silu MLP, quantized weights
+    //   already uploaded). Q and K must be Q4_K_M; V may be Q4_K_M OR Q6K
+    //   — Qwen2 7B / Llama3 Q4_K_M GGUFs upgrade V to Q6K for attention
+    //   fidelity. `v_is_q6k` propagates to the kernel. ──
+    // Macro: require a weight to be Q4K. On miss, latch the process-global
+    // disable so subsequent layers short-circuit the gate. Non-Q4K on
+    // wo/gate/up/down is a permanent fail for this process — the kernel
+    // doesn't have Q6K paths for those yet. (V has a Q6K path as of
+    // Sprint 3, handled separately below.)
+    macro_rules! require_q4k {
+        ($qm:expr, $what:literal) => {
+            match $qm.q4k_gpu_data() {
+                Some((s, _, _)) => s,
+                None => {
+                    disable_for_process(concat!($what, " not Q4K (phase body doesn't handle it)"));
+                    return Err(AssembleError(concat!($what, " not Q4K").into()));
+                }
+            }
+        };
+    }
+
+    let (wq_bytes, wk_bytes, wv_bytes, v_is_q6k) = match &layer.qkv {
+        QkvWeights::Separate { wq, wk, wv } => {
+            let wq_b = require_q4k!(wq, "wq");
+            let wk_b = require_q4k!(wk, "wk");
+            // V: Q4K is Sprint-1 default; Q6K routed through Sprint-3 path.
+            let (wv_b, v_q6k) = if let Some((s, _, _)) = wv.q4k_gpu_data() {
+                (s, false)
+            } else if let Some((s, _, _)) = wv.q6k_gpu_data() {
+                (s, true)
+            } else {
+                disable_for_process("wv is neither Q4K nor Q6K");
+                return Err(AssembleError("wv is neither Q4K nor Q6K".into()));
+            };
+            (wq_b, wk_b, wv_b, v_q6k)
+        }
         QkvWeights::Merged { .. } => return Ok(false),
     };
-    let wo_bytes = layer.attention_wo.q4k_gpu_data().map(|(s, _, _)| s)
-        .ok_or_else(|| AssembleError("wo not Q4K or not uploaded".into()))?;
+    let wo_bytes = require_q4k!(&layer.attention_wo, "wo");
     let (gate_bytes, up_bytes, down_bytes) = match &layer.mlp_or_moe {
         MlpOrMoe::Mlp(m) => (
-            m.feed_forward_w1.q4k_gpu_data().map(|(s, _, _)| s)
-                .ok_or_else(|| AssembleError("gate not Q4K".into()))?,
-            m.feed_forward_w3.q4k_gpu_data().map(|(s, _, _)| s)
-                .ok_or_else(|| AssembleError("up not Q4K".into()))?,
-            m.feed_forward_w2.q4k_gpu_data().map(|(s, _, _)| s)
-                .ok_or_else(|| AssembleError("down not Q4K".into()))?,
+            require_q4k!(&m.feed_forward_w1, "gate"),
+            require_q4k!(&m.feed_forward_w3, "up"),
+            require_q4k!(&m.feed_forward_w2, "down"),
         ),
         _ => return Ok(false),
     };
@@ -315,6 +350,7 @@ pub(crate) fn try_megakernel_layer(
         n_heads, n_kv_heads, head_dim, rope_dim,
         max_seq, seq_len, pos,
         rope_interleaved,
+        v_is_q6k,
         rms_eps, attn_scale,
     ).map_err(|e| AssembleError(format!("persistent_decode_layer launch: {:?}", e)))?;
 
