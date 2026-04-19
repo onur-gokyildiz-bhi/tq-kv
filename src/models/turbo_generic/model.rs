@@ -1932,30 +1932,34 @@ impl GenericTurboModel {
                 layer_idx, layer_uses_compression,
             );
 
-            // ── Megakernel opt-in path (TQ_MEGAKERNEL=1) ──
-            // Sprint 3 added Q6K V support to phase_rmsnorm_qkv_body, so
-            // Qwen2 7B / Llama3 Q4_K_M layers now assemble cleanly. Any
-            // remaining ineligible shape (Gemma post-norms, Phi merged
-            // QKV, MoE, TQ compressed layer, prefill) falls through.
-            #[cfg(all(feature = "cuda", feature = "persistent-kernel"))]
-            {
-                match super::megakernel::try_megakernel_layer(
-                    layer, &mut layer_in, &mut decode_scratch,
-                    seq_len, capturing, layer_uses_compression, index_pos,
-                ) {
-                    Ok(true)  => continue,
-                    Ok(false) => {},
-                    Err(e) => {
-                        // Kernel launch failure — shout once and fall back
-                        // so the token still gets generated.
-                        static WARN: std::sync::atomic::AtomicBool =
-                            std::sync::atomic::AtomicBool::new(false);
-                        if !WARN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            eprintln!("[megakernel] disabled after launch failure: {}", e);
-                        }
-                    }
-                }
-            }
+            // ── Megakernel wiring DISABLED pending v0.9.0 optimization ──
+            // Sprint 4 (2026-04-19) validated end-to-end firing on Qwen2 7B
+            // Q4_K_M with Q6K V + Q6K down. PPL bit-identical. BUT the
+            // measured bench was -22% Std (58.7 → 45.8 tok/s) vs baseline.
+            // Root causes for the regression (all known-addressable):
+            //   1. phase_attn uses naive one-block-per-head; only 28/68 SMs
+            //      active during attention. Needs flash_decode split-KV port.
+            //   2. 95 KB shmem caps occupancy at 1 block/SM on sm_86. Phase-4
+            //      shmem aliasing can drop this under 48 KB for 2 blocks/SM.
+            //   3. Phase bodies use basic dp4a. Standalone path has
+            //      dp4a_v2/v3/mrow8 variants that the persistent kernel
+            //      doesn't pick up.
+            // A user setting TQ_MEGAKERNEL=1 hoping for the originally
+            // projected +10% would instead hit -22% — that's actively bad
+            // UX. So the call site stays commented out until one of the
+            // above optimization sprints lands.
+            //
+            // #[cfg(all(feature = "cuda", feature = "persistent-kernel"))]
+            // {
+            //     match super::megakernel::try_megakernel_layer(
+            //         layer, &mut layer_in, &mut decode_scratch,
+            //         seq_len, capturing, layer_uses_compression, index_pos,
+            //     ) {
+            //         Ok(true)  => continue,
+            //         Ok(false) => {},
+            //         Err(_)    => {}
+            //     }
+            // }
 
             #[cfg(feature = "cuda")]
             if try_fused_decode_layer(

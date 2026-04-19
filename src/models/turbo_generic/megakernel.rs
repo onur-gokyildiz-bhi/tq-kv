@@ -273,12 +273,21 @@ pub(crate) fn try_megakernel_layer(
         QkvWeights::Merged { .. } => return Ok(false),
     };
     let wo_bytes = require_q4k!(&layer.attention_wo, "wo");
-    let (gate_bytes, up_bytes, down_bytes) = match &layer.mlp_or_moe {
-        MlpOrMoe::Mlp(m) => (
-            require_q4k!(&m.feed_forward_w1, "gate"),
-            require_q4k!(&m.feed_forward_w3, "up"),
-            require_q4k!(&m.feed_forward_w2, "down"),
-        ),
+    let (gate_bytes, up_bytes, down_bytes, down_is_q6k) = match &layer.mlp_or_moe {
+        MlpOrMoe::Mlp(m) => {
+            let g = require_q4k!(&m.feed_forward_w1, "gate");
+            let u = require_q4k!(&m.feed_forward_w3, "up");
+            // down: Q4K default, Q6K via Sprint-4 path (Qwen2 7B / Llama3).
+            let (d, d_q6k) = if let Some((s, _, _)) = m.feed_forward_w2.q4k_gpu_data() {
+                (s, false)
+            } else if let Some((s, _, _)) = m.feed_forward_w2.q6k_gpu_data() {
+                (s, true)
+            } else {
+                disable_for_process("down is neither Q4K nor Q6K");
+                return Err(AssembleError("down is neither Q4K nor Q6K".into()));
+            };
+            (g, u, d, d_q6k)
+        }
         _ => return Ok(false),
     };
     let bias_q_ref = layer.attention_bq.as_ref().map(|t| t.cuda_data());
@@ -351,6 +360,7 @@ pub(crate) fn try_megakernel_layer(
         max_seq, seq_len, pos,
         rope_interleaved,
         v_is_q6k,
+        down_is_q6k,
         rms_eps, attn_scale,
     ).map_err(|e| AssembleError(format!("persistent_decode_layer launch: {:?}", e)))?;
 
