@@ -3438,6 +3438,196 @@ mod tests {
 
         eprintln!("[persistent-decode smoke] PASS — launcher + phase-0/1 bodies executed");
     }
+
+    /// Qwen2-7B-dim smoke: verifies the shmem opt-in path. stage_cap is
+    /// intermediate_dim=18944 → ~95 KB dynamic shmem, well past the 48 KB
+    /// default limit. Without the `cuFuncSetAttribute` opt-in the launch
+    /// would return CUDA_ERROR_INVALID_VALUE; this test is the guard
+    /// against a silent regression there.
+    #[cfg(feature = "persistent-kernel")]
+    #[test]
+    fn persistent_decode_layer_qwen2_dims_smoke() {
+        std::env::set_var("TQ_PERSISTENT", "1");
+
+        let ctx = match cudarc::driver::CudaContext::new(0) {
+            Ok(c) => c,
+            Err(e) => { eprintln!("[skip] no CUDA device: {:?}", e); return; }
+        };
+        let stream = ctx.default_stream();
+        let (sm_major, sm_minor) = {
+            use cudarc::driver::sys;
+            let mut device: sys::CUdevice = 0;
+            let mut major: i32 = 0;
+            let mut minor: i32 = 0;
+            unsafe {
+                sys::cuDeviceGet(&mut device, 0);
+                sys::cuDeviceGetAttribute(&mut major,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+                sys::cuDeviceGetAttribute(&mut minor,
+                    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+            }
+            (major as u32, minor as u32)
+        };
+        if sm_major < 6 || (sm_major == 6 && sm_minor < 1) {
+            eprintln!("[skip] persistent_decode requires sm_61+ (dp4a), have sm_{}{}",
+                sm_major, sm_minor);
+            return;
+        }
+        let reg = KernelRegistry::new(&ctx, &stream, sm_major, sm_minor)
+            .expect("kernel registry init");
+
+        // Qwen2-7B-Instruct dims.
+        const HIDDEN:       usize = 3584;
+        const INTERMEDIATE: usize = 18944;
+        const N_HEADS:      usize = 28;
+        const N_KV_HEADS:   usize = 4;
+        const HEAD_DIM:     usize = 128;
+        const ROPE_DIM:     usize = HEAD_DIM;
+        const MAX_SEQ:      usize = 128;           // tight — keeps KV alloc small
+        const SEQ_LEN:      usize = 1;
+        const POS:          usize = 0;
+        const Q4K_BYTES:    usize = 144;
+
+        let q_out  = N_HEADS    * HEAD_DIM;   // 3584
+        let kv_out = N_KV_HEADS * HEAD_DIM;   // 512
+        let n_sb_hidden = HIDDEN / 256;       // 14
+        let n_sb_inter  = INTERMEDIATE / 256; // 74
+        let bytes_row_hidden = n_sb_hidden * Q4K_BYTES;
+        let bytes_row_inter  = n_sb_inter  * Q4K_BYTES;
+
+        // ── Minimal valid Q4_K super-block: tiny d, zero dmin, unit scales,
+        //    deterministic nibble pattern per seed. Same recipe as the
+        //    256-dim smoke test.
+        let build_sb = |mut s: u32| -> [u8; Q4K_BYTES] {
+            let mut row = [0u8; Q4K_BYTES];
+            row[0] = 0x00; row[1] = 0x18;
+            row[2] = 0x00; row[3] = 0x00;
+            for j in 0..12 { row[4 + j] = 1; }
+            for j in 0..128 {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                row[16 + j] = (s >> 24) as u8;
+            }
+            row
+        };
+        let mk_weights = |out_rows: usize, n_sb: usize, seed_base: u32| -> Vec<u8> {
+            let bytes_per_row = n_sb * Q4K_BYTES;
+            let mut buf = Vec::with_capacity(out_rows * bytes_per_row);
+            for r in 0..out_rows {
+                for sb in 0..n_sb {
+                    let s = seed_base
+                        .wrapping_add(r as u32)
+                        .wrapping_mul(31)
+                        .wrapping_add(sb as u32);
+                    buf.extend_from_slice(&build_sb(s));
+                }
+            }
+            buf
+        };
+
+        let w_q_host     = mk_weights(q_out,   n_sb_hidden, 0x1000);
+        let w_k_host     = mk_weights(kv_out,  n_sb_hidden, 0x2000);
+        let w_v_host     = mk_weights(kv_out,  n_sb_hidden, 0x3000);
+        let w_o_host     = mk_weights(HIDDEN,  n_sb_hidden, 0x4000);
+        let w_gate_host  = mk_weights(INTERMEDIATE, n_sb_hidden, 0x5000);
+        let w_up_host    = mk_weights(INTERMEDIATE, n_sb_hidden, 0x6000);
+        let w_down_host  = mk_weights(HIDDEN,  n_sb_inter,  0x7000);
+
+        assert_eq!(w_q_host.len(),    q_out * bytes_row_hidden);
+        assert_eq!(w_down_host.len(), HIDDEN * bytes_row_inter);
+
+        let mut residual_host = vec![0.0f32; HIDDEN];
+        for i in 0..HIDDEN { residual_host[i] = 0.1 + 0.001 * (i as f32); }
+        let norm_attn_host: Vec<f32> = vec![1.0; HIDDEN];
+        let norm_ffn_host:  Vec<f32> = vec![1.0; HIDDEN];
+
+        let half = ROPE_DIM / 2;
+        let mut cos_host = vec![0.0f32; MAX_SEQ * half];
+        let mut sin_host = vec![0.0f32; MAX_SEQ * half];
+        for p in 0..MAX_SEQ {
+            for i in 0..half {
+                let theta = (p as f32) / 10000f32.powf(2.0 * i as f32 / ROPE_DIM as f32);
+                cos_host[p * half + i] = theta.cos();
+                sin_host[p * half + i] = theta.sin();
+            }
+        }
+
+        let bias_q_host: Vec<f32> = (0..q_out ).map(|i| 0.0001 * i as f32).collect();
+        let bias_k_host: Vec<f32> = (0..kv_out).map(|i| 0.0002 * i as f32).collect();
+        let bias_v_host: Vec<f32> = (0..kv_out).map(|i| 0.0003 * i as f32).collect();
+
+        let mut residual    = stream.memcpy_stod(&residual_host).expect("up residual");
+        let norm_attn       = stream.memcpy_stod(&norm_attn_host).expect("up na");
+        let norm_ffn        = stream.memcpy_stod(&norm_ffn_host).expect("up nf");
+        let w_q             = stream.memcpy_stod(&w_q_host).expect("up wq");
+        let w_k             = stream.memcpy_stod(&w_k_host).expect("up wk");
+        let w_v             = stream.memcpy_stod(&w_v_host).expect("up wv");
+        let bias_q_dev      = stream.memcpy_stod(&bias_q_host).expect("up bq");
+        let bias_k_dev      = stream.memcpy_stod(&bias_k_host).expect("up bk");
+        let bias_v_dev      = stream.memcpy_stod(&bias_v_host).expect("up bv");
+        let w_o             = stream.memcpy_stod(&w_o_host).expect("up wo");
+        let w_gate          = stream.memcpy_stod(&w_gate_host).expect("up wg");
+        let w_up            = stream.memcpy_stod(&w_up_host).expect("up wu");
+        let w_down          = stream.memcpy_stod(&w_down_host).expect("up wd");
+        let cos_table       = stream.memcpy_stod(&cos_host).expect("up cos");
+        let sin_table       = stream.memcpy_stod(&sin_host).expect("up sin");
+
+        let mut q_buf: CudaSlice<f32>       = stream.alloc_zeros(q_out).expect("q_buf");
+        let mut k_buf: CudaSlice<f32>       = stream.alloc_zeros(kv_out).expect("k_buf");
+        let mut v_buf: CudaSlice<f32>       = stream.alloc_zeros(kv_out).expect("v_buf");
+        let mut attn_buf: CudaSlice<f32>    = stream.alloc_zeros(q_out).expect("attn_buf");
+        let mut wo_buf: CudaSlice<f32>      = stream.alloc_zeros(HIDDEN).expect("wo_buf");
+        let mut intermediate: CudaSlice<f32> = stream.alloc_zeros(INTERMEDIATE).expect("intermediate");
+        let mut k_cache: CudaSlice<f32>     =
+            stream.alloc_zeros(MAX_SEQ * N_KV_HEADS * HEAD_DIM).expect("k_cache");
+        let mut v_cache: CudaSlice<f32>     =
+            stream.alloc_zeros(MAX_SEQ * N_KV_HEADS * HEAD_DIM).expect("v_cache");
+        let mut phase_counter: CudaSlice<i32> = stream.alloc_zeros(1).expect("phase_counter");
+
+        let mut bufs = PersistentDecodeBuffers {
+            residual:         &mut residual,
+            norm_attn_weight: &norm_attn,
+            norm_ffn_weight:  &norm_ffn,
+            w_q: &w_q, w_k: &w_k, w_v: &w_v,
+            bias_q: Some(&bias_q_dev),
+            bias_k: Some(&bias_k_dev),
+            bias_v: Some(&bias_v_dev),
+            w_o: &w_o,
+            w_gate: &w_gate, w_up: &w_up, w_down: &w_down,
+            cos_table: &cos_table, sin_table: &sin_table,
+            q_buf: &mut q_buf, k_buf: &mut k_buf, v_buf: &mut v_buf,
+            attn_buf: &mut attn_buf, wo_buf: &mut wo_buf,
+            intermediate: &mut intermediate,
+            k_cache: &mut k_cache, v_cache: &mut v_cache,
+            phase_counter: &mut phase_counter,
+        };
+
+        let rms_eps: f32 = 1e-6;
+        let attn_scale: f32 = 1.0 / (HEAD_DIM as f32).sqrt();
+
+        // This is the critical call — with shmem ≈ 95 KB the launch will
+        // fail with CUDA_ERROR_INVALID_VALUE unless the cuFuncSetAttribute
+        // opt-in fired first inside persistent_decode_layer.
+        persistent_decode_layer(
+            &reg, &mut bufs,
+            HIDDEN, INTERMEDIATE,
+            N_HEADS, N_KV_HEADS, HEAD_DIM, ROPE_DIM,
+            MAX_SEQ, SEQ_LEN, POS,
+            /* rope_interleaved = */ false,
+            rms_eps, attn_scale,
+        ).expect("persistent_decode_layer launch with >48KB shmem");
+
+        stream.synchronize().expect("sync after qwen2-dims launch");
+
+        let pc = stream.memcpy_dtov(&phase_counter).expect("dl pc");
+        assert!(pc[0] > 0, "phase counter did not advance — kernel silently skipped");
+
+        let q_host = stream.memcpy_dtov(&q_buf).expect("dl q");
+        assert!(q_host.iter().all(|x| x.is_finite()),
+            "q_buf contains NaN/Inf after Qwen2-dim launch");
+
+        eprintln!("[persistent-decode qwen2 smoke] PASS — shmem opt-in ({} bytes) worked",
+            (HIDDEN.max(INTERMEDIATE) * 4 + (HIDDEN.max(INTERMEDIATE) / 32) * 36));
+    }
 }
 
 // ─── GQA Shared-K decode attention (skeleton launcher) ───────────────────
@@ -3586,12 +3776,33 @@ pub fn persistent_decode_layer(
     // the first hidden_dim floats so oversizing is harmless.
     //
     // Qwen2 7B: stage_cap=18944 → 75776 + 21312 = 97088 bytes ≈ 95 KB.
-    // Exceeds the 48 KB default → TODO(phase-4): cudaFuncSetAttribute
-    // MaxDynamicSharedMemorySize opt-in before the launch.
     // Smoke test: stage_cap=256 → 1024 + 288 = 1312 bytes.
     let stage_cap = hidden_dim.max(intermediate_dim);
     let shmem: u32 =
         (stage_cap * 4 + (stage_cap / 32) * 36) as u32;
+
+    // ── Opt-in for dynamic shmem > 48 KB ────────────────────────────────
+    // Hopper-style carveout via cuFuncSetAttribute; without this call a
+    // launch asking for >48 KB returns CUDA_ERROR_INVALID_VALUE. Called
+    // once per layer launch is cheap (the driver caches). sm_86 caps at
+    // 100 KB/block, so we assert before setting.
+    const DEFAULT_SHMEM_LIMIT: u32 = 48 * 1024;
+    if shmem > DEFAULT_SHMEM_LIMIT {
+        use cudarc::driver::sys::CUfunction_attribute_enum as Attr;
+        // sm_86 supports up to 100 KB/block dynamic shmem. Bail early
+        // with a clear error instead of letting the driver reject.
+        const SM86_MAX_SHMEM: u32 = 100 * 1024;
+        if shmem > SM86_MAX_SHMEM {
+            eprintln!(
+                "[persistent-decode] shmem {} bytes exceeds sm_86 cap {} — shmem aliasing required",
+                shmem, SM86_MAX_SHMEM
+            );
+            return Err(DriverError(
+                cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+            ));
+        }
+        f.set_attribute(Attr::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shmem as i32)?;
+    }
 
     let cfg = LaunchConfig {
         grid_dim: (n_sm, 1, 1),
