@@ -20,24 +20,28 @@ Now with **Pre-RoPE key quantization** (34-59% less PPL gap), **KV Compaction** 
 
 ## Current performance
 
-> RTX 3080 10GB, Qwen2.5-7B-Instruct Q4_K_M, own CUDA kernels, no external inference dependency. Three-run average, warmup discarded, TTFT separated.
+> RTX 3080 10 GB, Qwen2.5-7B-Instruct Q4_K_M, own CUDA kernels, no external inference dependency. Three-run mean at 2026-04-19, warmup discarded, TTFT separated.
 
-| Mode | tok/s | TTFT | PPL (wikitext-2) | KV memory |
+| Mode | tok/s | TTFT | PPL (`/tmp/ppl_bench.txt`) | KV memory |
 |:---|---:|---:|---:|:---|
-| Standard | **28.0** | 0.19 s | 4.136 | grows linearly |
-| TQ 4-bit | **19.7** | 0.10 s | 4.457 (+7.8%) | 3.8× smaller |
-| TQ 4-bit + TriAttention | **19.4** | 0.11 s | 4.574 (+10.6%) | **constant** |
+| Standard | **63.6** | 0.19 s | 11.508 | grows linearly |
+| TQ 4-bit | **39.3** | 0.11 s | 12.473 (+8.4%) | 3.8× smaller |
+| TQ 4-bit + TriAttention | **37.6** | 0.11 s | 12.473 (+8.4%) | **constant** |
+
+- llama.cpp head-to-head gap narrowed from 4.0× at v0.6.0 to **1.83×** at v0.7.0.
+- A pre-push hook enforces PPL thresholds (Std ≤ 12.66, TQ ≤ 13.72) on every kernel change.
+- Known limit on 10 GB cards: prefill attention is O(N²), so the CLI OOMs past ~2 K prompt length regardless of KV compression. See `scripts/bench-long-context.sh` for the forcing measurement.
 
 Full matrix (Llama 3.1 8B, Mistral 7B, multi-context, reproducible CLIs): [BENCHMARKS.md](BENCHMARKS.md).
 
-## What's next (v0.7.0)
+## What's next (v0.8.0)
 
-Sprint in progress. Targets:
+Everything below is gated and unscoped; priorities in order:
 
-- **dp4a Q4_K matvec** — close the Q4K instruction-efficiency gap against upstream llama.cpp (target ≥70 tok/s Qwen2 7B Standard on RTX 3080).
-- **Sparse V** — skip value rows where softmax weight falls below threshold in the decode attention kernel.
-- **Asymmetric K/V bitwidth** — 4-bit keys, 2-bit values by default; per-layer overrides.
-- **Metal port kickoff** — shared kernel interface, Metal backend skeleton, MPS-only fallbacks for the ops without Metal kernels yet.
+- **Megakernel wiring.** v0.7.0 ships the 6-phase persistent kernel with all stubs promoted to real bodies and the >48 KB shmem opt-in; the last mile is routing `TQ_MEGAKERNEL=1` through `model.rs::forward`. Architect projection +~10 %; will be measured, not claimed, at merge.
+- **Flash-attention for PREFILL.** We only have `flash_decode` (single-token). Prefill attention's N×N score tensor is the real long-context OOM cliff; a flash-prefill port unlocks ≥ 4 K contexts on 10 GB cards.
+- **EAGLE acceptance debug.** Sprint 1–3 shipped the draft loader, tree attention, and acceptance probe in v0.7.0. The draft forward is bit-correct against a numpy reference but acceptance sits at ~6.7 % — a torch-based reference covering non-zero inputs is the likely unlock. Week-scale.
+- **Metal backend kickoff** (blocked on a collaborator with Apple Silicon).
 
 Full plan: see the `status:planned` nodes in the project knowledge graph.
 
