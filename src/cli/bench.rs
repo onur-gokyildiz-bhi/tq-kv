@@ -7,14 +7,22 @@ use crate::engine::{Engine, GenerationParams};
 use crate::{auto_tq, calibrate, catalog, config, hub, model, models, Cli, Commands};
 
 pub(crate) fn cmd_bench(cli: &Cli) -> Result<()> {
-    let (model_name, tokens, json_output, custom_prompt, tq_only, draft_model, spec_k) = match &cli.command {
-        Some(Commands::Bench { model, tokens, json, prompt, tq_only, draft, speculate }) => {
-            (model.as_str(), *tokens, *json, prompt.as_deref(), *tq_only, draft.as_deref(), *speculate)
+    let (model_name, tokens, json_output, custom_prompt, prompt_file, tq_only, draft_model, spec_k) = match &cli.command {
+        Some(Commands::Bench { model, tokens, json, prompt, prompt_file, tq_only, draft, speculate }) => {
+            (model.as_str(), *tokens, *json, prompt.as_deref(), prompt_file.as_ref(), *tq_only, draft.as_deref(), *speculate)
         }
         _ => unreachable!(),
     };
 
-    let bench_prompt = custom_prompt.unwrap_or(
+    // Resolve prompt: --prompt-file wins over --prompt; both fall back to default.
+    let file_prompt = match prompt_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading --prompt-file {}", path.display()))?
+        ),
+        None => None,
+    };
+    let bench_prompt: &str = file_prompt.as_deref().or(custom_prompt).unwrap_or(
         "Explain the theory of relativity in simple terms. Include examples."
     );
 

@@ -147,6 +147,10 @@ pub(crate) enum Commands {
         /// Custom prompt for benchmark
         #[arg(long)]
         prompt: Option<String>,
+        /// Read prompt from file (bypasses CLI argv length limit — required
+        /// for long-context benches, e.g. 16K/32K prompts).
+        #[arg(long)]
+        prompt_file: Option<std::path::PathBuf>,
         /// Skip standard (non-TQ) run — use when CUDA lacks stock model support
         #[arg(long)]
         tq_only: bool,
