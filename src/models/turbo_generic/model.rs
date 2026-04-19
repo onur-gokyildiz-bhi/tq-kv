@@ -1932,6 +1932,28 @@ impl GenericTurboModel {
                 layer_idx, layer_uses_compression,
             );
 
+            // ── Megakernel wiring deferred to v0.8.1+ ──
+            // Sprint 2 discovered that `phase_rmsnorm_qkv_body` only
+            // handles Q4_K_M weights, but Qwen2 7B Q4_K_M GGUFs store V
+            // as Q6K (quality upgrade that the standalone fused path
+            // already accommodates via an f32-matvec fallback). Until
+            // the persistent kernel learns Q6K V, `try_megakernel_layer`
+            // bails at assemble time on every real-world call. The
+            // wire-up code itself is correct — revived by uncommenting
+            // the call site below once the kernel gains Q6K V support.
+            //
+            // #[cfg(all(feature = "cuda", feature = "persistent-kernel"))]
+            // {
+            //     match super::megakernel::try_megakernel_layer(
+            //         layer, &mut layer_in, &mut decode_scratch,
+            //         seq_len, capturing, layer_uses_compression, index_pos,
+            //     ) {
+            //         Ok(true)  => continue,
+            //         Ok(false) => {},
+            //         Err(_)    => {} // fall through to standalone
+            //     }
+            // }
+
             #[cfg(feature = "cuda")]
             if try_fused_decode_layer(
                 layer, layer_idx, &mut layer_in, mask.as_ref(), index_pos,
