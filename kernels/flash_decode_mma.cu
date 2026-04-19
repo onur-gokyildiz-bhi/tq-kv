@@ -34,13 +34,21 @@
 #endif
 
 // MMA tile shape — fixed by the PTX instruction.
+//
+// Note (2026-04-19): the inline asm below emits m16n8k8 (one .b32 per B
+// thread, two .b32 per A thread). CUDA 12 accepted a mislabelled
+// `m16n8k16` name against those argument counts; CUDA 13's ptxas is
+// strict and rejects it (`Argument vector size mismatch for instruction
+// 'mma'`). The loop that calls the helper steps `kk += FDM_MMA_K`, so
+// this constant stays in lockstep with the actual PTX shape to keep the
+// kernel semantically correct.
 #define FDM_MMA_M 16
 #define FDM_MMA_N 8
-#define FDM_MMA_K 16
+#define FDM_MMA_K 8
 
 // ─────────────────────────────────────────────────────────────────────────────
 // mma_m16n8k16_f16: inline PTX wrapper for
-//   mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+//   mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
 //
 // A: 16×16 half, row-major. Per-thread frag = 4 halves in 2 × .b32.
 // B: 16× 8 half, col-major. Per-thread frag = 2 halves in 1 × .b32.
@@ -58,7 +66,7 @@ __device__ __forceinline__ void mma_m16n8k16_f16(
     const uint32_t b
 ) {
     asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
         "{%0, %1, %2, %3}, "
         "{%4, %5}, "
         "{%6}, "
