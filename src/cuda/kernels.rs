@@ -3618,14 +3618,49 @@ mod tests {
 
         stream.synchronize().expect("sync after qwen2-dims launch");
 
+        // Expected phase counter: TQ_N_PHASES * n_blocks = 9 * 68 = 612.
+        // Anything less means a phase barrier didn't fire; the residual
+        // then carries stale data from a prior phase.
         let pc = stream.memcpy_dtov(&phase_counter).expect("dl pc");
-        assert!(pc[0] > 0, "phase counter did not advance — kernel silently skipped");
+        assert_eq!(pc[0], 9 * 68,
+            "phase counter {} != 612 (9 phases × 68 blocks) — a phase barrier didn't fire", pc[0]);
 
-        let q_host = stream.memcpy_dtov(&q_buf).expect("dl q");
-        assert!(q_host.iter().all(|x| x.is_finite()),
-            "q_buf contains NaN/Inf after Qwen2-dim launch");
+        // Every intermediate buffer must be finite AND non-zero: NaN/Inf
+        // means a numerically broken phase body; all-zero means that body
+        // never ran (despite the counter saying otherwise — could happen
+        // if only warp 0 of block 0 incremented without executing the
+        // matvec).
+        let assert_live = |v: &[f32], name: &str| {
+            assert!(v.iter().all(|x| x.is_finite()),
+                "{} contains NaN/Inf — phase produced garbage", name);
+            assert!(v.iter().any(|&x| x != 0.0),
+                "{} is all-zero — phase did not write", name);
+        };
 
-        eprintln!("[persistent-decode qwen2 smoke] PASS — shmem opt-in ({} bytes) worked",
+        let q_host     = stream.memcpy_dtov(&q_buf    ).expect("dl q");
+        let k_host     = stream.memcpy_dtov(&k_buf    ).expect("dl k");
+        let v_host     = stream.memcpy_dtov(&v_buf    ).expect("dl v");
+        let attn_host  = stream.memcpy_dtov(&attn_buf ).expect("dl attn");
+        let wo_host    = stream.memcpy_dtov(&wo_buf   ).expect("dl wo");
+        let inter_host = stream.memcpy_dtov(&intermediate).expect("dl inter");
+        let resid_host = stream.memcpy_dtov(&residual ).expect("dl residual");
+        let kc_host    = stream.memcpy_dtov(&k_cache  ).expect("dl kc");
+
+        assert_live(&q_host,     "q_buf (phase 0+1: QKV+RoPE)");
+        assert_live(&k_host,     "k_buf (phase 0+1: QKV+RoPE)");
+        assert_live(&v_host,     "v_buf (phase 0: QKV)");
+        assert_live(&attn_host,  "attn_buf (phase 3: attention)");
+        assert_live(&wo_host,    "wo_buf (phase 4: o-projection)");
+        assert_live(&inter_host, "intermediate (phase 6: rmsnorm+gate/up+silu)");
+        assert_live(&resid_host, "residual (phase 5+7: residual adds)");
+
+        // k_cache at slot POS must have the post-RoPE k_buf values.
+        // Phase 2 scatters k_new → K_cache[kv_head, pos, :].
+        let first_head_slice = &kc_host[POS * HEAD_DIM .. (POS + 1) * HEAD_DIM];
+        assert!(first_head_slice.iter().any(|&x| x != 0.0),
+            "k_cache[head=0, pos={}] is zero — phase 2 (kv_append) did not scatter", POS);
+
+        eprintln!("[persistent-decode qwen2 smoke] PASS — shmem opt-in ({} bytes) + all 9 phases advanced + every buffer live",
             (HIDDEN.max(INTERMEDIATE) * 4 + (HIDDEN.max(INTERMEDIATE) / 32) * 36));
     }
 }
